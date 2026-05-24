@@ -14,24 +14,44 @@ public crate is the same code, MIT-licensed, with no internal dependencies.
 
 ## Why a Rust port
 
-The upstream Node.js [`live-mutex`](https://github.com/ORESoftware/live-mutex)
-broker is well-loved and battle-tested, but the JavaScript runtime puts a
-ceiling on throughput and tail latency for a service whose entire job is to
-park, wake, and dispatch correlation-ID frames as fast as possible. This crate
-is a from-scratch Rust port that picks up several improvements the upstream
-project planned but had not landed (composite locking, fencing tokens, a single
-TTL sweeper instead of a per-request timer, an HTML status page) up front:
+The Node.js [`live-mutex`](https://github.com/ORESoftware/live-mutex) broker is
+well-loved and battle-tested, but the JavaScript runtime puts a ceiling on
+throughput and tail latency for a service whose entire job is to park, wake,
+and dispatch correlation-ID frames as fast as possible. This crate is a
+from-scratch Rust port. Several features landed in this port first and were
+later mirrored back into upstream `live-mutex` (composite locking, fencing
+tokens, a single TTL sweeper, an HTML status page); the issue numbers below
+are kept for historical traceability.
 
-- Reader-writer locks alongside the regular exclusive lock client (`RwClient`).
-- **Fencing tokens** — every successful `acquire` returns a per-key
-  monotonically increasing `u64`. Callers should attach the token to whatever
-  resource the lock protects so that a stale leaseholder's eventual write can
-  be rejected. (See <https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html>.)
-- **Composite (multi-key) locking** — atomic acquisition of up to five keys in
-  one request, deadlock-free via global lexicographic ordering. Resolves
-  upstream issue [`live-mutex#105`](https://github.com/ORESoftware/live-mutex/issues/105).
+Headline features:
+
+- **Multi-key (composite) locking** — atomic acquisition of up to five keys
+  in a single request, deadlock-free via global lexicographic ordering, with
+  a per-key fencing token returned for each acquired key. See
+  [Multi-key (composite) locking](#multi-key-composite-locking) below.
+  (Originally tracked at [`live-mutex#105`](https://github.com/ORESoftware/live-mutex/issues/105),
+  now also landed in upstream Node.js.)
+- **Fencing tokens** — every successful `acquire` (single-key, semaphore
+  slot, or composite member) returns a per-key strictly-increasing `u64`.
+  Callers attach the token to whatever resource the lock protects so a
+  stale leaseholder's eventual write can be rejected. See
+  <https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html>.
+- **Reader-writer locks** alongside the regular exclusive-lock client
+  (`RwClient`). Reader/writer state is tracked in the same broker key, with
+  fencing tokens emitted on both reader and writer grants.
+- **Semaphore-style locks** — `max=N` admits up to N simultaneous holders for
+  a key. Each holder gets its own fencing token. See
+  [Semaphore-style locks](#semaphore-style-locks-concurrency--1) below.
 - **HTTP transport** for callers that can't hold a long-lived TCP connection
   (Lambda, Cloudflare Workers, Vercel functions). Long-poll via `waitMs`.
+- **Single TTL sweeper** instead of a per-request timer. Originally tracked
+  at [`live-mutex#13`](https://github.com/ORESoftware/live-mutex/issues/13);
+  now also landed in upstream Node.js.
+- **HTML operator status page**. Originally tracked at
+  [`live-mutex#108`](https://github.com/ORESoftware/live-mutex/issues/108).
+- **TCP\_NODELAY / TCP\_QUICKACK socket-tuning experiment** with Prometheus
+  counters. Originally tracked at
+  [`live-mutex#22`](https://github.com/ORESoftware/live-mutex/issues/22).
 - **TLS** behind the optional `tls` cargo feature, although a load balancer or
   service mesh is usually a more capable terminator.
 
@@ -149,7 +169,7 @@ multiple responses per correlation UUID.
 
 | Method | Path                  | Body                                                                  | Notes                                                                       |
 | ------ | --------------------- | --------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| GET    | `/`, `/status`        | —                                                                     | HTML operator status page (upstream `live-mutex#108`). Auto-refreshes 5s.   |
+| GET    | `/`, `/status`        | —                                                                     | HTML operator status page (originally `live-mutex#108`). Auto-refreshes 5s. |
 | GET    | `/healthz`, `/readyz` | —                                                                     | Liveness/readiness.                                                         |
 | GET    | `/metrics`            | —                                                                     | Prometheus text exposition (`dd_rust_network_mutex_*`).                      |
 | POST   | `/v1/lock`            | `{ "key" \| "keys", "ttlMs?", "max?", "waitMs?" }`                    | Returns `{ acquired, lockUuid?, fencingTokens, queueDepth, keys, error? }`. Validation failures (missing `key`/`keys`, oversized composite, `key` and `keys` both set) come back as 400 with `error` populated. |
@@ -182,8 +202,8 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_DEFAULT_TTL_MS`    | `4000`           | Default lock TTL in milliseconds.                                                                |
 | `LMX_MAX_LOCK_HOLDERS`  | `1`              | Default `max` per key. Per-request `max` overrides.                                              |
 | `LMX_MAX_CONCURRENCY_CAP` | `1000`         | Hard ceiling on per-key `max` (semaphore-style locks). Requests above this are silently clamped and counted in `dd_rust_network_mutex_concurrency_cap_clamps_total`. |
-| `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (upstream `live-mutex#13`). `0` disables auto-eviction.      |
-| `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (upstream `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
+| `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
+| `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
 | `LMX_TCP_NODELAY`       | `true`           | Apply `TCP_NODELAY` on broker-accepted sockets. Experiment from `live-mutex#22`.                 |
 | `LMX_TCP_QUICKACK`      | `true`           | Re-apply `TCP_QUICKACK` after every read on Linux. No-op on macOS/BSD. See `live-mutex#22`.      |
 | `LMX_TLS_CERT`          | unset            | (`tls` feature) PEM-encoded server certificate path.                                             |
@@ -193,9 +213,9 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 
 ## Socket-tuning experiment (`live-mutex#22`)
 
-Upstream issue [`live-mutex#22`](https://github.com/ORESoftware/live-mutex/issues/22)
-proposes two TCP knobs to take the ~40 ms delayed-ACK + Nagle interaction
-out of the request/response RPC path:
+Originally requested at [`live-mutex#22`](https://github.com/ORESoftware/live-mutex/issues/22):
+two TCP knobs that take the ~40 ms delayed-ACK + Nagle interaction out of the
+request/response RPC path:
 
 1. **Client `TCP_NODELAY`** — every client we ship (Rust, TS, Go, Dart,
    Gleam) sets it on connect.
@@ -340,9 +360,8 @@ is implemented in this initial version.
 
 ## HTML status page (`live-mutex#108`)
 
-Upstream issue [`live-mutex#108`](https://github.com/ORESoftware/live-mutex/issues/108)
-asks for "a simple html via tcp or uds etc with status page". The broker
-serves one at:
+Originally requested at [`live-mutex#108`](https://github.com/ORESoftware/live-mutex/issues/108)
+("a simple html via tcp or uds etc with status page"). The broker serves one at:
 
 - `GET /` and `GET /status` on the main HTTP listener (`LMX_HTTP_PORT`).
 - A dedicated read-only listener on `LMX_STATUS_PORT` if set. The
@@ -368,12 +387,86 @@ What the page shows:
 
 - Connected clients, tracked keys, active holders, queued waiters.
 - Pending TTL deadlines and the cumulative TTL evictions counter
-  (the new `live-mutex#13` series — high values are an operator
-  signal that callers are dying with held locks).
+  (the `live-mutex#13` series — high values are an operator signal
+  that callers are dying with held locks).
 - Top 10 keys by contention with per-key fencing-counter values.
 - Listener configuration (TCP / UDS / HTTP / status, auth, TLS,
   socket-tuning knobs, default TTL, sweep cadence, max holders).
 - The `/metrics` exposition embedded inline.
+
+## Multi-key (composite) locking
+
+A `lock` request can carry **either** a single `key` **or** a `keys` array
+(1..=5). Any request with `keys` is a *composite* lock: the broker either
+acquires every requested key atomically or none of them. The wire response
+arrives as `compositeLock` (not `lock`) and includes a per-key `fencingTokens`
+map so callers can fence each protected resource independently.
+
+Two correctness properties hold by construction:
+
+1. **Atomicity.** A composite acquirer always either holds *all* of its
+   keys or *none* — even under concurrent contention, sweeper TTL
+   evictions, partial-grant races, or owning-client disconnects. The
+   broker tracks partial grants and rolls them back if any later key in
+   the set turns out to be already held.
+2. **Deadlock freedom via lexicographic ordering.** Two callers issuing
+   `acquire_composite(["A","B"])` and `acquire_composite(["B","A"])`
+   could deadlock under naive grant order. The broker normalises the
+   request to lexicographic order before queueing, so both callers wait
+   on the same key's notify queue and one always wins outright.
+
+Composite locks are a primary feature of this broker, used in production
+to guard cross-shard operations that touch more than one logical
+resource (e.g. transferring an item between two queues, or rotating a
+two-key credential without exposing a window where neither key is held).
+
+### Rust API
+
+```rust
+use std::time::Duration;
+use dd_rust_network_mutex::{Client, ClientConfig};
+
+let client = Client::connect_tcp("broker:6970", ClientConfig::default()).await?;
+
+let composite = client
+    .acquire_composite(&["users", "orders"], Duration::from_millis(5_000))
+    .await?;
+
+assert_eq!(composite.keys.len(), 2);
+// composite.fencing_tokens => HashMap<String, u64>
+//   { "orders": 7, "users": 3 } (order is alphabetical, mint is broker-side)
+
+// … critical section that touches both resources …
+
+client.release(&composite).await?;
+```
+
+### HTTP
+
+```bash
+curl -s http://127.0.0.1:6971/v1/lock \
+  -H 'content-type: application/json' \
+  -d '{"keys":["users","orders"],"ttlMs":5000}' | jq
+# => { "acquired": true, "keys":["orders","users"],
+#      "lockUuid":"…", "fencingTokens": {"orders": 7, "users": 3},
+#      "queueDepth": 0 }
+
+curl -s http://127.0.0.1:6971/v1/unlock \
+  -H 'content-type: application/json' \
+  -d '{"keys":["users","orders"],"lockUuid":"<uuid>"}' | jq
+```
+
+### Constraints and interaction with semaphores
+
+- `keys` is bounded to **1..=5** by the broker. Larger sets are rejected
+  with a 400 (HTTP) or `error: "..."` (TCP) before any state mutation.
+- `max` is **single-key only**. Composite locks always use `max=1` per
+  member key — combining semaphore and composite is a deadlock-prone
+  surface area (see the dedicated discussion in
+  [Composite locks and `max`](#composite-locks-and-max) below).
+- A composite acquirer that disconnects while holding some keys has
+  every member released by the broker's `drop_client` path — the
+  partial-grant tracker guarantees no leaked sub-keys.
 
 ## Semaphore-style locks (concurrency &gt; 1)
 
@@ -469,9 +562,9 @@ If you genuinely want "use whatever the per-key cap currently is",
 
 ## TTL eviction (`live-mutex#13`)
 
-Upstream issue [`live-mutex#13`](https://github.com/ORESoftware/live-mutex/issues/13)
-flags the cost of doing a per-request timer ("instead create a setTimeout,
-every 10 ms or so"). We implement it that way:
+Originally requested at [`live-mutex#13`](https://github.com/ORESoftware/live-mutex/issues/13),
+which flagged the cost of doing a per-request timer ("instead create a
+setTimeout, every 10 ms or so"). We implement it that way:
 
 - Every successful exclusive grant — single-key or composite — registers a
   `(deadline, lock_uuid, keys, client)` row in a single broker-wide
