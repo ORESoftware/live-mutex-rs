@@ -28,6 +28,7 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
+        crate::routine_id!("ddl-routine-rKS5wwT_syifRxDnTm");
         let registry = Registry::new();
         let requests_total = IntCounter::new(
             "dd_rust_network_mutex_requests_total",
@@ -96,6 +97,7 @@ impl Metrics {
     }
 
     pub fn render(&self, broker: &Broker) -> String {
+        crate::routine_id!("ddl-routine-0Wb5ER7VYrf2fPU4LU");
         let snapshot = broker.metrics();
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
@@ -144,6 +146,7 @@ impl Metrics {
 
 impl Default for Metrics {
     fn default() -> Self {
+        crate::routine_id!("ddl-routine-0kOF9HII9dTwi5WcsE");
         Self::new()
     }
 }

@@ -80,6 +80,7 @@ pub struct TlsConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        crate::routine_id!("ddl-routine-Hw9N40elbjzI0ZcFDP");
         Self {
             tcp_bind: Some("0.0.0.0:6970".parse().unwrap()),
             uds_path: None,
@@ -103,6 +104,7 @@ struct AppState {
 }
 
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
+    crate::routine_id!("ddl-routine-NiYLHbcx_IzD00AJBp");
     let broker = Broker::new(config.broker.clone());
     let metrics = Arc::new(crate::metrics::Metrics::new());
     let auth_token = config.auth_token.clone();
@@ -331,6 +333,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 
 #[cfg(feature = "tls")]
 fn build_tls_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, std::io::Error> {
+    crate::routine_id!("ddl-routine-lSOwgN4txz94l_DsiC");
     use std::fs::File;
     use std::io::BufReader as StdBufReader;
     let cert_file = File::open(&cfg.cert_path)?;
@@ -366,6 +369,7 @@ pub(crate) enum AfterRead {
 
 impl AfterRead {
     fn run(&self, metrics: &crate::metrics::Metrics) {
+        crate::routine_id!("ddl-routine-bOwqZ9tGHJ5m7NJrZs");
         match self {
             AfterRead::None => {}
             AfterRead::Tcp { fd, quickack } => {
@@ -389,6 +393,7 @@ async fn handle_stream<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    crate::routine_id!("ddl-routine-98pGTji7SYVytpEQBA");
     let (read, mut write) = tokio::io::split(stream);
     let (client_id, mut rx) = broker.register_client();
     let mut buf = String::new();
@@ -498,6 +503,7 @@ async fn _ensure_tcp_handler_compiles(
     auth_token: Option<String>,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> std::io::Result<()> {
+    crate::routine_id!("ddl-routine-ZqIntiJXkbXsAaDxZT");
     handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await
 }
 
@@ -508,16 +514,19 @@ async fn _ensure_uds_handler_compiles(
     auth_token: Option<String>,
     metrics: Arc<crate::metrics::Metrics>,
 ) -> std::io::Result<()> {
+    crate::routine_id!("ddl-routine-0jVAwo_ZNAd4KHqjYl");
     handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await
 }
 
 // ---------------- HTTP layer -----------------------------------------------
 
 fn http_unauthorized() -> AxumResponse {
+    crate::routine_id!("ddl-routine-KaHmdHGpsEcVCMn-TA");
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
 }
 
 fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    crate::routine_id!("ddl-routine-68-wt_8VTaRoe5rbQz");
     let Some(token) = state.auth_token.as_ref() else {
         return true;
     };
@@ -534,10 +543,12 @@ fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 async fn healthz() -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-TswAzuekSL3ki9tHzu");
     Json(serde_json::json!({"ok": true, "service": "dd-rust-network-mutex"}))
 }
 
 async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-4f1x2CLglT8maVVKYh");
     let body = state.metrics.render(&state.broker);
     (
         StatusCode::OK,
@@ -555,6 +566,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 /// and `/metrics`. Operators relying on private posture should bind
 /// `status_bind` to loopback or a VPN-only interface.
 async fn status_page(State(state): State<StatusAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-leTmUgVn8BaNKdrlty");
     let metrics_text = state.metrics.render(&state.broker);
     let html = crate::status::render(&state.broker, &state.info, &metrics_text);
     (
@@ -575,6 +587,7 @@ struct StatusAppState {
 }
 
 fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
+    crate::routine_id!("ddl-routine-aps2N0EHQfJbC80RxJ");
     crate::status::StatusServerInfo {
         tcp_bind: config.tcp_bind.map(|a| a.to_string()),
         uds_path: config
@@ -599,6 +612,7 @@ fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
 }
 
 fn status_router(state: StatusAppState) -> Router {
+    crate::routine_id!("ddl-routine-ElPo3wC15B8bZyLP5u");
     Router::new()
         .route("/", get(status_page))
         .route("/status", get(status_page))
@@ -609,6 +623,7 @@ fn status_router(state: StatusAppState) -> Router {
 }
 
 async fn metrics_endpoint_status(State(state): State<StatusAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-i3VYM9l8j70h2x7bg6");
     let body = state.metrics.render(&state.broker);
     (
         StatusCode::OK,
@@ -628,6 +643,7 @@ async fn run_ephemeral(
     wait: Duration,
     is_acquire: bool,
 ) -> Option<Response> {
+    crate::routine_id!("ddl-routine-Ju7vsu-dtrVT5bjTzJ");
     let (client_id, mut rx) = state.broker.register_client();
     state.broker.handle_request(client_id, request);
     let outcome = wait_for(&mut rx, request_uuid, wait, is_acquire).await;
@@ -671,6 +687,7 @@ async fn http_acquire(
     headers: HeaderMap,
     Json(req): Json<AcquireRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-T5EHOY2NmST_NSzimj");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -767,6 +784,7 @@ async fn http_release(
     headers: HeaderMap,
     Json(req): Json<ReleaseRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-PMtoSZPDfVphM8N9Bz");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -808,6 +826,7 @@ async fn http_rw_read(
     headers: HeaderMap,
     Json(req): Json<RwAcquireRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-48iX_Lmr3tl95p__v_");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -860,6 +879,7 @@ async fn http_rw_read_end(
     headers: HeaderMap,
     Json(req): Json<RwReleaseRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-X1MXPfJCWk8TxUSU5S");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -899,6 +919,7 @@ async fn http_rw_write(
     headers: HeaderMap,
     Json(req): Json<RwAcquireRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-6Uk8OjI7dBoBeZKwgK");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -951,6 +972,7 @@ async fn http_rw_write_end(
     headers: HeaderMap,
     Json(req): Json<RwReleaseRequest>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-yiL_jYhCPvqvrCLT8q");
     http_rw_read_end(State(state), headers, Json(req)).await
 }
 
@@ -959,6 +981,7 @@ async fn http_lock_info(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> AxumResponse {
+    crate::routine_id!("ddl-routine-PR-FIDcsqi_1KmgjpN");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -997,6 +1020,7 @@ async fn http_lock_info(
 }
 
 async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumResponse {
+    crate::routine_id!("ddl-routine-81lPAudjnSt0pV3DSg");
     if !http_authorized(&state, &headers) {
         return http_unauthorized();
     }
@@ -1026,6 +1050,7 @@ async fn wait_for(
     wait: Duration,
     keep_polling_until_definitive: bool,
 ) -> Option<Response> {
+    crate::routine_id!("ddl-routine-aDbCebFJGfVUwTsm4K");
     let _ = keep_polling_until_definitive;
     let timeout = if wait.is_zero() {
         Duration::from_millis(50)

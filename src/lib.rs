@@ -32,6 +32,7 @@ pub mod client;
 pub mod metrics;
 pub mod protocol;
 pub mod queue;
+pub mod routine;
 pub mod server;
 pub mod sockopt;
 pub mod status;
@@ -39,6 +40,7 @@ pub mod status;
 pub use broker::{Broker, BrokerConfig, BrokerMetrics};
 pub use client::{Client, ClientConfig, ClientError, LockGuard, LockInfo, RwClient};
 pub use protocol::{Request, Response, MAX_COMPOSITE_KEYS, PROTOCOL_VERSION};
+pub use routine::{init_tracing, shutdown_tracing};
 pub use server::{run as run_server, ServerConfig};
 
 #[cfg(feature = "tls")]

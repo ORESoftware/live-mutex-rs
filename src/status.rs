@@ -47,6 +47,7 @@ pub struct StatusServerInfo {
 /// `<pre>` block so the same page is useful in a browser AND scrapeable
 /// by curl / `kubectl logs`.
 pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> String {
+    crate::routine_id!("ddl-routine-TR5lqBHl-LcqnfERNK");
     let snapshot = broker.metrics();
     let started_at = broker.started_at();
     let uptime = Instant::now().saturating_duration_since(started_at);
@@ -228,6 +229,7 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
 }
 
 fn render_top_row(snap: &KeyContentionSnapshot) -> String {
+    crate::routine_id!("ddl-routine-gYIbskRuuLylWvv4pI");
     // Holders/max collapses to just the holder count for the
     // overwhelming-common `max=1` case so the table stays compact for
     // classic mutex users.
@@ -248,6 +250,7 @@ fn render_top_row(snap: &KeyContentionSnapshot) -> String {
 }
 
 fn on_off(b: bool) -> &'static str {
+    crate::routine_id!("ddl-routine-VrkSheCcfAmnVpqOuO");
     if b {
         "<strong>on</strong>"
     } else {
@@ -260,6 +263,7 @@ fn on_off(b: bool) -> &'static str {
 /// status page. We avoid pulling in `askama` / `tera` for this one
 /// function.
 fn html_escape(s: &str) -> String {
+    crate::routine_id!("ddl-routine-9Uh2a-68x-63HyPz3V");
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -278,6 +282,7 @@ fn html_escape(s: &str) -> String {
 /// unit that keeps the leading digit non-zero (`42s`, `7m 13s`,
 /// `2h 04m`, `9d 03h`).
 fn format_duration(d: Duration) -> String {
+    crate::routine_id!("ddl-routine-9ZTva3vMeb8Y9v_eeN");
     let secs = d.as_secs();
     if secs < 60 {
         format!("{secs}s")
@@ -297,6 +302,7 @@ mod tests {
     use crate::protocol::Request;
 
     fn info() -> StatusServerInfo {
+        crate::routine_id!("ddl-routine-HhD4HTEvbjujZaAeBI");
         StatusServerInfo {
             tcp_bind: Some("0.0.0.0:6970".into()),
             uds_path: None,
@@ -316,6 +322,7 @@ mod tests {
 
     #[test]
     fn html_escape_handles_special_characters() {
+        crate::routine_id!("ddl-routine-uPOtHAigHLfu2NM8rk");
         assert_eq!(
             html_escape(r#"<script>alert("x&y")</script>"#),
             "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;",
@@ -324,6 +331,7 @@ mod tests {
 
     #[test]
     fn duration_formatting_picks_appropriate_unit() {
+        crate::routine_id!("ddl-routine-RlMR8IV4b8SXOqkM2O");
         assert_eq!(format_duration(Duration::from_secs(0)), "0s");
         assert_eq!(format_duration(Duration::from_secs(45)), "45s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
@@ -333,6 +341,7 @@ mod tests {
 
     #[test]
     fn renders_idle_broker() {
+        crate::routine_id!("ddl-routine-k-sHN8WcA_cbh8kCgm");
         let broker = Broker::new(BrokerConfig::default());
         let html = render(&broker, &info(), "# fake metrics\nfoo 1\n");
         assert!(html.starts_with("<!doctype html>"));
@@ -345,6 +354,7 @@ mod tests {
 
     #[test]
     fn renders_a_held_lock_in_top_keys() {
+        crate::routine_id!("ddl-routine-ZdbWpbcru3uWAfb2mn");
         let broker = Broker::new(BrokerConfig::default());
         let (a, _a_rx) = broker.register_client();
         broker.handle_request(
@@ -369,6 +379,7 @@ mod tests {
 
     #[test]
     fn html_escapes_keys_to_prevent_xss_via_lock_key() {
+        crate::routine_id!("ddl-routine-BccoicjJPCvim6HGno");
         let broker = Broker::new(BrokerConfig::default());
         let (a, _a_rx) = broker.register_client();
         let evil = r#"<script>x="y"</script>"#;

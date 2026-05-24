@@ -64,6 +64,7 @@ pub struct BrokerConfig {
 
 impl Default for BrokerConfig {
     fn default() -> Self {
+        crate::routine_id!("ddl-routine-G0Rs-3QRGfpIGaKxIT");
         Self {
             default_ttl: Duration::from_millis(4000),
             max_lock_holders: 1,
@@ -113,6 +114,7 @@ struct LockState {
 
 impl LockState {
     fn new(max: u32) -> Self {
+        crate::routine_id!("ddl-routine-dBj7gUl_DGMNSi9kLz");
         Self {
             exclusive_holders: HashMap::new(),
             max: max.max(1),
@@ -150,6 +152,7 @@ impl LockState {
 
     #[allow(dead_code)] // wired up by future TTL/GC sweeps
     fn is_idle(&self) -> bool {
+        crate::routine_id!("ddl-routine-EXScnKwI3L7i7chNkf");
         self.exclusive_holders.is_empty()
             && self.readers.is_empty()
             && self.writer.is_none()
@@ -157,6 +160,7 @@ impl LockState {
     }
 
     fn next_fencing_token(&mut self) -> u64 {
+        crate::routine_id!("ddl-routine-V5cwqbCaR6r3T4yENj");
         self.fencing_counter = self.fencing_counter.wrapping_add(1).max(1);
         self.fencing_counter
     }
@@ -261,6 +265,7 @@ struct BrokerState {
 
 impl BrokerState {
     fn new(config: BrokerConfig) -> Self {
+        crate::routine_id!("ddl-routine-teWZ7PuRjYTRJlYARn");
         Self {
             locks: HashMap::new(),
             clients: HashMap::new(),
@@ -286,6 +291,7 @@ impl BrokerState {
     /// called. We treat it the same as `None` here purely defensively,
     /// in case a future code path bypasses the validation.
     fn resolve_max(&mut self, current_lock_max: u32, requested: Option<u32>) -> u32 {
+        crate::routine_id!("ddl-routine-CUS0RH207soda48al_");
         let cap = self.config.max_concurrency_cap.max(1);
         match requested {
             None | Some(0) => current_lock_max.min(cap).max(1),
@@ -311,6 +317,7 @@ impl BrokerState {
         kind: RwHoldKind,
         client: ClientId,
     ) {
+        crate::routine_id!("ddl-routine-2lgzzbgohSwSILDhc1");
         let Some(ttl) = ttl else { return };
         if ttl.is_zero() {
             return;
@@ -329,6 +336,7 @@ impl BrokerState {
     }
 
     fn lock_or_default(&mut self, key: &str) -> &mut LockState {
+        crate::routine_id!("ddl-routine-1mpkfa_yLbcablw2xr");
         // The per-key starting `max` is clamped to the broker-wide
         // ceiling, so a misconfigured `LMX_MAX_LOCK_HOLDERS` can't
         // smuggle a giant default past `max_concurrency_cap`.
@@ -339,6 +347,7 @@ impl BrokerState {
 
     #[allow(dead_code)] // wired up by future TTL/GC sweeps
     fn maybe_gc(&mut self, key: &str) {
+        crate::routine_id!("ddl-routine-BqokwfXoVWp7HgkhKO");
         if let Some(state) = self.locks.get(key) {
             if state.is_idle() && state.fencing_counter > 0 {
                 // Keep the fencing counter alive — drop the entry only after
@@ -360,6 +369,7 @@ pub struct Broker {
 
 impl Broker {
     pub fn new(config: BrokerConfig) -> Self {
+        crate::routine_id!("ddl-routine-V4_qGcXJ5Hjo8hOHBJ");
         Self {
             state: Arc::new(Mutex::new(BrokerState::new(config))),
         }
@@ -369,6 +379,7 @@ impl Broker {
     /// pre-built `mpsc::UnboundedReceiver<Response>` the listener should pump
     /// onto its socket.
     pub fn register_client(&self) -> (ClientId, mpsc::UnboundedReceiver<Response>) {
+        crate::routine_id!("ddl-routine-DlZgZB0LiJJZNP7VSQ");
         let (tx, rx) = mpsc::unbounded_channel();
         let mut state = self.state.lock();
         let id = state.next_client_id;
@@ -388,6 +399,7 @@ impl Broker {
     /// request it owned. Callers should invoke this exactly once when the
     /// client's transport goes away.
     pub fn drop_client(&self, client: ClientId) {
+        crate::routine_id!("ddl-routine-gQrzxtKPDCU4Qyiwar");
         let mut state = self.state.lock();
         let Some(mut handle) = state.clients.remove(&client) else {
             return;
@@ -445,6 +457,7 @@ impl Broker {
     /// via the client's mpsc sender (no return value because there can be
     /// many or zero outbound messages: e.g. composite-lock partial progress).
     pub fn handle_request(&self, client: ClientId, request: Request) {
+        crate::routine_id!("ddl-routine-0GBKaWmx2RzXgUnbEr");
         let mut state = self.state.lock();
         match request {
             Request::Version { uuid, value: _ } => {
@@ -665,6 +678,7 @@ impl Broker {
         max: Option<u32>,
         keep_locks_after_death: bool,
     ) {
+        crate::routine_id!("ddl-routine--MjJFOFOY7fGYtsmOT");
         // Resolve & clamp the requested concurrency level *before* we
         // touch the LockState. Pulling the current per-key `max` first
         // keeps the resolution rule consistent across the fast path
@@ -761,6 +775,7 @@ impl Broker {
         pid: Option<i64>,
         ttl: Option<Duration>,
     ) {
+        crate::routine_id!("ddl-routine-UD_1TQ6n72nYb_GRcW");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
             self.send(
                 state,
@@ -885,6 +900,7 @@ impl Broker {
         lock_uuid: Option<String>,
         force: bool,
     ) {
+        crate::routine_id!("ddl-routine-F6gViY4_MAcAx57bwL");
         let mut total_unlocked = false;
         let mut last_depth: usize = 0;
 
@@ -968,6 +984,7 @@ impl Broker {
         uuid: String,
         key: String,
     ) {
+        crate::routine_id!("ddl-routine-20EN0HnEEFCThg4PVw");
         let lock = state.lock_or_default(&key);
         if lock.writer.is_none()
             && lock.exclusive_holders.is_empty()
@@ -1039,6 +1056,7 @@ impl Broker {
         uuid: String,
         key: String,
     ) {
+        crate::routine_id!("ddl-routine-jtFimB2SzQApojR-Xt");
         let lock = state.lock_or_default(&key);
         if lock.writer.is_none() && lock.readers.is_empty() && lock.exclusive_holders.is_empty() {
             let token = lock.next_fencing_token();
@@ -1101,6 +1119,7 @@ impl Broker {
         uuid: String,
         key: String,
     ) {
+        crate::routine_id!("ddl-routine-bcRprfoS-qeSiQGC0b");
         if let Some(lock) = state.locks.get_mut(&key) {
             // Drop *any* readers held by this client. Note: a client can hold
             // multiple read leases on the same key, but typical use is one
@@ -1149,6 +1168,7 @@ impl Broker {
         uuid: String,
         key: String,
     ) {
+        crate::routine_id!("ddl-routine-HCcGv21IjU5kyJr3vE");
         if let Some(lock) = state.locks.get_mut(&key) {
             if let Some(w) = lock.writer.take_if(|w| w.client == client) {
                 if let Some(handle) = state.clients.get_mut(&client) {
@@ -1176,6 +1196,7 @@ impl Broker {
     /// Inspect the head of `key`'s queue and grant if possible. Repeats while
     /// progress is made (a granted reader allows the next reader to advance).
     fn try_grant_next(&self, state: &mut BrokerState, key: &str) {
+        crate::routine_id!("ddl-routine-kgo2IA5f14EZoNkFmn");
         loop {
             let made_progress = self.try_grant_once(state, key);
             if !made_progress {
@@ -1185,6 +1206,7 @@ impl Broker {
     }
 
     fn try_grant_once(&self, state: &mut BrokerState, key: &str) -> bool {
+        crate::routine_id!("ddl-routine-JpvC7GaYO7SXxieWyJ");
         let Some(lock) = state.locks.get_mut(key) else {
             return false;
         };
@@ -1326,6 +1348,7 @@ impl Broker {
     }
 
     fn try_grant_composite(&self, state: &mut BrokerState, key: &str) -> bool {
+        crate::routine_id!("ddl-routine-mb7TrINchMa7_5XgzQ");
         let Some(lock) = state.locks.get_mut(key) else {
             return false;
         };
@@ -1453,6 +1476,7 @@ impl Broker {
         keys: &[String],
         kind: RwHoldKind,
     ) {
+        crate::routine_id!("ddl-routine-nDX6C_jmUhiZ6iUfwe");
         if let Some(handle) = state.clients.get_mut(&client) {
             handle.held_lock_uuids.insert(
                 lock_uuid.to_string(),
@@ -1471,6 +1495,7 @@ impl Broker {
         key: &str,
         request_uuid: &str,
     ) {
+        crate::routine_id!("ddl-routine-z8LhkAyw33THqG3Cfh");
         if let Some(handle) = state.clients.get_mut(&client) {
             handle
                 .pending_request_uuids
@@ -1485,6 +1510,7 @@ impl Broker {
         key: &str,
         request_uuid: &str,
     ) {
+        crate::routine_id!("ddl-routine-n491ef9clCYZzZBQnH");
         if let Some(handle) = state.clients.get_mut(&client) {
             handle
                 .pending_request_uuids
@@ -1493,6 +1519,7 @@ impl Broker {
     }
 
     fn send(&self, state: &BrokerState, client: ClientId, response: Response) {
+        crate::routine_id!("ddl-routine-u2hHnsw12uVIwzoDO9");
         if let Some(handle) = state.clients.get(&client) {
             let _ = handle.sender.send(response);
         }
@@ -1503,6 +1530,7 @@ impl Broker {
     /// listeners to surface protocol-level errors (e.g. malformed JSON, auth
     /// failures) without a fake `Request` round-trip.
     pub fn try_send(&self, client: ClientId, response: Response) -> bool {
+        crate::routine_id!("ddl-routine-63KLXrLYAbC6O95P0d");
         let state = self.state.lock();
         match state.clients.get(&client) {
             Some(handle) => handle.sender.send(response).is_ok(),
@@ -1516,6 +1544,7 @@ impl Broker {
     /// outlive that client (the next HTTP /v1/unlock will release it via
     /// lock_uuid). Detaching here prevents `drop_client` from releasing it.
     pub fn detach_lock_from_client(&self, client: ClientId, lock_uuid: &str) {
+        crate::routine_id!("ddl-routine-dIyxZKGdksBxszWr_1");
         let mut state = self.state.lock();
         if let Some(handle) = state.clients.get_mut(&client) {
             handle.held_lock_uuids.remove(lock_uuid);
@@ -1524,6 +1553,7 @@ impl Broker {
 
     /// Snapshot of broker counters used by `/metrics`.
     pub fn metrics(&self) -> BrokerMetrics {
+        crate::routine_id!("ddl-routine-oQmRZkKSUjdFlC2hsV");
         let state = self.state.lock();
         let mut total_holders = 0u64;
         let mut total_waiters = 0u64;
@@ -1549,6 +1579,7 @@ impl Broker {
     /// the HTML status page (upstream `live-mutex#108`) to render an
     /// uptime string. Cheap — single mutex + copy.
     pub fn started_at(&self) -> Instant {
+        crate::routine_id!("ddl-routine-9Z1Ac1EJ5x103fNjCk");
         self.state.lock().started_at
     }
 
@@ -1558,6 +1589,7 @@ impl Broker {
     /// don't call from a hot path. Returns at most `n` entries; ties
     /// are broken arbitrarily (HashMap iteration order).
     pub fn top_keys(&self, n: usize) -> Vec<KeyContentionSnapshot> {
+        crate::routine_id!("ddl-routine-S2ORKahTJb6iVwyYpY");
         if n == 0 {
             return Vec::new();
         }
@@ -1603,6 +1635,7 @@ impl Broker {
     /// optimization: a single pass over a sorted index, regardless of
     /// how many locks are currently held with TTLs.
     pub fn tick_ttl(&self, now: Instant) -> usize {
+        crate::routine_id!("ddl-routine-XXcJ382G-X7FQpx0YO");
         let mut state = self.state.lock();
         // Pop everything in `..= (now, u64::MAX)` from the BTreeMap. We
         // collect the keys first to avoid holding a borrow on
@@ -1708,6 +1741,7 @@ impl Broker {
     /// still accept TTLs but will only evict when callers manually
     /// invoke `tick_ttl`.
     pub fn spawn_ttl_sweeper(&self) -> tokio::task::JoinHandle<()> {
+        crate::routine_id!("ddl-routine-uw6ZxhiKx_XgdpHkDa");
         let interval = self.state.lock().config.ttl_sweep_interval;
         let me = self.clone();
         tokio::spawn(async move {
@@ -1774,6 +1808,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     fn drain(rx: &mut UnboundedReceiver<Response>) -> Vec<Response> {
+        crate::routine_id!("ddl-routine-5za2DOl-1aft1UKbOy");
         let mut out = Vec::new();
         while let Ok(msg) = rx.try_recv() {
             out.push(msg);
@@ -1783,6 +1818,7 @@ mod tests {
 
     #[test]
     fn exclusive_lock_granted_then_queued() {
+        crate::routine_id!("ddl-routine-NtcQmUG_FIY_DfqdQo");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -1866,6 +1902,7 @@ mod tests {
 
     #[test]
     fn fencing_tokens_are_monotonic() {
+        crate::routine_id!("ddl-routine-CC22S8RqzYNARpshGb");
         let broker = Broker::new(BrokerConfig::default());
         let (c, mut rx) = broker.register_client();
         let mut last = 0u64;
@@ -1915,6 +1952,7 @@ mod tests {
 
     #[test]
     fn composite_lock_acquires_atomically() {
+        crate::routine_id!("ddl-routine-QyOJ2kRN9b4sEd7pdw");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2031,6 +2069,7 @@ mod tests {
 
     #[test]
     fn rw_writer_blocks_readers_until_done() {
+        crate::routine_id!("ddl-routine-E8a4TwTjPsQ3d2-exo");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2088,6 +2127,7 @@ mod tests {
 
     #[test]
     fn dropping_client_releases_locks_and_queue() {
+        crate::routine_id!("ddl-routine-g9Qk5cWEaz9JgGK8OC");
         let broker = Broker::new(BrokerConfig::default());
         let (a, _a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2144,6 +2184,7 @@ mod tests {
     /// This is the structural fix from upstream `live-mutex#13`.
     #[test]
     fn tick_ttl_evicts_expired_holder_and_grants_next_waiter() {
+        crate::routine_id!("ddl-routine-4H4ODnZw0ibxFfSMSv");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2204,6 +2245,7 @@ mod tests {
     /// `range(..=now)` returns empty and we don't touch the LockState.
     #[test]
     fn tick_ttl_is_idempotent_when_nothing_expired() {
+        crate::routine_id!("ddl-routine-CWLi3VgQgQbVCXnsf4");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         broker.handle_request(
@@ -2234,6 +2276,7 @@ mod tests {
     /// sweeper must skip it without panicking.
     #[test]
     fn tick_ttl_skips_locks_released_before_their_deadline() {
+        crate::routine_id!("ddl-routine-1sGlfQa6Nc6QbabX-9");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         broker.handle_request(
@@ -2283,6 +2326,7 @@ mod tests {
     /// releases all of them in one pass.
     #[test]
     fn tick_ttl_evicts_composite_holder_atomically() {
+        crate::routine_id!("ddl-routine-HCvFiziZVug_p4IFCj");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2335,6 +2379,7 @@ mod tests {
     /// fencing token so a downstream resource can disambiguate slots.
     #[test]
     fn concurrency_max_three_admits_three_holders_then_queues_fourth() {
+        crate::routine_id!("ddl-routine-u4_2tpDeH_Ul7hylUn");
         let broker = Broker::new(BrokerConfig::default());
         let mut clients = Vec::new();
         for _ in 0..4 {
@@ -2420,6 +2465,7 @@ mod tests {
     /// caps holders at the ceiling — not at the requested value.
     #[test]
     fn concurrency_cap_clamps_oversized_max_request() {
+        crate::routine_id!("ddl-routine-pPDJD5a0veKa3TcPdF");
         let cfg = BrokerConfig {
             max_concurrency_cap: 5,
             ..BrokerConfig::default()
@@ -2484,6 +2530,7 @@ mod tests {
     /// try to release.
     #[test]
     fn force_unlock_releases_holders_owned_by_other_clients() {
+        crate::routine_id!("ddl-routine-_b81ZSIAbk0HRmKaDN");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2548,6 +2595,7 @@ mod tests {
     /// `unlocked: false` so the caller can distinguish from success.
     #[test]
     fn unlock_with_wrong_lock_uuid_is_a_no_op() {
+        crate::routine_id!("ddl-routine-mFDrBKyagORZcBK9hZ");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2597,6 +2645,7 @@ mod tests {
     /// Composite locks reject empty key arrays.
     #[test]
     fn composite_rejects_empty_keys() {
+        crate::routine_id!("ddl-routine-ywtJ3MT9dYVEhxbCys");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         broker.handle_request(
@@ -2628,6 +2677,7 @@ mod tests {
     /// Composite locks reject more than `MAX_COMPOSITE_KEYS` keys.
     #[test]
     fn composite_rejects_oversized_keyset() {
+        crate::routine_id!("ddl-routine-kF2jpYdXiPcycCoi8L");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let too_many: Vec<String> = (0..(MAX_COMPOSITE_KEYS + 1))
@@ -2658,6 +2708,7 @@ mod tests {
     /// arbitrarily far into the future doesn't evict the lock.
     #[test]
     fn ttl_zero_does_not_register_deadline() {
+        crate::routine_id!("ddl-routine-IXR9BP8iP2QVc-tv8N");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         broker.handle_request(
@@ -2693,6 +2744,7 @@ mod tests {
     /// `concurrency_max_zero_is_rejected_with_clear_error` below.
     #[test]
     fn concurrency_max_none_preserves_existing_per_key_cap() {
+        crate::routine_id!("ddl-routine-pFc44VtL7q-2sHdquA");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
         let (b, mut b_rx) = broker.register_client();
@@ -2764,6 +2816,7 @@ mod tests {
     /// be set on the key).
     #[test]
     fn concurrency_max_zero_is_rejected_with_clear_error() {
+        crate::routine_id!("ddl-routine-rHoreRKbi5cVFvB9Yw");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
 
@@ -2807,6 +2860,7 @@ mod tests {
     /// `type` see a consistent variant.
     #[test]
     fn concurrency_max_zero_on_composite_is_rejected() {
+        crate::routine_id!("ddl-routine-oTuwSI0_xmF6pYkfFl");
         let broker = Broker::new(BrokerConfig::default());
         let (a, mut a_rx) = broker.register_client();
 

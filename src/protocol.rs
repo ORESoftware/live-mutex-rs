@@ -248,6 +248,7 @@ pub enum Response {
 impl Response {
     /// Convenience for routers and tests.
     pub fn correlation_uuid(&self) -> &str {
+        crate::routine_id!("ddl-routine-d7PH3GeHXLkM2Nb0I0");
         match self {
             Response::Version { uuid, .. }
             | Response::Auth { uuid, .. }
@@ -382,6 +383,7 @@ mod tests {
 
     #[test]
     fn lock_request_round_trips() {
+        crate::routine_id!("ddl-routine-c8BV5Smf3UYt1BM_R8");
         let req = Request::Lock {
             uuid: "u-1".into(),
             key: Some("k1".into()),
@@ -400,6 +402,7 @@ mod tests {
 
     #[test]
     fn composite_response_serialises() {
+        crate::routine_id!("ddl-routine-eiBiIPhsWPZ3wqZixX");
         let mut tokens = std::collections::BTreeMap::new();
         tokens.insert("a".to_string(), 1u64);
         tokens.insert("b".to_string(), 1u64);
@@ -420,6 +423,7 @@ mod tests {
 
     #[test]
     fn lock_response_uses_camel_case_wire_fields() {
+        crate::routine_id!("ddl-routine-q6cNU91QOmjsFO1XuR");
         let resp = Response::Lock {
             uuid: "u".into(),
             key: "k".into(),
@@ -444,6 +448,7 @@ mod tests {
 
     #[test]
     fn register_read_request_uses_camel_case_tag() {
+        crate::routine_id!("ddl-routine-UJlTT7ESgL_BMCOGdl");
         let req = Request::RegisterRead {
             uuid: "u".into(),
             key: "k".into(),

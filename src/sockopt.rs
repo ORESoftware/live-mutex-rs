@@ -28,6 +28,7 @@ use std::os::fd::AsRawFd;
 /// Apply `TCP_NODELAY = 1` to a TCP stream. Errors are not fatal — the
 /// option is a hint, and we shouldn't fail the connection on a tunable.
 pub fn apply_nodelay(stream: &tokio::net::TcpStream) -> io::Result<()> {
+    crate::routine_id!("ddl-routine-F00CV-i_xRTMHqbbNC");
     stream.set_nodelay(true)
 }
 
@@ -35,6 +36,7 @@ pub fn apply_nodelay(stream: &tokio::net::TcpStream) -> io::Result<()> {
 /// on platforms where the option doesn't exist so callers can update a
 /// "applied" counter only on real applications.
 pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {
+    crate::routine_id!("ddl-routine-FrCnst7QDKZRlB2v54");
     #[cfg(target_os = "linux")]
     {
         let on: libc::c_int = 1;
@@ -62,6 +64,7 @@ pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {
 /// and the startup banner to tell operators whether the option will be
 /// honored at runtime.
 pub fn quickack_supported() -> bool {
+    crate::routine_id!("ddl-routine-rkljS_AVn7foTX-8hV");
     cfg!(target_os = "linux")
 }
 
@@ -71,6 +74,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_nodelay_on_loopback_socket() {
+        crate::routine_id!("ddl-routine-T83O_OkMaKYz4C2tBU");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _h = tokio::spawn(async move {
@@ -83,6 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_quickack_is_safe_on_loopback() {
+        crate::routine_id!("ddl-routine-gUcsz83ImIyMXWxekS");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let _h = tokio::spawn(async move {

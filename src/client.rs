@@ -54,6 +54,7 @@ pub struct ClientConfig {
 
 impl Default for ClientConfig {
     fn default() -> Self {
+        crate::routine_id!("ddl-routine-h0o70WdF73Tn1IM1HU");
         Self {
             auth_token: None,
             default_request_timeout: Duration::from_secs(5),
@@ -82,6 +83,7 @@ struct ClientInner {
 
 impl Drop for ClientInner {
     fn drop(&mut self) {
+        crate::routine_id!("ddl-routine-ABoMt9DWOh9F9GM4hA");
         self.reader_task.abort();
     }
 }
@@ -94,6 +96,7 @@ impl Client {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-Vs4WhHDADTirOfwOaP");
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
         Self::start(stream, config).await
@@ -103,6 +106,7 @@ impl Client {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-rymSP7H4L8S6yqNSir");
         let stream = UnixStream::connect(path.as_ref()).await?;
         Self::start(stream, config).await
     }
@@ -111,6 +115,7 @@ impl Client {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
+        crate::routine_id!("ddl-routine-U8KUwlqwY8R2TlhiK8");
         let (read, write) = tokio::io::split(stream);
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
         let inflight_reader = inflight.clone();
@@ -204,6 +209,7 @@ impl Client {
     }
 
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LockGuard, ClientError> {
+        crate::routine_id!("ddl-routine-d2XKMm8wCgREqHR4iw");
         self.acquire_internal(Some(key.to_string()), None, ttl, None).await
     }
 
@@ -234,6 +240,7 @@ impl Client {
         max: u32,
         ttl: Duration,
     ) -> Result<LockGuard, ClientError> {
+        crate::routine_id!("ddl-routine---QRAg2Rtms9lwn768");
         if max == 0 {
             return Err(ClientError::Invalid(
                 "acquire_with_max requires max >= 1; use acquire() for default semantics".into(),
@@ -248,6 +255,7 @@ impl Client {
         keys: &[&str],
         ttl: Duration,
     ) -> Result<LockGuard, ClientError> {
+        crate::routine_id!("ddl-routine--MNPLcy68N9Ksp7Y52");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
             return Err(ClientError::Invalid(format!(
                 "composite acquire requires 1..={MAX_COMPOSITE_KEYS} keys"
@@ -269,6 +277,7 @@ impl Client {
         ttl: Duration,
         max: Option<u32>,
     ) -> Result<LockGuard, ClientError> {
+        crate::routine_id!("ddl-routine-E2WC66KPw4xPllqeal");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.register_inflight(&request_uuid);
 
@@ -300,6 +309,7 @@ impl Client {
         request_uuid: &str,
         timeout: Duration,
     ) -> Result<LockGuard, ClientError> {
+        crate::routine_id!("ddl-routine-rYoW6DP7XrtX17pFyY");
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -348,6 +358,7 @@ impl Client {
     }
 
     pub async fn release(&self, guard: &LockGuard) -> Result<(), ClientError> {
+        crate::routine_id!("ddl-routine-NLencuC-xXTiVHvNsj");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.register_inflight(&request_uuid);
         let request = Request::Unlock {
@@ -386,6 +397,7 @@ impl Client {
     }
 
     pub async fn lock_info(&self, key: &str) -> Result<LockInfo, ClientError> {
+        crate::routine_id!("ddl-routine-JhVDA3885_Mh1B8gYL");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.register_inflight(&request_uuid);
         let request = Request::LockInfo {
@@ -417,6 +429,7 @@ impl Client {
     }
 
     pub async fn ls(&self) -> Result<Vec<String>, ClientError> {
+        crate::routine_id!("ddl-routine-AHMJ2XAm_T1ufxiHgH");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.register_inflight(&request_uuid);
         let outcome = self
@@ -436,16 +449,19 @@ impl Client {
     }
 
     fn register_inflight(&self, uuid: &str) -> mpsc::UnboundedReceiver<Response> {
+        crate::routine_id!("ddl-routine-2CBu_Ti9-v9H5eOGph");
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.inflight.lock().insert(uuid.to_string(), tx);
         rx
     }
 
     fn unregister_inflight(&self, uuid: &str) {
+        crate::routine_id!("ddl-routine-xoZtjre8ORbuxPAw47");
         self.inner.inflight.lock().remove(uuid);
     }
 
     async fn write_request(&self, request: Request) -> Result<(), ClientError> {
+        crate::routine_id!("ddl-routine-OJJ5gqugYULiWQ96ZX");
         let mut bytes = serde_json::to_vec(&request)?;
         bytes.push(b'\n');
         let mut writer = self.inner.writer.lock().await;
@@ -460,6 +476,7 @@ impl Client {
         _uuid: &str,
         timeout: Duration,
     ) -> Result<Response, ClientError> {
+        crate::routine_id!("ddl-routine-UQewmszhGwoIxFb3Jn");
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(resp)) => Ok(resp),
             Ok(None) => Err(ClientError::Closed),
@@ -473,6 +490,7 @@ impl Client {
         request_uuid: &str,
         rx: &mut mpsc::UnboundedReceiver<Response>,
     ) -> Result<Response, ClientError> {
+        crate::routine_id!("ddl-routine-Xw2i3L2CdWqt0hyUn8");
         self.write_request(request).await?;
         self.recv_one(rx, request_uuid, self.inner.config.default_request_timeout)
             .await
@@ -491,6 +509,7 @@ impl RwClient {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-BBsdaJ4ryHsNYPIk4P");
         Ok(Self {
             inner: Client::connect_tcp(addr, config).await?,
         })
@@ -500,12 +519,14 @@ impl RwClient {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-O6v0Ns6yFrkvxBM0gW");
         Ok(Self {
             inner: Client::connect_uds(path, config).await?,
         })
     }
 
     pub async fn acquire_read(&self, key: &str) -> Result<RwReadGuard, ClientError> {
+        crate::routine_id!("ddl-routine-c_r-gmONuZMejrz47X");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.inner.register_inflight(&request_uuid);
         let send = self
@@ -531,6 +552,7 @@ impl RwClient {
     }
 
     pub async fn acquire_write(&self, key: &str) -> Result<RwWriteGuard, ClientError> {
+        crate::routine_id!("ddl-routine-f32sihPjsPJC-vFo7O");
         let request_uuid = Uuid::new_v4().to_string();
         let mut rx = self.inner.register_inflight(&request_uuid);
         let send = self
@@ -561,6 +583,7 @@ impl RwClient {
         is_read: bool,
         _key: &str,
     ) -> Result<(String, Option<u64>), ClientError> {
+        crate::routine_id!("ddl-routine-_VkY3EWAQzWVwMceKa");
         let timeout = self.inner.inner.config.default_request_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -614,6 +637,7 @@ pub struct LockGuard {
 
 impl LockGuard {
     fn single(key: String, lock_uuid: String, fencing_token: Option<u64>) -> Self {
+        crate::routine_id!("ddl-routine-43Vd0AnZsbqmAAi6eb");
         let mut tokens = BTreeMap::new();
         if let Some(t) = fencing_token {
             tokens.insert(key.clone(), t);
@@ -631,6 +655,7 @@ impl LockGuard {
         lock_uuid: String,
         fencing_tokens: BTreeMap<String, u64>,
     ) -> Self {
+        crate::routine_id!("ddl-routine-CTCD-uPtmZSyMSv2eo");
         Self {
             keys,
             lock_uuid,
@@ -659,6 +684,7 @@ pub struct RwReadGuard {
 
 impl RwReadGuard {
     pub async fn release(self) -> Result<(), ClientError> {
+        crate::routine_id!("ddl-routine-Vjn5LJ94ZLnulDL8RZ");
         self.client
             .release(&LockGuard::single(
                 self.key.clone(),
@@ -678,6 +704,7 @@ pub struct RwWriteGuard {
 
 impl RwWriteGuard {
     pub async fn release(self) -> Result<(), ClientError> {
+        crate::routine_id!("ddl-routine-nRbRFq1_GRo4TWIU1y");
         self.client
             .release(&LockGuard::single(
                 self.key.clone(),
@@ -691,6 +718,7 @@ impl RwWriteGuard {
 impl Client {
     /// Read-only accessor for the configured `ClientConfig`.
     pub fn config(&self) -> &ClientConfig {
+        crate::routine_id!("ddl-routine-PJgckbbW53tEIY21kv");
         &self.inner.config
     }
 }

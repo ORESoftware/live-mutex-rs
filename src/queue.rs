@@ -44,12 +44,14 @@ pub struct LinkedQueue<K: Eq + Hash + Clone, V> {
 
 impl<K: Eq + Hash + Clone, V> Default for LinkedQueue<K, V> {
     fn default() -> Self {
+        crate::routine_id!("ddl-routine-jXkFFGyoB-wXxOy7FC");
         Self::new()
     }
 }
 
 impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     pub fn new() -> Self {
+        crate::routine_id!("ddl-routine-u7zVp19R7LDL_wL2Au");
         Self {
             slots: Vec::new(),
             free: Vec::new(),
@@ -61,24 +63,29 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     }
 
     pub fn len(&self) -> usize {
+        crate::routine_id!("ddl-routine-yOpS-zAjNsvBXBLSOt");
         self.len
     }
 
     pub fn is_empty(&self) -> bool {
+        crate::routine_id!("ddl-routine-2R0CreVvd2mDaVd-G-");
         self.len == 0
     }
 
     pub fn contains(&self, key: &K) -> bool {
+        crate::routine_id!("ddl-routine-AER48-JGALNyb5R_xP");
         self.index.contains_key(key)
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
+        crate::routine_id!("ddl-routine-1TZ61XitZ7fwwXz0Mm");
         let idx = *self.index.get(key)?;
         self.slots[idx].value.as_ref()
     }
 
     /// Append to the tail (FIFO). No-op if `key` is already present.
     pub fn push_back(&mut self, key: K, value: V) -> bool {
+        crate::routine_id!("ddl-routine-_luiuBgLux_GbtPGIo");
         if self.index.contains_key(&key) {
             return false;
         }
@@ -99,6 +106,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     /// Push to the head. Used for force/retry insertions that should jump the
     /// queue. No-op if `key` is already present.
     pub fn push_front(&mut self, key: K, value: V) -> bool {
+        crate::routine_id!("ddl-routine-JWMK_pZuMQVZLjDpAI");
         if self.index.contains_key(&key) {
             return false;
         }
@@ -118,6 +126,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
 
     /// Pop the head element (FIFO dequeue). Returns `(key, value)`.
     pub fn pop_front(&mut self) -> Option<(K, V)> {
+        crate::routine_id!("ddl-routine-z5ECAdo119VbDKreQJ");
         if self.head == NIL {
             return None;
         }
@@ -134,6 +143,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
 
     /// Peek at the head without removing it.
     pub fn front(&self) -> Option<(&K, &V)> {
+        crate::routine_id!("ddl-routine-HdN0Nd-ERLc5HFSzKW");
         if self.head == NIL {
             return None;
         }
@@ -143,6 +153,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
 
     /// Remove an element by `key` in O(1). Returns the value if present.
     pub fn remove(&mut self, key: &K) -> Option<V> {
+        crate::routine_id!("ddl-routine-2kna_P2-hQO1bUmmZD");
         let idx = self.index.remove(key)?;
         let prev = self.slots[idx].prev;
         let next = self.slots[idx].next;
@@ -162,6 +173,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
 
     /// Iterate from head to tail without consuming.
     pub fn iter(&self) -> Iter<'_, K, V> {
+        crate::routine_id!("ddl-routine-YL8_XRwkTGmdu0Eo2b");
         Iter {
             queue: self,
             cursor: self.head,
@@ -169,6 +181,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     }
 
     fn alloc(&mut self, key: K, value: V) -> usize {
+        crate::routine_id!("ddl-routine-bkjbWoCU2ZCCSUDKWF");
         if let Some(idx) = self.free.pop() {
             let slot = &mut self.slots[idx];
             slot.key = Some(key);
@@ -191,6 +204,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     }
 
     fn detach(&mut self, idx: usize) -> Option<(K, V)> {
+        crate::routine_id!("ddl-routine-ejn9IHUzFwBP2k1RTD");
         let slot = &mut self.slots[idx];
         let key = slot.key.take()?;
         let value = slot.value.take()?;
@@ -204,6 +218,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     }
 
     fn detach_no_index(&mut self, idx: usize) -> Option<(K, V)> {
+        crate::routine_id!("ddl-routine-PqD3OTR8Tp2LAsy-dl");
         let slot = &mut self.slots[idx];
         let key = slot.key.take()?;
         let value = slot.value.take()?;
@@ -225,6 +240,7 @@ impl<'a, K: Eq + Hash + Clone, V> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        crate::routine_id!("ddl-routine-_GapTQepfQqvSD-41z");
         if self.cursor == NIL {
             return None;
         }
@@ -240,6 +256,7 @@ mod tests {
 
     #[test]
     fn fifo_order() {
+        crate::routine_id!("ddl-routine--er5KgxaOJcyZbEpMe");
         let mut q: LinkedQueue<&'static str, u32> = LinkedQueue::new();
         assert!(q.push_back("a", 1));
         assert!(q.push_back("b", 2));
@@ -253,6 +270,7 @@ mod tests {
 
     #[test]
     fn duplicate_key_is_noop() {
+        crate::routine_id!("ddl-routine-WR0Bc-O2-i_NWp3JYr");
         let mut q: LinkedQueue<&'static str, u32> = LinkedQueue::new();
         assert!(q.push_back("a", 1));
         assert!(!q.push_back("a", 99));
@@ -262,6 +280,7 @@ mod tests {
 
     #[test]
     fn remove_from_middle_o1() {
+        crate::routine_id!("ddl-routine-tIny8nlxpTWQXqG772");
         let mut q: LinkedQueue<&'static str, u32> = LinkedQueue::new();
         q.push_back("a", 1);
         q.push_back("b", 2);
@@ -277,6 +296,7 @@ mod tests {
 
     #[test]
     fn remove_head_and_tail() {
+        crate::routine_id!("ddl-routine-32PjlKmz6LNtCvFQ6T");
         let mut q: LinkedQueue<&'static str, u32> = LinkedQueue::new();
         q.push_back("a", 1);
         q.push_back("b", 2);
@@ -289,6 +309,7 @@ mod tests {
 
     #[test]
     fn push_front_jumps_queue() {
+        crate::routine_id!("ddl-routine-HsNPxbgCEqaBQ7LUFq");
         let mut q: LinkedQueue<&'static str, u32> = LinkedQueue::new();
         q.push_back("a", 1);
         q.push_back("b", 2);
@@ -300,6 +321,7 @@ mod tests {
 
     #[test]
     fn slots_get_reused() {
+        crate::routine_id!("ddl-routine-hXGfUqonWsQZcIALxa");
         let mut q: LinkedQueue<u32, u32> = LinkedQueue::new();
         for i in 0..1000 {
             q.push_back(i, i);

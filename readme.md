@@ -535,6 +535,52 @@ If you are looking for the **Node.js** original, use
 want the same shape of broker in Rust with the additions listed above, use
 this crate.
 
+## Observability — `routineId` and OpenTelemetry
+
+Every top-level function/method in this crate starts with a single line:
+
+```rust
+fn handle_request(...) {
+    crate::routine_id!("ddl-routine-XYZ123abc");
+    // ...
+}
+```
+
+This expands to a `const ROUTINE_ID: &str = "ddl-routine-XYZ123abc";` plus a
+brief `tracing::info_span!(…)` that emits an `info!("enter")` log line tagged
+with both `routine_id` (the static nanoid) and `code.function` (the
+`module_path!`). The IDs are **statically embedded literals** — never
+generated at runtime — so the same string appears in source, in stdout
+logs, and as a span attribute in OTel telemetry. To find the source of any
+log line:
+
+```bash
+rg ddl-routine-XYZ123abc
+```
+
+…will land you on the exact function. No fuzzy log-text matching.
+
+### Wiring OTel
+
+`init_tracing()` (re-exported from the crate root) checks the standard OTel
+env vars at startup:
+
+| Env var                         | Effect                                                                                                |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`   | When set, install a `tracing-opentelemetry` layer that exports spans + events to that OTLP/gRPC URL.  |
+| `OTEL_SERVICE_NAME`             | Service name attribute (default `dd-rust-network-mutex`).                                             |
+| `OTEL_RESOURCE_ATTRIBUTES`      | Honored by `opentelemetry_sdk` for arbitrary `k=v` resource attributes.                               |
+| `LMX_LOG_FORMAT`                | `text` (default) or `json` for the stdout layer. Independent of OTel.                                 |
+| `RUST_LOG`                      | Standard `tracing` filter (e.g. `lmx=debug,info`).                                                    |
+
+If `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, the binary stays a single-process
+broker that writes structured logs to stdout — no extra dependencies wake up.
+
+You can also disable the OTel exporter at compile time with
+`--no-default-features --features tls` (drops the `opentelemetry*` crates).
+This produces a smaller binary suitable for environments that can't afford
+the gRPC/protobuf footprint.
+
 ## Contributing
 
 Pull requests welcome. Please:
@@ -543,6 +589,10 @@ Pull requests welcome. Please:
 2. Keep `PROTOCOL.md` and the cross-runtime clients (`clients/{ts,go,dart,gleam}/`)
    in sync if you touch the wire format.
 3. Add a regression test in `tests/integration.rs` for any behavior change.
+4. New top-level fns/methods should start with a `crate::routine_id!(...)`
+   call. Generate a fresh nanoid (e.g.
+   `python3 -c "import secrets; print('ddl-routine-' + secrets.token_urlsafe(15)[:18])"`)
+   and use it as a literal — do not generate it at runtime.
 
 ## License
 

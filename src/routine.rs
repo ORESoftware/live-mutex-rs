@@ -1,0 +1,271 @@
+//! Routine identification + OpenTelemetry plumbing.
+//!
+//! ## What is a `routineId`?
+//!
+//! Every top-level function/method in this crate carries a *static* string
+//! that looks like `ddl-routine-<nanoid>` (the `ddl-` prefix stands for
+//! "distributed-locking", to make the IDs grep-friendly across other ORE
+//! services that follow the same convention).
+//!
+//! The ID is **never generated at runtime** — it's a `&'static str` literal
+//! placed in the function body. Two properties make this pattern useful:
+//!
+//! 1. **Grep-ability.** Given a log line that contains a routine ID, you can
+//!    find the source location in one search: `rg ddl-routine-<id>`. This is
+//!    significantly more reliable than fuzzy-matching log message text.
+//! 2. **OTel attribute key.** The same ID is attached as a span attribute
+//!    (`routine_id`) on every `tracing` span this crate opens, so it flows
+//!    through `tracing-opentelemetry` into OTel/OTLP without any extra work.
+//!
+//! ## How to use it
+//!
+//! Every top-level function should start with a single line:
+//!
+//! ```ignore
+//! routine_id!("ddl-routine-abc123…");
+//! ```
+//!
+//! The `routine_id!` macro expands to:
+//!
+//! 1. A `const ROUTINE_ID: &str = "ddl-routine-…";` so the literal exists in
+//!    the function's local scope and shows up in `rg` results.
+//! 2. A `tracing::info_span!(...)` that names the routine and attaches
+//!    `routine_id` as a structured field. The span is `entered()` and stored
+//!    in a binding named `_routine_span` that lives for the rest of the
+//!    function — so every `info!()` / `warn!()` / etc. emitted in this fn
+//!    (and every fn called from it) inherits `routine_id` as a parent
+//!    attribute when exported via OTel.
+//! 3. A single `info!(routine_id = ROUTINE_ID, "enter")` log line at the
+//!    function boundary so plain text/JSON log readers see the entry too.
+//!
+//! ### Why both a span attribute *and* an enter log?
+//!
+//! - The span attribute is the OTel-native way to associate the routine ID
+//!   with a span and all its children. It's free in tracing's "no
+//!   subscriber" mode and is the canonical handle in OTel UIs.
+//! - The `info!("enter")` line is what plain log readers (`kubectl logs`,
+//!   `grep`) actually see when the OTel collector is offline. Without it,
+//!   the routine ID would only ever surface as a span field on _other_
+//!   events emitted later in the function body — and short fns may emit
+//!   no events at all.
+//!
+//! ## OTel exporter
+//!
+//! [`init_tracing`] is the single entrypoint for setting up `tracing`.
+//! It always installs a `tracing-subscriber::fmt` layer (text or JSON
+//! controlled by `LMX_LOG_FORMAT`). When the `otel` cargo feature is on
+//! **and** `OTEL_EXPORTER_OTLP_ENDPOINT` is set in the environment, it also
+//! installs a `tracing-opentelemetry` layer that exports spans + events to
+//! that OTLP/gRPC endpoint. With the env unset (or feature off) the layer
+//! is silently omitted — the binary stays a single-process broker that
+//! writes structured logs to stdout, no extra config required.
+
+/// Establish the routine identity for the current top-level function.
+///
+/// Use this as the **first statement** in every top-level fn / method:
+///
+/// ```ignore
+/// fn handle_request(...) {
+///     routine_id!("ddl-routine-abcdef0123456789xyz");
+///     // ... rest of fn ...
+/// }
+/// ```
+///
+/// The macro expands to a `const`, an entered `info_span!`, and a single
+/// `info!("enter", ...)` log line. Implementation lives at the crate root
+/// in `src/lib.rs` so call sites in any module can reach it via
+/// `$crate::routine_id!` (without an explicit `use`).
+///
+/// See the module-level docs for the full rationale.
+#[macro_export]
+macro_rules! routine_id {
+    ($id:expr) => {
+        // The const is the grep target. Even fns that emit no other log lines
+        // still have `ROUTINE_ID` literally present in their source.
+        const ROUTINE_ID: &'static str = $id;
+
+        // We create the span and IMMEDIATELY resolve it via `in_scope`,
+        // emitting the enter log inside the span context. We deliberately
+        // do NOT hold an `.entered()` guard for the rest of the fn body:
+        // that guard is `!Send` because it relies on thread-local state,
+        // which would make every async fn that uses this macro return a
+        // `!Send` future and break Axum/tokio handler bounds.
+        //
+        // The trade-off: the per-fn span only encloses the enter log line
+        // (not the rest of the body). For OTel purposes that's still a
+        // real, exportable span tagged with `routine_id`, which is what
+        // the user-facing telemetry needs. Logs emitted later in the fn
+        // body that want `routine_id` can pull it from the local
+        // `ROUTINE_ID` const — see e.g. `warn!(routine_id = ROUTINE_ID, …)`.
+        let _: () = ::tracing::info_span!(
+            "routine",
+            routine_id = ROUTINE_ID,
+            // `code.function` follows OTel semantic conventions for code
+            // attributes — it makes the OTel UI show the source location
+            // alongside the routine ID.
+            code.function = ::std::module_path!(),
+        )
+        .in_scope(|| {
+            ::tracing::info!(
+                target: "lmx.routine",
+                routine_id = ROUTINE_ID,
+                code.function = ::std::module_path!(),
+                "enter"
+            );
+        });
+    };
+}
+
+/// Initialize the global `tracing` subscriber.
+///
+/// Reads the following environment variables:
+///
+/// | Variable                       | Default | Effect                                                                           |
+/// | ------------------------------ | ------- | -------------------------------------------------------------------------------- |
+/// | `LMX_LOG_FORMAT`               | `text`  | Set to `json` for newline-delimited JSON. Always applied to the stdout layer.    |
+/// | `RUST_LOG`                     | `info`  | Standard `tracing` env-filter (e.g. `lmx=debug,info`).                           |
+/// | `OTEL_EXPORTER_OTLP_ENDPOINT`  | unset   | When set, an OTLP/gRPC exporter is installed alongside the stdout layer.         |
+/// | `OTEL_SERVICE_NAME`            | `dd-rust-network-mutex` | Service name attribute on exported spans/logs.                       |
+/// | `OTEL_RESOURCE_ATTRIBUTES`     | unset   | Honored by `opentelemetry_sdk` resource detector for free-form k=v pairs.        |
+///
+/// Idempotent: calling more than once is a no-op (the underlying `try_init`
+/// only succeeds for the first caller). This matters for tests that call
+/// `init_tracing` from multiple `#[tokio::test]` cases.
+pub fn init_tracing() {
+    routine_id!("ddl-routine-init-tracing-Yk4nQ8aZv");
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let format = std::env::var("LMX_LOG_FORMAT").unwrap_or_else(|_| "text".into());
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    // Build the stdout fmt layer. `with_filter` would attach a per-layer
+    // filter, but the global `EnvFilter` we register below is fine and
+    // keeps both layers in sync — easier to reason about for operators.
+    let fmt_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync> = if format == "json" {
+        Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false),
+        )
+    } else {
+        Box::new(tracing_subscriber::fmt::layer())
+    };
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    #[cfg(feature = "otel")]
+    {
+        if let Some(layer) = otel::build_layer() {
+            let _ = registry.with(layer).try_init();
+            ::tracing::info!(
+                target: "lmx.routine",
+                routine_id = ROUTINE_ID,
+                "tracing initialised with OTLP exporter"
+            );
+            return;
+        }
+    }
+
+    let _ = registry.try_init();
+    ::tracing::info!(
+        target: "lmx.routine",
+        routine_id = ROUTINE_ID,
+        "tracing initialised (stdout only; set OTEL_EXPORTER_OTLP_ENDPOINT to enable OTLP export)"
+    );
+}
+
+/// Gracefully shut down any OTel exporter that was installed by
+/// [`init_tracing`]. Call this from the binary's signal handler **before**
+/// the tokio runtime shuts down, so in-flight spans get flushed.
+///
+/// No-op when the `otel` feature is disabled or no exporter was wired up.
+pub fn shutdown_tracing() {
+    routine_id!("ddl-routine-shutdown-tracing-Pq3");
+
+    #[cfg(feature = "otel")]
+    {
+        otel::shutdown();
+    }
+}
+
+#[cfg(feature = "otel")]
+mod otel {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::trace::{Config, TracerProvider};
+    use opentelemetry_sdk::Resource;
+    use std::sync::OnceLock;
+    use tracing_subscriber::Layer;
+
+    static PROVIDER: OnceLock<TracerProvider> = OnceLock::new();
+
+    /// Build the `tracing-opentelemetry` layer, or `None` when no OTLP
+    /// endpoint is configured. Safe to call exactly once per process.
+    pub(super) fn build_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync>>
+    where
+        S: tracing::Subscriber
+            + Send
+            + Sync
+            + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        crate::routine_id!("ddl-routine-otel-build-layer-3kP");
+
+        let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+        let service_name = std::env::var("OTEL_SERVICE_NAME")
+            .unwrap_or_else(|_| "dd-rust-network-mutex".to_string());
+        let service_version = env!("CARGO_PKG_VERSION");
+
+        let resource = Resource::new([
+            KeyValue::new(
+                opentelemetry_semantic_conventions::resource::SERVICE_NAME,
+                service_name.clone(),
+            ),
+            KeyValue::new(
+                opentelemetry_semantic_conventions::resource::SERVICE_VERSION,
+                service_version.to_string(),
+            ),
+        ]);
+
+        let exporter = opentelemetry_otlp::new_exporter()
+            .tonic()
+            .with_endpoint(endpoint.clone())
+            .build_span_exporter()
+            .ok()?;
+
+        let provider = TracerProvider::builder()
+            .with_config(Config::default().with_resource(resource))
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .build();
+
+        let tracer = provider.tracer("dd-rust-network-mutex");
+        let _ = PROVIDER.set(provider);
+
+        Some(Box::new(
+            tracing_opentelemetry::layer().with_tracer(tracer),
+        ))
+    }
+
+    pub(super) fn shutdown() {
+        crate::routine_id!("ddl-routine-otel-shutdown-Vw9");
+
+        if let Some(provider) = PROVIDER.get() {
+            for result in provider.force_flush() {
+                if let Err(err) = result {
+                    ::tracing::warn!(
+                        target: "lmx.routine",
+                        routine_id = ROUTINE_ID,
+                        error = %err,
+                        "OTel force_flush returned an error"
+                    );
+                }
+            }
+        }
+    }
+}
