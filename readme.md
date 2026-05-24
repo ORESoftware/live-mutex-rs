@@ -339,10 +339,29 @@ this is the same code we run internally at ORE Software under that name.)
 
 ### As a Docker container
 
-A reproducible build needs nothing beyond a stock `rust:1.90-bookworm` image,
-`cargo build --release`, and `target/release/dd-rust-network-mutex`. The
-broker reads everything it needs from environment variables; no config file is
-required.
+The repo root ships a multi-stage `Dockerfile` (build with
+`rust:1.90-bookworm`, run on `debian:bookworm-slim`) that produces a
+small, non-root image with TLS and OTel features enabled by default:
+
+```bash
+# Build (linux/amd64 by default; pass --platform for cross-arch).
+docker build -t oresoftware/live-mutex-rs:0.1.123 .
+
+# Run (TCP 6970 + HTTP 6971 — see Environment variables for everything).
+docker run --rm -p 6970:6970 -p 6971:6971 \
+    oresoftware/live-mutex-rs:0.1.123
+```
+
+The published image at
+[`oresoftware/live-mutex-rs`](https://hub.docker.com/r/oresoftware/live-mutex-rs)
+is built from `dev` and tagged with the matching `Cargo.toml`
+version. To opt out of TLS / OTel for a smaller image, pass
+`--build-arg CARGO_BUILD_FLAGS="--no-default-features"` (or
+`--no-default-features --features tls` for TLS-only).
+
+If you'd rather build the binary outside Docker, the broker reads
+everything it needs from environment variables and has no config file:
+`cargo build --release` plus the env vars in the table above is enough.
 
 ### High availability
 

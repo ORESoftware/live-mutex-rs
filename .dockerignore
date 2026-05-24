@@ -1,0 +1,21 @@
+# Keep the build context small and reproducible.
+target/
+**/target/
+.git/
+.github/
+.gitignore
+.gitattributes
+*.md.bak
+
+# Cross-runtime client subtrees aren't needed by the Rust broker build.
+# (They each have their own build pipelines under `clients/<lang>/`.)
+clients/
+
+# Local scripts and one-shot experiments don't influence the broker
+# binary that ships in the image.
+scripts/
+
+# Editor / OS junk.
+.idea/
+.vscode/
+.DS_Store
