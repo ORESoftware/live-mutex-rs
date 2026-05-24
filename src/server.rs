@@ -277,6 +277,12 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
             .route("/v1/rw/write/end", post(http_rw_write_end))
             .route("/v1/lock-info/:key", get(http_lock_info))
             .route("/v1/locks", get(http_ls))
+            // Runtime OTel kill-switch. Authenticated by a separate
+            // admin token (NOT the broker's general-purpose
+            // `auth_token`) so an operator can flip the flag in
+            // environments where lock callers don't share the admin
+            // password.
+            .route("/admin/otel", get(admin_otel_get).post(admin_otel_post))
             .with_state(app_state)
             // Status views — `live-mutex#108`. Unauthenticated, matching
             // `/healthz` and `/metrics` on the same listener.
@@ -540,6 +546,100 @@ fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
+}
+
+/// Shared secret used to authenticate `/admin/*` requests. Defaults to
+/// the literal string the operator explicitly chose at request time;
+/// override via the `LMX_ADMIN_TOKEN` env var in production. This is
+/// deliberately a *separate* token from `AppState::auth_token` so the
+/// admin surface can be locked down even when general-purpose lock API
+/// auth is disabled.
+fn admin_token() -> String {
+    crate::routine_id!("ddl-routine-admin-token-Ld2");
+    std::env::var("LMX_ADMIN_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "all-dogs-go-to-heaven".to_string())
+}
+
+/// Validate an admin shared-secret header on `/admin/*` routes. Accepts
+/// either `x-admin-token: <token>` or `Authorization: Bearer <token>`.
+fn admin_authorized(headers: &HeaderMap) -> bool {
+    crate::routine_id!("ddl-routine-admin-authorized-Vr8");
+    let expected = admin_token();
+    let custom = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    custom.as_deref() == Some(expected.as_str())
+        || bearer.as_deref() == Some(expected.as_str())
+}
+
+#[derive(serde::Deserialize)]
+struct OtelToggleRequest {
+    enabled: bool,
+}
+
+/// `GET /admin/otel` — return the current state of the OTel kill-switch.
+async fn admin_otel_get(headers: HeaderMap) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-otel-get-Hs5");
+    if !admin_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
+            })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({
+        "enabled": crate::routine::is_otel_enabled(),
+    }))
+    .into_response()
+}
+
+/// `POST /admin/otel` — flip the OTel kill-switch at runtime. Body is
+/// `{"enabled": true|false}`. Response includes `previous` so audit
+/// logs can record the transition without an extra GET.
+///
+/// We auth FIRST against the headers, then take the body via a raw
+/// `bytes::Bytes` extractor so we control the parse path. axum's
+/// built-in `Json<T>` would 400 before our auth check has a chance to
+/// run on a missing or malformed body, which would let unauth callers
+/// distinguish "endpoint exists" from "endpoint missing" via the error
+/// shape — minor info leak, but easy to avoid.
+async fn admin_otel_post(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-otel-post-Kt4");
+    if !admin_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
+            })),
+        )
+            .into_response();
+    }
+    let parsed: Result<OtelToggleRequest, _> = serde_json::from_slice(&body);
+    let Ok(req) = parsed else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "`enabled` is required and must be a boolean."
+            })),
+        )
+            .into_response();
+    };
+    let previous = crate::routine::set_otel_enabled(req.enabled);
+    Json(serde_json::json!({
+        "previous": previous,
+        "enabled": crate::routine::is_otel_enabled(),
+    }))
+    .into_response()
 }
 
 async fn healthz() -> impl IntoResponse {

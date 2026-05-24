@@ -1487,6 +1487,132 @@ async fn status_page_with_many_keys_shows_at_most_ten_rows() {
     assert!(row_count > 0, "expected at least one manykey row; got 0");
 }
 
+// ---- /admin/otel runtime kill-switch -------------------------------------
+
+/// `GET /admin/otel` requires a shared-secret header. Without it, every
+/// method returns 401 with the `lmx admin` error shape.
+#[tokio::test]
+async fn admin_otel_requires_shared_secret_header() {
+    let (_, http_port) = start_server(false, true).await;
+    let port = http_port.unwrap();
+
+    let resp = http_get_with_headers(&format!("http://127.0.0.1:{port}/admin/otel"), &[]).await;
+    assert!(
+        resp.starts_with("HTTP/1.1 401"),
+        "unauthenticated GET /admin/otel must be 401; got: {resp:.120}"
+    );
+
+    let resp_post = http_send_raw(
+        "127.0.0.1",
+        port,
+        b"POST /admin/otel HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"enabled\":true}",
+    )
+    .await;
+    assert!(
+        resp_post.starts_with("HTTP/1.1 401"),
+        "unauthenticated POST /admin/otel must be 401; got: {resp_post:.120}"
+    );
+}
+
+/// Authenticated GET → POST → GET round-trip flips the runtime
+/// kill-switch and the response body reports both the new and previous
+/// values for audit logging.
+#[tokio::test]
+async fn admin_otel_toggle_round_trip() {
+    let (_, http_port) = start_server(false, true).await;
+    let port = http_port.unwrap();
+    let url_get = format!("http://127.0.0.1:{port}/admin/otel");
+
+    // Snapshot whatever the kill-switch happens to be before the test —
+    // other tests run in parallel and may have left it on or off.
+    let before = http_get_json_with_headers(
+        &url_get,
+        &[("x-admin-token", "all-dogs-go-to-heaven")],
+    )
+    .await;
+    assert!(before["enabled"].is_boolean());
+    let was = before["enabled"].as_bool().unwrap();
+
+    // Flip to the opposite value.
+    let next = !was;
+    let body = serde_json::json!({"enabled": next});
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let req = format!(
+        "POST /admin/otel HTTP/1.1\r\nHost: 127.0.0.1\r\nx-admin-token: all-dogs-go-to-heaven\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        len = body_bytes.len(),
+    );
+    let mut raw = req.into_bytes();
+    raw.extend_from_slice(&body_bytes);
+    let post_resp = http_send_raw("127.0.0.1", port, &raw).await;
+    assert!(
+        post_resp.starts_with("HTTP/1.1 200"),
+        "authed POST should be 200; got: {post_resp:.160}"
+    );
+    let post_body = parse_json_body(&post_resp);
+    assert_eq!(post_body["previous"], serde_json::Value::Bool(was));
+    assert_eq!(post_body["enabled"], serde_json::Value::Bool(next));
+
+    // Read-back via GET.
+    let after = http_get_json_with_headers(
+        &url_get,
+        &[("x-admin-token", "all-dogs-go-to-heaven")],
+    )
+    .await;
+    assert_eq!(after["enabled"], serde_json::Value::Bool(next));
+
+    // Confirm the in-process accessor agrees with the HTTP response.
+    assert_eq!(dd_rust_network_mutex::is_otel_enabled(), next);
+
+    // Also accepts `Authorization: Bearer …`.
+    let bearer_resp = http_get_json_with_headers(
+        &url_get,
+        &[("authorization", "Bearer all-dogs-go-to-heaven")],
+    )
+    .await;
+    assert!(bearer_resp["enabled"].is_boolean());
+
+    // Restore the prior value so we don't leak state into other parallel tests.
+    let restore_body = serde_json::to_vec(&serde_json::json!({"enabled": was})).unwrap();
+    let mut raw_restore = format!(
+        "POST /admin/otel HTTP/1.1\r\nHost: 127.0.0.1\r\nx-admin-token: all-dogs-go-to-heaven\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        len = restore_body.len(),
+    )
+    .into_bytes();
+    raw_restore.extend_from_slice(&restore_body);
+    let _ = http_send_raw("127.0.0.1", port, &raw_restore).await;
+}
+
+/// POST without a body, or with the wrong shape, returns 400.
+#[tokio::test]
+async fn admin_otel_post_validates_body() {
+    let (_, http_port) = start_server(false, true).await;
+    let port = http_port.unwrap();
+
+    let no_body = http_send_raw(
+        "127.0.0.1",
+        port,
+        b"POST /admin/otel HTTP/1.1\r\nHost: 127.0.0.1\r\nx-admin-token: all-dogs-go-to-heaven\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(
+        no_body.starts_with("HTTP/1.1 400") || no_body.starts_with("HTTP/1.1 415"),
+        "empty body must be rejected; got: {no_body:.160}"
+    );
+
+    // `{"enabled":"on"}` is exactly 16 bytes — Content-Length must match
+    // or the server will block waiting for an extra byte.
+    let wrong_type = http_send_raw(
+        "127.0.0.1",
+        port,
+        b"POST /admin/otel HTTP/1.1\r\nHost: 127.0.0.1\r\nx-admin-token: all-dogs-go-to-heaven\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"enabled\":\"on\"}",
+    )
+    .await;
+    assert!(
+        wrong_type.starts_with("HTTP/1.1 400") || wrong_type.starts_with("HTTP/1.1 422"),
+        "string `enabled` must be rejected; got: {wrong_type:.160}"
+    );
+}
+
 // ---- tiny HTTP helpers (no reqwest dependency) ----------------------------
 
 async fn http_post(url: &str, body: serde_json::Value) -> serde_json::Value {
@@ -1511,6 +1637,25 @@ async fn http_get_text(url: &str) -> String {
     );
     let resp = http_send(&url, request.as_bytes(), b"").await;
     body_only(&resp).to_string()
+}
+
+async fn http_get_with_headers(url: &str, headers: &[(&str, &str)]) -> String {
+    let url = url::ParseUrl::parse(url);
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
+        path = url.path,
+        host = url.host_port(),
+    );
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    http_send(&url, req.as_bytes(), b"").await
+}
+
+async fn http_get_json_with_headers(url: &str, headers: &[(&str, &str)]) -> serde_json::Value {
+    let resp = http_get_with_headers(url, headers).await;
+    parse_json_body(&resp)
 }
 
 async fn http_send(url: &url::ParseUrl, head: &[u8], body: &[u8]) -> String {
