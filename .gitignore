@@ -1,0 +1,29 @@
+# Rust / Cargo
+target/
+**/*.rs.bk
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cross-runtime client artifacts
+clients/ts/node_modules/
+clients/ts/dist/
+clients/ts/*.tsbuildinfo
+clients/go/cmd/smoke/smoke
+clients/go/go.sum.lock
+clients/dart/.dart_tool/
+clients/dart/.packages
+clients/dart/pubspec.lock
+clients/gleam/build/
+clients/gleam/erl_crash.dump
+
+# Test / scratch outputs
+*.log
+.cargo-cache/
