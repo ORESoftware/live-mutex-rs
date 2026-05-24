@@ -29,11 +29,23 @@ ARG CARGO_BUILD_FLAGS=""
 
 WORKDIR /app
 
-# Cache deps separately from src to keep rebuilds fast.
+# Cache deps separately from src to keep rebuilds fast. Two
+# subtleties to watch for:
+#   1. The dummy `src/lib.rs` must contain at least one item or
+#      cargo will skip building the lib and the second pass won't
+#      have the cached artifacts. An empty file isn't enough.
+#   2. After the real `COPY src ./src`, we must invalidate cargo's
+#      "this crate is up to date" fingerprint for the broker
+#      package itself. Docker COPY preserves source mtimes, so the
+#      real source can land with timestamps OLDER than the
+#      stub's compiled artifact, and cargo will refuse to rebuild
+#      the broker (only its dependencies). `cargo clean -p` on the
+#      broker package forces the second pass to recompile the real
+#      source while keeping every transitive dep's `.rlib` cached.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src \
   && echo "fn main() {}" > src/main.rs \
-  && echo "" > src/lib.rs \
+  && echo "pub fn _stub() {}" > src/lib.rs \
   && cargo build --release ${CARGO_BUILD_FLAGS} \
   && rm -rf src
 
@@ -44,7 +56,8 @@ COPY PROTOCOL.md ./PROTOCOL.md
 COPY readme.md ./readme.md
 COPY LICENSE ./LICENSE
 
-RUN cargo build --release --bin dd-rust-network-mutex ${CARGO_BUILD_FLAGS}
+RUN cargo clean -p dd-rust-network-mutex --release \
+  && cargo build --release --bin dd-rust-network-mutex ${CARGO_BUILD_FLAGS}
 
 FROM debian:bookworm-slim
 
