@@ -13,11 +13,11 @@
 #          callers + Prometheus `/metrics`).
 #
 # Build:
-#   docker build -t oresoftware/live-mutex-rs:0.1.123 .
+#   docker build -t oresoftware/live-mutex-rs:0.1.124 .
 #
 # Run:
 #   docker run --rm -p 6970:6970 -p 6971:6971 \
-#     oresoftware/live-mutex-rs:0.1.123
+#     oresoftware/live-mutex-rs:0.1.124
 #
 # See `readme.md` for the full env-var surface
 # (`LMX_BIND_HOST`, `LMX_TCP_PORT`, `LMX_HTTP_PORT`, `LMX_AUTH_TOKEN`,

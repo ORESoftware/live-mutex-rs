@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,11 +97,47 @@ impl Default for ServerConfig {
     }
 }
 
+/// Runtime-mutable TCP socket-tuning flags. Owned by [`AppState`] (and
+/// shared into the per-connection accept loop) so `POST /admin/tcp`
+/// can flip behavior for newly-accepted connections without
+/// restarting the broker.
+///
+/// `quickack` is honored only on Linux. On other platforms the flag is
+/// stored faithfully so a future Linux deploy will pick it up, but
+/// `apply_quickack` is a no-op (see `crate::sockopt`).
+#[derive(Debug)]
+pub(crate) struct TcpFlags {
+    pub(crate) nodelay: AtomicBool,
+    pub(crate) quickack: AtomicBool,
+}
+
+impl TcpFlags {
+    fn new(nodelay: bool, quickack: bool) -> Self {
+        Self {
+            nodelay: AtomicBool::new(nodelay),
+            quickack: AtomicBool::new(quickack),
+        }
+    }
+    pub(crate) fn nodelay(&self) -> bool {
+        self.nodelay.load(Ordering::Relaxed)
+    }
+    pub(crate) fn quickack(&self) -> bool {
+        self.quickack.load(Ordering::Relaxed)
+    }
+    fn set_nodelay(&self, v: bool) {
+        self.nodelay.store(v, Ordering::Relaxed);
+    }
+    fn set_quickack(&self, v: bool) {
+        self.quickack.store(v, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     broker: Broker,
     auth_token: Option<String>,
     metrics: Arc<crate::metrics::Metrics>,
+    tcp_flags: Arc<TcpFlags>,
 }
 
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
@@ -108,6 +145,13 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     let broker = Broker::new(config.broker.clone());
     let metrics = Arc::new(crate::metrics::Metrics::new());
     let auth_token = config.auth_token.clone();
+    // Shared, runtime-mutable view of TCP socket flags. Initial values
+    // come from `ServerConfig` (kept as `bool` for backwards-compat with
+    // existing callers); operators flip them at runtime via
+    // `POST /admin/tcp` and the change is picked up by both the
+    // accept loop (NODELAY) and the per-frame `AfterRead` hook
+    // (QUICKACK) on the very next event.
+    let tcp_flags = Arc::new(TcpFlags::new(config.tcp_nodelay, config.tcp_quickack));
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut listeners_bound = 0usize;
@@ -130,8 +174,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         let broker_c = broker.clone();
         let auth_c = auth_token.clone();
         let metrics_c = metrics.clone();
-        let nodelay = config.tcp_nodelay;
-        let quickack = config.tcp_quickack;
+        let tcp_flags_c = tcp_flags.clone();
         #[cfg(feature = "tls")]
         let tls_acceptor = match config.tls.as_ref() {
             Some(t) => Some(build_tls_acceptor(t)?),
@@ -143,7 +186,10 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                     Ok((sock, peer)) => {
                         debug!(target: "lmx::tcp", %peer, "accept");
                         metrics_c.tcp_connections_total.inc();
-                        if nodelay && crate::sockopt::apply_nodelay(&sock).is_ok() {
+                        // Read the live values on every accept so a
+                        // runtime toggle via `POST /admin/tcp` takes
+                        // effect for newly-accepted connections.
+                        if tcp_flags_c.nodelay() && crate::sockopt::apply_nodelay(&sock).is_ok() {
                             metrics_c.tcp_nodelay_applied_total.inc();
                         }
                         // Snapshot the fd *before* `sock` is moved into a
@@ -153,7 +199,10 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                             use std::os::fd::AsRawFd;
                             sock.as_raw_fd()
                         };
-                        let after_read = AfterRead::Tcp { fd, quickack };
+                        let after_read = AfterRead::Tcp {
+                            fd,
+                            flags: tcp_flags_c.clone(),
+                        };
                         let broker = broker_c.clone();
                         let auth = auth_c.clone();
                         let metrics_inner = metrics_c.clone();
@@ -259,11 +308,13 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
             broker: broker.clone(),
             auth_token: auth_token.clone(),
             metrics: metrics.clone(),
+            tcp_flags: tcp_flags.clone(),
         };
         let status_state = StatusAppState {
             broker: broker.clone(),
             metrics: metrics.clone(),
             info: status_info.clone(),
+            tcp_flags: tcp_flags.clone(),
         };
         let app = Router::new()
             .route("/healthz", get(healthz))
@@ -283,6 +334,11 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
             // environments where lock callers don't share the admin
             // password.
             .route("/admin/otel", get(admin_otel_get).post(admin_otel_post))
+            .route(
+                "/admin/log-level",
+                get(admin_log_level_get).post(admin_log_level_post),
+            )
+            .route("/admin/tcp", get(admin_tcp_get).post(admin_tcp_post))
             .with_state(app_state)
             // Status views — `live-mutex#108`. Unauthenticated, matching
             // `/healthz` and `/metrics` on the same listener.
@@ -310,6 +366,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
             broker: broker.clone(),
             metrics: metrics.clone(),
             info: status_info.clone(),
+            tcp_flags: tcp_flags.clone(),
         };
         let app = status_router(status_state);
         let listener = TcpListener::bind(addr).await?;
@@ -360,16 +417,22 @@ fn build_tls_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, std:
 
 /// Per-connection hook that runs after every successful frame read. Used
 /// to re-apply `TCP_QUICKACK` on Linux (the option is one-shot).
-#[derive(Clone, Copy)]
+///
+/// The `Tcp` variant carries an `Arc<TcpFlags>` rather than a snapshot
+/// `bool` so that runtime toggles via `POST /admin/tcp` take effect
+/// for already-accepted long-lived connections on the very next
+/// frame, without waiting for the connection to reconnect.
+#[derive(Clone)]
 pub(crate) enum AfterRead {
     /// Non-TCP transport (UDS, in-process tests). No-op.
     None,
     /// TCP connection. We hold the raw fd; on Linux we set TCP_QUICKACK
     /// after every read so the kernel ACKs immediately rather than
-    /// queueing a delayed ACK.
+    /// queueing a delayed ACK. The `quickack` decision is read
+    /// dynamically from the shared `TcpFlags`.
     Tcp {
         fd: std::os::fd::RawFd,
-        quickack: bool,
+        flags: Arc<TcpFlags>,
     },
 }
 
@@ -378,8 +441,8 @@ impl AfterRead {
         crate::routine_id!("ddl-routine-bOwqZ9tGHJ5m7NJrZs");
         match self {
             AfterRead::None => {}
-            AfterRead::Tcp { fd, quickack } => {
-                if *quickack {
+            AfterRead::Tcp { fd, flags } => {
+                if flags.quickack() {
                     if let Ok(true) = crate::sockopt::apply_quickack(*fd) {
                         metrics.tcp_quickack_applied_total.inc();
                     }
@@ -580,9 +643,86 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
         || bearer.as_deref() == Some(expected.as_str())
 }
 
+/// `true` when the inbound request looks like it came from HTMX. We
+/// consult the standard `HX-Request: true` header HTMX always sets on
+/// AJAX-driven requests. Used to dual-output the admin POST handlers:
+/// HTML snippet for HTMX (so `hx-swap` can drop it straight into a
+/// `<span>`), JSON for everyone else (so `curl`/operators see the
+/// same response shape they always have).
+fn is_htmx_request(headers: &HeaderMap) -> bool {
+    headers
+        .get("hx-request")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// HTML response with the right content-type for `hx-swap`. We return
+/// a tiny snippet (no `<html>`/`<body>`) because HTMX swaps it as
+/// fragment content.
+fn html_snippet(status: StatusCode, body: String) -> AxumResponse {
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+/// Parse a small admin-POST body as either `application/json` or
+/// `application/x-www-form-urlencoded`, depending on the inbound
+/// `Content-Type`. HTMX (without the optional `json-enc` extension)
+/// posts `application/x-www-form-urlencoded`; `curl -d '{...}'` posts
+/// JSON. Empty / unset content types fall back to JSON since that's
+/// the historical contract for `/admin/otel`.
+fn parse_admin_body<T>(headers: &HeaderMap, body: &[u8]) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct.starts_with("application/x-www-form-urlencoded") {
+        serde_urlencoded::from_bytes(body).map_err(|e| e.to_string())
+    } else {
+        // Default to JSON. `application/json` and the empty default
+        // both land here.
+        serde_json::from_slice(body).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct OtelToggleRequest {
+    // `application/x-www-form-urlencoded` deserialises numeric/string
+    // values into bool via serde, so the form payload `enabled=true`
+    // and the JSON payload `{"enabled":true}` both populate this.
     enabled: bool,
+}
+
+fn render_otel_snippet(enabled: bool) -> String {
+    let state = if enabled { "on" } else { "off" };
+    format!("otel: <strong>{state}</strong>")
+}
+
+/// Tiny HTML escaper for the inline admin response snippets. We
+/// don't pull in the (private) `status::html_escape` here because
+/// it'd force a `pub(crate)` widening; the admin snippets only
+/// interpolate operator-controlled directive strings and parser
+/// error messages, both small enough that this fits in five
+/// branches.
+fn html_escape_min(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// `GET /admin/otel` — return the current state of the OTel kill-switch.
@@ -624,22 +764,276 @@ async fn admin_otel_post(headers: HeaderMap, body: axum::body::Bytes) -> impl In
         )
             .into_response();
     }
-    let parsed: Result<OtelToggleRequest, _> = serde_json::from_slice(&body);
-    let Ok(req) = parsed else {
+    let htmx = is_htmx_request(&headers);
+    let parsed: Result<OtelToggleRequest, _> = parse_admin_body(&headers, &body);
+    let req = match parsed {
+        Ok(r) => r,
+        Err(err) => {
+            // Mirror the JSON error in HTML for HTMX so the inline
+            // `<span>` shows something useful instead of going stale.
+            if htmx {
+                return html_snippet(
+                    StatusCode::BAD_REQUEST,
+                    format!("otel: <strong>error</strong> ({})", html_escape_min(&err)),
+                );
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("`enabled` is required and must be a boolean ({err})."),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let previous = crate::routine::set_otel_enabled(req.enabled);
+    let now = crate::routine::is_otel_enabled();
+    if htmx {
+        html_snippet(StatusCode::OK, render_otel_snippet(now))
+    } else {
+        Json(serde_json::json!({
+            "previous": previous,
+            "enabled": now,
+        }))
+        .into_response()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LogLevelRequest {
+    directive: String,
+}
+
+/// `GET /admin/log-level` — return the current `EnvFilter` directive.
+async fn admin_log_level_get(headers: HeaderMap) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-log-level-get-Bm6");
+    if !admin_authorized(&headers) {
         return (
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({
-                "error": "`enabled` is required and must be a boolean."
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
             })),
         )
             .into_response();
-    };
-    let previous = crate::routine::set_otel_enabled(req.enabled);
+    }
     Json(serde_json::json!({
-        "previous": previous,
-        "enabled": crate::routine::is_otel_enabled(),
+        "directive": crate::routine::current_log_level(),
     }))
     .into_response()
+}
+
+/// `POST /admin/log-level` — install a new `EnvFilter` directive at
+/// runtime via the `tracing-subscriber::reload` handle wired up in
+/// `init_tracing`. Body is `{"directive": "<value>"}`. Returns
+/// `{"previous": "...", "directive": "..."}` on success, 400 with the
+/// parser error on malformed input.
+async fn admin_log_level_post(headers: HeaderMap, body: axum::body::Bytes) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-log-level-post-Cn7");
+    if !admin_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
+            })),
+        )
+            .into_response();
+    }
+    let htmx = is_htmx_request(&headers);
+    let parsed: Result<LogLevelRequest, _> = parse_admin_body(&headers, &body);
+    let req = match parsed {
+        Ok(r) => r,
+        Err(err) => {
+            if htmx {
+                return html_snippet(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "log-level: <strong>error</strong> ({})",
+                        html_escape_min(&err)
+                    ),
+                );
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("`directive` is required and must be a string ({err})."),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let previous = crate::routine::current_log_level();
+    match crate::routine::set_log_level(&req.directive) {
+        Ok(applied) => {
+            if htmx {
+                html_snippet(
+                    StatusCode::OK,
+                    format!(
+                        "log-level: <strong>{}</strong>",
+                        html_escape_min(&applied)
+                    ),
+                )
+            } else {
+                Json(serde_json::json!({
+                    "previous": previous,
+                    "directive": applied,
+                }))
+                .into_response()
+            }
+        }
+        Err(err) => {
+            if htmx {
+                html_snippet(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "log-level: <strong>error</strong> ({})",
+                        html_escape_min(&err)
+                    ),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": err,
+                        "previous": previous,
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TcpToggleRequest {
+    nodelay: Option<bool>,
+    quickack: Option<bool>,
+}
+
+/// `GET /admin/tcp` — return the current TCP socket-tuning flags
+/// (live values, not the long-stale `ServerConfig` snapshot).
+async fn admin_tcp_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-tcp-get-Dp8");
+    if !admin_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
+            })),
+        )
+            .into_response();
+    }
+    let nodelay = state.tcp_flags.nodelay();
+    let quickack = state.tcp_flags.quickack();
+    Json(serde_json::json!({
+        "nodelay": nodelay,
+        "quickack": quickack,
+        "quickack_supported": cfg!(target_os = "linux"),
+    }))
+    .into_response()
+}
+
+/// `POST /admin/tcp` — flip NODELAY and/or QUICKACK at runtime. Body
+/// is `{"nodelay"?: bool, "quickack"?: bool}`. The change is picked
+/// up by the accept loop on the next accept (NODELAY) and by the
+/// per-frame `AfterRead` hook on the next read (QUICKACK), so already
+/// long-lived connections see the new behavior without having to
+/// reconnect.
+///
+/// On non-Linux targets, setting `quickack: true` still stores the
+/// flag (so a future Linux deploy will pick it up) but the response
+/// includes a `warning` field reminding the operator that the option
+/// is a no-op on the current OS.
+async fn admin_tcp_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-admin-tcp-post-Eq9");
+    if !admin_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "admin endpoint requires `x-admin-token` (or `Authorization: Bearer ...`)."
+            })),
+        )
+            .into_response();
+    }
+    let htmx = is_htmx_request(&headers);
+    let parsed: Result<TcpToggleRequest, _> = parse_admin_body(&headers, &body);
+    let req = match parsed {
+        Ok(r) => r,
+        Err(err) => {
+            if htmx {
+                return html_snippet(
+                    StatusCode::BAD_REQUEST,
+                    format!("tcp: <strong>error</strong> ({})", html_escape_min(&err)),
+                );
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("expected body with optional `nodelay` and/or `quickack` booleans ({err})."),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if req.nodelay.is_none() && req.quickack.is_none() {
+        if htmx {
+            return html_snippet(
+                StatusCode::BAD_REQUEST,
+                "tcp: <strong>error</strong> (need nodelay or quickack)".to_string(),
+            );
+        }
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "at least one of `nodelay` or `quickack` must be present."
+            })),
+        )
+            .into_response();
+    }
+    let previous_nodelay = state.tcp_flags.nodelay();
+    let previous_quickack = state.tcp_flags.quickack();
+    if let Some(v) = req.nodelay {
+        state.tcp_flags.set_nodelay(v);
+    }
+    let mut warning: Option<&'static str> = None;
+    if let Some(v) = req.quickack {
+        state.tcp_flags.set_quickack(v);
+        if v && !cfg!(target_os = "linux") {
+            warning = Some("TCP_QUICKACK is no-op on this OS");
+        }
+    }
+    if htmx {
+        let nodelay_str = if state.tcp_flags.nodelay() { "on" } else { "off" };
+        let quickack_str = if state.tcp_flags.quickack() { "on" } else { "off" };
+        let warn_html = warning
+            .map(|w| format!(" <em>({})</em>", html_escape_min(w)))
+            .unwrap_or_default();
+        return html_snippet(
+            StatusCode::OK,
+            format!(
+                "tcp: NODELAY <strong>{nodelay_str}</strong> · QUICKACK <strong>{quickack_str}</strong>{warn_html}"
+            ),
+        );
+    }
+    let mut body = serde_json::json!({
+        "nodelay": state.tcp_flags.nodelay(),
+        "quickack": state.tcp_flags.quickack(),
+        "quickack_supported": cfg!(target_os = "linux"),
+        "previous": {
+            "nodelay": previous_nodelay,
+            "quickack": previous_quickack,
+        },
+    });
+    if let Some(w) = warning {
+        body["warning"] = serde_json::Value::String(w.to_string());
+    }
+    Json(body).into_response()
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -668,7 +1062,18 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
 async fn status_page(State(state): State<StatusAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-leTmUgVn8BaNKdrlty");
     let metrics_text = state.metrics.render(&state.broker);
-    let html = crate::status::render(&state.broker, &state.info, &metrics_text);
+    // Refresh the live runtime fields on each render so the page
+    // reflects whatever the most recent `POST /admin/*` actions have
+    // toggled. The fields baked into `StatusServerInfo` at startup
+    // (bind addresses, TLS config, broker tunables) stay stable.
+    let mut info = (*state.info).clone();
+    info.tcp_nodelay = state.tcp_flags.nodelay();
+    info.tcp_quickack = state.tcp_flags.quickack();
+    info.tcp_quickack_effective =
+        state.tcp_flags.quickack() && crate::sockopt::quickack_supported();
+    info.log_directive = crate::routine::current_log_level();
+    info.otel_enabled = crate::routine::is_otel_enabled();
+    let html = crate::status::render(&state.broker, &info, &metrics_text);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -678,12 +1083,16 @@ async fn status_page(State(state): State<StatusAppState>) -> impl IntoResponse {
 
 /// State for the status routes. Distinct from `AppState` so the
 /// dedicated status listener doesn't accidentally pull in the
-/// auth-token field.
+/// auth-token field. Carries the same `Arc<TcpFlags>` so the
+/// server-rendered status page reflects whatever the most recent
+/// `POST /admin/tcp` flipped the flags to (rather than the values
+/// from the long-stale startup `ServerConfig`).
 #[derive(Clone)]
 struct StatusAppState {
     broker: Broker,
     metrics: Arc<crate::metrics::Metrics>,
     info: Arc<crate::status::StatusServerInfo>,
+    tcp_flags: Arc<TcpFlags>,
 }
 
 fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
@@ -697,9 +1106,14 @@ fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
         http_bind: config.http_bind.map(|a| a.to_string()),
         status_bind: config.status_bind.map(|a| a.to_string()),
         auth_token_set: config.auth_token.is_some(),
+        // Initial values — `status_page()` overwrites these on each
+        // render with the live `Arc<TcpFlags>` snapshot so the page
+        // reflects runtime toggles, not just startup config.
         tcp_nodelay: config.tcp_nodelay,
         tcp_quickack: config.tcp_quickack,
         tcp_quickack_effective: config.tcp_quickack && crate::sockopt::quickack_supported(),
+        log_directive: crate::routine::current_log_level(),
+        otel_enabled: crate::routine::is_otel_enabled(),
         default_ttl: config.broker.default_ttl,
         ttl_sweep_interval: config.broker.ttl_sweep_interval,
         max_lock_holders: config.broker.max_lock_holders,

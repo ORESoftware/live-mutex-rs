@@ -25,6 +25,13 @@ use crate::broker::{Broker, KeyContentionSnapshot};
 /// Snapshot of `ServerConfig` fields we want to surface on the status
 /// page. Decoupled from `ServerConfig` itself so this module stays free
 /// of the (large) `tls`-feature surface.
+///
+/// Some fields (`tcp_nodelay`, `tcp_quickack`, `tcp_quickack_effective`,
+/// `log_directive`, `otel_enabled`) are *runtime-mutable* — the server
+/// re-snapshots them on every render via the live atomics owned by
+/// `AppState` so the page reflects the latest values flipped by
+/// `POST /admin/*`, not the long-stale values from startup
+/// `ServerConfig`.
 #[derive(Debug, Clone)]
 pub struct StatusServerInfo {
     pub tcp_bind: Option<String>,
@@ -35,6 +42,11 @@ pub struct StatusServerInfo {
     pub tcp_nodelay: bool,
     pub tcp_quickack: bool,
     pub tcp_quickack_effective: bool,
+    /// Current `EnvFilter` directive (e.g. `info`, `lmx=debug,info`).
+    /// Empty before `init_tracing` has run.
+    pub log_directive: String,
+    /// Live state of the OTel kill-switch (`POST /admin/otel`).
+    pub otel_enabled: bool,
     pub default_ttl: Duration,
     pub ttl_sweep_interval: Duration,
     pub max_lock_holders: u32,
@@ -76,7 +88,7 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
     };
 
     format!(
-        r#"<!doctype html>
+        r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -116,9 +128,34 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
   pre {{ background: var(--table-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow: auto; max-height: 320px; font: 11px/1.4 SFMono-Regular, ui-monospace, Menlo, monospace; }}
   footer {{ margin-top: 30px; color: var(--muted); font-size: 12px; }}
   footer a {{ color: var(--accent); }}
+  #lmx-admin {{ background: var(--table-bg); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; }}
+  #lmx-admin .admin-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }}
+  #lmx-admin .admin-row:last-of-type {{ border-bottom: none; }}
+  #lmx-admin label {{ display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }}
+  #lmx-admin input[type=text], #lmx-admin input[type=password] {{ font: inherit; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); min-width: 220px; }}
+  #lmx-admin button {{ font: inherit; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--fg); cursor: pointer; }}
+  #lmx-admin button:hover {{ border-color: var(--accent); }}
+  #lmx-admin button[disabled] {{ opacity: 0.5; cursor: not-allowed; }}
+  #lmx-admin .control-label {{ font-size: 12px; color: var(--muted); min-width: 180px; }}
+  #lmx-admin .control-current {{ font-size: 12px; color: var(--muted); }}
+  #lmx-admin .status {{ font-size: 12px; }}
+  #lmx-admin .status.ok {{ color: var(--ok); }}
+  #lmx-admin .status.warn {{ color: var(--warn); }}
+  .small {{ font-size: 11px; }}
 </style>
 </head>
 <body>
+<!--
+  HTMX runtime, loaded from the public unpkg CDN with an
+  integrity (SRI) hash so the browser refuses to execute a
+  tampered file. Pinned to 2.0.4. The broker itself NEVER
+  serves any JS or CSS asset; everything not part of this
+  rendered HTML comes from the CDN.
+-->
+<script
+  src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"
+  integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+  crossorigin="anonymous"></script>
 <h1>dd-rust-network-mutex</h1>
 <p class="subtitle">Protocol <code>{protocol_version}</code> · uptime <strong>{uptime}</strong> · auto-refreshes every 5s</p>
 
@@ -164,6 +201,117 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
     </tbody>
 </table>
 
+<h2>Admin controls</h2>
+<!--
+  HTMX-driven admin UI. The status page itself stays 100%
+  server-rendered HTML — the only client-side dependency is the
+  HTMX runtime loaded from a public CDN with an SRI hash (see
+  the <script> tag at the top of <body>). The broker does not
+  serve any JS/CSS assets of its own.
+
+  Each `hx-post` URL is *relative* (no leading slash) so the page
+  works whether served at `/`, `/status`, or behind a gateway
+  prefix like `/lmx-rs/`. The token bridge below injects the
+  operator's `x-admin-token` header on every HTMX request via
+  the `htmx:configRequest` event.
+-->
+<form id="lmx-admin" onsubmit="return false;">
+  <div class="admin-row">
+    <label for="lmx-admin-token">Admin token
+      <input id="lmx-admin-token" type="password" autocomplete="off" placeholder="x-admin-token">
+    </label>
+    <button id="lmx-save-token" type="button">Save token (this browser)</button>
+    <span id="lmx-save-status" class="status muted"></span>
+  </div>
+  <fieldset class="admin-row" name="admin-otel">
+    <legend>Telemetry (OTel)</legend>
+    <button type="button"
+            hx-post="admin/otel"
+            hx-vals='{{"enabled": "true"}}'
+            hx-target="#lmx-otel-status"
+            hx-swap="innerHTML">Enable</button>
+    <button type="button"
+            hx-post="admin/otel"
+            hx-vals='{{"enabled": "false"}}'
+            hx-target="#lmx-otel-status"
+            hx-swap="innerHTML">Disable</button>
+    <span id="lmx-otel-status" class="status muted">otel: <strong>{otel_current}</strong></span>
+  </fieldset>
+  <fieldset class="admin-row" name="admin-log-level">
+    <legend>Log level</legend>
+    <input id="lmx-log-level" type="text" name="directive" autocomplete="off"
+           value="{log_directive_value}" placeholder="e.g. info, lmx=debug,info">
+    <button type="button"
+            hx-post="admin/log-level"
+            hx-include="#lmx-log-level"
+            hx-target="#lmx-log-status"
+            hx-swap="innerHTML">Apply</button>
+    <span id="lmx-log-status" class="status muted">log-level: <strong>{log_directive_value}</strong></span>
+  </fieldset>
+  <fieldset class="admin-row" name="admin-tcp-nodelay">
+    <legend><code>TCP_NODELAY</code></legend>
+    <button type="button"
+            hx-post="admin/tcp"
+            hx-vals='{{"nodelay": "true"}}'
+            hx-target="#lmx-tcp-status"
+            hx-swap="innerHTML">On</button>
+    <button type="button"
+            hx-post="admin/tcp"
+            hx-vals='{{"nodelay": "false"}}'
+            hx-target="#lmx-tcp-status"
+            hx-swap="innerHTML">Off</button>
+  </fieldset>
+  <fieldset class="admin-row" name="admin-tcp-quickack">
+    <legend><code>TCP_QUICKACK</code>{quickack_note}</legend>
+    <button type="button"
+            hx-post="admin/tcp"
+            hx-vals='{{"quickack": "true"}}'
+            hx-target="#lmx-tcp-status"
+            hx-swap="innerHTML"{quickack_disabled_attr}>On</button>
+    <button type="button"
+            hx-post="admin/tcp"
+            hx-vals='{{"quickack": "false"}}'
+            hx-target="#lmx-tcp-status"
+            hx-swap="innerHTML"{quickack_disabled_attr}>Off</button>
+    <span id="lmx-tcp-status" class="status muted">tcp: NODELAY <strong>{nodelay_current}</strong> · QUICKACK <strong>{quickack_current}</strong></span>
+  </fieldset>
+  <p class="muted small">
+    Token is stored in <code>localStorage</code> under
+    <code>lmx-admin-token</code> for this browser only and sent as the
+    <code>x-admin-token</code> header. Endpoints accept the same value
+    as <code>Authorization: Bearer &lt;token&gt;</code>.
+  </p>
+</form>
+
+<!--
+  Token bridge: injects `x-admin-token` on every HTMX request and
+  persists the value across the auto-refresh meta tag in
+  `localStorage`. This is the ONLY inline JS on the page; everything
+  else flows through HTMX attributes on the buttons above. We do
+  not load any first-party JS bundle.
+-->
+<script>
+  document.body.addEventListener('htmx:configRequest', function (e) {{
+    var t = localStorage.getItem('lmx-admin-token');
+    if (t) e.detail.headers['x-admin-token'] = t;
+  }});
+  (function () {{
+    var input = document.getElementById('lmx-admin-token');
+    var saved = '';
+    try {{ saved = localStorage.getItem('lmx-admin-token') || ''; }} catch (_) {{}}
+    if (input && saved) {{ input.value = saved; }}
+    var save = document.getElementById('lmx-save-token');
+    if (save) {{
+      save.addEventListener('click', function () {{
+        var v = (input && input.value) || '';
+        if (v) {{ try {{ localStorage.setItem('lmx-admin-token', v); }} catch (_) {{}} }}
+        var s = document.getElementById('lmx-save-status');
+        if (s) {{ s.textContent = 'saved'; s.className = 'status ok'; }}
+      }});
+    }}
+  }})();
+</script>
+
 <h2>Prometheus exposition</h2>
 <pre>{metrics_text}</pre>
 
@@ -174,7 +322,7 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
 </footer>
 </body>
 </html>
-"#,
+"##,
         protocol_version = html_escape(crate::protocol::PROTOCOL_VERSION),
         uptime = format_duration(uptime),
         clients = snapshot.clients,
@@ -225,6 +373,29 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
         max_lock_holders = info.max_lock_holders,
         max_concurrency_cap = info.max_concurrency_cap,
         metrics_text = html_escape(metrics_text),
+        // Admin-controls section. Every dynamic string is run through
+        // `html_escape` before being interpolated — never trust the
+        // env-derived `RUST_LOG` value, even though only operators
+        // can have set it.
+        otel_current = if info.otel_enabled { "on" } else { "off" },
+        log_directive_value = html_escape(&info.log_directive),
+        nodelay_current = if info.tcp_nodelay { "on" } else { "off" },
+        quickack_current = if info.tcp_quickack { "on" } else { "off" },
+        // Disable the QUICKACK toggle when the OS doesn't support
+        // it. We still render the buttons so the page DOM stays
+        // stable for tests, but they're disabled with an
+        // explanatory note. On Linux the `effective` and
+        // `quickack` fields agree, so the buttons stay live.
+        quickack_disabled_attr = if !info.tcp_quickack_effective && !cfg!(target_os = "linux") {
+            " disabled"
+        } else {
+            ""
+        },
+        quickack_note = if !cfg!(target_os = "linux") {
+            " <span class=\"muted small\">(Linux only)</span>"
+        } else {
+            ""
+        },
     )
 }
 
@@ -312,6 +483,8 @@ mod tests {
             tcp_nodelay: true,
             tcp_quickack: true,
             tcp_quickack_effective: cfg!(target_os = "linux"),
+            log_directive: "info".into(),
+            otel_enabled: false,
             default_ttl: Duration::from_millis(4000),
             ttl_sweep_interval: Duration::from_millis(10),
             max_lock_holders: 1,
@@ -375,6 +548,78 @@ mod tests {
         assert!(html.contains("contended"));
         // Exclusive count column should reflect the single holder.
         assert!(html.contains("<code>contended</code>"));
+    }
+
+    #[test]
+    fn renders_admin_controls_section() {
+        crate::routine_id!("ddl-routine-renders-admin-controls-Yz1");
+        let broker = Broker::new(BrokerConfig::default());
+        let html = render(&broker, &info(), "");
+        assert!(html.contains("id=\"lmx-admin\""), "admin form id missing");
+        assert!(
+            html.contains("name=\"admin-otel\""),
+            "admin-otel fieldset name missing",
+        );
+        assert!(
+            html.contains("name=\"admin-tcp-nodelay\""),
+            "admin-tcp-nodelay fieldset name missing",
+        );
+        assert!(
+            html.contains("name=\"admin-tcp-quickack\""),
+            "admin-tcp-quickack fieldset name missing",
+        );
+        assert!(
+            html.contains("name=\"admin-log-level\""),
+            "admin-log-level fieldset name missing",
+        );
+        assert!(
+            html.contains("'lmx-admin-token'"),
+            "localStorage key string missing",
+        );
+        // HTMX-driven buttons. Each `hx-post` URL must be relative so
+        // the page works under gateway prefixes like `/lmx-rs/` —
+        // a leading slash would short-circuit the prefix and 404.
+        assert!(
+            html.contains("hx-post=\"admin/otel\""),
+            "hx-post=\"admin/otel\" missing",
+        );
+        assert!(
+            html.contains("hx-post=\"admin/log-level\""),
+            "hx-post=\"admin/log-level\" missing",
+        );
+        assert!(
+            html.contains("hx-post=\"admin/tcp\""),
+            "hx-post=\"admin/tcp\" missing",
+        );
+        assert!(
+            !html.contains("hx-post=\"/admin/"),
+            "no leading-slash absolute admin paths allowed",
+        );
+        assert!(
+            !html.contains("hx-get=\"/admin/"),
+            "no leading-slash absolute admin paths allowed",
+        );
+    }
+
+    #[test]
+    fn loads_htmx_from_cdn_with_integrity() {
+        crate::routine_id!("ddl-routine-loads-htmx-cdn-Tk2");
+        let broker = Broker::new(BrokerConfig::default());
+        let html = render(&broker, &info(), "");
+        assert!(
+            html.contains("https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"),
+            "htmx CDN URL missing",
+        );
+        assert!(
+            html.contains(
+                "integrity=\"sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+\""
+            ),
+            "htmx SRI hash missing",
+        );
+        assert!(
+            html.contains("crossorigin=\"anonymous\""),
+            "crossorigin=anonymous missing on the htmx <script>",
+        );
     }
 
     #[test]
