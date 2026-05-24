@@ -1409,15 +1409,24 @@ impl Broker {
 
         self.untrack_pending(state, pop.client, key, &pop.request_uuid);
 
+        // Register the partial hold against the client immediately so a
+        // mid-flight disconnect can roll it back via `drop_client`. We
+        // re-register at the final grant too — the call is idempotent
+        // (same lock_uuid + same `all_keys` payload). Without this, a
+        // client that drops while holding `granted_keys` but still queued
+        // on a remaining key would leak those grants: `drop_client` walks
+        // `held_lock_uuids` (which only contained fully-granted
+        // composites) and `pending_request_uuids` (which only handles the
+        // queued tail), missing the partial state in between.
+        self.track_holder(
+            state,
+            pop.client,
+            &composite_lock_uuid,
+            &all_keys,
+            RwHoldKind::Exclusive,
+        );
+
         if remaining_keys.is_empty() {
-            // Whole composite is now granted.
-            self.track_holder(
-                state,
-                pop.client,
-                &composite_lock_uuid,
-                &all_keys,
-                RwHoldKind::Exclusive,
-            );
             state.schedule_deadline(
                 pop.ttl,
                 &composite_lock_uuid,

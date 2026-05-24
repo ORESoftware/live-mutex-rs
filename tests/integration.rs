@@ -860,7 +860,203 @@ async fn semaphore_stress_50_clients_max_5() {
     assert!(final_metrics.contains("dd_rust_network_mutex_waiters 0"));
 }
 
+/// Mirrors the production load tester's `useAcquireMany: true` profile:
+/// many concurrent clients each call `acquire_composite` over a sliding
+/// 3-key window, release, repeat. Stresses the broker's progressive
+/// queue-and-grant machinery for `acquire-many` requests under heavy
+/// contention. Asserts:
+///   - every iteration eventually completes (no stalled queueing path).
+///   - per-key fencing tokens stay strictly monotonic across handoffs
+///     (no double-grant under contention).
+///   - holders + waiters drain to zero once all workers finish.
+#[tokio::test]
+async fn composite_lock_stress_50_clients_overlapping_3_key_windows() {
+    let (tcp_port, http_port) = start_server(true, true).await;
+    let port = tcp_port.unwrap();
+    let http = http_port.unwrap();
+
+    const N_CLIENTS: usize = 50;
+    const ITERS_PER_CLIENT: usize = 6;
+    const KEYSPACE: usize = 16;
+
+    let high_water: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let violations =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for client_idx in 0..N_CLIENTS {
+        let high_water = high_water.clone();
+        let violations = violations.clone();
+        let h = tokio::spawn(async move {
+            let c = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+                .await
+                .unwrap();
+            for it in 0..ITERS_PER_CLIENT {
+                let base = (client_idx * 7 + it * 3) % KEYSPACE;
+                let k0 = format!("composite-stress-{:03}", base);
+                let k1 = format!("composite-stress-{:03}", (base + 1) % KEYSPACE);
+                let k2 = format!("composite-stress-{:03}", (base + 2) % KEYSPACE);
+                let keys: Vec<&str> = vec![k0.as_str(), k1.as_str(), k2.as_str()];
+                let g = c
+                    .acquire_composite(&keys, Duration::from_millis(15_000))
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("client {client_idx} iter {it} composite failed: {err:?}")
+                    });
+                {
+                    let mut hi = high_water.lock();
+                    for (k, v) in &g.fencing_tokens {
+                        let prev = hi.get(k).copied().unwrap_or(0);
+                        if *v <= prev {
+                            violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            hi.insert(k.clone(), *v);
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                c.release(&g).await.unwrap();
+            }
+        });
+        handles.push(h);
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    assert_eq!(
+        violations.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "fencing-token monotonicity broken under composite contention"
+    );
+
+    let final_metrics = http_get_text(&format!("http://127.0.0.1:{http}/metrics")).await;
+    assert!(
+        final_metrics.contains("dd_rust_network_mutex_holders 0"),
+        "holders should drain to 0 after stress; got:\n{final_metrics}"
+    );
+    assert!(
+        final_metrics.contains("dd_rust_network_mutex_waiters 0"),
+        "waiters should drain to 0 after stress; got:\n{final_metrics}"
+    );
+}
+
+/// Variation that mixes single-key and composite contenders on the same
+/// keyspace. The single-key acquirers should not starve the composite
+/// requests, and vice versa — the only correctness contract this test
+/// asserts is *forward progress* and *fencing monotonicity*.
+#[tokio::test]
+async fn composite_and_single_key_mix_under_contention() {
+    let (tcp_port, _) = start_server(true, false).await;
+    let port = tcp_port.unwrap();
+
+    const N: usize = 30;
+    const ITERS: usize = 5;
+
+    let mut handles = Vec::new();
+    for client_idx in 0..N {
+        let h = tokio::spawn(async move {
+            let c = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+                .await
+                .unwrap();
+            for _ in 0..ITERS {
+                if client_idx % 2 == 0 {
+                    let k = format!("mix-key-{:03}", client_idx % 8);
+                    let g = c.acquire(&k, Duration::from_millis(10_000)).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    c.release(&g).await.unwrap();
+                } else {
+                    let k0 = format!("mix-key-{:03}", client_idx % 8);
+                    let k1 = format!("mix-key-{:03}", (client_idx + 1) % 8);
+                    let g = c
+                        .acquire_composite(&[k0.as_str(), k1.as_str()], Duration::from_millis(10_000))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    c.release(&g).await.unwrap();
+                }
+            }
+        });
+        handles.push(h);
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
 // ---- Disconnect & ownership tests ----------------------------------------
+
+/// A client that disconnects after **partially acquiring** a composite —
+/// holding key A while still queued on key B — must not leak A to the
+/// broker. Forces the partial-grant code path by:
+///   1. blocker_a holds "pa" (single-key).
+///   2. blocker_b holds "pb" (single-key).
+///   3. composite_client queues on `acquire_composite(["pa","pb"])`.
+///   4. blocker_a releases "pa" — broker's progressive-grant code grants
+///      "pa" to the composite (partial!) and re-queues it on "pb".
+///   5. composite_client disconnects.
+/// Now "pa" must come back to the pool. A fresh single-key acquire on
+/// "pa" should succeed; if the partial hold leaked, it would queue
+/// behind a phantom holder forever.
+#[tokio::test]
+async fn composite_partial_grant_then_disconnect_releases_held_keys() {
+    let (tcp_port, _) = start_server(true, false).await;
+    let port = tcp_port.unwrap();
+
+    let blocker_a = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+    let blocker_b = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+
+    let g_a = blocker_a.acquire("pa", Duration::from_millis(60_000)).await.unwrap();
+    let g_b = blocker_b.acquire("pb", Duration::from_millis(60_000)).await.unwrap();
+
+    let composite_client = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+    let composite_fut = tokio::spawn({
+        let cc = composite_client.clone();
+        async move {
+            cc.acquire_composite(&["pa", "pb"], Duration::from_millis(60_000))
+                .await
+        }
+    });
+    // Let the composite request reach the broker and queue on "pa".
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Trigger the progressive-grant: release "pa". Broker grants "pa" to
+    // the composite (partial) and re-queues it on "pb" (still held).
+    blocker_a.release(&g_a).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Disconnect the composite_client mid-progress.
+    drop(composite_client);
+    let _ = composite_fut.await;
+
+    // Grace period for the tokio reader task to land `drop_client`.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // "pa" must be releasable for a brand-new caller. If the partial hold
+    // leaked, this acquire would queue forever (or time out).
+    let fresh = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+    let g_pa = tokio::time::timeout(
+        Duration::from_millis(2_000),
+        fresh.acquire("pa", Duration::from_millis(5_000)),
+    )
+    .await
+    .expect("pa should be free after partial-grant disconnect; partial grant leaked")
+    .unwrap();
+    fresh.release(&g_pa).await.unwrap();
+
+    blocker_b.release(&g_b).await.unwrap();
+}
 
 /// Dropping the TCP connection releases everything that client held.
 /// This is the broker's `drop_client` path on the integration surface.
