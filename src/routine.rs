@@ -133,6 +133,11 @@ macro_rules! routine_id {
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::reload;
+use tracing_subscriber::Registry;
 
 /// Runtime kill-switch for OTel span/event export. Read by the
 /// `FilterFn` wrapping the OTel layer (see [`otel::build_layer`]). When
@@ -140,6 +145,66 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// everything as usual. Default `false`; set to `true` at the end of
 /// [`init_tracing`] iff an OTLP exporter was successfully installed.
 pub static OTEL_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Process-global handle to the reloadable `EnvFilter` layer installed
+/// in [`init_tracing`]. Populated by the **first** call to that
+/// function; subsequent `init_tracing` invocations are no-ops, matching
+/// the existing idempotency contract relied on by tests that spawn
+/// multiple brokers.
+///
+/// The handle's `S` type parameter is `Registry` — that's the
+/// concrete subscriber the reload layer is composed onto in both the
+/// default and the `otel` cargo-feature builds. Keeping the type
+/// stable across feature flags is what lets [`set_log_level`] /
+/// [`current_log_level`] live outside of any `#[cfg]` block.
+static RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+/// Snapshot of the directive currently in effect on the reloadable
+/// `EnvFilter`. Updated by [`set_log_level`]; seeded by
+/// [`init_tracing`] from `RUST_LOG` (or the `info` default).
+///
+/// We mirror the directive into a `String` because `EnvFilter`'s
+/// `Display` impl is the canonical render of "what the filter would
+/// match", but only the **input** directive string is useful for
+/// round-tripping through `set_log_level`. Storing the raw input
+/// keeps the `GET /admin/log-level` payload meaningful for operators
+/// who want to copy-paste it back.
+static CURRENT_LOG_DIRECTIVE: OnceLock<parking_lot::RwLock<String>> = OnceLock::new();
+
+fn current_directive_slot() -> &'static parking_lot::RwLock<String> {
+    CURRENT_LOG_DIRECTIVE.get_or_init(|| parking_lot::RwLock::new(String::new()))
+}
+
+/// Read-only accessor for the current `EnvFilter` directive. Returns
+/// the empty string before [`init_tracing`] has run.
+pub fn current_log_level() -> String {
+    crate::routine_id!("ddl-routine-current-log-level-Q9");
+    current_directive_slot().read().clone()
+}
+
+/// Replace the `EnvFilter` directive at runtime. Returns the new
+/// directive on success, or a parser error message on failure.
+///
+/// Keeps [`current_log_level`] in sync so a follow-up GET reflects
+/// the change. Safe to call from any thread / async runtime — the
+/// reload handle internally serializes modifications.
+pub fn set_log_level(directive: &str) -> Result<String, String> {
+    crate::routine_id!("ddl-routine-set-log-level-Wp4");
+    let new = EnvFilter::try_new(directive).map_err(|err| err.to_string())?;
+    let handle = RELOAD_HANDLE
+        .get()
+        .ok_or_else(|| "tracing reload handle not installed (init_tracing not run)".to_string())?;
+    handle
+        .modify(|f| *f = new)
+        .map_err(|err| err.to_string())?;
+    *current_directive_slot().write() = directive.to_string();
+    tracing::info!(
+        target: "lmx.routine",
+        directive = directive,
+        "log-level reload applied"
+    );
+    Ok(directive.to_string())
+}
 
 /// Set the runtime kill-switch. Returns the previous value so callers
 /// (e.g. the HTTP admin endpoint) can include it in an audit log.
@@ -189,8 +254,14 @@ pub fn init_tracing() {
     use tracing_subscriber::util::SubscriberInitExt;
 
     let format = std::env::var("LMX_LOG_FORMAT").unwrap_or_else(|_| "text".into());
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // Capture the user's chosen directive verbatim so we can hand it
+    // back from `current_log_level()` (and so `set_log_level` has a
+    // sensible starting baseline). When no directive is set we fall
+    // back to "info" — the same default `EnvFilter::try_new` would
+    // produce.
+    let initial_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let env_filter = EnvFilter::try_new(&initial_directive)
+        .unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Build the stdout fmt layer. `with_filter` would attach a per-layer
     // filter, but the global `EnvFilter` we register below is fine and
@@ -206,18 +277,41 @@ pub fn init_tracing() {
         Box::new(tracing_subscriber::fmt::layer())
     };
 
+    // Wrap the EnvFilter in a `reload::Layer` so `POST /admin/log-level`
+    // can swap directives at runtime without restarting the broker.
+    // The handle's S type is `Registry` (the base subscriber); both
+    // the default and the `otel` branch below compose onto the same
+    // Registry so the type stays stable across feature flags.
+    let (reload_layer, reload_handle) = reload::Layer::new(env_filter);
+
     let registry = tracing_subscriber::registry()
-        .with(env_filter)
+        .with(reload_layer)
         .with(fmt_layer);
+
+    let install_handle = || {
+        // OnceLock ensures only the first init populates the slot —
+        // subsequent `init_tracing` calls (typically from tests that
+        // spin up multiple brokers in one process) are no-ops as far
+        // as the reload-handle goes. Mirror the same idempotency for
+        // the directive snapshot.
+        let _ = RELOAD_HANDLE.set(reload_handle);
+        let mut slot = current_directive_slot().write();
+        if slot.is_empty() {
+            *slot = initial_directive.clone();
+        }
+    };
 
     #[cfg(feature = "otel")]
     {
         if let Some(layer) = otel::build_layer() {
-            let _ = registry.with(layer).try_init();
+            let success = registry.with(layer).try_init().is_ok();
             // Default the runtime kill-switch to ON now that an exporter
             // is wired. Operators can flip it via `POST /admin/otel`
             // without restarting the process.
             OTEL_ENABLED.store(true, Ordering::Relaxed);
+            if success {
+                install_handle();
+            }
             ::tracing::info!(
                 target: "lmx.routine",
                 routine_id = ROUTINE_ID,
@@ -227,7 +321,10 @@ pub fn init_tracing() {
         }
     }
 
-    let _ = registry.try_init();
+    let success = registry.try_init().is_ok();
+    if success {
+        install_handle();
+    }
     ::tracing::info!(
         target: "lmx.routine",
         routine_id = ROUTINE_ID,
