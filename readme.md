@@ -421,23 +421,71 @@ acquires every requested key atomically or none of them. The wire response
 arrives as `compositeLock` (not `lock`) and includes a per-key `fencingTokens`
 map so callers can fence each protected resource independently.
 
-Two correctness properties hold by construction:
+### Why a multi-key lock instead of N single-key acquires
 
-1. **Atomicity.** A composite acquirer always either holds *all* of its
-   keys or *none* — even under concurrent contention, sweeper TTL
-   evictions, partial-grant races, or owning-client disconnects. The
-   broker tracks partial grants and rolls them back if any later key in
-   the set turns out to be already held.
-2. **Deadlock freedom via lexicographic ordering.** Two callers issuing
-   `acquire_composite(["A","B"])` and `acquire_composite(["B","A"])`
-   could deadlock under naive grant order. The broker normalises the
-   request to lexicographic order before queueing, so both callers wait
-   on the same key's notify queue and one always wins outright.
+The textbook way to "lock A and B" is to acquire them in some agreed
+global order. That gets you correctness, but you still own the
+bookkeeping:
 
-Composite locks are a primary feature of this broker, used in production
-to guard cross-shard operations that touch more than one logical
-resource (e.g. transferring an item between two queues, or rotating a
-two-key credential without exposing a window where neither key is held).
+- You have to remember the canonical order and apply it everywhere a
+  caller wants both keys, forever.
+- A timeout or panic between acquiring `A` and acquiring `B` leaves `A`
+  held and orphaned until its TTL fires.
+- A second caller that wants only `B` can grab it between your two
+  acquires — you never observe a quiet moment when both are held by no
+  one else.
+- Releasing requires two calls; if the second `release` fails or the
+  process dies between them, you leak one key until the sweeper
+  catches up.
+
+`acquire_composite` collapses all of that into one broker round-trip:
+the broker checks every key, grants only when *all* of them are free,
+and emits a single `lockUuid` that releases the whole set with one
+call. There is no in-between state visible to anyone — including the
+caller's own retries.
+
+Concretely, callers use it for things like: transferring an item
+between two queues, rotating a two-key credential without ever exposing
+a window where neither key is held, or running a migration that has to
+hold the source and destination shard locks simultaneously.
+
+### Guarantees
+
+The two properties below hold *by construction*, not by polling or
+retries:
+
+1. **Atomicity.** While a composite holder owns `lockUuid X` covering
+   keys `[A, B]`, no other caller will ever be granted `A` alone, `B`
+   alone, or any composite that overlaps `{A, B}`. Equivalently: no
+   subset of your keys is ever observable to another holder.
+
+   This is preserved through every failure mode the broker handles:
+   contention with single-key acquires on overlapping keys, contention
+   with another composite, partial-grant races (the broker rolls back
+   any keys it tentatively claimed if a later key in the set is held),
+   the centralised TTL sweeper expiring one of your keys, and the
+   owning client's TCP socket closing — `drop_client` releases every
+   member of the set together.
+
+2. **Deadlock freedom via global lexicographic ordering.** The broker
+   sorts every `keys` array into ascending Unicode-code-point order
+   before queueing. Two callers issuing `acquire_composite(["A","B"])`
+   and `acquire_composite(["B","A"])` therefore wait on the same key's
+   notify queue and one wins outright; neither can hold one half while
+   waiting on the other. Worked example:
+
+   ```text
+   t=0  caller-1 sends keys=[A, B]   → broker sorts → wait on A.notify
+   t=0  caller-2 sends keys=[B, A]   → broker sorts → wait on A.notify
+   t=1  A is free → caller-1 wins A, then atomically claims B
+   t=1  caller-2 stays in A.notify   (A is now held by caller-1)
+   t=N  caller-1 releases lockUuid   → A and B both free
+   t=N  caller-2 wakes, claims A and B atomically
+   ```
+
+   Without the broker-side sort, caller-1 could claim `A`, caller-2
+   could claim `B`, and both would block forever waiting for the
+   other's key — a classic two-resource deadlock.
 
 ### Rust API
 
@@ -453,10 +501,13 @@ let composite = client
 
 assert_eq!(composite.keys.len(), 2);
 // composite.fencing_tokens => HashMap<String, u64>
-//   { "orders": 7, "users": 3 } (order is alphabetical, mint is broker-side)
+//   { "orders": 7, "users": 3 } (alphabetical; tokens are minted broker-side)
 
 // … critical section that touches both resources …
 
+// Single release call drops every member of the set atomically. The
+// broker rejects any release that doesn't match the original lockUuid,
+// so one caller can't accidentally release another caller's composite.
 client.release(&composite).await?;
 ```
 
@@ -475,14 +526,53 @@ curl -s http://127.0.0.1:6971/v1/unlock \
   -d '{"keys":["users","orders"],"lockUuid":"<uuid>"}' | jq
 ```
 
-### Constraints and interaction with semaphores
+### Direct TCP wire format
+
+Any client that speaks the newline-delimited JSON protocol can drive a
+composite lock without going through the Rust client:
+
+```text
+client → broker
+{ "type": "lock",
+  "uuid": "<correlation-id>",
+  "keys": ["users", "orders"],
+  "ttl": 5000 }
+
+broker → client (when every key is free)
+{ "type": "compositeLock",
+  "uuid": "<correlation-id>",
+  "acquired": true,
+  "keys": ["orders", "users"],
+  "lockUuid": "...",
+  "fencingTokens": { "orders": 7, "users": 3 } }
+
+client → broker
+{ "type": "unlock",
+  "uuid": "<correlation-id-2>",
+  "keys": ["users", "orders"],
+  "lockUuid": "..." }
+```
+
+Under contention the broker first responds with `acquired: false` plus
+the current `queueDepth`, and emits a second `compositeLock` frame
+with `acquired: true` once every key is held.
+
+### Constraints
 
 - `keys` is bounded to **1..=5** by the broker. Larger sets are rejected
-  with a 400 (HTTP) or `error: "..."` (TCP) before any state mutation.
-- `max` is **single-key only**. Composite locks always use `max=1` per
-  member key — combining semaphore and composite is a deadlock-prone
-  surface area (see the dedicated discussion in
-  [Composite locks and `max`](#composite-locks-and-max) below).
+  with a 400 (HTTP) or a `compositeLock { acquired: false, error: "..." }`
+  frame (TCP) before any state mutation.
+- Empty `keys` arrays and requests that set both `key` and `keys` are
+  rejected the same way — there is no "fall back to single-key on empty
+  composite" sentinel.
+- `max` is **single-key only**. Composite locks always behave like
+  `max=1` per member — combining semaphore-style concurrency with
+  composite is a deadlock-prone surface area; see the dedicated
+  discussion in [Composite locks and `max`](#composite-locks-and-max).
+- Composite locks are exclusive across *all* lock kinds on a member
+  key: while a composite is held on `A`, no exclusive `acquire("A")`,
+  semaphore-slot acquire, RW reader, or RW writer can grant. The
+  inverse also holds.
 - A composite acquirer that disconnects while holding some keys has
   every member released by the broker's `drop_client` path — the
   partial-grant tracker guarantees no leaked sub-keys.
