@@ -27,7 +27,6 @@ struct Slot<K, V> {
     value: Option<V>,
     prev: usize,
     next: usize,
-    in_use: bool,
 }
 
 /// FIFO queue keyed by `K`. Each `K` is unique within the queue; pushing the
@@ -99,7 +98,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
             self.tail = idx;
         }
         self.index.insert(key, idx);
-        self.len += 1;
+        self.len = self.len.saturating_add(1);
         true
     }
 
@@ -120,7 +119,7 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
             self.head = idx;
         }
         self.index.insert(key, idx);
-        self.len += 1;
+        self.len = self.len.saturating_add(1);
         true
     }
 
@@ -188,7 +187,6 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
             slot.value = Some(value);
             slot.prev = NIL;
             slot.next = NIL;
-            slot.in_use = true;
             idx
         } else {
             let idx = self.slots.len();
@@ -197,7 +195,6 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
                 value: Some(value),
                 prev: NIL,
                 next: NIL,
-                in_use: true,
             });
             idx
         }
@@ -210,10 +207,12 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
         let value = slot.value.take()?;
         slot.prev = NIL;
         slot.next = NIL;
-        slot.in_use = false;
         self.free.push(idx);
         self.index.remove(&key);
-        self.len -= 1;
+        // `saturating_sub` defends against an internal logic bug
+        // double-detaching a slot. We'd rather under-count by 1 than
+        // panic in release.
+        self.len = self.len.saturating_sub(1);
         Some((key, value))
     }
 
@@ -224,9 +223,8 @@ impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
         let value = slot.value.take()?;
         slot.prev = NIL;
         slot.next = NIL;
-        slot.in_use = false;
         self.free.push(idx);
-        self.len -= 1;
+        self.len = self.len.saturating_sub(1);
         Some((key, value))
     }
 }
@@ -335,5 +333,81 @@ mod tests {
         // Free list should keep total slots bounded near peak occupancy.
         assert!(q.slots.len() <= 1000);
         assert_eq!(q.len(), 1000);
+    }
+
+    /// Randomised sequence of ops driven by an LCG. The invariant
+    /// we verify: a parallel `VecDeque` model agrees with our queue
+    /// on `front`, `len`, `contains`, and full iteration order
+    /// after every step. This catches any drift between
+    /// `head`/`tail`/`prev`/`next` and the index without needing a
+    /// fuzzer.
+    #[test]
+    fn fuzz_against_vecdeque_oracle() {
+        crate::routine_id!("ddl-routine-fuzz-vecdeque-_4M");
+        use std::collections::VecDeque;
+
+        let mut q: LinkedQueue<u32, u32> = LinkedQueue::new();
+        let mut model: VecDeque<(u32, u32)> = VecDeque::new();
+        // Tiny LCG so the test is deterministic across stdlib versions.
+        let mut state: u64 = 0xdeadbeefcafef00d;
+        let mut rng = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+
+        for step in 0..10_000u32 {
+            let op = rng() % 6;
+            let k = (rng() % 64) as u32;
+            let v = (rng() % 1024) as u32;
+            match op {
+                0 => {
+                    let inserted = q.push_back(k, v);
+                    if !model.iter().any(|(mk, _)| *mk == k) {
+                        assert!(inserted, "step {step}: push_back({k}) should have inserted");
+                        model.push_back((k, v));
+                    } else {
+                        assert!(!inserted, "step {step}: push_back({k}) should be idempotent");
+                    }
+                }
+                1 => {
+                    let inserted = q.push_front(k, v);
+                    if !model.iter().any(|(mk, _)| *mk == k) {
+                        assert!(inserted, "step {step}: push_front({k}) should have inserted");
+                        model.push_front((k, v));
+                    } else {
+                        assert!(!inserted, "step {step}: push_front({k}) should be idempotent");
+                    }
+                }
+                2 => {
+                    let popped = q.pop_front();
+                    let model_pop = model.pop_front();
+                    assert_eq!(popped, model_pop, "step {step}: pop_front mismatch");
+                }
+                3 => {
+                    let removed = q.remove(&k);
+                    let pos = model.iter().position(|(mk, _)| *mk == k);
+                    let model_removed = pos.map(|p| model.remove(p).unwrap().1);
+                    assert_eq!(removed, model_removed, "step {step}: remove({k}) mismatch");
+                }
+                4 => {
+                    assert_eq!(
+                        q.contains(&k),
+                        model.iter().any(|(mk, _)| *mk == k),
+                        "step {step}: contains({k}) mismatch"
+                    );
+                }
+                _ => {
+                    assert_eq!(q.len(), model.len(), "step {step}: len mismatch");
+                    let q_order: Vec<(u32, u32)> = q.iter().map(|(k, v)| (*k, *v)).collect();
+                    let m_order: Vec<(u32, u32)> = model.iter().copied().collect();
+                    assert_eq!(q_order, m_order, "step {step}: iter order drift");
+                    assert_eq!(
+                        q.front().map(|(k, v)| (*k, *v)),
+                        model.front().copied(),
+                        "step {step}: front mismatch"
+                    );
+                }
+            }
+        }
     }
 }

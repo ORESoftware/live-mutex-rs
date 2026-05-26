@@ -29,7 +29,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -452,6 +452,96 @@ impl AfterRead {
     }
 }
 
+/// Hard ceiling on the per-frame line length for the TCP/UDS broker
+/// transport. A pre-auth client that opens a connection and never
+/// sends a newline used to be able to balloon the broker's per-
+/// connection read buffer into the gigabytes (the underlying
+/// `BufReader::read_line` reads until `\n` or EOF without any
+/// per-frame cap). Capping at 1 MiB is well above any realistic
+/// composite-lock JSON payload (single-key locks fit in ~250 bytes;
+/// the 5-key composite max-payload comes in under 2 KiB) while
+/// keeping a misbehaving — or malicious — peer from exhausting
+/// memory.
+///
+/// Override at runtime via `LMX_MAX_FRAME_BYTES` (any non-zero
+/// integer). A value of `0` or invalid input falls back to the
+/// default. The cap applies to TCP and Unix-domain-socket clients
+/// alike; the dedicated HTTP listener has its own body limit.
+const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+fn max_frame_bytes() -> usize {
+    crate::routine_id!("ddl-routine-max-frame-bytes-Pq3");
+    std::env::var("LMX_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+}
+
+/// Read one newline-terminated frame into `buf`, refusing to grow
+/// past `max_bytes`. Returns:
+///
+/// * `Ok(true)`   — a complete frame was read (trailing `\n` is
+///   included so the caller can strip it).
+/// * `Ok(false)`  — clean EOF before any bytes were read.
+/// * `Err(InvalidData)` — the framer hit `max_bytes` without seeing
+///   a newline. Caller MUST close the connection; the stream is
+///   desynchronised at this point (we've consumed bytes that don't
+///   belong to a known frame).
+/// * `Err(UnexpectedEof)` — connection closed mid-frame.
+///
+/// We loop on `fill_buf`/`consume` rather than `read_until` because
+/// the latter has no built-in size cap; using it requires growing
+/// `buf` first and checking afterwards, which is exactly the
+/// vulnerability we're trying to plug.
+async fn read_frame_bounded<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    crate::routine_id!("ddl-routine-read-frame-bounded-Vz7");
+    use tokio::io::AsyncBufReadExt;
+    buf.clear();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() {
+                return Ok(false);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF before newline",
+            ));
+        }
+        if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
+            let take = idx + 1;
+            if buf.len() + take > max_bytes {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame exceeds {max_bytes} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+            return Ok(true);
+        }
+        let take = chunk.len();
+        if buf.len() + take > max_bytes {
+            reader.consume(take);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame exceeds {max_bytes} bytes"),
+            ));
+        }
+        buf.extend_from_slice(chunk);
+        reader.consume(take);
+    }
+}
+
 async fn handle_stream<S>(
     stream: S,
     broker: Broker,
@@ -465,9 +555,10 @@ where
     crate::routine_id!("ddl-routine-98pGTji7SYVytpEQBA");
     let (read, mut write) = tokio::io::split(stream);
     let (client_id, mut rx) = broker.register_client();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut reader = BufReader::new(read);
     let mut authed = auth_token.is_none();
+    let frame_cap = max_frame_bytes();
 
     let writer_task = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
@@ -488,9 +579,32 @@ where
 
     let result = async {
         loop {
-            buf.clear();
-            let n = reader.read_line(&mut buf).await?;
-            if n == 0 {
+            let got_frame = match read_frame_bounded(&mut reader, &mut buf, frame_cap).await {
+                Ok(b) => b,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    // Oversized / unframed input from the peer. Surface
+                    // a structured error to anyone still reading on the
+                    // writer side, then close. Don't drain to EOF — the
+                    // stream is desynchronised.
+                    metrics.malformed_requests_total.inc();
+                    broker.try_send(
+                        client_id,
+                        Response::Error {
+                            uuid: "frame-too-large".into(),
+                            error: err.to_string(),
+                        },
+                    );
+                    warn!(
+                        target: "lmx::tcp",
+                        client=%client_id,
+                        cap=%frame_cap,
+                        "frame exceeded cap; dropping connection"
+                    );
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            if !got_frame {
                 break;
             }
             // Re-apply TCP_QUICKACK *immediately* after we've consumed a
@@ -499,12 +613,19 @@ where
             // upstream issue ORESoftware/live-mutex#22 and
             // src/sockopt.rs.
             after_read.run(&metrics);
-            let line = buf.trim();
-            if line.is_empty() {
+            // Trim trailing `\n` and any `\r` before it. JSON payloads
+            // don't legitimately contain unescaped control characters
+            // outside of the framing newline.
+            let mut end = buf.len();
+            while end > 0 && (buf[end - 1] == b'\n' || buf[end - 1] == b'\r') {
+                end -= 1;
+            }
+            let payload = &buf[..end];
+            if payload.is_empty() {
                 continue;
             }
             metrics.requests_total.inc();
-            let request: Request = match serde_json::from_str(line) {
+            let request: Request = match serde_json::from_slice(payload) {
                 Ok(r) => r,
                 Err(err) => {
                     metrics.malformed_requests_total.inc();

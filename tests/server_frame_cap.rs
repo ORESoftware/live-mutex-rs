@@ -1,0 +1,124 @@
+//! Regression test for the per-frame TCP read cap.
+//!
+//! Pre-fix, the broker used `BufReader::read_line` which has no
+//! upper bound on the per-frame buffer growth. A pre-auth client
+//! could open a TCP connection and write arbitrarily many bytes
+//! without sending `\n`, ballooning the broker's per-connection
+//! buffer until OOM. With the cap in place the broker disconnects
+//! the offender once the line crosses `LMX_MAX_FRAME_BYTES` (or the
+//! built-in default), and stays available to honest peers.
+
+use std::time::Duration;
+
+use dd_rust_network_mutex::{
+    broker::BrokerConfig,
+    server::{run as run_server, ServerConfig},
+};
+use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+fn cfg(tcp: std::net::SocketAddr) -> ServerConfig {
+    ServerConfig {
+        tcp_bind: Some(tcp),
+        uds_path: None,
+        http_bind: None,
+        auth_token: None,
+        broker: BrokerConfig::default(),
+        tcp_nodelay: true,
+        tcp_quickack: false,
+        status_bind: None,
+        #[cfg(feature = "tls")]
+        tls: None,
+    }
+}
+
+async fn ephemeral_addr() -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    drop(l);
+    a
+}
+
+async fn wait_listening(addr: std::net::SocketAddr) {
+    for _ in 0..50 {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("broker never bound {addr}");
+}
+
+#[tokio::test]
+async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
+    // Force a small cap so the test stays fast. 4 KiB is well below
+    // a real composite-lock JSON payload so any actual call would
+    // still fit; here we explicitly send way more.
+    std::env::set_var("LMX_MAX_FRAME_BYTES", "4096");
+
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    // Attacker: send 64 KiB of garbage with no newline. Broker should
+    // close the connection once the cap is crossed; the writer side
+    // surfaces a structured `Error` frame that we may or may not see
+    // depending on scheduling — what we MUST see is the read side
+    // returning EOF after a finite amount of bytes.
+    let mut atk = TcpStream::connect(addr).await.unwrap();
+    let mut blob = vec![b'x'; 64 * 1024];
+    blob[0] = b'{';
+    let _ = atk.write_all(&blob).await;
+    let _ = atk.flush().await;
+    let (mut atk_r, mut atk_w) = atk.split();
+    let mut sink = Vec::new();
+    let read_fut = async {
+        let mut tmp = [0u8; 4096];
+        loop {
+            match atk_r.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => sink.extend_from_slice(&tmp[..n]),
+                Err(_) => break,
+            }
+        }
+    };
+    let timed_out =
+        tokio::time::timeout(Duration::from_secs(3), read_fut).await.is_err();
+    let _ = atk_w.shutdown().await;
+    assert!(
+        !timed_out,
+        "broker did not close oversized-frame connection within 3s — DoS vector"
+    );
+
+    // Honest client should still be served — the broker survived.
+    let honest = TcpStream::connect(addr).await.unwrap();
+    let (h_r, mut h_w) = honest.into_split();
+    let mut h_r = BufReader::new(h_r);
+    let payload = json!({
+        "type": "version",
+        "uuid": "v1",
+        "value": "test"
+    })
+    .to_string();
+    h_w.write_all(payload.as_bytes()).await.unwrap();
+    h_w.write_all(b"\n").await.unwrap();
+    h_w.flush().await.unwrap();
+
+    let mut reply = String::new();
+    let read_one = async {
+        use tokio::io::AsyncBufReadExt;
+        h_r.read_line(&mut reply).await.unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(3), read_one)
+        .await
+        .expect("honest client got no reply within 3s");
+    assert!(
+        reply.contains("\"type\":\"version\""),
+        "honest client did not get a version reply after attacker DoS attempt; got `{reply}`"
+    );
+
+    server.abort();
+    let _ = server.await;
+    std::env::remove_var("LMX_MAX_FRAME_BYTES");
+}
