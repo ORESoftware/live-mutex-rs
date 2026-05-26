@@ -383,7 +383,13 @@ impl Broker {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut state = self.state.lock();
         let id = state.next_client_id;
-        state.next_client_id += 1;
+        // `wrapping_add` to defend against a debug-mode panic if a
+        // very long-lived broker exhausts u64 (~1 client/ns for ~580
+        // years). The next id of 0 is harmless: 0 has no special
+        // meaning, just a hash-map key. We never reuse a *currently
+        // live* id — `clients` is keyed on `ClientId` and we'd
+        // collide on insert before that happens, so this is safe.
+        state.next_client_id = state.next_client_id.wrapping_add(1);
         state.clients.insert(
             id,
             ClientHandle {
@@ -405,11 +411,20 @@ impl Broker {
             return;
         };
 
+        // Track every key whose state we might mutate so the final
+        // try_grant_next sweep is bounded by the dropped client's
+        // touched keys instead of `state.locks.len()`. On a busy
+        // broker (millions of keys, frequent client churn), the
+        // previous O(N_keys * N_drops) loop showed up at the top of
+        // `drop_client`'s flame graph; this caps it at O(touched).
+        let mut touched_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // Release pending waiters first so they cannot win an unlock race.
         for (key, request_uuid) in handle.pending_request_uuids.drain(..) {
             if let Some(lock) = state.locks.get_mut(&key) {
                 lock.queue.remove(&request_uuid);
             }
+            touched_keys.insert(key);
         }
 
         // Release every held lock.
@@ -443,12 +458,13 @@ impl Broker {
                         }
                     }
                 }
+                touched_keys.insert(key);
             }
         }
 
-        // After dropping holders, try to grant the next waiter on every key.
-        let keys: Vec<String> = state.locks.keys().cloned().collect();
-        for key in keys {
+        // After dropping holders, try to grant the next waiter on each
+        // key the dropped client actually touched.
+        for key in touched_keys {
             self.try_grant_next(&mut state, &key);
         }
     }
@@ -492,7 +508,7 @@ impl Broker {
                 pid,
                 ttl,
                 max,
-                force: _force,
+                force,
                 retry_count: _retry_count,
                 keep_locks_after_death,
             } => {
@@ -548,6 +564,7 @@ impl Broker {
                             ttl,
                             max,
                             keep_locks_after_death,
+                            force,
                         );
                     }
                     (None, Some(ks)) => {
@@ -677,6 +694,7 @@ impl Broker {
         ttl: Option<Duration>,
         max: Option<u32>,
         keep_locks_after_death: bool,
+        force: bool,
     ) {
         crate::routine_id!("ddl-routine--MjJFOFOY7fGYtsmOT");
         // Resolve & clamp the requested concurrency level *before* we
@@ -733,19 +751,24 @@ impl Broker {
             return;
         }
 
-        // Otherwise queue it.
+        // Otherwise queue it. `force: true` jumps to the head of the
+        // FIFO (matches upstream live-mutex's writer-preference
+        // affordance — when an operator marks an acquire as urgent it
+        // bypasses peers that have already been waiting).
         let request_uuid = uuid.clone();
-        lock.queue.push_back(
-            request_uuid.clone(),
-            PendingRequest {
-                request_uuid: request_uuid.clone(),
-                client,
-                pid,
-                ttl,
-                keep_locks_after_death,
-                kind: PendingKind::Exclusive,
-            },
-        );
+        let pending = PendingRequest {
+            request_uuid: request_uuid.clone(),
+            client,
+            pid,
+            ttl,
+            keep_locks_after_death,
+            kind: PendingKind::Exclusive,
+        };
+        if force {
+            lock.queue.push_front(request_uuid.clone(), pending);
+        } else {
+            lock.queue.push_back(request_uuid.clone(), pending);
+        }
         let depth = lock.queue.len();
         self.track_pending(state, client, &key, &request_uuid);
         self.send(
@@ -904,10 +927,28 @@ impl Broker {
         let mut total_unlocked = false;
         let mut last_depth: usize = 0;
 
-        let target_lock_uuid = match lock_uuid.clone() {
-            Some(v) => v,
-            None if force => String::new(),
-            None => {
+        // Three legitimate unlock variants:
+        //   * `lock_uuid: Some(_)` + `force: false` — release exactly that
+        //     holder. Wrong uuid is a no-op (`unlocked: false`).
+        //   * `lock_uuid: Some(_)` + `force: true` — release exactly that
+        //     holder, but ignore broker-side ownership/identity checks.
+        //     If the uuid does not match anyone, this is a "phantom"
+        //     unlock and we MUST NOT wipe peer holders just because
+        //     `force: true` is set. Surface as `unlocked: false` with a
+        //     descriptive error so callers can distinguish it from
+        //     success. (Mirrors live-mutex#131 on the Node side.)
+        //   * `lock_uuid: None` + `force: true` — operator escape hatch.
+        //     Wipe every holder on every requested key. We additionally
+        //     clean up `held_lock_uuids` on each wiped holder's owning
+        //     client, so a peer client's bookkeeping stays consistent
+        //     with the broker's truth (otherwise `drop_client` later
+        //     would attempt to release things the broker has already
+        //     evicted; harmless today, but a footgun for any future
+        //     code path that trusts `held_lock_uuids`).
+        let target_lock_uuid: Option<String> = match (lock_uuid, force) {
+            (Some(v), _) => Some(v),
+            (None, true) => None,
+            (None, false) => {
                 self.send(
                     state,
                     client,
@@ -923,37 +964,73 @@ impl Broker {
             }
         };
 
+        // For wipe-all (target == None) we collect (owner_client,
+        // lock_uuid) for every holder we evict so we can purge the
+        // entries from each owner's `held_lock_uuids`.
+        let mut wiped_holder_ownership: Vec<(ClientId, String)> = Vec::new();
+
         for key in &keys {
             let Some(lock) = state.locks.get_mut(key) else {
                 continue;
             };
-            if force {
-                lock.exclusive_holders.clear();
-                lock.readers.clear();
-                lock.writer = None;
-                total_unlocked = true;
-            } else {
-                let removed_exclusive =
-                    lock.exclusive_holders.remove(&target_lock_uuid).is_some();
-                let removed_reader = lock.readers.remove(&target_lock_uuid).is_some();
-                let removed_writer = lock
-                    .writer
-                    .as_ref()
-                    .is_some_and(|w| w.lock_uuid == target_lock_uuid);
-                if removed_writer {
-                    lock.writer = None;
+            match &target_lock_uuid {
+                Some(target) => {
+                    let removed_exclusive =
+                        lock.exclusive_holders.remove(target).is_some();
+                    let removed_reader = lock.readers.remove(target).is_some();
+                    let removed_writer = lock
+                        .writer
+                        .as_ref()
+                        .is_some_and(|w| w.lock_uuid == *target);
+                    if removed_writer {
+                        lock.writer = None;
+                    }
+                    if removed_exclusive || removed_reader || removed_writer {
+                        total_unlocked = true;
+                    }
                 }
-                if removed_exclusive || removed_reader || removed_writer {
-                    total_unlocked = true;
+                None => {
+                    // Wipe-all: snapshot holder ownership BEFORE clearing
+                    // so we can fix up bookkeeping after.
+                    for (lu, h) in lock.exclusive_holders.iter() {
+                        wiped_holder_ownership.push((h.client, lu.clone()));
+                    }
+                    for (lu, h) in lock.readers.iter() {
+                        wiped_holder_ownership.push((h.client, lu.clone()));
+                    }
+                    if let Some(w) = &lock.writer {
+                        wiped_holder_ownership.push((w.client, w.lock_uuid.clone()));
+                    }
+                    let any_existed = !lock.exclusive_holders.is_empty()
+                        || !lock.readers.is_empty()
+                        || lock.writer.is_some();
+                    lock.exclusive_holders.clear();
+                    lock.readers.clear();
+                    lock.writer = None;
+                    if any_existed {
+                        total_unlocked = true;
+                    }
                 }
             }
             last_depth = lock.queue.len();
         }
 
-        // Drop the holder bookkeeping on the client side.
-        if !target_lock_uuid.is_empty() {
-            if let Some(handle) = state.clients.get_mut(&client) {
-                handle.held_lock_uuids.remove(&target_lock_uuid);
+        // Drop the holder bookkeeping on every client whose holder we
+        // just evicted.
+        match &target_lock_uuid {
+            Some(target) => {
+                if total_unlocked {
+                    if let Some(handle) = state.clients.get_mut(&client) {
+                        handle.held_lock_uuids.remove(target);
+                    }
+                }
+            }
+            None => {
+                for (owner_client, lu) in &wiped_holder_ownership {
+                    if let Some(handle) = state.clients.get_mut(owner_client) {
+                        handle.held_lock_uuids.remove(lu);
+                    }
+                }
             }
         }
 
@@ -961,6 +1038,20 @@ impl Broker {
         for key in &keys {
             self.try_grant_next(state, key);
         }
+
+        // `force: true` + `lock_uuid: Some(_)` that didn't match anyone
+        // is the "phantom" case: surface a structured error so the
+        // caller can distinguish a no-op force-unlock from an honest
+        // success.
+        let error = if !total_unlocked && force {
+            target_lock_uuid.as_deref().map(|t| {
+                format!(
+                    "unlock(force=true) lock_uuid `{t}` did not match any current holder for the requested keys"
+                )
+            })
+        } else {
+            None
+        };
 
         self.send(
             state,
@@ -970,7 +1061,7 @@ impl Broker {
                 keys,
                 unlocked: total_unlocked,
                 lock_request_count: last_depth,
-                error: None,
+                error,
             },
         );
     }
