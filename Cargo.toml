@@ -1,6 +1,6 @@
 [package]
 name = "dd-rust-network-mutex"
-version = "0.1.126"
+version = "0.1.127"
 edition = "2021"
 publish = false
 description = "Networked mutex broker + client (Rust port of live-mutex). Synchronizes access to lock state via TCP, Unix domain sockets, and HTTP, with reader-writer locks, fencing tokens, composite (multi-key) locks, and optional TLS."

@@ -111,6 +111,11 @@ fn config_from_env() -> ServerConfig {
             dd_rust_network_mutex::protocol::DEFAULT_MAX_CONCURRENCY_CAP,
         )
         .max(1),
+        // 60s grace by default. Set `LMX_IDLE_KEY_GRACE_MS=0` to
+        // disable empty-key pruning entirely (`state.locks` will
+        // grow monotonically with the set of distinct keys ever
+        // observed — the historical behaviour).
+        idle_key_grace: Duration::from_millis(env_u64("LMX_IDLE_KEY_GRACE_MS", 60_000)),
     };
 
     #[cfg(feature = "tls")]
