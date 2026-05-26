@@ -60,6 +60,26 @@ pub struct BrokerConfig {
     /// it. Default: [`crate::protocol::DEFAULT_MAX_CONCURRENCY_CAP`]
     /// (`1_000`).
     pub max_concurrency_cap: u32,
+    /// How long a `LockState` must remain fully idle (no holders, no
+    /// readers, no writer, no waiters) before the periodic TTL sweep
+    /// reclaims it from `state.locks`. The point of the grace period
+    /// is to absorb bursty workloads where keys cycle between active
+    /// and idle within milliseconds, without paying the cost of
+    /// destroying and rebuilding `LockState` on every cycle.
+    ///
+    /// Set to `Duration::ZERO` to disable empty-key pruning entirely
+    /// (the historical behaviour: `state.locks` grows monotonically
+    /// with the set of distinct keys ever observed). Default
+    /// `60s`.
+    ///
+    /// Cross-incarnation fencing-token monotonicity is preserved
+    /// regardless of pruning thanks to the broker-wide
+    /// `fencing_watermark` (see `BrokerMetrics::fencing_watermark`):
+    /// a freshly-materialised `LockState` always seeds its per-key
+    /// counter from `max(wall_clock_ms, watermark)`, so a hot key
+    /// that gets pruned and re-acquired never mints a smaller
+    /// token than was previously in use for any key.
+    pub idle_key_grace: Duration,
 }
 
 impl Default for BrokerConfig {
@@ -70,6 +90,7 @@ impl Default for BrokerConfig {
             max_lock_holders: 1,
             ttl_sweep_interval: Duration::from_millis(10),
             max_concurrency_cap: crate::protocol::DEFAULT_MAX_CONCURRENCY_CAP,
+            idle_key_grace: Duration::from_secs(60),
         }
     }
 }
@@ -150,7 +171,6 @@ impl LockState {
         }
     }
 
-    #[allow(dead_code)] // wired up by future TTL/GC sweeps
     fn is_idle(&self) -> bool {
         crate::routine_id!("ddl-routine-EXScnKwI3L7i7chNkf");
         self.exclusive_holders.is_empty()
@@ -261,6 +281,32 @@ struct BrokerState {
     /// value here means at least one client is asking for a concurrency
     /// level above the broker's ceiling.
     concurrency_cap_clamps_total: u64,
+    /// Strictly monotonic upper bound on every fencing token issued
+    /// since broker start, across every key. Updated on every grant
+    /// (exclusive, composite, reader, writer) via
+    /// `observe_fencing_token`. Re-applied as the seed floor whenever
+    /// `lock_or_default` materialises a fresh `LockState` so that
+    /// pruning a hot key and recreating it cannot mint a smaller
+    /// token than was previously in use. Surfaced as
+    /// `dd_rust_network_mutex_fencing_watermark`.
+    ///
+    /// The watermark exists in memory only — it is not persisted
+    /// across broker restarts. After a restart the in-memory
+    /// watermark resets to 0 and the wall-clock-millis seed in
+    /// `LockState::new` takes over again, which preserves
+    /// monotonicity *as long as wall-clock progress between starts
+    /// exceeds the number of acquires of any single key*. Operators
+    /// who need strict cross-restart monotonicity should layer
+    /// disk persistence on top in a follow-up.
+    fencing_watermark: u64,
+    /// Cumulative count of idle `LockState` entries reclaimed by the
+    /// periodic empty-key prune sweep (see
+    /// `BrokerConfig::idle_key_grace`). Surfaced as
+    /// `dd_rust_network_mutex_idle_keys_pruned_total`. A
+    /// monotonically increasing value here is healthy on a broker
+    /// with churning keys; a flat value means no key has been idle
+    /// past the grace window.
+    idle_keys_pruned_total: u64,
 }
 
 impl BrokerState {
@@ -276,6 +322,49 @@ impl BrokerState {
             ttl_evictions_total: 0,
             started_at: Instant::now(),
             concurrency_cap_clamps_total: 0,
+            fencing_watermark: 0,
+            idle_keys_pruned_total: 0,
+        }
+    }
+
+    /// Bump the broker-wide fencing watermark to at least `token`. Cheap —
+    /// a single u64 max + maybe a write. Must be called after every
+    /// successful grant (exclusive, composite, reader, writer) so that
+    /// a freshly-materialised `LockState` for a previously-pruned key
+    /// can seed its counter from the watermark and never mint a
+    /// smaller token than was previously in use.
+    fn observe_fencing_token(&mut self, token: u64) {
+        crate::routine_id!("ddl-routine-observe-fencing-token-Q3z");
+        if token > self.fencing_watermark {
+            self.fencing_watermark = token;
+        }
+    }
+
+    /// Refresh `lock.timestamp_emptied` for `key` based on the
+    /// lock's current idle status. Called from every code path that
+    /// could change a `LockState`'s idleness — unlock, end_read,
+    /// end_write, drop_client, ttl eviction, or try_grant when the
+    /// queue is drained. Works as both "mark idle now" and "mark
+    /// active now": exactly one transition per call.
+    ///
+    /// We deliberately don't maintain a separate idle-key index
+    /// here. The prune sweep walks `state.locks` once per
+    /// `ttl_sweep_interval` (default 10ms); for brokers with
+    /// extremely large key cardinalities this can be revisited by
+    /// adding a `BTreeSet<(Instant, String)>` populated alongside
+    /// `timestamp_emptied`, but the simple walk keeps the data
+    /// structure surface small and matches the cost of the
+    /// existing deadline sweep.
+    fn maybe_mark_idle(&mut self, key: &str) {
+        crate::routine_id!("ddl-routine-maybe-mark-idle-Yv4");
+        if let Some(lock) = self.locks.get_mut(key) {
+            if lock.is_idle() {
+                if lock.timestamp_emptied.is_none() {
+                    lock.timestamp_emptied = Some(Instant::now());
+                }
+            } else if lock.timestamp_emptied.is_some() {
+                lock.timestamp_emptied = None;
+            }
         }
     }
 
@@ -342,7 +431,21 @@ impl BrokerState {
         // smuggle a giant default past `max_concurrency_cap`.
         let cap = self.config.max_concurrency_cap.max(1);
         let max = self.config.max_lock_holders.min(cap).max(1);
-        self.locks.entry(key.to_string()).or_insert_with(|| LockState::new(max))
+        // A freshly-materialised LockState normally seeds its
+        // fencing counter from wall-clock-millis. When the broker
+        // has previously issued a higher token (recorded in the
+        // watermark), we lift the seed so the next grant on this
+        // key cannot collide with — or trail — a token already in
+        // circulation. Cheap: a u64 max in the cold path of first
+        // acquire only.
+        let seed_floor = self.fencing_watermark;
+        self.locks.entry(key.to_string()).or_insert_with(|| {
+            let mut s = LockState::new(max);
+            if seed_floor > s.fencing_counter {
+                s.fencing_counter = seed_floor;
+            }
+            s
+        })
     }
 
     #[allow(dead_code)] // wired up by future TTL/GC sweeps
@@ -705,8 +808,9 @@ impl Broker {
                     composite_member: false,
                 },
             );
-            lock.timestamp_emptied = None;
             let queue_depth = lock.queue.len();
+            state.observe_fencing_token(token);
+            state.maybe_mark_idle(&key);
             self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Exclusive);
             // Single shared deadline index — see upstream live-mutex#13.
             state.schedule_deadline(
@@ -747,6 +851,7 @@ impl Broker {
             },
         );
         let depth = lock.queue.len();
+        state.maybe_mark_idle(&key);
         self.track_pending(state, client, &key, &request_uuid);
         self.send(
             state,
@@ -808,6 +913,7 @@ impl Broker {
         let composite_lock_uuid = Uuid::new_v4().to_string();
         if all_free {
             let mut tokens: BTreeMap<String, u64> = BTreeMap::new();
+            let mut max_token: u64 = 0;
             for k in &keys {
                 let lock = state.lock_or_default(k);
                 let token = lock.next_fencing_token();
@@ -822,7 +928,13 @@ impl Broker {
                         composite_member: true,
                     },
                 );
-                lock.timestamp_emptied = None;
+                if token > max_token {
+                    max_token = token;
+                }
+            }
+            state.observe_fencing_token(max_token);
+            for k in &keys {
+                state.maybe_mark_idle(k);
             }
             self.track_holder(
                 state,
@@ -872,6 +984,7 @@ impl Broker {
         };
         let lock = state.lock_or_default(&head);
         lock.queue.push_back(uuid.clone(), pending);
+        state.maybe_mark_idle(&head);
         self.track_pending(state, client, &head, &uuid);
 
         // Tell the client they're queued.
@@ -1000,8 +1113,9 @@ impl Broker {
                     lock_uuid: lock_uuid.clone(),
                 },
             );
-            lock.timestamp_emptied = None;
             let readers = lock.readers.len() as u32;
+            state.observe_fencing_token(token);
+            state.maybe_mark_idle(&key);
             self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Read);
             self.send(
                 state,
@@ -1033,6 +1147,7 @@ impl Broker {
         );
         let writer_flag = lock.writer.is_some();
         let readers = lock.readers.len() as u32;
+        state.maybe_mark_idle(&key);
         self.track_pending(state, client, &key, &uuid);
         self.send(
             state,
@@ -1066,7 +1181,8 @@ impl Broker {
                 fencing_token: token,
                 lock_uuid: lock_uuid.clone(),
             });
-            lock.timestamp_emptied = None;
+            state.observe_fencing_token(token);
+            state.maybe_mark_idle(&key);
             self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Write);
             self.send(
                 state,
@@ -1096,6 +1212,7 @@ impl Broker {
         );
         let writer_flag = lock.writer.is_some();
         let readers = lock.readers.len() as u32;
+        state.maybe_mark_idle(&key);
         self.track_pending(state, client, &key, &uuid);
         self.send(
             state,
@@ -1195,6 +1312,8 @@ impl Broker {
 
     /// Inspect the head of `key`'s queue and grant if possible. Repeats while
     /// progress is made (a granted reader allows the next reader to advance).
+    /// Always refreshes the lock's `timestamp_emptied` after the loop so the
+    /// empty-key prune sweep sees a coherent idle/active flag.
     fn try_grant_next(&self, state: &mut BrokerState, key: &str) {
         crate::routine_id!("ddl-routine-kgo2IA5f14EZoNkFmn");
         loop {
@@ -1203,6 +1322,7 @@ impl Broker {
                 break;
             }
         }
+        state.maybe_mark_idle(key);
     }
 
     fn try_grant_once(&self, state: &mut BrokerState, key: &str) -> bool {
@@ -1235,6 +1355,7 @@ impl Broker {
                     },
                 );
                 let depth = lock.queue.len();
+                state.observe_fencing_token(token);
                 self.untrack_pending(state, head.client, key, &head.request_uuid);
                 self.track_holder(
                     state,
@@ -1282,6 +1403,7 @@ impl Broker {
                     },
                 );
                 let readers = lock.readers.len() as u32;
+                state.observe_fencing_token(token);
                 self.untrack_pending(state, head.client, key, &head.request_uuid);
                 self.track_holder(
                     state,
@@ -1320,6 +1442,7 @@ impl Broker {
                     fencing_token: token,
                     lock_uuid: lock_uuid.clone(),
                 });
+                state.observe_fencing_token(token);
                 self.untrack_pending(state, head.client, key, &head.request_uuid);
                 self.track_holder(
                     state,
@@ -1406,6 +1529,7 @@ impl Broker {
         granted_tokens.insert(key.to_string(), token);
         granted_keys.push(key.to_string());
         remaining_keys.remove(0);
+        state.observe_fencing_token(token);
 
         self.untrack_pending(state, pop.client, key, &pop.request_uuid);
 
@@ -1581,6 +1705,8 @@ impl Broker {
             ttl_evictions_total: state.ttl_evictions_total,
             max_concurrency_cap: state.config.max_concurrency_cap,
             concurrency_cap_clamps_total: state.concurrency_cap_clamps_total,
+            fencing_watermark: state.fencing_watermark,
+            idle_keys_pruned_total: state.idle_keys_pruned_total,
         }
     }
 
@@ -1655,9 +1781,6 @@ impl Broker {
             .range(..=cutoff)
             .map(|(k, _)| *k)
             .collect();
-        if expired_keys.is_empty() {
-            return 0;
-        }
 
         let mut evicted_keys: std::collections::HashSet<String> =
             std::collections::HashSet::new();
@@ -1731,6 +1854,38 @@ impl Broker {
             self.try_grant_next(&mut state, &key);
         }
 
+        // Empty-key prune sweep. Walk locks once, drop any that have
+        // been idle past `idle_key_grace`. Cross-incarnation fencing
+        // monotonicity is preserved because `lock_or_default` seeds
+        // every freshly-materialised LockState from
+        // `state.fencing_watermark`, which is bumped on every grant.
+        //
+        // Cost: O(N_keys) per tick. For brokers that habitually
+        // accumulate millions of distinct keys this can be revisited
+        // by populating a `BTreeSet<(Instant, String)>` alongside
+        // `timestamp_emptied` for an O(log N) range query, but the
+        // simple walk keeps the data structure surface small and
+        // sits at a small fraction of the deadline-sweep cost.
+        let grace = state.config.idle_key_grace;
+        if !grace.is_zero() {
+            if let Some(cutoff) = now.checked_sub(grace) {
+                let prune_keys: Vec<String> = state
+                    .locks
+                    .iter()
+                    .filter_map(|(k, l)| match l.timestamp_emptied {
+                        Some(t) if t <= cutoff && l.is_idle() => Some(k.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for k in &prune_keys {
+                    state.locks.remove(k);
+                }
+                state.idle_keys_pruned_total = state
+                    .idle_keys_pruned_total
+                    .wrapping_add(prune_keys.len() as u64);
+            }
+        }
+
         evicted_count
     }
 
@@ -1789,6 +1944,16 @@ pub struct BrokerMetrics {
     /// `max_concurrency_cap`. Non-zero means at least one client is
     /// asking for more parallelism than the broker is willing to grant.
     pub concurrency_cap_clamps_total: u64,
+    /// Strictly monotonic upper bound on every fencing token issued
+    /// since broker start, across every key. Re-applied as the seed
+    /// floor whenever `lock_or_default` materialises a fresh
+    /// `LockState`, so cross-incarnation fencing-token monotonicity
+    /// is preserved across empty-key prunes.
+    pub fencing_watermark: u64,
+    /// Cumulative count of idle `LockState` entries reclaimed by the
+    /// periodic empty-key prune sweep
+    /// (`BrokerConfig::idle_key_grace`).
+    pub idle_keys_pruned_total: u64,
 }
 
 /// Per-key contention snapshot used by the HTML status page (upstream

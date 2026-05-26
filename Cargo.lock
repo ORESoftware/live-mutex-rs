@@ -171,7 +171,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "dd-rust-network-mutex"
-version = "0.1.125"
+version = "0.1.127"
 dependencies = [
  "axum",
  "futures-util",

@@ -1023,6 +1023,7 @@ async fn fuzz_ttl_eviction_under_burst() {
         max_lock_holders: 1,
         ttl_sweep_interval: Duration::from_millis(5),
         max_concurrency_cap: 1_000,
+        idle_key_grace: Duration::ZERO,
     };
     let port = start_broker(cfg).await;
     let keys: Vec<String> = (0..3).map(|i| format!("ttl-key-{i}")).collect();

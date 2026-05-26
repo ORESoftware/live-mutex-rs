@@ -130,6 +130,12 @@ impl Metrics {
                 "# HELP dd_rust_network_mutex_concurrency_cap_clamps_total Cumulative `lock` requests whose `max` was clamped to the cap.\n",
                 "# TYPE dd_rust_network_mutex_concurrency_cap_clamps_total counter\n",
                 "dd_rust_network_mutex_concurrency_cap_clamps_total {}\n",
+                "# HELP dd_rust_network_mutex_fencing_watermark Strictly monotonic upper bound on every fencing token issued since broker start; seeds freshly-materialised LockState entries to preserve cross-prune monotonicity.\n",
+                "# TYPE dd_rust_network_mutex_fencing_watermark counter\n",
+                "dd_rust_network_mutex_fencing_watermark {}\n",
+                "# HELP dd_rust_network_mutex_idle_keys_pruned_total Cumulative idle LockState entries reclaimed by the periodic empty-key prune sweep.\n",
+                "# TYPE dd_rust_network_mutex_idle_keys_pruned_total counter\n",
+                "dd_rust_network_mutex_idle_keys_pruned_total {}\n",
             ),
             snapshot.keys,
             snapshot.holders,
@@ -139,6 +145,8 @@ impl Metrics {
             snapshot.ttl_evictions_total,
             snapshot.max_concurrency_cap,
             snapshot.concurrency_cap_clamps_total,
+            snapshot.fencing_watermark,
+            snapshot.idle_keys_pruned_total,
         ));
         body
     }
