@@ -176,6 +176,7 @@ dependencies = [
  "axum",
  "futures-util",
  "libc",
+ "linked-queue",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
@@ -557,6 +558,11 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "linked-queue"
+version = "0.1.0"
+source = "git+https://github.com/ORESoftware/linked-queue.rs?rev=edb6138101bd579d848f0fe58bd4d77e1a1d6094#edb6138101bd579d848f0fe58bd4d77e1a1d6094"
 
 [[package]]
 name = "lock_api"

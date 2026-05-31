@@ -41,6 +41,15 @@ otel = [
 
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
+# Keyed doubly-linked FIFO queue (O(1) push/pop/lookup/middle-removal) used by
+# the broker for pending lock requests. Extracted from this crate and published
+# standalone at github.com/ORESoftware/linked-queue.rs; property- + fuzz-tested
+# against a VecDeque oracle. Pinned by `rev` so the broker build is fully
+# reproducible (the exact commit is also locked in Cargo.lock) and resolves
+# inside the standalone Docker build context, which a sibling `path = "../"`
+# could not. To move to a newer queue, bump this rev and re-run
+# `cargo update -p linked-queue`.
+linked-queue = { git = "https://github.com/ORESoftware/linked-queue.rs", rev = "edb6138101bd579d848f0fe58bd4d77e1a1d6094" }
 futures-util = "0.3"
 # `libc` is only used on Linux to call setsockopt(TCP_QUICKACK), but it's
 # small enough on other platforms (the cfg-gated code is just compiled
