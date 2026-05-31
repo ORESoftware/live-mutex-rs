@@ -78,6 +78,7 @@ fn acquire(broker: &Broker, client: u64, key: &str, uuid: &str) -> (Option<Strin
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     (None, None)

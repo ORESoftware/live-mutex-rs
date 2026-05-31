@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Run the smoke test for every cross-runtime client (TS / Rust / Go / Dart /
-# Gleam) against a local broker. Each runtime exits non-zero on failure.
+# Gleam / Python / C++ / Java) against a local broker. Each runtime exits
+# non-zero on failure.
 #
-# Prerequisites: cargo, node, npm, go, gleam, and either dart or docker
-# (the dart smoke runs in `docker run dart:stable …` if no local SDK is
-# available).
+# Prerequisites: cargo, node, npm, go, gleam, python3, a C++17 compiler, a JDK
+# 17+ (javac), and either dart or docker (the dart smoke runs in
+# `docker run dart:stable …` if no local SDK is available). Missing optional
+# toolchains are skipped with a notice rather than failing the run.
 #
 #   ./scripts/run-all-client-smokes.sh
 #
@@ -37,6 +39,33 @@ echo "==> go smoke"
 
 echo "==> gleam smoke"
 ( cd "$HERE/clients/gleam" && LIVE_MUTEX_SMOKE=1 gleam test 2>&1 | grep -E '\[smoke-gleam\]|passed|failures' )
+
+echo "==> python smoke"
+if command -v python3 >/dev/null 2>&1; then
+  ( cd "$HERE/clients/python" && python3 -m unittest discover -s tests -p 'test_*.py' -q && python3 smoke.py )
+else
+  echo "(skipping python: python3 not found)"
+fi
+
+echo "==> c++ smoke"
+if command -v c++ >/dev/null 2>&1 || command -v g++ >/dev/null 2>&1; then
+  ( cd "$HERE/clients/cpp" && make test >/dev/null && make run )
+else
+  echo "(skipping c++: no C++ compiler found)"
+fi
+
+echo "==> java smoke"
+JAVAC_BIN="${JAVAC:-javac}"
+if ! command -v "$JAVAC_BIN" >/dev/null 2>&1 && [ -x /opt/homebrew/opt/openjdk@17/bin/javac ]; then
+  export PATH="/opt/homebrew/opt/openjdk@17/bin:$PATH"
+fi
+if command -v javac >/dev/null 2>&1; then
+  ( cd "$HERE/clients/java" && ./build.sh >/dev/null \
+      && java -cp out com.oresoftware.networkmutex.ProtocolTest \
+      && java -cp out com.oresoftware.networkmutex.Smoke )
+else
+  echo "(skipping java: javac not found; install a JDK 17+)"
+fi
 
 echo "==> dart smoke"
 if command -v dart >/dev/null 2>&1; then

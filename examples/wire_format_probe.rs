@@ -15,6 +15,7 @@ fn main() {
         force: false,
         retry_count: 0,
         keep_locks_after_death: false,
+        wait: Some(true),
     };
     println!("REQ_LOCK: {}", serde_json::to_string(&req).unwrap());
 

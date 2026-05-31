@@ -78,6 +78,13 @@ pub enum Request {
         retry_count: u32,
         #[serde(default)]
         keep_locks_after_death: bool,
+        /// Whether the broker should queue this request and block until the
+        /// lock can be granted (`true`/absent, the default), or fail fast and
+        /// return `acquired:false` immediately when the key(s) are contended
+        /// (`false`). No-wait requests are never enqueued, so they cannot leak
+        /// a later grant. Applies to both single-key and composite locks.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wait: Option<bool>,
     },
     /// Release a previously held lock. `lockUuid` must match the one returned
     /// by the broker on acquisition (or `force` must be true).
@@ -394,6 +401,7 @@ mod tests {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: Some(false),
         };
         let s = serde_json::to_string(&req).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();

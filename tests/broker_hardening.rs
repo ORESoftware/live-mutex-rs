@@ -48,6 +48,7 @@ fn h1_force_lock_jumps_to_head_of_queue() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let lock_uuid_a = drain(&mut a_rx)
@@ -72,6 +73,7 @@ fn h1_force_lock_jumps_to_head_of_queue() {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(rx);
@@ -91,6 +93,7 @@ fn h1_force_lock_jumps_to_head_of_queue() {
             force: true,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let _ = drain(&mut urgent_rx);
@@ -166,6 +169,7 @@ fn h2_drop_client_does_not_disturb_unrelated_keys() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let _ = drain(&mut u_rx);
@@ -182,6 +186,7 @@ fn h2_drop_client_does_not_disturb_unrelated_keys() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let _ = drain(&mut d_rx);
@@ -199,6 +204,7 @@ fn h2_drop_client_does_not_disturb_unrelated_keys() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let _ = drain(&mut waiter_rx);

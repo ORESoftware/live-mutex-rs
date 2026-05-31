@@ -1338,6 +1338,12 @@ async fn http_acquire(
         force: false,
         retry_count: 0,
         keep_locks_after_death: false,
+        // HTTP always enqueues (wait=default): the long-poll window is governed
+        // by `run_ephemeral` below, and the ephemeral client's teardown prunes
+        // any still-queued waiter, so this can't leak a deferred grant. The
+        // `wait:false` fail-fast contract is for persistent TCP/UDS clients
+        // that would otherwise abandon a queued request.
+        wait: None,
     };
     let wait = req.wait_ms.map(Duration::from_millis).unwrap_or_default();
     let outcome = run_ephemeral(&state, request, &request_uuid, wait, true).await;

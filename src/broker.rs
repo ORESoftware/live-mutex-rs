@@ -614,7 +614,13 @@ impl Broker {
                 force,
                 retry_count: _retry_count,
                 keep_locks_after_death,
+                wait,
             } => {
+                // Default (absent) is wait=true: queue and block until grant,
+                // matching the historical broker behaviour. `wait:false` makes
+                // the request fail fast (acquired:false) without ever being
+                // enqueued, so it can't leak a deferred grant.
+                let wait = wait.unwrap_or(true);
                 let ttl = ttl.map(Duration::from_millis);
                 // `max = Some(0)` is rejected eagerly. It used to mean
                 // "preserve the existing per-key cap" (same as
@@ -668,10 +674,11 @@ impl Broker {
                             max,
                             keep_locks_after_death,
                             force,
+                            wait,
                         );
                     }
                     (None, Some(ks)) => {
-                        self.handle_composite_lock(&mut state, client, uuid, ks, pid, ttl);
+                        self.handle_composite_lock(&mut state, client, uuid, ks, pid, ttl, wait);
                     }
                     (Some(_), Some(_)) => {
                         self.send(
@@ -798,6 +805,7 @@ impl Broker {
         max: Option<u32>,
         keep_locks_after_death: bool,
         force: bool,
+        wait: bool,
     ) {
         crate::routine_id!("ddl-routine--MjJFOFOY7fGYtsmOT");
         // Resolve & clamp the requested concurrency level *before* we
@@ -855,6 +863,28 @@ impl Broker {
             return;
         }
 
+        // No-wait (try-lock): the caller asked to fail fast rather than be
+        // enqueued. Report contention immediately and DO NOT queue, so there's
+        // no deferred grant for the caller to leak.
+        if !wait {
+            let depth = state.locks.get(&key).map(|s| s.queue.len()).unwrap_or(0);
+            self.send(
+                state,
+                client,
+                Response::Lock {
+                    uuid,
+                    key,
+                    acquired: false,
+                    lock_request_count: depth,
+                    lock_uuid: None,
+                    fencing_token: None,
+                    readers_count: Some(0),
+                    error: None,
+                },
+            );
+            return;
+        }
+
         // Otherwise queue it. `force: true` jumps to the head of the
         // FIFO (matches upstream live-mutex's writer-preference
         // affordance — when an operator marks an acquire as urgent it
@@ -902,6 +932,7 @@ impl Broker {
         mut keys: Vec<String>,
         pid: Option<i64>,
         ttl: Option<Duration>,
+        wait: bool,
     ) {
         crate::routine_id!("ddl-routine-UD_1TQ6n72nYb_GRcW");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
@@ -982,6 +1013,24 @@ impl Broker {
                     acquired: true,
                     lock_uuid: Some(composite_lock_uuid),
                     fencing_tokens: Some(tokens),
+                    error: None,
+                },
+            );
+            return;
+        }
+
+        // No-wait (try-lock): fail fast on contention without enqueuing, so a
+        // caller that doesn't loop can't leak a deferred composite grant.
+        if !wait {
+            self.send(
+                state,
+                client,
+                Response::CompositeLock {
+                    uuid,
+                    keys,
+                    acquired: false,
+                    lock_uuid: None,
+                    fencing_tokens: None,
                     error: None,
                 },
             );
@@ -2100,6 +2149,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let a_msgs = drain(&mut a_rx);
@@ -2129,6 +2179,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let b_msgs = drain(&mut b_rx);
@@ -2184,6 +2235,7 @@ mod tests {
                     force: false,
                     retry_count: 0,
                     keep_locks_after_death: false,
+                    wait: None,
                 },
             );
             let msgs = drain(&mut rx);
@@ -2236,6 +2288,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let lock_uuid_a = drain(&mut a_rx)
@@ -2263,6 +2316,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let b_pre = drain(&mut b_rx);
@@ -2287,6 +2341,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let c_pre = drain(&mut c_rx);
@@ -2409,6 +2464,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         broker.handle_request(
@@ -2423,6 +2479,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let pre = drain(&mut b_rx);
@@ -2467,6 +2524,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2484,6 +2542,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let pre = drain(&mut b_rx);
@@ -2525,6 +2584,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2556,6 +2616,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let lock_uuid = drain(&mut a_rx)
@@ -2608,6 +2669,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2624,6 +2686,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut b_rx);
@@ -2664,6 +2727,7 @@ mod tests {
                     force: false,
                     retry_count: 0,
                     keep_locks_after_death: false,
+                    wait: None,
                 },
             );
             let msgs = drain(rx);
@@ -2750,6 +2814,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2779,6 +2844,7 @@ mod tests {
                     force: false,
                     retry_count: 0,
                     keep_locks_after_death: false,
+                    wait: None,
                 },
             );
             let _ = drain(rx);
@@ -2813,6 +2879,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2830,6 +2897,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut b_rx);
@@ -2877,6 +2945,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -2925,6 +2994,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let msgs = drain(&mut a_rx);
@@ -2960,6 +3030,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let msgs = drain(&mut a_rx);
@@ -2988,6 +3059,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -3027,6 +3099,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut a_rx);
@@ -3044,6 +3117,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(&mut b_rx);
@@ -3061,6 +3135,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let pre = drain(&mut c_rx);
@@ -3097,6 +3172,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let msgs = drain(&mut a_rx);
@@ -3141,6 +3217,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let msgs = drain(&mut a_rx);

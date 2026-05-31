@@ -42,6 +42,9 @@ export interface LockRequest {
   force?: boolean;
   retryCount?: number;
   keepLocksAfterDeath?: boolean;
+  /** When false, the broker fails fast (acquired:false) instead of queuing.
+   * Absent/true = block until grant. */
+  wait?: boolean;
 }
 
 export interface UnlockRequest {

@@ -75,6 +75,7 @@ fn r1_force_unlock_with_wrong_uuid_does_not_wipe_semaphore_peers() {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let msgs = drain(rx);
@@ -133,6 +134,7 @@ fn r2_force_unlock_with_wrong_uuid_does_not_evict_exclusive_holder() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let _ = drain(&mut a_rx);
@@ -186,6 +188,7 @@ fn r3_force_unlock_on_empty_key_reports_false() {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: None,
         },
     );
     let lock_uuid_a = lock_uuid_of(&drain(&mut a_rx)).unwrap();
@@ -253,6 +256,7 @@ fn r4_operator_wipe_cleans_up_held_lock_uuids_on_peer_clients() {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(rx);
@@ -337,6 +341,7 @@ fn r5_force_unlock_with_valid_uuid_releases_only_that_semaphore_slot() {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let _ = drain(rx);

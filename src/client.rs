@@ -291,6 +291,7 @@ impl Client {
             force: false,
             retry_count: 0,
             keep_locks_after_death: false,
+            wait: Some(true),
         };
         if let Err(err) = self.write_request(request).await {
             self.unregister_inflight(&request_uuid);
@@ -301,6 +302,114 @@ impl Client {
         let result = self.wait_for_acquire(&mut rx, &request_uuid, timeout).await;
         self.unregister_inflight(&request_uuid);
         result
+    }
+
+    /// Non-blocking single-key acquire. Returns `Ok(None)` immediately if the
+    /// key is currently contended (the broker does not enqueue the request, so
+    /// nothing is leaked). Use [`Self::acquire`] for the blocking variant.
+    pub async fn try_acquire(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>, ClientError> {
+        crate::routine_id!("ddl-routine-tryacq-single-7Qp");
+        self.try_acquire_internal(Some(key.to_string()), None, ttl, None)
+            .await
+    }
+
+    /// Non-blocking composite acquire. Returns `Ok(None)` immediately if any
+    /// member key is contended; otherwise grabs all keys atomically.
+    pub async fn try_acquire_composite(
+        &self,
+        keys: &[&str],
+        ttl: Duration,
+    ) -> Result<Option<LockGuard>, ClientError> {
+        crate::routine_id!("ddl-routine-tryacq-comp-2Lm");
+        if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
+            return Err(ClientError::Invalid(format!(
+                "composite acquire requires 1..={MAX_COMPOSITE_KEYS} keys"
+            )));
+        }
+        self.try_acquire_internal(
+            None,
+            Some(keys.iter().map(|s| s.to_string()).collect()),
+            ttl,
+            None,
+        )
+        .await
+    }
+
+    async fn try_acquire_internal(
+        &self,
+        key: Option<String>,
+        keys: Option<Vec<String>>,
+        ttl: Duration,
+        max: Option<u32>,
+    ) -> Result<Option<LockGuard>, ClientError> {
+        crate::routine_id!("ddl-routine-tryacq-internal-9Vd");
+        let request_uuid = Uuid::new_v4().to_string();
+        let mut rx = self.register_inflight(&request_uuid);
+
+        let request = Request::Lock {
+            uuid: request_uuid.clone(),
+            key,
+            keys,
+            pid: Some(std::process::id() as i64),
+            ttl: Some(ttl.as_millis() as u64),
+            max,
+            force: false,
+            retry_count: 0,
+            keep_locks_after_death: false,
+            wait: Some(false),
+        };
+        if let Err(err) = self.write_request(request).await {
+            self.unregister_inflight(&request_uuid);
+            return Err(err);
+        }
+
+        let timeout = self.inner.config.default_request_timeout;
+        // No-wait: the broker sends exactly one terminal reply.
+        let result = match self.roundtrip_recv(&mut rx, timeout).await {
+            Ok(Response::Lock {
+                acquired: true,
+                key,
+                lock_uuid: Some(lock_uuid),
+                fencing_token,
+                ..
+            }) => Ok(Some(LockGuard::single(key, lock_uuid, fencing_token))),
+            Ok(Response::CompositeLock {
+                acquired: true,
+                keys,
+                lock_uuid: Some(lock_uuid),
+                fencing_tokens,
+                ..
+            }) => Ok(Some(LockGuard::composite(
+                keys,
+                lock_uuid,
+                fencing_tokens.unwrap_or_default(),
+            ))),
+            Ok(Response::Lock { acquired: false, .. })
+            | Ok(Response::CompositeLock { acquired: false, .. }) => Ok(None),
+            Ok(Response::Error { error, .. }) => Err(ClientError::Broker(error)),
+            Ok(other) => Err(ClientError::Broker(format!(
+                "unexpected try-acquire response: {other:?}"
+            ))),
+            Err(err) => Err(err),
+        };
+        self.unregister_inflight(&request_uuid);
+        result
+    }
+
+    async fn roundtrip_recv(
+        &self,
+        rx: &mut mpsc::UnboundedReceiver<Response>,
+        timeout: Duration,
+    ) -> Result<Response, ClientError> {
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(resp)) => Ok(resp),
+            Ok(None) => Err(ClientError::Closed),
+            Err(_) => Err(ClientError::Timeout(timeout)),
+        }
     }
 
     async fn wait_for_acquire(

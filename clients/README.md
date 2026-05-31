@@ -1,6 +1,6 @@
 # `rust-network-mutex-rs` clients
 
-Five language clients that all speak the same JSON wire protocol (see
+Eight language clients that all speak the same JSON wire protocol (see
 `../PROTOCOL.md`) to the Rust broker. Each client mirrors the Rust
 `Request` / `Response` enum in its native idiom — **no magic strings**,
 unlike the upstream Node `live-mutex` library which uses `if (data.type
@@ -13,6 +13,9 @@ unlike the upstream Node `live-mutex` library which uses `if (data.type
 | Go         | `go/`               | typed `RequestType` const block + switch     | `go run ./clients/go/cmd/smoke`                              |
 | Dart       | `dart/`             | `sealed class Request` + pattern matching   | `dart run clients/dart/bin/smoke.dart`                       |
 | Gleam      | `gleam/`            | `pub type Request { … }` (true ADT)          | `LIVE_MUTEX_SMOKE=1 gleam test` (in `clients/gleam/`)        |
+| Python     | `python/`           | `enum.Enum` `RequestType` + typed builders   | `python3 clients/python/smoke.py`                            |
+| C++        | `cpp/`              | `enum class RequestType` + `switch`          | `make -C clients/cpp run`                                    |
+| Java       | `java/`             | `enum RequestType` + `switch` (records)      | `clients/java/build.sh && java -cp clients/java/out com.oresoftware.networkmutex.Smoke` |
 
 The TypeScript client also ships a head-to-head benchmark harness
 (`ts/src/compare.ts`) that runs the same workload against

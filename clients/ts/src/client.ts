@@ -33,6 +33,13 @@ export interface AcquireOptions {
   waitMs?: number;
 }
 
+export interface TryAcquireOptions {
+  /** TTL hint for the broker (ms). 0 means "no TTL". */
+  ttlMs?: number;
+  /** Deadline to receive the broker's (immediate) reply (ms). */
+  replyTimeoutMs?: number;
+}
+
 export interface SingleLockHandle {
   kind: "single";
   key: string;
@@ -129,7 +136,7 @@ export class NetworkMutexClient {
     });
   }
 
-  /** Acquire a single-key exclusive lock. */
+  /** Acquire a single-key exclusive lock, blocking until granted. */
   async acquire(key: string, opts: AcquireOptions = {}): Promise<SingleLockHandle> {
     const req: LockRequest = {
       type: "lock",
@@ -137,6 +144,7 @@ export class NetworkMutexClient {
       key,
       ttl: opts.ttlMs ?? 30_000,
       keepLocksAfterDeath: false,
+      wait: true,
     };
     const grant = await this.awaitGrant(req, opts.waitMs ?? 30_000);
     if (grant.type !== "lock" || !grant.acquired || !grant.lockUuid) {
@@ -150,7 +158,8 @@ export class NetworkMutexClient {
     };
   }
 
-  /** Acquire a composite (multi-key) exclusive lock atomically. */
+  /** Acquire a composite (multi-key) exclusive lock atomically, blocking
+   * until every key is granted. */
   async acquireMany(keys: string[], opts: AcquireOptions = {}): Promise<CompositeLockHandle> {
     if (keys.length === 0 || keys.length > 5) {
       throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
@@ -161,6 +170,7 @@ export class NetworkMutexClient {
       keys,
       ttl: opts.ttlMs ?? 30_000,
       keepLocksAfterDeath: false,
+      wait: true,
     };
     const grant = await this.awaitGrant(req, opts.waitMs ?? 30_000);
     if (grant.type !== "compositeLock" || !grant.acquired || !grant.lockUuid) {
@@ -172,6 +182,48 @@ export class NetworkMutexClient {
       lockUuid: grant.lockUuid,
       fencingTokens: grant.fencingTokens ?? {},
     };
+  }
+
+  /** Non-blocking single-key acquire. Resolves to `null` immediately if the
+   * key is contended (the broker does not enqueue the request). */
+  async tryAcquire(key: string, opts: TryAcquireOptions = {}): Promise<SingleLockHandle | null> {
+    const req: LockRequest = {
+      type: "lock",
+      uuid: randomUUID(),
+      key,
+      ttl: opts.ttlMs ?? 30_000,
+      keepLocksAfterDeath: false,
+      wait: false,
+    };
+    const resp = await this.send(req, { multi: false });
+    if (resp.type === "error") throw new Error(`tryAcquire(${key}) error: ${resp.error}`);
+    if (resp.type !== "lock") throw new Error(`tryAcquire(${key}) unexpected: ${resp.type}`);
+    if (!resp.acquired || !resp.lockUuid) return null;
+    return { kind: "single", key, lockUuid: resp.lockUuid, fencingToken: resp.fencingToken ?? 0 };
+  }
+
+  /** Non-blocking composite acquire. Resolves to `null` immediately if any
+   * member key is contended; otherwise grabs all keys atomically. */
+  async tryAcquireMany(
+    keys: string[],
+    opts: TryAcquireOptions = {},
+  ): Promise<CompositeLockHandle | null> {
+    if (keys.length === 0 || keys.length > 5) {
+      throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
+    }
+    const req: LockRequest = {
+      type: "lock",
+      uuid: randomUUID(),
+      keys,
+      ttl: opts.ttlMs ?? 30_000,
+      keepLocksAfterDeath: false,
+      wait: false,
+    };
+    const resp = await this.send(req, { multi: false });
+    if (resp.type === "error") throw new Error(`tryAcquireMany error: ${resp.error}`);
+    if (resp.type !== "compositeLock") throw new Error(`tryAcquireMany unexpected: ${resp.type}`);
+    if (!resp.acquired || !resp.lockUuid) return null;
+    return { kind: "composite", keys, lockUuid: resp.lockUuid, fencingTokens: resp.fencingTokens ?? {} };
   }
 
   /** Release a previously held lock (single or composite). */
@@ -243,7 +295,6 @@ export class NetworkMutexClient {
     switch (resp.type) {
       case "version":
       case "auth":
-      case "compositeLock":
       case "unlock":
       case "endReadResult":
       case "endWriteResult":
@@ -255,6 +306,10 @@ export class NetworkMutexClient {
         inf.resolve(resp);
         return;
       case "lock":
+      case "compositeLock":
+        // A blocking (multi) acquire may receive an interim acquired:false
+        // "queued" notice before the real grant — keep the slot open for it.
+        // A non-blocking (try) acquire resolves on the first reply.
         if (resp.acquired || resp.error) {
           this.inflight.delete(uuid);
           inf.resolve(resp);

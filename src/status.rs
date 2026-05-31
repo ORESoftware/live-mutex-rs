@@ -542,6 +542,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let html = render(&broker, &info(), "");
@@ -640,6 +641,7 @@ mod tests {
                 force: false,
                 retry_count: 0,
                 keep_locks_after_death: false,
+                wait: None,
             },
         );
         let html = render(&broker, &info(), "");
