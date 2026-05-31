@@ -1072,6 +1072,21 @@ impl Broker {
                 error: None,
             },
         );
+
+        // Critical: `all_free` was false because *some* member is contended,
+        // but the smallest key `head` we just queued on may itself be FREE
+        // (the contention is on a later key). Nothing will ever emit a release
+        // event for an already-free `head`, so without an explicit kick here
+        // the waiter would never be woken — a missed-wakeup deadlock. Drive the
+        // scheduler now: if `head` is free, `try_grant_composite` grants it and
+        // advances the request key-by-key until it reaches the genuinely
+        // contended key, where it parks on a lock that *will* fire a release.
+        // If `head` is contended this is a no-op and we correctly wait for its
+        // release. Ordering: the queued notice is already sent above, so the
+        // client observes acquired:false then (later) acquired:true, matching
+        // the wait-mode contract. No full grant can happen in this call because
+        // at least one member key is still held.
+        self.try_grant_next(state, &head);
     }
 
     // ---- unlock -----------------------------------------------------------
