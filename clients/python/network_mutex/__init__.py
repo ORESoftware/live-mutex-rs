@@ -2,7 +2,8 @@
 
 See ``../../PROTOCOL.md`` for the wire contract. Public surface mirrors the
 Go/Dart/TS clients: connect, acquire / acquire_many / release, and the
-reader-writer helpers acquire_read / acquire_write / release_read / release_write.
+try_acquire / try_acquire_many fail-fast helpers, plus the reader-writer helpers
+acquire_read / acquire_write / release_read / release_write.
 """
 
 from .client import (

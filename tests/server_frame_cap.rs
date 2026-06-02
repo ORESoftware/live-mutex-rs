@@ -122,3 +122,54 @@ async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
     let _ = server.await;
     std::env::remove_var("LMX_MAX_FRAME_BYTES");
 }
+
+#[tokio::test]
+async fn broker_handles_empty_malformed_and_crlf_jsonl_frames() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    write.write_all(b"\n\r\nnot-json\n").await.unwrap();
+    let payload = json!({
+        "type": "version",
+        "uuid": "v-crlf",
+        "value": "test"
+    })
+    .to_string();
+    write.write_all(payload.as_bytes()).await.unwrap();
+    write.write_all(b"\r\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        let read_one = async {
+            use tokio::io::AsyncBufReadExt;
+            reader.read_line(&mut line).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(3), read_one)
+            .await
+            .expect("broker did not reply to malformed + CRLF frames within 3s");
+        replies.push(line);
+    }
+
+    assert!(
+        replies
+            .iter()
+            .any(|line| line.contains("\"type\":\"error\"") && line.contains("malformed")),
+        "broker did not report malformed JSON; replies: {replies:?}"
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|line| line.contains("\"type\":\"version\"") && line.contains("v-crlf")),
+        "broker did not accept CRLF version frame after malformed input; replies: {replies:?}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}

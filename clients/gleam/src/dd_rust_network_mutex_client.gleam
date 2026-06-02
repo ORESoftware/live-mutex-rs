@@ -9,10 +9,9 @@
 
 import dd_rust_network_mutex_client/protocol.{
   type Request, type Response, AuthRequest, CompositeLockResponse,
-  EndReadRequest, EndWriteRequest, LockRequest, LockResponse,
+  EndReadRequest, EndWriteRequest, LockRequest, LockResponse, ReelectionResponse,
   RegisterReadRequest, RegisterReadResultResponse, RegisterWriteRequest,
-  RegisterWriteResultResponse, ReelectionResponse, UnlockRequest,
-  UnlockResponse,
+  RegisterWriteResultResponse, UnlockRequest, UnlockResponse,
 }
 import gleam/dict.{type Dict}
 import gleam/list
@@ -139,6 +138,7 @@ pub fn acquire(
       force: False,
       retry_count: 0,
       keep_locks_after_death: False,
+      wait: Some(True),
     )
   use resp <- result.try(send_until_grant(client, req, 30_000))
   case resp {
@@ -147,6 +147,35 @@ pub fn acquire(
     LockResponse(_, _, True, _, Some(lu), None, _, _) ->
       Ok(SingleLockHandle(key, lu, 0))
     other -> Error(format_unexpected("acquire", other))
+  }
+}
+
+pub fn try_acquire(
+  client: Client,
+  key: String,
+  ttl_ms: Int,
+) -> Result(Option(SingleLockHandle), String) {
+  let req =
+    LockRequest(
+      uuid: new_uuid(),
+      key: Some(key),
+      keys: None,
+      pid: None,
+      ttl: ttl_ms,
+      max: None,
+      force: False,
+      retry_count: 0,
+      keep_locks_after_death: False,
+      wait: Some(False),
+    )
+  use resp <- result.try(send_and_recv(client, req, 5000))
+  case resp {
+    LockResponse(_, k, True, _, Some(lu), Some(ft), _, _) ->
+      Ok(Some(SingleLockHandle(k, lu, ft)))
+    LockResponse(_, _, True, _, Some(lu), None, _, _) ->
+      Ok(Some(SingleLockHandle(key, lu, 0)))
+    LockResponse(_, _, False, _, _, _, _, None) -> Ok(None)
+    other -> Error(format_unexpected("try_acquire", other))
   }
 }
 
@@ -169,6 +198,7 @@ pub fn acquire_many(
           force: False,
           retry_count: 0,
           keep_locks_after_death: False,
+          wait: Some(True),
         )
       use resp <- result.try(send_until_grant(client, req, 30_000))
       case resp {
@@ -177,6 +207,40 @@ pub fn acquire_many(
         CompositeLockResponse(_, ks, True, Some(lu), None, _) ->
           Ok(CompositeLockHandle(ks, lu, dict.new()))
         other -> Error(format_unexpected("acquire_many", other))
+      }
+    }
+  }
+}
+
+pub fn try_acquire_many(
+  client: Client,
+  keys: List(String),
+  ttl_ms: Int,
+) -> Result(Option(CompositeLockHandle), String) {
+  case list.length(keys) {
+    n if n < 1 || n > 5 -> Error("composite key count must be 1..=5")
+    _ -> {
+      let req =
+        LockRequest(
+          uuid: new_uuid(),
+          key: None,
+          keys: Some(keys),
+          pid: None,
+          ttl: ttl_ms,
+          max: None,
+          force: False,
+          retry_count: 0,
+          keep_locks_after_death: False,
+          wait: Some(False),
+        )
+      use resp <- result.try(send_and_recv(client, req, 5000))
+      case resp {
+        CompositeLockResponse(_, ks, True, Some(lu), Some(ft), _) ->
+          Ok(Some(CompositeLockHandle(ks, lu, ft)))
+        CompositeLockResponse(_, ks, True, Some(lu), None, _) ->
+          Ok(Some(CompositeLockHandle(ks, lu, dict.new())))
+        CompositeLockResponse(_, _, False, _, _, None) -> Ok(None)
+        other -> Error(format_unexpected("try_acquire_many", other))
       }
     }
   }
@@ -220,7 +284,10 @@ pub fn release_composite(
   }
 }
 
-pub fn acquire_read(client: Client, key: String) -> Result(#(String, Int), String) {
+pub fn acquire_read(
+  client: Client,
+  key: String,
+) -> Result(#(String, Int), String) {
   let req = RegisterReadRequest(uuid: new_uuid(), key: key)
   use resp <- result.try(send_until_grant(client, req, 30_000))
   case resp {

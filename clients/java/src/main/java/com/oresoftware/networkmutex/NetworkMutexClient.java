@@ -12,6 +12,7 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -90,20 +91,50 @@ public final class NetworkMutexClient implements AutoCloseable {
 
   public SingleLockHandle acquire(String key, long ttlMs, Integer maxHolders, long timeoutMs) {
     String uuid = newUuid();
-    Response r = roundtripGrant(Protocol.lockRequestSingle(uuid, key, ttlMs, maxHolders), uuid, timeoutMs);
+    Response r = roundtripGrant(Protocol.lockRequestSingle(uuid, key, ttlMs, maxHolders, Boolean.TRUE), uuid, timeoutMs);
     if (r.type != ResponseType.LOCK || !r.acquired() || r.lockUuid().isEmpty()) {
       throw new NetworkMutexException("lock(" + key + ") failed: " + Json.stringify(r.raw));
     }
     return new SingleLockHandle(key, r.lockUuid(), r.fencingToken());
   }
 
+  public Optional<SingleLockHandle> tryAcquire(String key, long ttlMs) {
+    return tryAcquire(key, ttlMs, null, 30_000);
+  }
+
+  public Optional<SingleLockHandle> tryAcquire(String key, long ttlMs, Integer maxHolders, long timeoutMs) {
+    String uuid = newUuid();
+    Response r = roundtrip(Protocol.lockRequestSingle(uuid, key, ttlMs, maxHolders, Boolean.FALSE), uuid, timeoutMs);
+    if (r.type == ResponseType.ERROR) {
+      throw new NetworkMutexException("tryAcquire(" + key + ") error: " + r.error());
+    }
+    if (r.type != ResponseType.LOCK) {
+      throw new NetworkMutexException("tryAcquire(" + key + ") unexpected: " + Json.stringify(r.raw));
+    }
+    if (!r.acquired() || r.lockUuid().isEmpty()) return Optional.empty();
+    return Optional.of(new SingleLockHandle(key, r.lockUuid(), r.fencingToken()));
+  }
+
   public CompositeLockHandle acquireMany(List<String> keys, long ttlMs) {
     String uuid = newUuid();
-    Response r = roundtripGrant(Protocol.lockRequestComposite(uuid, keys, ttlMs), uuid, 30_000);
+    Response r = roundtripGrant(Protocol.lockRequestComposite(uuid, keys, ttlMs, Boolean.TRUE), uuid, 30_000);
     if (r.type != ResponseType.COMPOSITE_LOCK || !r.acquired() || r.lockUuid().isEmpty()) {
       throw new NetworkMutexException("acquireMany failed: " + Json.stringify(r.raw));
     }
     return new CompositeLockHandle(keys, r.lockUuid(), r.fencingTokens());
+  }
+
+  public Optional<CompositeLockHandle> tryAcquireMany(List<String> keys, long ttlMs) {
+    String uuid = newUuid();
+    Response r = roundtrip(Protocol.lockRequestComposite(uuid, keys, ttlMs, Boolean.FALSE), uuid, 30_000);
+    if (r.type == ResponseType.ERROR) {
+      throw new NetworkMutexException("tryAcquireMany error: " + r.error());
+    }
+    if (r.type != ResponseType.COMPOSITE_LOCK) {
+      throw new NetworkMutexException("tryAcquireMany unexpected: " + Json.stringify(r.raw));
+    }
+    if (!r.acquired() || r.lockUuid().isEmpty()) return Optional.empty();
+    return Optional.of(new CompositeLockHandle(keys, r.lockUuid(), r.fencingTokens()));
   }
 
   public void release(SingleLockHandle h) {

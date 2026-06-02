@@ -86,7 +86,9 @@ sprinkling `if (msg.type === "lock")` strings around the code base.
                               // Composite locks (`keys`) always treat this as 1.
   "force": false,             // bypass holder check on contention
   "retryCount": 0,            // informational; broker doesn't retry
-  "keepLocksAfterDeath": false
+  "keepLocksAfterDeath": false,
+  "wait": true                // optional. absent/true = queue until granted;
+                              // false = fail fast with acquired:false and do not enqueue.
 }
 
 // Single-key grant:
@@ -123,6 +125,19 @@ sprinkling `if (msg.type === "lock")` strings around the code base.
 
 The full set of fields lives in `src/protocol.rs`. Cross-runtime clients should
 keep their representations 1:1 with that file.
+
+## Wait / No-Wait Acquire
+
+For both single-key and composite `lock` requests, `wait` controls what happens
+when the lock cannot be acquired on the first attempt:
+
+- `wait` absent or `true`: the broker queues the request, sends an
+  `acquired:false` queued notice, then later sends `acquired:true` with the same
+  `uuid` when the lock is granted. Clients must keep the request registered and
+  drain responses until the grant or an error.
+- `wait:false`: the broker returns one immediate `acquired:false` response on
+  contention and never enqueues the request. This is the correct wire mode for
+  fail-fast / try-lock APIs because it cannot leak a deferred grant.
 
 ## Error correlation
 

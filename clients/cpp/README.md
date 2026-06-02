@@ -38,4 +38,7 @@ auto client = nm::Client::connect("127.0.0.1", 6970);
 auto h = client->acquire("my-key", /*ttl_ms=*/30000);
 // ... critical section; attach h.fencing_token to downstream writes ...
 client->release(h);
+
+auto maybe_h = client->try_acquire_many({"a", "b"}, /*ttl_ms=*/30000);
+if (maybe_h) client->release(*maybe_h);
 ```

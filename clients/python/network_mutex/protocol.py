@@ -92,6 +92,7 @@ def lock_request(
     max_holders: Optional[int] = None,
     force: bool = False,
     keep_locks_after_death: bool = False,
+    wait: Optional[bool] = None,
 ) -> bytes:
     if (key is None) == (keys is None):
         raise ValueError("lock_request: pass exactly one of key= or keys=")
@@ -110,6 +111,7 @@ def lock_request(
             "max": max_holders,
             "force": force or None,
             "keepLocksAfterDeath": keep_locks_after_death or None,
+            "wait": wait,
         }
     )
 

@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from network_mutex import protocol  # noqa: E402
+from network_mutex import NetworkMutexClient, protocol  # noqa: E402
 from network_mutex.protocol import Response, ResponseType  # noqa: E402
 
 
@@ -32,9 +32,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("keys", obj)  # None fields stripped
 
     def test_composite_lock_request_sorted_by_broker_not_client(self):
-        obj = decode_frame(protocol.lock_request("u-2", keys=["c", "a", "b"]))
+        obj = decode_frame(protocol.lock_request("u-2", keys=["c", "a", "b"], wait=False))
         self.assertEqual(obj["type"], "lock")
         self.assertEqual(obj["keys"], ["c", "a", "b"])  # client does not sort
+        self.assertFalse(obj["wait"])
+
+    def test_lock_request_preserves_wait_true(self):
+        obj = decode_frame(protocol.lock_request("u-3", key="k", wait=True))
+        self.assertTrue(obj["wait"])
+
+    def test_lock_request_omits_wait_by_default(self):
+        obj = decode_frame(protocol.lock_request("u-4", key="k"))
+        self.assertNotIn("wait", obj)
 
     def test_lock_request_rejects_both_key_and_keys(self):
         with self.assertRaises(ValueError):
@@ -78,6 +87,62 @@ class ProtocolTests(unittest.TestCase):
     def test_unknown_response_type_raises(self):
         with self.assertRaises(ValueError):
             Response.decode(json.dumps({"type": "totallyBogus", "uuid": "u"}).encode())
+
+
+class StubClient(NetworkMutexClient):
+    def __init__(self, responses):
+        self.frames = []
+        self.responses = list(responses)
+
+    def _roundtrip(self, frame: bytes, uuid: str, *, timeout=None) -> Response:
+        self.frames.append(decode_frame(frame))
+        return self.responses.pop(0)
+
+    def _roundtrip_grant(self, frame: bytes, uuid: str, *, timeout=None) -> Response:
+        self.frames.append(decode_frame(frame))
+        return self.responses.pop(0)
+
+
+class ClientWaitTests(unittest.TestCase):
+    def test_try_acquire_many_sends_wait_false_and_returns_none(self):
+        client = StubClient(
+            [
+                Response.from_dict(
+                    {
+                        "type": "compositeLock",
+                        "uuid": "u",
+                        "keys": ["a", "b"],
+                        "acquired": False,
+                    }
+                )
+            ]
+        )
+
+        handle = client.try_acquire_many(["a", "b"], ttl_ms=1000)
+
+        self.assertIsNone(handle)
+        self.assertFalse(client.frames[0]["wait"])
+
+    def test_acquire_many_sends_wait_true_and_returns_grant(self):
+        client = StubClient(
+            [
+                Response.from_dict(
+                    {
+                        "type": "compositeLock",
+                        "uuid": "u",
+                        "keys": ["a", "b"],
+                        "acquired": True,
+                        "lockUuid": "L-1",
+                        "fencingTokens": {"a": 1, "b": 2},
+                    }
+                )
+            ]
+        )
+
+        handle = client.acquire_many(["a", "b"], ttl_ms=1000)
+
+        self.assertEqual(handle.lock_uuid, "L-1")
+        self.assertTrue(client.frames[0]["wait"])
 
 
 if __name__ == "__main__":

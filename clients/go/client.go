@@ -129,13 +129,54 @@ type CompositeLockHandle struct {
 	FencingTokens map[string]uint64
 }
 
+// AcquireOptions configures an exclusive single-key acquire. Wait defaults to
+// broker-default blocking semantics when nil; pass WaitOption(false) for a
+// fail-fast request, or use [Client.TryAcquire].
+type AcquireOptions struct {
+	TTL        time.Duration
+	MaxHolders *int
+	Wait       *bool
+}
+
+// AcquireManyOptions configures an exclusive composite acquire. Wait defaults
+// to broker-default blocking semantics when nil; pass WaitOption(false) for a
+// fail-fast request, or use [Client.TryAcquireMany].
+type AcquireManyOptions struct {
+	TTL  time.Duration
+	Wait *bool
+}
+
+// WaitOption returns a pointer suitable for AcquireOptions.Wait while preserving
+// the distinction between omitted and explicit false.
+func WaitOption(wait bool) *bool {
+	return &wait
+}
+
 // Acquire takes an exclusive lock on a single key.
 func (c *Client) Acquire(ctx context.Context, key string, ttl time.Duration) (SingleLockHandle, error) {
+	return c.AcquireWithOptions(ctx, key, AcquireOptions{TTL: ttl, Wait: WaitOption(true)})
+}
+
+// AcquireWithOptions takes an exclusive lock on a single key. With Wait nil or
+// true it blocks until the broker grants the lock; with Wait false it sends a
+// no-wait request and returns an error if the key is currently contended.
+func (c *Client) AcquireWithOptions(ctx context.Context, key string, opts AcquireOptions) (SingleLockHandle, error) {
+	if opts.Wait != nil && !*opts.Wait {
+		h, ok, err := c.tryAcquireWithOptions(ctx, key, opts)
+		if err != nil {
+			return SingleLockHandle{}, err
+		}
+		if !ok {
+			return SingleLockHandle{}, fmt.Errorf("lock(%s) not acquired", key)
+		}
+		return h, nil
+	}
 	uuid := newUUID()
 	c.markMulti(uuid)
 	defer c.unmarkMulti(uuid)
 	resp, err := c.roundtripGrant(ctx, Request{
-		Type: ReqLock, UUID: uuid, Key: key, TTL: int(ttl.Milliseconds()),
+		Type: ReqLock, UUID: uuid, Key: key, TTL: int(opts.TTL.Milliseconds()),
+		Max: opts.MaxHolders, Wait: opts.Wait,
 	})
 	if err != nil {
 		return SingleLockHandle{}, err
@@ -150,17 +191,65 @@ func (c *Client) Acquire(ctx context.Context, key string, ttl time.Duration) (Si
 	return SingleLockHandle{Key: key, LockUUID: resp.LockUUID, FencingToken: token}, nil
 }
 
+// TryAcquire attempts a single-key acquire without queuing. It returns ok=false
+// immediately when the key is currently contended.
+func (c *Client) TryAcquire(ctx context.Context, key string, ttl time.Duration) (SingleLockHandle, bool, error) {
+	return c.tryAcquireWithOptions(ctx, key, AcquireOptions{TTL: ttl, Wait: WaitOption(false)})
+}
+
+func (c *Client) tryAcquireWithOptions(ctx context.Context, key string, opts AcquireOptions) (SingleLockHandle, bool, error) {
+	uuid := newUUID()
+	resp, err := c.roundtrip(ctx, Request{
+		Type: ReqLock, UUID: uuid, Key: key, TTL: int(opts.TTL.Milliseconds()),
+		Max: opts.MaxHolders, Wait: WaitOption(false),
+	})
+	if err != nil {
+		return SingleLockHandle{}, false, err
+	}
+	if resp.Type == RespError {
+		return SingleLockHandle{}, false, fmt.Errorf("try lock(%s): %s", key, resp.Error)
+	}
+	if resp.Type != RespLock || resp.Acquired == nil {
+		return SingleLockHandle{}, false, fmt.Errorf("try lock(%s) unexpected: %+v", key, resp)
+	}
+	if !*resp.Acquired || resp.LockUUID == "" {
+		return SingleLockHandle{}, false, nil
+	}
+	var token uint64
+	if resp.FencingToken != nil {
+		token = *resp.FencingToken
+	}
+	return SingleLockHandle{Key: key, LockUUID: resp.LockUUID, FencingToken: token}, true, nil
+}
+
 // AcquireMany atomically acquires up to 5 keys. The broker sorts the keys
 // to prevent deadlocks; the caller doesn't have to.
 func (c *Client) AcquireMany(ctx context.Context, keys []string, ttl time.Duration) (CompositeLockHandle, error) {
+	return c.AcquireManyWithOptions(ctx, keys, AcquireManyOptions{TTL: ttl, Wait: WaitOption(true)})
+}
+
+// AcquireManyWithOptions atomically acquires up to 5 keys. With Wait nil or
+// true it blocks until every key is granted; with Wait false it sends a no-wait
+// request and returns an error if any member key is currently contended.
+func (c *Client) AcquireManyWithOptions(ctx context.Context, keys []string, opts AcquireManyOptions) (CompositeLockHandle, error) {
 	if n := len(keys); n == 0 || n > 5 {
 		return CompositeLockHandle{}, fmt.Errorf("composite key count must be 1..=5, got %d", n)
+	}
+	if opts.Wait != nil && !*opts.Wait {
+		h, ok, err := c.tryAcquireManyWithOptions(ctx, keys, opts)
+		if err != nil {
+			return CompositeLockHandle{}, err
+		}
+		if !ok {
+			return CompositeLockHandle{}, fmt.Errorf("acquireMany(%v) not acquired", keys)
+		}
+		return h, nil
 	}
 	uuid := newUUID()
 	c.markMulti(uuid)
 	defer c.unmarkMulti(uuid)
 	resp, err := c.roundtripGrant(ctx, Request{
-		Type: ReqLock, UUID: uuid, Keys: keys, TTL: int(ttl.Milliseconds()),
+		Type: ReqLock, UUID: uuid, Keys: keys, TTL: int(opts.TTL.Milliseconds()), Wait: opts.Wait,
 	})
 	if err != nil {
 		return CompositeLockHandle{}, err
@@ -169,6 +258,35 @@ func (c *Client) AcquireMany(ctx context.Context, keys []string, ttl time.Durati
 		return CompositeLockHandle{}, fmt.Errorf("acquireMany(%v) failed: %+v", keys, resp)
 	}
 	return CompositeLockHandle{Keys: keys, LockUUID: resp.LockUUID, FencingTokens: resp.FencingTokens}, nil
+}
+
+// TryAcquireMany attempts a composite acquire without queuing. It returns
+// ok=false immediately when any member key is currently contended.
+func (c *Client) TryAcquireMany(ctx context.Context, keys []string, ttl time.Duration) (CompositeLockHandle, bool, error) {
+	return c.tryAcquireManyWithOptions(ctx, keys, AcquireManyOptions{TTL: ttl, Wait: WaitOption(false)})
+}
+
+func (c *Client) tryAcquireManyWithOptions(ctx context.Context, keys []string, opts AcquireManyOptions) (CompositeLockHandle, bool, error) {
+	if n := len(keys); n == 0 || n > 5 {
+		return CompositeLockHandle{}, false, fmt.Errorf("composite key count must be 1..=5, got %d", n)
+	}
+	uuid := newUUID()
+	resp, err := c.roundtrip(ctx, Request{
+		Type: ReqLock, UUID: uuid, Keys: keys, TTL: int(opts.TTL.Milliseconds()), Wait: WaitOption(false),
+	})
+	if err != nil {
+		return CompositeLockHandle{}, false, err
+	}
+	if resp.Type == RespError {
+		return CompositeLockHandle{}, false, fmt.Errorf("try acquireMany(%v): %s", keys, resp.Error)
+	}
+	if resp.Type != RespCompositeLock || resp.Acquired == nil {
+		return CompositeLockHandle{}, false, fmt.Errorf("try acquireMany(%v) unexpected: %+v", keys, resp)
+	}
+	if !*resp.Acquired || resp.LockUUID == "" {
+		return CompositeLockHandle{}, false, nil
+	}
+	return CompositeLockHandle{Keys: keys, LockUUID: resp.LockUUID, FencingTokens: resp.FencingTokens}, true, nil
 }
 
 // Release releases either a single or composite lock.

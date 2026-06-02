@@ -110,18 +110,43 @@ class Client {
   SingleLockHandle acquire(const std::string& key, uint64_t ttl_ms = 0,
                            std::optional<uint32_t> max_holders = std::nullopt) {
     std::string uuid = new_uuid();
-    Response r = roundtrip_grant(lock_request_single(uuid, key, ttl_ms, max_holders), uuid);
+    Response r = roundtrip_grant(lock_request_single(uuid, key, ttl_ms, max_holders, true), uuid);
     if (r.type != ResponseType::Lock || !r.acquired || r.lock_uuid.empty())
       throw NetworkMutexError("lock(" + key + ") failed: " + r.raw.dump());
     return {key, r.lock_uuid, r.fencing_token};
   }
 
+  std::optional<SingleLockHandle> try_acquire(
+      const std::string& key, uint64_t ttl_ms = 0,
+      std::optional<uint32_t> max_holders = std::nullopt) {
+    std::string uuid = new_uuid();
+    Response r = roundtrip(lock_request_single(uuid, key, ttl_ms, max_holders, false), uuid);
+    if (r.type == ResponseType::Error)
+      throw NetworkMutexError("try_acquire(" + key + ") error: " + r.error);
+    if (r.type != ResponseType::Lock)
+      throw NetworkMutexError("try_acquire(" + key + ") unexpected: " + r.raw.dump());
+    if (!r.acquired || r.lock_uuid.empty()) return std::nullopt;
+    return SingleLockHandle{key, r.lock_uuid, r.fencing_token};
+  }
+
   CompositeLockHandle acquire_many(const std::vector<std::string>& keys, uint64_t ttl_ms = 0) {
     std::string uuid = new_uuid();
-    Response r = roundtrip_grant(lock_request_composite(uuid, keys, ttl_ms), uuid);
+    Response r = roundtrip_grant(lock_request_composite(uuid, keys, ttl_ms, true), uuid);
     if (r.type != ResponseType::CompositeLock || !r.acquired || r.lock_uuid.empty())
       throw NetworkMutexError("acquire_many failed: " + r.raw.dump());
     return {keys, r.lock_uuid, r.fencing_tokens};
+  }
+
+  std::optional<CompositeLockHandle> try_acquire_many(
+      const std::vector<std::string>& keys, uint64_t ttl_ms = 0) {
+    std::string uuid = new_uuid();
+    Response r = roundtrip(lock_request_composite(uuid, keys, ttl_ms, false), uuid);
+    if (r.type == ResponseType::Error)
+      throw NetworkMutexError("try_acquire_many error: " + r.error);
+    if (r.type != ResponseType::CompositeLock)
+      throw NetworkMutexError("try_acquire_many unexpected: " + r.raw.dump());
+    if (!r.acquired || r.lock_uuid.empty()) return std::nullopt;
+    return CompositeLockHandle{keys, r.lock_uuid, r.fencing_tokens};
   }
 
   void release(const SingleLockHandle& h) {

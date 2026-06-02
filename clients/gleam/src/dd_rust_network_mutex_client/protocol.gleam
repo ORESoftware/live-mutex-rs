@@ -26,6 +26,7 @@ pub type Request {
     force: Bool,
     retry_count: Int,
     keep_locks_after_death: Bool,
+    wait: Option(Bool),
   )
   UnlockRequest(
     uuid: String,
@@ -66,7 +67,10 @@ fn opt_str(field: String, value: Option(String)) -> List(#(String, Json)) {
   }
 }
 
-fn opt_strs(field: String, value: Option(List(String))) -> List(#(String, Json)) {
+fn opt_strs(
+  field: String,
+  value: Option(List(String)),
+) -> List(#(String, Json)) {
   case value {
     Some(vs) -> [#(field, json.array(vs, json.string))]
     None -> []
@@ -76,6 +80,13 @@ fn opt_strs(field: String, value: Option(List(String))) -> List(#(String, Json))
 fn opt_int(field: String, value: Option(Int)) -> List(#(String, Json)) {
   case value {
     Some(v) -> [#(field, json.int(v))]
+    None -> []
+  }
+}
+
+fn opt_bool(field: String, value: Option(Bool)) -> List(#(String, Json)) {
+  case value {
+    Some(v) -> [#(field, json.bool(v))]
     None -> []
   }
 }
@@ -102,6 +113,7 @@ pub fn encode_request(req: Request) -> String {
       force,
       retry_count,
       keep_locks_after_death,
+      wait,
     ) -> {
       [
         #("type", json.string("lock")),
@@ -115,6 +127,7 @@ pub fn encode_request(req: Request) -> String {
       |> append(opt_strs("keys", keys))
       |> append(opt_int("pid", pid))
       |> append(opt_int("max", max))
+      |> append(opt_bool("wait", wait))
     }
     UnlockRequest(uuid, key, keys, lock_uuid, force) -> {
       [
@@ -373,9 +386,15 @@ fn response_decoder() -> decode.Decoder(Response) {
       use granted <- dec_bool_default("granted", False)
       use lu <- dec_optional_string("lockUuid")
       use ft <- dec_optional_int("fencingToken")
-      decode.success(
-        RegisterReadResultResponse(uuid, key, rc, wf, granted, lu, ft),
-      )
+      decode.success(RegisterReadResultResponse(
+        uuid,
+        key,
+        rc,
+        wf,
+        granted,
+        lu,
+        ft,
+      ))
     }
     "registerWriteResult" -> {
       use key <- dec_string_default("key", "")
@@ -384,9 +403,15 @@ fn response_decoder() -> decode.Decoder(Response) {
       use granted <- dec_bool_default("granted", False)
       use lu <- dec_optional_string("lockUuid")
       use ft <- dec_optional_int("fencingToken")
-      decode.success(
-        RegisterWriteResultResponse(uuid, key, rc, wf, granted, lu, ft),
-      )
+      decode.success(RegisterWriteResultResponse(
+        uuid,
+        key,
+        rc,
+        wf,
+        granted,
+        lu,
+        ft,
+      ))
     }
     "endReadResult" -> {
       use key <- dec_string_default("key", "")
@@ -406,9 +431,15 @@ fn response_decoder() -> decode.Decoder(Response) {
       use lrc <- dec_int_default("lockRequestCount", 0)
       use rc <- dec_int_default("readersCount", 0)
       use wf <- dec_bool_default("writerFlag", False)
-      decode.success(
-        LockInfoResponse(uuid, key, is_locked, lockholders, lrc, rc, wf),
-      )
+      decode.success(LockInfoResponse(
+        uuid,
+        key,
+        is_locked,
+        lockholders,
+        lrc,
+        rc,
+        wf,
+      ))
     }
     "lsResult" -> {
       use keys <- dec_list_string("keys")

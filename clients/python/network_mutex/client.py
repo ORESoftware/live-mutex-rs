@@ -95,15 +95,55 @@ class NetworkMutexClient:
         ttl_ms: int = 0,
         max_holders: Optional[int] = None,
         timeout: Optional[float] = None,
+        wait: bool = True,
     ) -> SingleLockHandle:
+        if not wait:
+            handle = self.try_acquire(key, ttl_ms=ttl_ms, max_holders=max_holders, timeout=timeout)
+            if handle is None:
+                raise NetworkMutexError(f"lock({key}) not acquired")
+            return handle
         uuid = _new_uuid()
         resp = self._roundtrip_grant(
-            protocol.lock_request(uuid, key=key, ttl_ms=ttl_ms or None, max_holders=max_holders),
+            protocol.lock_request(
+                uuid,
+                key=key,
+                ttl_ms=ttl_ms or None,
+                max_holders=max_holders,
+                wait=True,
+            ),
             uuid,
             timeout=timeout,
         )
         if resp.type is not ResponseType.LOCK or not resp.acquired or not resp.lock_uuid:
             raise NetworkMutexError(f"lock({key}) failed: {resp.raw}")
+        return SingleLockHandle(key=key, lock_uuid=resp.lock_uuid, fencing_token=resp.fencing_token or 0)
+
+    def try_acquire(
+        self,
+        key: str,
+        *,
+        ttl_ms: int = 0,
+        max_holders: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> Optional[SingleLockHandle]:
+        uuid = _new_uuid()
+        resp = self._roundtrip(
+            protocol.lock_request(
+                uuid,
+                key=key,
+                ttl_ms=ttl_ms or None,
+                max_holders=max_holders,
+                wait=False,
+            ),
+            uuid,
+            timeout=timeout,
+        )
+        if resp.type is ResponseType.ERROR:
+            raise NetworkMutexError(f"try_acquire({key}) error: {resp.error}")
+        if resp.type is not ResponseType.LOCK:
+            raise NetworkMutexError(f"try_acquire({key}) unexpected: {resp.raw}")
+        if not resp.acquired or not resp.lock_uuid:
+            return None
         return SingleLockHandle(key=key, lock_uuid=resp.lock_uuid, fencing_token=resp.fencing_token or 0)
 
     def acquire_many(
@@ -112,15 +152,44 @@ class NetworkMutexClient:
         *,
         ttl_ms: int = 0,
         timeout: Optional[float] = None,
+        wait: bool = True,
     ) -> CompositeLockHandle:
+        if not wait:
+            handle = self.try_acquire_many(keys, ttl_ms=ttl_ms, timeout=timeout)
+            if handle is None:
+                raise NetworkMutexError(f"acquire_many({keys}) not acquired")
+            return handle
         uuid = _new_uuid()
         resp = self._roundtrip_grant(
-            protocol.lock_request(uuid, keys=keys, ttl_ms=ttl_ms or None),
+            protocol.lock_request(uuid, keys=keys, ttl_ms=ttl_ms or None, wait=True),
             uuid,
             timeout=timeout,
         )
         if resp.type is not ResponseType.COMPOSITE_LOCK or not resp.acquired or not resp.lock_uuid:
             raise NetworkMutexError(f"acquire_many({keys}) failed: {resp.raw}")
+        return CompositeLockHandle(
+            keys=keys, lock_uuid=resp.lock_uuid, fencing_tokens=resp.fencing_tokens or {}
+        )
+
+    def try_acquire_many(
+        self,
+        keys: List[str],
+        *,
+        ttl_ms: int = 0,
+        timeout: Optional[float] = None,
+    ) -> Optional[CompositeLockHandle]:
+        uuid = _new_uuid()
+        resp = self._roundtrip(
+            protocol.lock_request(uuid, keys=keys, ttl_ms=ttl_ms or None, wait=False),
+            uuid,
+            timeout=timeout,
+        )
+        if resp.type is ResponseType.ERROR:
+            raise NetworkMutexError(f"try_acquire_many({keys}) error: {resp.error}")
+        if resp.type is not ResponseType.COMPOSITE_LOCK:
+            raise NetworkMutexError(f"try_acquire_many({keys}) unexpected: {resp.raw}")
+        if not resp.acquired or not resp.lock_uuid:
+            return None
         return CompositeLockHandle(
             keys=keys, lock_uuid=resp.lock_uuid, fencing_tokens=resp.fencing_tokens or {}
         )

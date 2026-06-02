@@ -30,6 +30,15 @@ theirs    total=  76411  throughput=   38206 ops/s  avg=   0.21ms  max=   3.69ms
 [compare] ratio (ours / theirs) = 1.35x
 ```
 
+## Wait / No-Wait Acquire
+
+All exclusive-lock clients now expose both blocking acquire and fail-fast
+try-lock behavior for single-key and composite locks. Blocking acquire sends
+`wait:true` and keeps the request registered through the queued
+`acquired:false` notice until the final `acquired:true` grant. Try-lock helpers
+send `wait:false`, read exactly one response, and return no handle on
+contention, so failed attempts cannot leave a deferred waiter behind.
+
 ## Run every smoke test
 
 ```bash

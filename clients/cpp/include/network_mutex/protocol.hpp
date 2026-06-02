@@ -104,22 +104,26 @@ inline std::string auth_request(const std::string& uuid, const std::string& toke
 
 inline std::string lock_request_single(const std::string& uuid, const std::string& key,
                                        uint64_t ttl_ms = 0,
-                                       std::optional<uint32_t> max_holders = std::nullopt) {
+                                       std::optional<uint32_t> max_holders = std::nullopt,
+                                       std::optional<bool> wait = std::nullopt) {
   json::Object o{{"type", to_wire(RequestType::Lock)}, {"uuid", uuid}, {"key", key}};
   if (ttl_ms) o["ttl"] = json::Value(static_cast<uint64_t>(ttl_ms));
   if (max_holders) o["max"] = json::Value(static_cast<uint64_t>(*max_holders));
+  if (wait) o["wait"] = json::Value(*wait);
   return frame(o);
 }
 
 inline std::string lock_request_composite(const std::string& uuid,
                                           const std::vector<std::string>& keys,
-                                          uint64_t ttl_ms = 0) {
+                                          uint64_t ttl_ms = 0,
+                                          std::optional<bool> wait = std::nullopt) {
   if (keys.empty() || keys.size() > kMaxCompositeKeys)
     throw std::invalid_argument("composite key count must be 1..=5");
   json::Array arr;
   for (const auto& k : keys) arr.emplace_back(k);
   json::Object o{{"type", to_wire(RequestType::Lock)}, {"uuid", uuid}, {"keys", std::move(arr)}};
   if (ttl_ms) o["ttl"] = json::Value(static_cast<uint64_t>(ttl_ms));
+  if (wait) o["wait"] = json::Value(*wait);
   return frame(o);
 }
 

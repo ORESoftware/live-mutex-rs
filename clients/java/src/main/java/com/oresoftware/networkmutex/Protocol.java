@@ -93,16 +93,25 @@ public final class Protocol {
   }
 
   public static String lockRequestSingle(String uuid, String key, long ttlMs, Integer maxHolders) {
+    return lockRequestSingle(uuid, key, ttlMs, maxHolders, null);
+  }
+
+  public static String lockRequestSingle(String uuid, String key, long ttlMs, Integer maxHolders, Boolean wait) {
     var o = new LinkedHashMap<String, Object>();
     o.put("type", RequestType.LOCK.wire);
     o.put("uuid", uuid);
     o.put("key", key);
     if (ttlMs > 0) o.put("ttl", ttlMs);
     if (maxHolders != null) o.put("max", (long) maxHolders);
+    if (wait != null) o.put("wait", wait);
     return frame(o);
   }
 
   public static String lockRequestComposite(String uuid, List<String> keys, long ttlMs) {
+    return lockRequestComposite(uuid, keys, ttlMs, null);
+  }
+
+  public static String lockRequestComposite(String uuid, List<String> keys, long ttlMs, Boolean wait) {
     if (keys.isEmpty() || keys.size() > MAX_COMPOSITE_KEYS) {
       throw new IllegalArgumentException("composite key count must be 1..=5, got " + keys.size());
     }
@@ -111,6 +120,7 @@ public final class Protocol {
     o.put("uuid", uuid);
     o.put("keys", keys);
     if (ttlMs > 0) o.put("ttl", ttlMs);
+    if (wait != null) o.put("wait", wait);
     return frame(o);
   }
 

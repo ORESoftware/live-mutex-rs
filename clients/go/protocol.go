@@ -71,6 +71,7 @@ type Request struct {
 	Force               bool     `json:"force,omitempty"`
 	RetryCount          int      `json:"retryCount,omitempty"`
 	KeepLocksAfterDeath bool     `json:"keepLocksAfterDeath,omitempty"`
+	Wait                *bool    `json:"wait,omitempty"`
 	LockUUID            string   `json:"lockUuid,omitempty"`
 }
 

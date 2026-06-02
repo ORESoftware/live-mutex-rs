@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -45,6 +45,76 @@ pub enum ClientError {
 }
 
 type Inflight = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Response>>>>;
+
+const DEFAULT_MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
+
+fn max_response_frame_bytes() -> usize {
+    crate::routine_id!("ddl-routine-client-max-frame-bytes-T2b");
+    std::env::var("LMX_MAX_RESPONSE_FRAME_BYTES")
+        .or_else(|_| std::env::var("LMX_MAX_FRAME_BYTES"))
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_FRAME_BYTES)
+}
+
+async fn read_response_frame_bounded<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<bool>
+where
+    R: AsyncBufRead + Unpin,
+{
+    crate::routine_id!("ddl-routine-client-read-frame-bounded-Q8k");
+    buf.clear();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() {
+                return Ok(false);
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF before newline",
+            ));
+        }
+
+        if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
+            let take = idx + 1;
+            if buf.len() + take > max_bytes {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("response frame exceeds {max_bytes} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+            return Ok(true);
+        }
+
+        let take = chunk.len();
+        if buf.len() + take > max_bytes {
+            reader.consume(take);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("response frame exceeds {max_bytes} bytes"),
+            ));
+        }
+        buf.extend_from_slice(chunk);
+        reader.consume(take);
+    }
+}
+
+fn trim_response_frame(buf: &[u8]) -> &[u8] {
+    crate::routine_id!("ddl-routine-client-trim-frame-G2c");
+    let mut end = buf.len();
+    while end > 0 && (buf[end - 1] == b'\n' || buf[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &buf[..end]
+}
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -121,21 +191,22 @@ impl Client {
         let inflight_reader = inflight.clone();
         let reader_handle = tokio::spawn(async move {
             let mut reader = BufReader::new(read);
-            let mut buf = String::new();
+            let mut buf = Vec::new();
+            let frame_cap = max_response_frame_bytes();
             loop {
-                buf.clear();
-                let n = match reader.read_line(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => break,
-                };
-                if n == 0 {
+                let got_frame =
+                    match read_response_frame_bounded(&mut reader, &mut buf, frame_cap).await {
+                        Ok(got_frame) => got_frame,
+                        Err(_) => break,
+                    };
+                if !got_frame {
                     break;
                 }
-                let line = buf.trim();
-                if line.is_empty() {
+                let payload = trim_response_frame(&buf);
+                if payload.is_empty() {
                     continue;
                 }
-                let resp: Response = match serde_json::from_str(line) {
+                let resp: Response = match serde_json::from_slice(payload) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
@@ -829,5 +900,91 @@ impl Client {
     pub fn config(&self) -> &ClientConfig {
         crate::routine_id!("ddl-routine-PJgckbbW53tEIY21kv");
         &self.inner.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn response_frame_reader_preserves_split_utf8_and_trims_crlf() {
+        let mut frame = serde_json::to_vec(&Response::Error {
+            uuid: "u1".into(),
+            error: "hello 😊".into(),
+        })
+        .unwrap();
+        frame.extend_from_slice(b"\r\n");
+
+        let emoji = "😊".as_bytes();
+        let split = frame
+            .windows(emoji.len())
+            .position(|w| w == emoji)
+            .expect("emoji bytes should be present")
+            + 1;
+        let first = frame[..split].to_vec();
+        let second = frame[split..].to_vec();
+
+        let (mut tx, rx) = tokio::io::duplex(256);
+        let writer = tokio::spawn(async move {
+            tx.write_all(&first).await.unwrap();
+            tokio::task::yield_now().await;
+            tx.write_all(&second).await.unwrap();
+        });
+
+        let mut reader = BufReader::new(rx);
+        let mut buf = Vec::new();
+        assert!(read_response_frame_bounded(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap());
+        writer.await.unwrap();
+
+        let resp: Response = serde_json::from_slice(trim_response_frame(&buf)).unwrap();
+        match resp {
+            Response::Error { uuid, error } => {
+                assert_eq!(uuid, "u1");
+                assert_eq!(error, "hello 😊");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_frame_reader_rejects_oversized_unterminated_frame() {
+        let (mut tx, rx) = tokio::io::duplex(16);
+        let writer = tokio::spawn(async move {
+            let _ = tx.write_all(&vec![b'x'; 128]).await;
+        });
+
+        let mut reader = BufReader::new(rx);
+        let mut buf = Vec::new();
+        let err = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_response_frame_bounded(&mut reader, &mut buf, 32),
+        )
+        .await
+        .expect("bounded reader should return promptly")
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn response_frame_reader_rejects_mid_frame_eof() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        tx.write_all(b"{\"type\":\"ok\"").await.unwrap();
+        drop(tx);
+
+        let mut reader = BufReader::new(rx);
+        let mut buf = Vec::new();
+        let err = read_response_frame_bounded(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

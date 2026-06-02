@@ -37,4 +37,8 @@ with NetworkMutexClient.connect("127.0.0.1", 6970) as client:
         ...  # critical section; attach handle.fencing_token to downstream writes
     finally:
         client.release(handle)
+
+    maybe_handle = client.try_acquire_many(["a", "b"], ttl_ms=30_000)
+    if maybe_handle is not None:
+        client.release(maybe_handle)
 ```

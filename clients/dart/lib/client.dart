@@ -6,14 +6,22 @@ import 'dart:math';
 import 'protocol.dart';
 
 class SingleLockHandle {
-  SingleLockHandle({required this.key, required this.lockUuid, required this.fencingToken});
+  SingleLockHandle({
+    required this.key,
+    required this.lockUuid,
+    required this.fencingToken,
+  });
   final String key;
   final String lockUuid;
   final int fencingToken;
 }
 
 class CompositeLockHandle {
-  CompositeLockHandle({required this.keys, required this.lockUuid, required this.fencingTokens});
+  CompositeLockHandle({
+    required this.keys,
+    required this.lockUuid,
+    required this.fencingTokens,
+  });
   final List<String> keys;
   final String lockUuid;
   final Map<String, int> fencingTokens;
@@ -63,33 +71,116 @@ class NetworkMutexClient {
     } catch (_) {}
   }
 
-  Future<SingleLockHandle> acquire(String key, {Duration ttl = const Duration(seconds: 30)}) async {
-    final req = LockRequest(uuid: _newUuid(), key: key, ttl: ttl.inMilliseconds);
+  Future<SingleLockHandle> acquire(
+    String key, {
+    Duration ttl = const Duration(seconds: 30),
+  }) async {
+    final req = LockRequest(
+      uuid: _newUuid(),
+      key: key,
+      ttl: ttl.inMilliseconds,
+      wait: true,
+    );
     final resp = await _sendUntilGrant(req);
     if (resp is! LockResponse || !resp.acquired || resp.lockUuid == null) {
       throw StateError('acquire($key) failed: $resp');
     }
-    return SingleLockHandle(key: key, lockUuid: resp.lockUuid!, fencingToken: resp.fencingToken ?? 0);
+    return SingleLockHandle(
+      key: key,
+      lockUuid: resp.lockUuid!,
+      fencingToken: resp.fencingToken ?? 0,
+    );
   }
 
-  Future<CompositeLockHandle> acquireMany(List<String> keys, {Duration ttl = const Duration(seconds: 30)}) async {
+  Future<SingleLockHandle?> tryAcquire(
+    String key, {
+    Duration ttl = const Duration(seconds: 30),
+  }) async {
+    final req = LockRequest(
+      uuid: _newUuid(),
+      key: key,
+      ttl: ttl.inMilliseconds,
+      wait: false,
+    );
+    final resp = await _send(req);
+    if (resp is ErrorResponse)
+      throw StateError('tryAcquire($key) error: ${resp.error}');
+    if (resp is! LockResponse)
+      throw StateError('tryAcquire($key) unexpected: $resp');
+    if (!resp.acquired || resp.lockUuid == null) return null;
+    return SingleLockHandle(
+      key: key,
+      lockUuid: resp.lockUuid!,
+      fencingToken: resp.fencingToken ?? 0,
+    );
+  }
+
+  Future<CompositeLockHandle> acquireMany(
+    List<String> keys, {
+    Duration ttl = const Duration(seconds: 30),
+  }) async {
     if (keys.isEmpty || keys.length > 5) {
       throw ArgumentError.value(keys.length, 'keys.length', 'must be 1..=5');
     }
-    final req = LockRequest(uuid: _newUuid(), keys: keys, ttl: ttl.inMilliseconds);
+    final req = LockRequest(
+      uuid: _newUuid(),
+      keys: keys,
+      ttl: ttl.inMilliseconds,
+      wait: true,
+    );
     final resp = await _sendUntilGrant(req);
-    if (resp is! CompositeLockResponse || !resp.acquired || resp.lockUuid == null) {
+    if (resp is! CompositeLockResponse ||
+        !resp.acquired ||
+        resp.lockUuid == null) {
       throw StateError('acquireMany($keys) failed: $resp');
     }
-    return CompositeLockHandle(keys: keys, lockUuid: resp.lockUuid!, fencingTokens: resp.fencingTokens ?? const {});
+    return CompositeLockHandle(
+      keys: keys,
+      lockUuid: resp.lockUuid!,
+      fencingTokens: resp.fencingTokens ?? const {},
+    );
+  }
+
+  Future<CompositeLockHandle?> tryAcquireMany(
+    List<String> keys, {
+    Duration ttl = const Duration(seconds: 30),
+  }) async {
+    if (keys.isEmpty || keys.length > 5) {
+      throw ArgumentError.value(keys.length, 'keys.length', 'must be 1..=5');
+    }
+    final req = LockRequest(
+      uuid: _newUuid(),
+      keys: keys,
+      ttl: ttl.inMilliseconds,
+      wait: false,
+    );
+    final resp = await _send(req);
+    if (resp is ErrorResponse)
+      throw StateError('tryAcquireMany($keys) error: ${resp.error}');
+    if (resp is! CompositeLockResponse)
+      throw StateError('tryAcquireMany($keys) unexpected: $resp');
+    if (!resp.acquired || resp.lockUuid == null) return null;
+    return CompositeLockHandle(
+      keys: keys,
+      lockUuid: resp.lockUuid!,
+      fencingTokens: resp.fencingTokens ?? const {},
+    );
   }
 
   Future<void> release(Object handle) async {
     UnlockRequest req;
     if (handle is SingleLockHandle) {
-      req = UnlockRequest(uuid: _newUuid(), key: handle.key, lockUuid: handle.lockUuid);
+      req = UnlockRequest(
+        uuid: _newUuid(),
+        key: handle.key,
+        lockUuid: handle.lockUuid,
+      );
     } else if (handle is CompositeLockHandle) {
-      req = UnlockRequest(uuid: _newUuid(), keys: handle.keys, lockUuid: handle.lockUuid);
+      req = UnlockRequest(
+        uuid: _newUuid(),
+        keys: handle.keys,
+        lockUuid: handle.lockUuid,
+      );
     } else {
       throw ArgumentError('release: unknown handle type ${handle.runtimeType}');
     }
@@ -102,8 +193,12 @@ class NetworkMutexClient {
   Future<({String lockUuid, int fencingToken})> acquireRead(String key) async {
     final req = RegisterReadRequest(uuid: _newUuid(), key: key);
     final resp = await _sendUntilGrant(req);
-    if (resp is! RegisterReadResultResponse) throw StateError('acquireRead: $resp');
-    return (lockUuid: resp.lockUuid ?? '', fencingToken: resp.fencingToken ?? 0);
+    if (resp is! RegisterReadResultResponse)
+      throw StateError('acquireRead: $resp');
+    return (
+      lockUuid: resp.lockUuid ?? '',
+      fencingToken: resp.fencingToken ?? 0,
+    );
   }
 
   Future<void> releaseRead(String key) async {
@@ -113,8 +208,12 @@ class NetworkMutexClient {
   Future<({String lockUuid, int fencingToken})> acquireWrite(String key) async {
     final req = RegisterWriteRequest(uuid: _newUuid(), key: key);
     final resp = await _sendUntilGrant(req);
-    if (resp is! RegisterWriteResultResponse) throw StateError('acquireWrite: $resp');
-    return (lockUuid: resp.lockUuid ?? '', fencingToken: resp.fencingToken ?? 0);
+    if (resp is! RegisterWriteResultResponse)
+      throw StateError('acquireWrite: $resp');
+    return (
+      lockUuid: resp.lockUuid ?? '',
+      fencingToken: resp.fencingToken ?? 0,
+    );
   }
 
   Future<void> releaseWrite(String key) async {
@@ -144,7 +243,8 @@ class NetworkMutexClient {
       },
       onDone: () {
         for (final inf in _inflight.values) {
-          if (!inf.completer.isCompleted) inf.completer.completeError(StateError('connection closed'));
+          if (!inf.completer.isCompleted)
+            inf.completer.completeError(StateError('connection closed'));
         }
         _inflight.clear();
       },
@@ -165,7 +265,8 @@ class NetworkMutexClient {
   bool _isIntermediate(Response r) {
     return switch (r) {
       LockResponse(:final acquired, :final error) => !acquired && error == null,
-      CompositeLockResponse(:final acquired, :final error) => !acquired && error == null,
+      CompositeLockResponse(:final acquired, :final error) =>
+        !acquired && error == null,
       RegisterReadResultResponse(:final granted) => !granted,
       RegisterWriteResultResponse(:final granted) => !granted,
       ReelectionResponse() => true,

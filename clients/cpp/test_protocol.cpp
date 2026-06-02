@@ -3,9 +3,12 @@
 //   make test && ./build/test_protocol
 #include <cassert>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 
-#include "network_mutex/protocol.hpp"
+#include "network_mutex/client.hpp"
 
 static int failures = 0;
 #define CHECK(cond)                                                       \
@@ -16,6 +19,14 @@ static int failures = 0;
       ++failures;                                                         \
     }                                                                     \
   } while (0)
+
+static_assert(std::is_same_v<
+              decltype(std::declval<nm::Client&>().try_acquire(std::declval<const std::string&>())),
+              std::optional<nm::SingleLockHandle>>);
+static_assert(std::is_same_v<
+              decltype(std::declval<nm::Client&>().try_acquire_many(
+                  std::declval<const std::vector<std::string>&>())),
+              std::optional<nm::CompositeLockHandle>>);
 
 int main() {
   using namespace nm;
@@ -31,14 +42,24 @@ int main() {
     CHECK(v.u64_or("ttl") == 4000);
     CHECK(v.u64_or("max") == 1);
     CHECK(!v.contains("keys"));
+    CHECK(!v.contains("wait"));
+  }
+
+  // Explicit wait=true is preserved for blocking lock requests.
+  {
+    std::string f = lock_request_single("u-wait", "k1", 4000, std::nullopt, true);
+    json::Parser p(f);
+    json::Value v = p.parse();
+    CHECK(v.bool_or("wait", false) == true);
   }
 
   // Composite request: keys preserved unsorted (broker sorts).
   {
-    std::string f = lock_request_composite("u-2", {"c", "a", "b"});
+    std::string f = lock_request_composite("u-2", {"c", "a", "b"}, 0, false);
     json::Parser p(f);
     json::Value v = p.parse();
     CHECK(v.str_or("type") == "lock");
+    CHECK(v.bool_or("wait", true) == false);
     const json::Value* ks = v.find("keys");
     CHECK(ks && ks->as_array().size() == 3);
     CHECK(ks->as_array()[0].as_string() == "c");

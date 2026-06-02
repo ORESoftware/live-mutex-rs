@@ -35,11 +35,17 @@ public final class ProtocolTest {
     check(((Number) v.get("max")).longValue() == 1, "max field");
     check(!v.containsKey("keys"), "no keys field for single");
 
+    Map<String, Object> waitTrue =
+        Json.parseObject(Protocol.lockRequestSingle("u-wait", "k1", 4000, null, Boolean.TRUE));
+    check(Boolean.TRUE.equals(waitTrue.get("wait")), "single wait true preserved");
+    check(!v.containsKey("wait"), "wait omitted by default");
+
     // Composite request keeps keys unsorted (broker sorts).
-    Map<String, Object> c = Json.parseObject(Protocol.lockRequestComposite("u-2", List.of("c", "a", "b"), 0));
+    Map<String, Object> c = Json.parseObject(Protocol.lockRequestComposite("u-2", List.of("c", "a", "b"), 0, Boolean.FALSE));
     @SuppressWarnings("unchecked")
     List<String> keys = (List<String>) c.get("keys");
     check(keys.size() == 3 && keys.get(0).equals("c"), "composite keys preserved");
+    check(Boolean.FALSE.equals(c.get("wait")), "composite wait false preserved");
 
     // Composite oversize rejected.
     boolean threw = false;

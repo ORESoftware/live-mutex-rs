@@ -44,5 +44,8 @@ try (var client = NetworkMutexClient.connect("127.0.0.1", 6970)) {
   } finally {
     client.release(h);
   }
+
+  var maybeH = client.tryAcquireMany(List.of("a", "b"), 30_000);
+  maybeH.ifPresent(client::release);
 }
 ```

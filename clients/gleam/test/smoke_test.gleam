@@ -28,14 +28,47 @@ pub fn encode_lock_request_uses_camel_case_test() {
       force: False,
       retry_count: 0,
       keep_locks_after_death: False,
+      wait: Some(False),
     )
   let encoded = p.encode_request(req)
   should.equal(string.contains(encoded, "\"type\":\"lock\""), True)
-  should.equal(
-    string.contains(encoded, "\"keepLocksAfterDeath\":false"),
-    True,
-  )
+  should.equal(string.contains(encoded, "\"keepLocksAfterDeath\":false"), True)
   should.equal(string.contains(encoded, "\"retryCount\":0"), True)
+  should.equal(string.contains(encoded, "\"wait\":false"), True)
+}
+
+pub fn encode_lock_request_preserves_wait_true_and_omits_absent_wait_test() {
+  let wait_true =
+    p.LockRequest(
+      uuid: "u-wait",
+      key: Some("k"),
+      keys: None,
+      pid: None,
+      ttl: 1000,
+      max: None,
+      force: False,
+      retry_count: 0,
+      keep_locks_after_death: False,
+      wait: Some(True),
+    )
+    |> p.encode_request
+  let wait_omitted =
+    p.LockRequest(
+      uuid: "u-omit",
+      key: Some("k"),
+      keys: None,
+      pid: None,
+      ttl: 1000,
+      max: None,
+      force: False,
+      retry_count: 0,
+      keep_locks_after_death: False,
+      wait: None,
+    )
+    |> p.encode_request
+
+  should.equal(string.contains(wait_true, "\"wait\":true"), True)
+  should.equal(string.contains(wait_omitted, "\"wait\""), False)
 }
 
 pub fn decode_composite_lock_response_test() {
