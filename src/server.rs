@@ -469,6 +469,17 @@ impl AfterRead {
 /// alike; the dedicated HTTP listener has its own body limit.
 const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Cooperative scheduling guard for peers that send many complete JSONL
+/// frames in one already-buffered burst. Tokio usually yields while
+/// waiting on I/O, but a hot `BufReader` buffer can let this connection
+/// task drain many frames without hitting a pending await. Yielding every
+/// N frames keeps admin HTTP, other TCP clients, and timers responsive.
+///
+/// Override at runtime via `LMX_FRAME_YIELD_EVERY` (any non-zero integer).
+/// The default intentionally mirrors the TypeScript parser's live-mutex
+/// class default.
+const DEFAULT_FRAME_YIELD_EVERY: usize = 1024;
+
 fn max_frame_bytes() -> usize {
     crate::routine_id!("ddl-routine-max-frame-bytes-Pq3");
     std::env::var("LMX_MAX_FRAME_BYTES")
@@ -478,17 +489,27 @@ fn max_frame_bytes() -> usize {
         .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
 }
 
+fn frame_yield_every() -> usize {
+    crate::routine_id!("ddl-routine-frame-yield-every-Nz2");
+    std::env::var("LMX_FRAME_YIELD_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_FRAME_YIELD_EVERY)
+}
+
 /// Read one newline-terminated frame into `buf`, refusing to grow
 /// past `max_bytes`. Returns:
 ///
-/// * `Ok(true)`   — a complete frame was read (trailing `\n` is
-///   included so the caller can strip it).
+/// * `Ok(true)`   — a complete frame was read. For normal JSONL
+///   frames the trailing `\n` is included so the caller can strip it;
+///   at EOF, a final unterminated record is also returned if at least
+///   one byte was buffered.
 /// * `Ok(false)`  — clean EOF before any bytes were read.
 /// * `Err(InvalidData)` — the framer hit `max_bytes` without seeing
 ///   a newline. Caller MUST close the connection; the stream is
 ///   desynchronised at this point (we've consumed bytes that don't
 ///   belong to a known frame).
-/// * `Err(UnexpectedEof)` — connection closed mid-frame.
 ///
 /// We loop on `fill_buf`/`consume` rather than `read_until` because
 /// the latter has no built-in size cap; using it requires growing
@@ -511,10 +532,7 @@ where
             if buf.is_empty() {
                 return Ok(false);
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF before newline",
-            ));
+            return Ok(true);
         }
         if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
             let take = idx + 1;
@@ -559,6 +577,8 @@ where
     let mut reader = BufReader::new(read);
     let mut authed = auth_token.is_none();
     let frame_cap = max_frame_bytes();
+    let yield_every = frame_yield_every();
+    let mut frames_seen: usize = 0;
 
     let writer_task = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
@@ -606,6 +626,10 @@ where
             };
             if !got_frame {
                 break;
+            }
+            frames_seen = frames_seen.wrapping_add(1);
+            if frames_seen % yield_every == 0 {
+                tokio::task::yield_now().await;
             }
             // Re-apply TCP_QUICKACK *immediately* after we've consumed a
             // frame from the kernel. This wins back the ~40 ms delayed-ACK
@@ -1738,4 +1762,3 @@ async fn wait_for(
         }
     }
 }
-

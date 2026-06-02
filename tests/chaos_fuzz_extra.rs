@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -305,12 +305,14 @@ async fn rw_writer_eventually_granted_under_reader_load() {
     // shared FIFO queue (readers/writers in the same wait list), writers
     // could be starved. With it, the writer arrives at some point in the
     // queue and is granted in bounded time.
-    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(tokio::sync::Notify::new());
     let read_count = Arc::new(AtomicUsize::new(0));
     let n_reader_clients = 16;
     let mut reader_tasks = JoinSet::new();
     for _ in 0..n_reader_clients {
         let stop = stop.clone();
+        let stop_notify = stop_notify.clone();
         let read_count = read_count.clone();
         let key_owned = key.to_string();
         reader_tasks.spawn(async move {
@@ -318,6 +320,9 @@ async fn rw_writer_eventually_granted_under_reader_load() {
                 .await
                 .expect("rw connect");
             loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 if let Ok(guard) = rw.acquire_read(&key_owned).await {
                     read_count.fetch_add(1, Ordering::Relaxed);
                     // Brief hold to make readers actually contend with the
@@ -325,8 +330,11 @@ async fn rw_writer_eventually_granted_under_reader_load() {
                     tokio::time::sleep(Duration::from_millis(2)).await;
                     let _ = guard.release().await;
                 }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 tokio::select! {
-                    _ = stop.notified() => break,
+                    _ = stop_notify.notified() => break,
                     _ = tokio::time::sleep(Duration::from_micros(200)) => {}
                 }
             }
@@ -355,7 +363,8 @@ async fn rw_writer_eventually_granted_under_reader_load() {
     let waited = started.elapsed();
 
     // Stop the readers and let the writer release.
-    stop.notify_waiters();
+    stop.store(true, Ordering::Relaxed);
+    stop_notify.notify_waiters();
     write_guard.release().await.unwrap();
 
     while let Some(r) = reader_tasks.join_next().await {

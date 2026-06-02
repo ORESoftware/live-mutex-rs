@@ -19,8 +19,12 @@ the upstream Node `live-mutex` library does.
 
 ## Transport
 
-- **TCP / UDS**: newline-delimited JSON (`\n` terminates each frame). The
-  broker accepts `EVENT_BYTE_LIMIT` (default 1 MiB) per frame.
+- **TCP / UDS**: newline-delimited JSON (`\n` terminates each frame). A final
+  valid JSON record without a trailing newline is accepted when the peer closes
+  its write side, matching common JSONL stream-parser flush behavior. The
+  broker accepts `LMX_MAX_FRAME_BYTES` (default 1 MiB) per frame and yields
+  cooperatively every `LMX_FRAME_YIELD_EVERY` frames (default 1024) while
+  draining large bursts.
 - **HTTP**: separate `/api/v1/*` endpoints (see `readme.md`). HTTP requests
   are stateless; the broker manufactures an ephemeral client per call and
   detaches the lock before the request returns.

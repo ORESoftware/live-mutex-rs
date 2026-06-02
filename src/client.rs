@@ -74,10 +74,7 @@ where
             if buf.is_empty() {
                 return Ok(false);
             }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF before newline",
-            ));
+            return Ok(true);
         }
 
         if let Some(idx) = chunk.iter().position(|&b| b == b'\n') {
@@ -981,10 +978,35 @@ mod tests {
 
         let mut reader = BufReader::new(rx);
         let mut buf = Vec::new();
-        let err = read_response_frame_bounded(&mut reader, &mut buf, 1024)
+        assert!(read_response_frame_bounded(&mut reader, &mut buf, 1024)
             .await
-            .unwrap_err();
+            .unwrap());
 
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(serde_json::from_slice::<Response>(trim_response_frame(&buf)).is_err());
+    }
+
+    #[tokio::test]
+    async fn response_frame_reader_accepts_final_response_without_newline() {
+        let frame = serde_json::to_vec(&Response::Ok {
+            uuid: "u-final".into(),
+        })
+        .unwrap();
+
+        let (mut tx, rx) = tokio::io::duplex(128);
+        tx.write_all(&frame).await.unwrap();
+        drop(tx);
+
+        let mut reader = BufReader::new(rx);
+        let mut buf = Vec::new();
+        assert!(read_response_frame_bounded(&mut reader, &mut buf, 1024)
+            .await
+            .unwrap());
+        assert_eq!(trim_response_frame(&buf), frame.as_slice());
+
+        let resp: Response = serde_json::from_slice(trim_response_frame(&buf)).unwrap();
+        match resp {
+            Response::Ok { uuid } => assert_eq!(uuid, "u-final"),
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }

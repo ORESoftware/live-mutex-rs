@@ -15,7 +15,7 @@ use dd_rust_network_mutex::{
     server::{run as run_server, ServerConfig},
 };
 use serde_json::json;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 fn cfg(tcp: std::net::SocketAddr) -> ServerConfig {
@@ -48,6 +48,18 @@ async fn wait_listening(addr: std::net::SocketAddr) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("broker never bound {addr}");
+}
+
+async fn read_reply_line<R>(reader: &mut BufReader<R>) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
+        .await
+        .expect("broker did not reply within 3s")
+        .expect("read_line failed");
+    line
 }
 
 #[tokio::test]
@@ -83,8 +95,9 @@ async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
             }
         }
     };
-    let timed_out =
-        tokio::time::timeout(Duration::from_secs(3), read_fut).await.is_err();
+    let timed_out = tokio::time::timeout(Duration::from_secs(3), read_fut)
+        .await
+        .is_err();
     let _ = atk_w.shutdown().await;
     assert!(
         !timed_out,
@@ -124,6 +137,111 @@ async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
 }
 
 #[tokio::test]
+async fn broker_accepts_final_json_frame_without_trailing_newline_on_eof() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    let payload = json!({
+        "type": "version",
+        "uuid": "v-final-no-newline",
+        "value": "test"
+    })
+    .to_string();
+    write.write_all(payload.as_bytes()).await.unwrap();
+    write.shutdown().await.unwrap();
+
+    let line = read_reply_line(&mut reader).await;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["type"], "version");
+    assert_eq!(reply["uuid"], "v-final-no-newline");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn broker_preserves_split_utf8_jsonl_frame() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    let payload = "{\"type\":\"version\",\"uuid\":\"split-😊\",\"value\":\"test\"}\n";
+    let emoji = "😊".as_bytes();
+    let split = payload
+        .as_bytes()
+        .windows(emoji.len())
+        .position(|w| w == emoji)
+        .expect("payload should contain emoji bytes")
+        + 1;
+
+    write.write_all(&payload.as_bytes()[..split]).await.unwrap();
+    tokio::task::yield_now().await;
+    write.write_all(&payload.as_bytes()[split..]).await.unwrap();
+    write.flush().await.unwrap();
+
+    let line = read_reply_line(&mut reader).await;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["type"], "version");
+    assert_eq!(reply["uuid"], "split-😊");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn broker_drains_large_jsonl_burst_with_frame_yield_option() {
+    std::env::set_var("LMX_FRAME_YIELD_EVERY", "1");
+
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    let total = 256usize;
+    let mut burst = Vec::new();
+    for i in 0..total {
+        let payload = json!({
+            "type": "version",
+            "uuid": format!("burst-{i}"),
+            "value": "test"
+        })
+        .to_string();
+        burst.extend_from_slice(payload.as_bytes());
+        burst.push(b'\n');
+    }
+    write.write_all(&burst).await.unwrap();
+    write.flush().await.unwrap();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..total {
+        let line = read_reply_line(&mut reader).await;
+        let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(reply["type"], "version");
+        seen.insert(reply["uuid"].as_str().unwrap().to_string());
+    }
+
+    assert_eq!(seen.len(), total);
+    assert!(seen.contains("burst-0"));
+    assert!(seen.contains(&format!("burst-{}", total - 1)));
+
+    server.abort();
+    let _ = server.await;
+    std::env::remove_var("LMX_FRAME_YIELD_EVERY");
+}
+
+#[tokio::test]
 async fn broker_handles_empty_malformed_and_crlf_jsonl_frames() {
     let addr = ephemeral_addr().await;
     let server = tokio::spawn(run_server(cfg(addr)));
@@ -146,15 +264,7 @@ async fn broker_handles_empty_malformed_and_crlf_jsonl_frames() {
 
     let mut replies = Vec::new();
     for _ in 0..2 {
-        let mut line = String::new();
-        let read_one = async {
-            use tokio::io::AsyncBufReadExt;
-            reader.read_line(&mut line).await.unwrap();
-        };
-        tokio::time::timeout(Duration::from_secs(3), read_one)
-            .await
-            .expect("broker did not reply to malformed + CRLF frames within 3s");
-        replies.push(line);
+        replies.push(read_reply_line(&mut reader).await);
     }
 
     assert!(

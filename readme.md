@@ -122,7 +122,9 @@ hardware-dependent, but the ratio is a useful first signal.)
 
 ## Wire protocol (TCP / UDS)
 
-Each frame is one JSON object terminated by `\n`. Every request carries a
+Each frame is one JSON object terminated by `\n`. A final valid JSON object
+without a trailing newline is also accepted when the peer closes its write side,
+matching common JSONL stream-parser flush behavior. Every request carries a
 client-generated `uuid` correlation ID; the broker echoes it on the matching
 response. **Both the `type` discriminator and every field are camelCase.**
 The canonical schema is `src/protocol.rs` (a serde-tagged Rust enum); see
@@ -202,6 +204,9 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_DEFAULT_TTL_MS`    | `4000`           | Default lock TTL in milliseconds.                                                                |
 | `LMX_MAX_LOCK_HOLDERS`  | `1`              | Default `max` per key. Per-request `max` overrides.                                              |
 | `LMX_MAX_CONCURRENCY_CAP` | `1000`         | Hard ceiling on per-key `max` (semaphore-style locks). Requests above this are silently clamped and counted in `dd_rust_network_mutex_concurrency_cap_clamps_total`. |
+| `LMX_MAX_FRAME_BYTES`  | `1048576`        | Hard cap for one TCP/UDS JSONL frame before the broker drops the connection.                              |
+| `LMX_FRAME_YIELD_EVERY` | `1024`          | Yield cooperatively after this many inbound TCP/UDS frames while draining a large already-buffered burst. |
+| `LMX_MAX_RESPONSE_FRAME_BYTES` | `1048576` | Rust client-side cap for one broker response frame. Falls back to `LMX_MAX_FRAME_BYTES` if unset.         |
 | `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
 | `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
 | `LMX_TCP_NODELAY`       | `true`           | Apply `TCP_NODELAY` on broker-accepted sockets. Experiment from `live-mutex#22`.                 |
@@ -777,6 +782,15 @@ env vars at startup:
 
 If `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, the binary stays a single-process
 broker that writes structured logs to stdout — no extra dependencies wake up.
+
+For a standard Kubernetes/Grafana stack:
+
+- scrape `GET /metrics` with Prometheus and build Grafana dashboards from the
+  `dd_rust_network_mutex_*` series.
+- set `LMX_LOG_FORMAT=json` and ship stdout/stderr to Loki with your normal
+  log collector.
+- set `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317` when you want
+  spans/events exported through an OpenTelemetry Collector.
 
 You can also disable the OTel exporter at compile time with
 `--no-default-features --features tls` (drops the `opentelemetry*` crates).
