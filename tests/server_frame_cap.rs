@@ -165,6 +165,60 @@ async fn broker_accepts_final_json_frame_without_trailing_newline_on_eof() {
 }
 
 #[tokio::test]
+async fn broker_processes_buffered_jsonl_then_final_eof_frame() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    let mut stream = Vec::new();
+    for uuid in ["buffered-0", "buffered-1"] {
+        let payload = json!({
+            "type": "version",
+            "uuid": uuid,
+            "value": "test"
+        })
+        .to_string();
+        stream.extend_from_slice(payload.as_bytes());
+        stream.push(b'\n');
+    }
+
+    let final_payload = json!({
+        "type": "version",
+        "uuid": "buffered-final-no-newline",
+        "value": "test"
+    })
+    .to_string();
+    stream.extend_from_slice(final_payload.as_bytes());
+
+    write.write_all(&stream).await.unwrap();
+    write.shutdown().await.unwrap();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        let line = read_reply_line(&mut reader).await;
+        let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(reply["type"], "version");
+        seen.insert(reply["uuid"].as_str().unwrap().to_string());
+    }
+
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([
+            "buffered-0".to_string(),
+            "buffered-1".to_string(),
+            "buffered-final-no-newline".to_string(),
+        ])
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn broker_reports_malformed_final_frame_without_trailing_newline_on_eof() {
     let addr = ephemeral_addr().await;
     let server = tokio::spawn(run_server(cfg(addr)));
@@ -187,6 +241,58 @@ async fn broker_reports_malformed_final_frame_without_trailing_newline_on_eof() 
     assert!(
         reply["error"].as_str().unwrap_or("").contains("malformed request"),
         "malformed final frame should produce a structured parser error, got {reply:?}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn broker_recovers_after_malformed_object_frame() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    write
+        .write_all(b"{\"type\":\"version\",\"uuid\":\"bad\",}\n")
+        .await
+        .unwrap();
+
+    let payload = json!({
+        "type": "version",
+        "uuid": "after-bad-object",
+        "value": "test"
+    })
+    .to_string();
+    write.write_all(payload.as_bytes()).await.unwrap();
+    write.write_all(b"\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let line = read_reply_line(&mut reader).await;
+        replies.push(serde_json::from_str::<serde_json::Value>(line.trim()).unwrap());
+    }
+
+    assert!(
+        replies.iter().any(|reply| {
+            reply["type"] == "error"
+                && reply["uuid"] == "malformed"
+                && reply["error"]
+                    .as_str()
+                    .is_some_and(|err| err.contains("malformed request"))
+        }),
+        "broker did not report the malformed frame: {replies:?}"
+    );
+    assert!(
+        replies
+            .iter()
+            .any(|reply| reply["type"] == "version" && reply["uuid"] == "after-bad-object"),
+        "broker did not recover for the next valid frame: {replies:?}"
     );
 
     server.abort();

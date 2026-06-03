@@ -2461,6 +2461,114 @@ mod tests {
     }
 
     #[test]
+    fn rw_waiting_writer_prevents_later_reader_barging() {
+        crate::routine_id!("ddl-routine-rw-waiting-writer-no-reader-barge-Zh4");
+        let broker = Broker::new(BrokerConfig::default());
+        let (reader_a, mut reader_a_rx) = broker.register_client();
+        let (writer_b, mut writer_b_rx) = broker.register_client();
+        let (reader_c, mut reader_c_rx) = broker.register_client();
+
+        broker.handle_request(
+            reader_a,
+            Request::RegisterRead {
+                uuid: "reader-a".into(),
+                key: "rw-no-barge".into(),
+            },
+        );
+        assert!(drain(&mut reader_a_rx).iter().any(|m| matches!(
+            m,
+            Response::RegisterReadResult {
+                uuid,
+                granted: true,
+                ..
+            } if uuid == "reader-a"
+        )));
+
+        broker.handle_request(
+            writer_b,
+            Request::RegisterWrite {
+                uuid: "writer-b".into(),
+                key: "rw-no-barge".into(),
+            },
+        );
+        assert!(drain(&mut writer_b_rx).iter().any(|m| matches!(
+            m,
+            Response::RegisterWriteResult {
+                uuid,
+                granted: false,
+                readers_count: 1,
+                ..
+            } if uuid == "writer-b"
+        )));
+
+        broker.handle_request(
+            reader_c,
+            Request::RegisterRead {
+                uuid: "reader-c".into(),
+                key: "rw-no-barge".into(),
+            },
+        );
+        assert!(drain(&mut reader_c_rx).iter().any(|m| matches!(
+            m,
+            Response::RegisterReadResult {
+                uuid,
+                granted: false,
+                ..
+            } if uuid == "reader-c"
+        )));
+
+        broker.handle_request(
+            reader_a,
+            Request::EndRead {
+                uuid: "end-reader-a".into(),
+                key: "rw-no-barge".into(),
+            },
+        );
+        let _ = drain(&mut reader_a_rx);
+
+        let writer_msgs = drain(&mut writer_b_rx);
+        assert!(
+            writer_msgs.iter().any(|m| matches!(
+                m,
+                Response::RegisterWriteResult {
+                    uuid,
+                    granted: true,
+                    writer_flag: true,
+                    ..
+                } if uuid == "writer-b"
+            )),
+            "queued writer should be granted before later reader: {writer_msgs:?}"
+        );
+        assert!(
+            drain(&mut reader_c_rx).is_empty(),
+            "later reader must not be granted while queued writer holds the key"
+        );
+
+        broker.handle_request(
+            writer_b,
+            Request::EndWrite {
+                uuid: "end-writer-b".into(),
+                key: "rw-no-barge".into(),
+            },
+        );
+        let _ = drain(&mut writer_b_rx);
+
+        let reader_c_msgs = drain(&mut reader_c_rx);
+        assert!(
+            reader_c_msgs.iter().any(|m| matches!(
+                m,
+                Response::RegisterReadResult {
+                    uuid,
+                    granted: true,
+                    writer_flag: false,
+                    ..
+                } if uuid == "reader-c"
+            )),
+            "later reader should be granted after writer completes: {reader_c_msgs:?}"
+        );
+    }
+
+    #[test]
     fn dropping_client_releases_locks_and_queue() {
         crate::routine_id!("ddl-routine-g9Qk5cWEaz9JgGK8OC");
         let broker = Broker::new(BrokerConfig::default());
