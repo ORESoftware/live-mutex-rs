@@ -165,6 +165,35 @@ async fn broker_accepts_final_json_frame_without_trailing_newline_on_eof() {
 }
 
 #[tokio::test]
+async fn broker_reports_malformed_final_frame_without_trailing_newline_on_eof() {
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg(addr)));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    write
+        .write_all(b"{\"type\":\"version\",\"uuid\":\"bad-final\"")
+        .await
+        .unwrap();
+    write.shutdown().await.unwrap();
+
+    let line = read_reply_line(&mut reader).await;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["type"], "error");
+    assert_eq!(reply["uuid"], "malformed");
+    assert!(
+        reply["error"].as_str().unwrap_or("").contains("malformed request"),
+        "malformed final frame should produce a structured parser error, got {reply:?}"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn broker_preserves_split_utf8_jsonl_frame() {
     let addr = ephemeral_addr().await;
     let server = tokio::spawn(run_server(cfg(addr)));
