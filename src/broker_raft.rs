@@ -1902,4 +1902,75 @@ mod tests {
 
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn compaction_clears_idle_committed_log_entries() {
+        let dir = temp_dir("raft-idle-state-maintenance");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_max_log_entries = 1;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let lock_entry = raft
+            .log
+            .append(
+                1,
+                RaftCommand::ClientRequest {
+                    client_id: 7,
+                    request: Request::Lock {
+                        uuid: "idle-lock-uuid".into(),
+                        key: Some("idle-key".into()),
+                        keys: None,
+                        pid: None,
+                        ttl: None,
+                        max: None,
+                        force: false,
+                        retry_count: 0,
+                        keep_locks_after_death: false,
+                        wait: None,
+                    },
+                },
+            )
+            .expect("append lock");
+        let unlock_entry = raft
+            .log
+            .append(
+                1,
+                RaftCommand::ClientRequest {
+                    client_id: 7,
+                    request: Request::Unlock {
+                        uuid: "idle-unlock-uuid".into(),
+                        key: Some("idle-key".into()),
+                        keys: None,
+                        lock_uuid: Some("idle-lock-uuid".into()),
+                        force: false,
+                    },
+                },
+            )
+            .expect("append unlock");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = unlock_entry.index;
+        }
+        raft.apply_committed().expect("apply lock and unlock");
+        assert_eq!(raft.broker.metrics().holders, 0);
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 2);
+
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("idle-state compaction");
+
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("snapshot")
+                .last_included_index,
+            unlock_entry.index
+        );
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 0);
+        assert_eq!(raft.log.last_index(), unlock_entry.index);
+        assert!(lock_entry.index < unlock_entry.index);
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }
