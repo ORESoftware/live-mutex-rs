@@ -28,7 +28,9 @@
 //!   format. Useful for code-gen / cross-runtime clients.
 
 pub mod broker;
+pub mod broker_raft;
 pub mod client;
+pub mod config;
 pub mod metrics;
 pub mod protocol;
 pub mod queue;
@@ -38,7 +40,12 @@ pub mod sockopt;
 pub mod status;
 
 pub use broker::{Broker, BrokerConfig, BrokerMetrics};
+pub use broker_raft::{
+    BrokerRaft, BrokerRaftConfig, BrokerRaftError, RaftCommand, RaftCompactionReport, RaftLogEntry,
+    RaftLogStore, RaftPeerConfig, RaftSnapshotMetadata,
+};
 pub use client::{Client, ClientConfig, ClientError, LockGuard, LockInfo, RwClient};
+pub use config::{load_runtime_config, ConfigError, RuntimeConfig};
 pub use protocol::{Request, Response, MAX_COMPOSITE_KEYS, PROTOCOL_VERSION};
 pub use routine::{
     current_log_level, init_tracing, is_otel_enabled, set_log_level, set_otel_enabled,

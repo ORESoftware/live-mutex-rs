@@ -32,10 +32,12 @@ use axum::{
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::broker::{Broker, BrokerConfig};
+use crate::broker_raft::{BrokerRaft, BrokerRaftConfig, BrokerRaftError};
 use crate::protocol::{
     http::{
         AcquireRequest, AcquireResponse, LockInfoResponse, ReleaseRequest, ReleaseResponse,
@@ -387,6 +389,62 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 
     let (_first, _idx, _rest) = futures_util::future::select_all(tasks).await;
     Ok(())
+}
+
+#[derive(Clone)]
+struct RaftAppState {
+    raft: BrokerRaft,
+    auth_token: Option<String>,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> std::io::Result<()> {
+    crate::routine_id!("ddl-routine-server-run-raft-1");
+    let raft = BrokerRaft::open(raft_config).map_err(raft_io_error)?;
+    let metrics = Arc::new(crate::metrics::Metrics::new());
+    let mut tasks = JoinSet::new();
+    raft.spawn_raft_tasks_into(&mut tasks)
+        .await
+        .map_err(raft_io_error)?;
+    let mut listeners_bound = 0usize;
+
+    if let Some(addr) = config.http_bind {
+        let app_state = RaftAppState {
+            raft: raft.clone(),
+            auth_token: config.auth_token.clone(),
+            metrics: metrics.clone(),
+        };
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/readyz", get(healthz))
+            .route("/metrics", get(raft_metrics_endpoint))
+            .route("/raft/status", get(raft_status))
+            .route("/v1/lock", post(raft_http_acquire))
+            .route("/v1/unlock", post(raft_http_release))
+            .with_state(app_state);
+        let listener = TcpListener::bind(addr).await?;
+        listeners_bound += 1;
+        info!(target: "lmx::raft::http", %addr, "raft HTTP listening");
+        tasks.spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                error!(target: "lmx::raft::http", error=%err, "raft HTTP exited");
+            }
+        });
+    }
+
+    if listeners_bound == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BrokerRaft requires http_bind for the LB-facing API",
+        ));
+    }
+
+    let _ = tasks.join_next().await;
+    Ok(())
+}
+
+fn raft_io_error(err: BrokerRaftError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
 }
 
 #[cfg(feature = "tls")]
@@ -749,6 +807,217 @@ fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
+}
+
+fn raft_http_authorized(state: &RaftAppState, headers: &HeaderMap) -> bool {
+    crate::routine_id!("ddl-routine-server-raft-http-auth-1");
+    let Some(token) = state.auth_token.as_ref() else {
+        return true;
+    };
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    let custom = headers
+        .get("x-lmx-auth")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
+}
+
+async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-server-raft-metrics-1");
+    let body = state.metrics.render(state.raft.broker());
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+}
+
+async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-server-raft-status-1");
+    Json(serde_json::json!({
+        "nodeId": state.raft.config().node_id,
+        "isLeader": state.raft.is_leader(),
+        "leaderId": state.raft.leader_id(),
+        "leaderAddr": state.raft.leader_addr(),
+        "clusterSize": state.raft.config().cluster_size(),
+        "quorumSize": state.raft.config().quorum_size(),
+        "lastLogIndex": state.raft.log().last_index(),
+        "lastLogTerm": state.raft.log().last_term(),
+    }))
+}
+
+async fn raft_http_acquire(
+    State(state): State<RaftAppState>,
+    headers: HeaderMap,
+    Json(req): Json<AcquireRequest>,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-acquire-1");
+    if !raft_http_authorized(&state, &headers) {
+        return http_unauthorized();
+    }
+    state.metrics.requests_total.inc();
+    let request_uuid = Uuid::new_v4().to_string();
+    let request = Request::Lock {
+        uuid: request_uuid.clone(),
+        key: req.key.clone(),
+        keys: req.keys.clone(),
+        pid: None,
+        ttl: req.ttl_ms,
+        max: req.max,
+        force: false,
+        retry_count: 0,
+        keep_locks_after_death: false,
+        wait: None,
+    };
+    let wait = req.wait_ms.map(Duration::from_millis).unwrap_or_default();
+    let outcome = state
+        .raft
+        .run_ephemeral(request, &request_uuid, wait, true)
+        .await;
+    match outcome {
+        Ok(Some(Response::Lock {
+            acquired,
+            key,
+            lock_uuid,
+            fencing_token,
+            lock_request_count,
+            error,
+            ..
+        })) => {
+            let mut tokens = BTreeMap::new();
+            if let Some(t) = fencing_token {
+                tokens.insert(key.clone(), t);
+            }
+            let body = AcquireResponse {
+                acquired,
+                keys: vec![key],
+                lock_uuid,
+                fencing_tokens: tokens,
+                queue_depth: lock_request_count,
+                error,
+            };
+            if !acquired && body.error.is_some() {
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            } else {
+                Json(body).into_response()
+            }
+        }
+        Ok(Some(Response::CompositeLock {
+            acquired,
+            keys,
+            lock_uuid,
+            fencing_tokens,
+            error,
+            ..
+        })) => {
+            let body = AcquireResponse {
+                acquired,
+                keys,
+                lock_uuid,
+                fencing_tokens: fencing_tokens.unwrap_or_default(),
+                queue_depth: 0,
+                error,
+            };
+            if !acquired && body.error.is_some() {
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            } else {
+                Json(body).into_response()
+            }
+        }
+        Ok(Some(Response::Error { error, .. })) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"acquired": false, "error": error})),
+        )
+            .into_response(),
+        Ok(_) => Json(AcquireResponse {
+            acquired: false,
+            keys: req.keys.unwrap_or_else(|| req.key.into_iter().collect()),
+            lock_uuid: None,
+            fencing_tokens: BTreeMap::new(),
+            queue_depth: 0,
+            error: None,
+        })
+        .into_response(),
+        Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
+        Err(err) => raft_unavailable(err),
+    }
+}
+
+async fn raft_http_release(
+    State(state): State<RaftAppState>,
+    headers: HeaderMap,
+    Json(req): Json<ReleaseRequest>,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-release-1");
+    if !raft_http_authorized(&state, &headers) {
+        return http_unauthorized();
+    }
+    state.metrics.requests_total.inc();
+    let request_uuid = Uuid::new_v4().to_string();
+    let outcome = state
+        .raft
+        .run_ephemeral(
+            Request::Unlock {
+                uuid: request_uuid.clone(),
+                key: req.key.clone(),
+                keys: req.keys.clone(),
+                lock_uuid: req.lock_uuid.clone(),
+                force: req.force,
+            },
+            &request_uuid,
+            Duration::from_millis(2000),
+            false,
+        )
+        .await;
+    match outcome {
+        Ok(Some(Response::Unlock { keys, unlocked, .. })) => {
+            Json(ReleaseResponse { unlocked, keys }).into_response()
+        }
+        Ok(Some(Response::Error { error, .. })) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"unlocked": false, "error": error})),
+        )
+            .into_response(),
+        Ok(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"unlocked": false, "error": "broker timed out"})),
+        )
+            .into_response(),
+        Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
+        Err(err) => raft_unavailable(err),
+    }
+}
+
+fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-unavailable-1");
+    match err {
+        BrokerRaftError::NotLeader {
+            leader_id,
+            leader_addr,
+        } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "raft leader unavailable",
+                "leaderId": leader_id,
+                "leaderAddr": leader_addr,
+            })),
+        )
+            .into_response(),
+        other => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": other.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Shared secret used to authenticate `/admin/*` requests. Defaults to

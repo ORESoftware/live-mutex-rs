@@ -120,6 +120,30 @@ theirs    total=  76411  throughput=   38206 ops/s  avg=   0.21ms  max=   3.69ms
 (Sample numbers from a single laptop M-class run; absolute throughput is
 hardware-dependent, but the ratio is a useful first signal.)
 
+### Redis vs. BrokerRaft benchmark
+
+`examples/redis_vs_raft_bench.rs` provides a rough acquire/release comparison
+between Redis locks and the BrokerRaft HTTP/LB path. It intentionally ignores
+fencing tokens: Redis uses `SET key token NX PX ttl` plus a compare-and-delete
+Lua unlock, while BrokerRaft uses `/v1/lock` and `/v1/unlock` and ignores the
+returned fencing-token fields.
+
+```bash
+# Redis on 127.0.0.1:6379 and a BrokerRaft LB/service on 127.0.0.1:6971.
+BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 \
+  cargo run --release --example redis_vs_raft_bench --no-default-features
+
+# Run only one side.
+BENCH_TARGET=redis cargo run --release --example redis_vs_raft_bench --no-default-features
+BENCH_TARGET=raft BENCH_RAFT=127.0.0.1:6971 \
+  cargo run --release --example redis_vs_raft_bench --no-default-features
+```
+
+The Raft client opens one short-lived HTTP connection per request, which matches
+the simple LB-facing API but means the number is not a pure consensus-cost
+measurement. It is useful for the practical “what does the exposed lock service
+cost?” comparison.
+
 ## Wire protocol (TCP / UDS)
 
 Each frame is one JSON object terminated by `\n`. A final valid JSON object
@@ -215,6 +239,26 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_TLS_KEY`           | unset            | (`tls` feature) PEM-encoded server private key path.                                             |
 | `LMX_LOG_FORMAT`        | `text`           | Set to `json` for structured logs.                                                               |
 | `RUST_LOG`              | `info`           | Standard `tracing` filter (e.g. `lmx=debug,info`).                                               |
+
+## TOML configuration
+
+The binary also reads an optional TOML config file. By default it looks for
+`lmx.toml` in the current working directory, then
+`/etc/dd-rust-network-mutex/lmx.toml`; set `LMX_CONFIG=/path/to/file.toml` to
+choose a specific file. Environment variables still override TOML values.
+
+The checked-in [`lmx.toml`](lmx.toml) mirrors the existing defaults and includes
+a disabled `raft` section. That section is intentionally peer-list driven:
+a 3-node peer list gives a quorum of 2, and a 5-node peer list gives a quorum
+of 3. Quorum is derived as `floor(cluster_size / 2) + 1`; it is not a manual
+knob because a too-small quorum would permit split-brain lock grants.
+
+When `[raft].enabled = true`, the binary starts the `BrokerRaft` HTTP backend:
+one elected leader orders lock operations, followers proxy HTTP lock/unlock
+requests to that leader, and the leader applies a request only after a quorum
+has accepted the log entry. The current Raft path is intended for the
+single-shot HTTP API; the TCP/UDS persistent-client listeners still use the
+regular in-process Broker.
 
 ## Socket-tuning experiment (`live-mutex#22`)
 
@@ -344,17 +388,27 @@ this is the same code we run internally at ORE Software under that name.)
 
 ### As a Docker container
 
-The repo root ships a multi-stage `Dockerfile` (build with
-`rust:1.90-bookworm`, run on `debian:bookworm-slim`) that produces a
-small, non-root image with TLS and OTel features enabled by default:
+The repo root ships two multi-stage Dockerfiles (build with
+`rust:1.90-bookworm`, run on `debian:bookworm-slim`):
+
+- `Dockerfile` builds the regular Broker image with Raft disabled by default.
+- `Dockerfile.raft` builds the BrokerRaft image with a Raft-enabled config,
+  Raft RPC port `7980`, and writable log storage under
+  `/var/lib/dd-rust-network-mutex/raft`.
 
 ```bash
 # Build (linux/amd64 by default; pass --platform for cross-arch).
 docker build -t oresoftware/live-mutex-rs:0.1.123 .
+docker build -f Dockerfile.raft -t oresoftware/live-mutex-rs-raft:0.1.123 .
 
 # Run (TCP 6970 + HTTP 6971 — see Environment variables for everything).
 docker run --rm -p 6970:6970 -p 6971:6971 \
     oresoftware/live-mutex-rs:0.1.123
+
+# Run BrokerRaft HTTP + Raft RPC. For real clusters, override the node id and
+# peer DNS with env/config per pod.
+docker run --rm -p 6971:6971 -p 7980:7980 \
+    oresoftware/live-mutex-rs-raft:0.1.123
 ```
 
 The published image at
@@ -364,23 +418,32 @@ version. To opt out of TLS / OTel for a smaller image, pass
 `--build-arg CARGO_BUILD_FLAGS="--no-default-features"` (or
 `--no-default-features --features tls` for TLS-only).
 
-If you'd rather build the binary outside Docker, the broker reads
-everything it needs from environment variables and has no config file:
-`cargo build --release` plus the env vars in the table above is enough.
+If you'd rather build the binary outside Docker, the broker can run from
+built-in defaults, `lmx.toml`, or environment variables:
+`cargo build --release` plus the config surface above is enough.
 
 ### High availability
 
-The reference deployment is **single-replica** because all lock state lives in
-process memory. A future HA mode would either:
+BrokerRaft uses a peer-list driven quorum: 3 nodes commit with 2 votes, and 5
+nodes commit with 3. One leader orders requests, but the leader cannot safely
+grant locks alone. Followers proxy HTTP lock/unlock calls to the current
+leader, so a load balancer can round-robin across all healthy nodes.
 
-1. Run an active-passive pair with a single-leader gate (e.g. a Postgres
-   advisory lock), so only the leader serves clients and the passive replica
-   picks up if the leader dies, **or**
-2. Replicate the operations log to a quorum (Raft) so any replica can serve
-   reads while writes go through the leader.
+If a load balancer sits in front, it can round-robin to all nodes and let
+followers proxy to the leader, or it can prefer the current leader via health
+checks. The load balancer's access logs are useful for observability, but the
+Raft log must live on the Raft nodes themselves; LB logs are not part of
+consensus recovery.
 
-Both are straightforward extensions of the broker `state` machine but neither
-is implemented in this initial version.
+Current BrokerRaft limitations: the cluster-facing API is HTTP-only, log
+replication sends the full local log on each append/heartbeat, and snapshot
+payload restore is not implemented yet, so restart recovery is strongest before
+old committed entries have been compacted. Raft hard state
+(`currentTerm` / `votedFor` / `commitIndex`) is persisted and committed log
+entries still present on disk are replayed on startup. Lock UUID replay is
+deterministic across nodes; fencing tokens are still generated by each broker
+instance, so performance comparisons should ignore fencing tokens until the
+committed log also carries deterministic fencing-token results.
 
 ## HTML status page (`live-mutex#108`)
 

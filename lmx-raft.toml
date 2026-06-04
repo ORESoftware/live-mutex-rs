@@ -1,0 +1,53 @@
+# Default BrokerRaft configuration for container and Kubernetes deployments.
+#
+# This file is intentionally separate from lmx.toml so the regular Broker image
+# can keep Raft disabled while Dockerfile.raft has cluster-ready defaults.
+# Environment variables still override these values.
+
+[server]
+bind_host = "0.0.0.0"
+tcp_port = 6970
+http_port = 6971
+disable_tcp = true
+disable_http = false
+tcp_nodelay = true
+tcp_quickack = true
+
+[broker]
+default_ttl_ms = 4000
+max_lock_holders = 1
+max_concurrency_cap = 1000
+ttl_sweep_interval_ms = 10
+idle_key_grace_ms = 60000
+
+[raft]
+enabled = true
+node_id = "node-1"
+bind_addr = "0.0.0.0:7980"
+advertise_addr = "node-1:7980"
+data_dir = "/var/lib/dd-rust-network-mutex/raft"
+
+# A 3-node cluster commits with 2 votes. For 5 nodes, add node-4/node-5 and
+# the derived quorum becomes 3.
+heartbeat_interval_ms = 50
+election_timeout_min_ms = 150
+election_timeout_max_ms = 300
+
+# Snapshot every 30 minutes by default. Old log entries are compacted only
+# after a durable snapshot includes their log index.
+snapshot_interval_ms = 1800000
+snapshot_max_log_entries = 100000
+snapshot_max_log_bytes = 67108864
+trailing_log_entries = 10000
+
+[[raft.peers]]
+id = "node-1"
+addr = "node-1:7980"
+
+[[raft.peers]]
+id = "node-2"
+addr = "node-2:7980"
+
+[[raft.peers]]
+id = "node-3"
+addr = "node-3:7980"

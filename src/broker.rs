@@ -212,6 +212,7 @@ struct PendingRequest {
     client: ClientId,
     pid: Option<i64>,
     ttl: Option<Duration>,
+    grant_lock_uuid: Option<String>,
     keep_locks_after_death: bool,
     kind: PendingKind,
 }
@@ -523,6 +524,32 @@ impl Broker {
         crate::routine_id!("ddl-routine-gQrzxtKPDCU4Qyiwar");
         let mut state = self.state.lock();
         let Some(mut handle) = state.clients.remove(&client) else {
+            // Raft followers replay leader-side ephemeral client IDs without
+            // registering transport handles for them. They can still have
+            // queued work for that client, so remove waiters by scanning
+            // queues. Do not release holders here: detached HTTP locks also
+            // have no live client handle and must survive until lockUuid
+            // unlock.
+            let mut touched_keys: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut removals: Vec<(String, String)> = Vec::new();
+            for (key, lock) in state.locks.iter() {
+                for (request_uuid, pending) in lock.queue.iter() {
+                    if pending.client == client {
+                        removals.push((key.clone(), request_uuid.clone()));
+                    }
+                }
+            }
+            for (key, request_uuid) in removals {
+                if let Some(lock) = state.locks.get_mut(&key) {
+                    lock.queue.remove(&request_uuid);
+                }
+                touched_keys.insert(key);
+            }
+            for key in touched_keys {
+                state.maybe_mark_idle(&key);
+                self.try_grant_next(&mut state, &key);
+            }
             return;
         };
 
@@ -588,6 +615,16 @@ impl Broker {
     /// via the client's mpsc sender (no return value because there can be
     /// many or zero outbound messages: e.g. composite-lock partial progress).
     pub fn handle_request(&self, client: ClientId, request: Request) {
+        crate::routine_id!("ddl-routine-broker-handle-request-public-1");
+        self.handle_request_with_grant_uuid(client, request, None);
+    }
+
+    pub(crate) fn handle_request_with_grant_uuid(
+        &self,
+        client: ClientId,
+        request: Request,
+        grant_lock_uuid: Option<String>,
+    ) {
         crate::routine_id!("ddl-routine-0GBKaWmx2RzXgUnbEr");
         let mut state = self.state.lock();
         match request {
@@ -689,10 +726,20 @@ impl Broker {
                             keep_locks_after_death,
                             force,
                             wait,
+                            grant_lock_uuid,
                         );
                     }
                     (None, Some(ks)) => {
-                        self.handle_composite_lock(&mut state, client, uuid, ks, pid, ttl, wait);
+                        self.handle_composite_lock(
+                            &mut state,
+                            client,
+                            uuid,
+                            ks,
+                            pid,
+                            ttl,
+                            wait,
+                            grant_lock_uuid,
+                        );
                     }
                     (Some(_), Some(_)) => {
                         self.send(
@@ -828,6 +875,7 @@ impl Broker {
         keep_locks_after_death: bool,
         force: bool,
         wait: bool,
+        grant_lock_uuid: Option<String>,
     ) {
         crate::routine_id!("ddl-routine--MjJFOFOY7fGYtsmOT");
         // Resolve & clamp the requested concurrency level *before* we
@@ -845,7 +893,9 @@ impl Broker {
         let cap = lock.max as usize;
         if lock.writer.is_none() && lock.readers.is_empty() && lock.exclusive_holders.len() < cap {
             let token = lock.next_fencing_token();
-            let lock_uuid = Uuid::new_v4().to_string();
+            let lock_uuid = grant_lock_uuid
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             lock.exclusive_holders.insert(
                 lock_uuid.clone(),
                 ExclusiveHolder {
@@ -923,6 +973,7 @@ impl Broker {
             client,
             pid,
             ttl,
+            grant_lock_uuid,
             keep_locks_after_death,
             kind: PendingKind::Exclusive,
         };
@@ -961,6 +1012,7 @@ impl Broker {
         pid: Option<i64>,
         ttl: Option<Duration>,
         wait: bool,
+        grant_lock_uuid: Option<String>,
     ) {
         crate::routine_id!("ddl-routine-UD_1TQ6n72nYb_GRcW");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
@@ -994,7 +1046,9 @@ impl Broker {
                 .unwrap_or(true)
         });
 
-        let composite_lock_uuid = Uuid::new_v4().to_string();
+        let composite_lock_uuid = grant_lock_uuid
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         if all_free {
             let mut tokens: BTreeMap<String, u64> = BTreeMap::new();
             let mut max_token: u64 = 0;
@@ -1075,6 +1129,7 @@ impl Broker {
             client,
             pid,
             ttl,
+            grant_lock_uuid: None,
             keep_locks_after_death: false,
             kind: PendingKind::Composite {
                 all_keys: keys.clone(),
@@ -1392,6 +1447,7 @@ impl Broker {
                 client,
                 pid: None,
                 ttl: None,
+                grant_lock_uuid: None,
                 keep_locks_after_death: false,
                 kind: PendingKind::Reader,
             },
@@ -1463,6 +1519,7 @@ impl Broker {
                 client,
                 pid: None,
                 ttl: None,
+                grant_lock_uuid: None,
                 keep_locks_after_death: false,
                 kind: PendingKind::Writer,
             },
@@ -1600,7 +1657,9 @@ impl Broker {
                 }
                 let head = lock.queue.pop_front().expect("just peeked").1;
                 let token = lock.next_fencing_token();
-                let lock_uuid = Uuid::new_v4().to_string();
+                let lock_uuid = head
+                    .grant_lock_uuid
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
                 lock.exclusive_holders.insert(
                     lock_uuid.clone(),
                     ExclusiveHolder {
@@ -1840,6 +1899,7 @@ impl Broker {
                 client: pop.client,
                 pid: pop.pid,
                 ttl: pop.ttl,
+                grant_lock_uuid: None,
                 keep_locks_after_death: pop.keep_locks_after_death,
                 kind: PendingKind::Composite {
                     all_keys,

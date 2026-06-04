@@ -80,10 +80,12 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/target/release/dd-rust-network-mutex /usr/local/bin/dd-rust-network-mutex
+COPY lmx.toml /etc/dd-rust-network-mutex/lmx.toml
 
 ENV LMX_BIND_HOST=0.0.0.0 \
     LMX_TCP_PORT=6970 \
     LMX_HTTP_PORT=6971 \
+    LMX_CONFIG=/etc/dd-rust-network-mutex/lmx.toml \
     LMX_LOG_FORMAT=text \
     RUST_LOG=info,lmx=info
 
