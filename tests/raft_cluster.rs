@@ -4,6 +4,7 @@
 //! load-balancer shape: HTTP requests can land on followers and get proxied to
 //! the elected leader, while commits still require a quorum.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,11 +52,43 @@ impl Drop for TestLb {
     }
 }
 
+struct RegularHttpServer {
+    port: u16,
+    handle: JoinHandle<()>,
+}
+
+impl Drop for RegularHttpServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 async fn pick_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+async fn start_regular_http_server() -> RegularHttpServer {
+    let port = pick_port().await;
+    let config = ServerConfig {
+        tcp_bind: None,
+        uds_path: None,
+        http_bind: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+        auth_token: None,
+        broker: BrokerConfig::default(),
+        tcp_nodelay: true,
+        tcp_quickack: true,
+        status_bind: None,
+        #[cfg(feature = "tls")]
+        tls: None,
+    };
+    let handle = tokio::spawn(async move {
+        let _ = server::run(config).await;
+    });
+    wait_for_http_port(port, "/healthz").await;
+    RegularHttpServer { port, handle }
 }
 
 async fn start_cluster() -> RaftCluster {
@@ -140,6 +173,20 @@ async fn wait_for_http(cluster: &RaftCluster) {
     }
 }
 
+async fn wait_for_http_port(port: u16, path: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if http_get_json(port, path).await.is_some() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for HTTP listener on port {port}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn wait_for_leader(cluster: &RaftCluster) -> usize {
     let nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
     wait_for_leader_among(cluster, &nodes).await
@@ -216,6 +263,26 @@ async fn wait_for_zero_holders_and_waiters_among(cluster: &RaftCluster, nodes: &
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for raft nodes to clear holders/waiters; latest={last:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_zero_holders_and_waiters_on_port(port: u16) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut latest = String::new();
+    loop {
+        if let Some(metrics) = http_get_text(port, "/metrics").await {
+            let holders = metric_value(&metrics, "dd_rust_network_mutex_holders");
+            let waiters = metric_value(&metrics, "dd_rust_network_mutex_waiters");
+            latest = format!("holders={holders:?} waiters={waiters:?}");
+            if holders == Some(0) && waiters == Some(0) {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for backend on port {port} to clear holders/waiters; latest={latest}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -346,6 +413,263 @@ async fn raft_lb_round_robin_survives_leader_failover() {
         reacquire["acquired"], true,
         "LB should route to the surviving Raft quorum after leader failover: {reacquire:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn broker_and_raft_http_contract_match() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let broker = start_regular_http_server().await;
+    assert_http_lock_contract(broker.port, "broker").await;
+
+    let cluster = start_cluster().await;
+    let _leader = wait_for_leader(&cluster).await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    assert_http_lock_contract(lb.port, "raft").await;
+    wait_for_zero_holders_and_waiters(&cluster).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_seeded_lock_model_fuzz() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let cluster = start_cluster().await;
+    let _leader = wait_for_leader(&cluster).await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    run_seeded_http_lock_model(lb.port, 0xB10C_AADE_5EED, 180).await;
+    wait_for_zero_holders_and_waiters(&cluster).await;
+}
+
+async fn assert_http_lock_contract(port: u16, label: &str) {
+    let key = format!("{label}-contract-{}", uuid::Uuid::new_v4());
+    let (status, invalid) = http_post_json(
+        port,
+        "/v1/lock",
+        json!({"key": key, "keys": ["other"], "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "{label} invalid key+keys response: {invalid:?}"
+    );
+    assert!(
+        invalid["error"].as_str().is_some(),
+        "{label} invalid response should include error: {invalid:?}"
+    );
+
+    let (status, acquire) =
+        http_post_json(port, "/v1/lock", json!({"key": key, "ttlMs": 5000})).await;
+    assert_eq!(status, 200, "{label} acquire response: {acquire:?}");
+    assert_eq!(
+        acquire["acquired"], true,
+        "{label} acquire response: {acquire:?}"
+    );
+    assert!(
+        acquire["fencingTokens"][&key].as_u64().is_some(),
+        "{label} acquire should include a fencing token: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+
+    let (status, contended) = http_post_json(
+        port,
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000, "waitMs": 25}),
+    )
+    .await;
+    assert_eq!(status, 200, "{label} contended response: {contended:?}");
+    assert_eq!(
+        contended["acquired"], false,
+        "{label} contended short-poll acquire should time out: {contended:?}"
+    );
+
+    let (status, wrong_release) = http_post_json(
+        port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": "not-the-lock"}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "{label} wrong release response: {wrong_release:?}"
+    );
+    assert_eq!(
+        wrong_release["unlocked"], false,
+        "{label} wrong UUID must not unlock: {wrong_release:?}"
+    );
+
+    let (status, release) = http_post_json(
+        port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(status, 200, "{label} release response: {release:?}");
+    assert_eq!(
+        release["unlocked"], true,
+        "{label} release response: {release:?}"
+    );
+
+    let keys = vec![
+        format!("{label}-composite-a-{}", uuid::Uuid::new_v4()),
+        format!("{label}-composite-b-{}", uuid::Uuid::new_v4()),
+    ];
+    let (status, composite) =
+        http_post_json(port, "/v1/lock", json!({"keys": keys, "ttlMs": 5000})).await;
+    assert_eq!(status, 200, "{label} composite response: {composite:?}");
+    assert_eq!(
+        composite["acquired"], true,
+        "{label} composite response: {composite:?}"
+    );
+    let composite_uuid = composite["lockUuid"].as_str().unwrap().to_string();
+    for key in composite["keys"].as_array().unwrap() {
+        assert!(
+            composite["fencingTokens"][key.as_str().unwrap()]
+                .as_u64()
+                .is_some(),
+            "{label} composite should include fencing token for {key:?}: {composite:?}"
+        );
+    }
+
+    let (status, composite_release) = http_post_json(
+        port,
+        "/v1/unlock",
+        json!({"keys": composite["keys"], "lockUuid": composite_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "{label} composite release response: {composite_release:?}"
+    );
+    assert_eq!(
+        composite_release["unlocked"], true,
+        "{label} composite release response: {composite_release:?}"
+    );
+
+    let force_key = format!("{label}-force-{}", uuid::Uuid::new_v4());
+    let (status, force_acquire) =
+        http_post_json(port, "/v1/lock", json!({"key": force_key, "ttlMs": 5000})).await;
+    assert_eq!(
+        status, 200,
+        "{label} force acquire response: {force_acquire:?}"
+    );
+    assert_eq!(force_acquire["acquired"], true);
+    let (status, forced) =
+        http_post_json(port, "/v1/unlock", json!({"key": force_key, "force": true})).await;
+    assert_eq!(status, 200, "{label} force release response: {forced:?}");
+    assert_eq!(
+        forced["unlocked"], true,
+        "{label} force release response: {forced:?}"
+    );
+
+    wait_for_zero_holders_and_waiters_on_port(port).await;
+}
+
+async fn run_seeded_http_lock_model(port: u16, seed: u64, steps: usize) {
+    let mut rng = seed;
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let mut fencing_watermark: BTreeMap<String, u64> = BTreeMap::new();
+    for step in 0..steps {
+        let key = format!("raft-fuzz-key-{}", next_fuzz(&mut rng) % 7);
+        if let Some(lock_uuid) = held.get(&key).cloned() {
+            match next_fuzz(&mut rng) % 4 {
+                0 => {
+                    let (status, denied) = http_post_json(
+                        port,
+                        "/v1/lock",
+                        json!({"key": key, "ttlMs": 5000, "waitMs": 10}),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "step={step} denied response: {denied:?}");
+                    assert_eq!(
+                        denied["acquired"], false,
+                        "step={step} held key should not double-grant: {denied:?}"
+                    );
+                }
+                1 => {
+                    let (status, wrong_release) = http_post_json(
+                        port,
+                        "/v1/unlock",
+                        json!({"key": key, "lockUuid": "wrong-lock-uuid"}),
+                    )
+                    .await;
+                    assert_eq!(
+                        status, 200,
+                        "step={step} wrong release response: {wrong_release:?}"
+                    );
+                    assert_eq!(
+                        wrong_release["unlocked"], false,
+                        "step={step} wrong UUID must not unlock: {wrong_release:?}"
+                    );
+                }
+                2 => {
+                    let (status, release) = http_post_json(
+                        port,
+                        "/v1/unlock",
+                        json!({"key": key, "lockUuid": lock_uuid}),
+                    )
+                    .await;
+                    assert_eq!(status, 200, "step={step} release response: {release:?}");
+                    assert_eq!(
+                        release["unlocked"], true,
+                        "step={step} release: {release:?}"
+                    );
+                    held.remove(&key);
+                }
+                _ => {
+                    let (status, forced) =
+                        http_post_json(port, "/v1/unlock", json!({"key": key, "force": true}))
+                            .await;
+                    assert_eq!(status, 200, "step={step} force response: {forced:?}");
+                    assert_eq!(forced["unlocked"], true, "step={step} force: {forced:?}");
+                    held.remove(&key);
+                }
+            }
+        } else {
+            let (status, acquire) = http_post_json(
+                port,
+                "/v1/lock",
+                json!({"key": key, "ttlMs": 5000, "waitMs": 25}),
+            )
+            .await;
+            assert_eq!(status, 200, "step={step} acquire response: {acquire:?}");
+            assert_eq!(
+                acquire["acquired"], true,
+                "step={step} unheld key should acquire: {acquire:?}"
+            );
+            let token = acquire["fencingTokens"][&key]
+                .as_u64()
+                .unwrap_or_else(|| panic!("step={step} missing fencing token: {acquire:?}"));
+            if let Some(previous) = fencing_watermark.insert(key.clone(), token) {
+                assert!(
+                    token > previous,
+                    "step={step} fencing token did not increase for {key}: previous={previous} token={token}"
+                );
+            }
+            held.insert(
+                key,
+                acquire["lockUuid"].as_str().expect("lockUuid").to_string(),
+            );
+        }
+    }
+
+    for (key, lock_uuid) in held {
+        let (status, release) = http_post_json(
+            port,
+            "/v1/unlock",
+            json!({"key": key, "lockUuid": lock_uuid}),
+        )
+        .await;
+        assert_eq!(status, 200, "cleanup release response: {release:?}");
+        assert_eq!(
+            release["unlocked"], true,
+            "cleanup release response: {release:?}"
+        );
+    }
+}
+
+fn next_fuzz(state: &mut u64) -> u64 {
+    *state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    *state
 }
 
 async fn http_get_json(port: u16, path: &str) -> Option<Value> {

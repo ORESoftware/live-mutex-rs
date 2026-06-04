@@ -1,12 +1,13 @@
-//! Rough Redis-vs-BrokerRaft lock benchmark.
+//! Rough Redis / Broker / BrokerRaft lock benchmark.
 //!
 //! This intentionally ignores fencing tokens. It measures successful
 //! acquire+release cycles for:
 //! - Redis: SET key token NX PX ttl, then EVAL compare-and-del.
+//! - Broker: POST /v1/lock, then POST /v1/unlock against one regular broker.
 //! - BrokerRaft: POST /v1/lock, then POST /v1/unlock.
 //!
-//! The Raft path uses one short-lived HTTP connection per request, matching
-//! the simple LB-facing API and avoiding extra client dependencies.
+//! The HTTP paths use one short-lived connection per request, matching the
+//! simple LB-facing API and avoiding extra client dependencies.
 
 use std::env;
 use std::sync::Arc;
@@ -23,13 +24,17 @@ const REDIS_UNLOCK_LUA: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
     Redis,
+    Broker,
     Raft,
+    BrokerRaft,
     Both,
+    All,
 }
 
 #[derive(Debug, Clone)]
 struct Config {
     redis_addr: String,
+    broker_addr: String,
     raft_addr: String,
     workers: usize,
     keys: usize,
@@ -77,22 +82,52 @@ enum RedisValue {
 async fn main() {
     let config = Config::from_env();
     println!(
-        "workers={} keys={} duration_ms={} ttl_ms={} redis={} raft={}",
+        "workers={} keys={} duration_ms={} ttl_ms={} redis={} broker={} raft={}",
         config.workers,
         config.keys,
         config.duration.as_millis(),
         config.ttl_ms,
         config.redis_addr,
+        config.broker_addr,
         config.raft_addr
     );
+
+    let mut redis_summary = None;
+    let mut broker_summary = None;
+    let mut raft_summary = None;
 
     if matches!(config.target, Target::Redis | Target::Both) {
         let summary = run_redis(config.clone()).await;
         print_summary("redis", &summary, config.duration);
+        redis_summary = Some(summary);
     }
-    if matches!(config.target, Target::Raft | Target::Both) {
+    if matches!(
+        config.target,
+        Target::Broker | Target::BrokerRaft | Target::All
+    ) {
+        let summary = run_broker(config.clone()).await;
+        print_summary("broker", &summary, config.duration);
+        broker_summary = Some(summary);
+    }
+    if matches!(
+        config.target,
+        Target::Raft | Target::Both | Target::BrokerRaft | Target::All
+    ) {
         let summary = run_raft(config.clone()).await;
         print_summary("raft", &summary, config.duration);
+        raft_summary = Some(summary);
+    }
+    if matches!(config.target, Target::All) {
+        let summary = run_redis(config.clone()).await;
+        print_summary("redis", &summary, config.duration);
+        redis_summary = Some(summary);
+    }
+
+    if let (Some(broker), Some(raft)) = (&broker_summary, &raft_summary) {
+        print_ratio("broker", broker, "raft", raft);
+    }
+    if let (Some(redis), Some(raft)) = (&redis_summary, &raft_summary) {
+        print_ratio("redis", redis, "raft", raft);
     }
 }
 
@@ -103,20 +138,27 @@ impl Config {
             .as_str()
         {
             "redis" => Target::Redis,
+            "broker" => Target::Broker,
             "raft" => Target::Raft,
+            "broker-raft" | "brokervsraft" | "broker_vs_raft" => Target::BrokerRaft,
             "both" => Target::Both,
-            other => panic!("BENCH_TARGET must be redis, raft, or both; got {other:?}"),
+            "all" => Target::All,
+            other => panic!(
+                "BENCH_TARGET must be redis, broker, raft, broker-raft, both, or all; got {other:?}"
+            ),
         };
         let workers = env_parse("BENCH_WORKERS", 8).max(1);
         Self {
             redis_addr: env_string("BENCH_REDIS").unwrap_or_else(|| "127.0.0.1:6379".into()),
+            broker_addr: env_string("BENCH_BROKER").unwrap_or_else(|| "127.0.0.1:6971".into()),
             raft_addr: env_string("BENCH_RAFT").unwrap_or_else(|| "127.0.0.1:6971".into()),
             workers,
             keys: env_parse("BENCH_KEYS", workers * 16).max(1),
             duration: Duration::from_millis(env_parse("BENCH_DURATION_MS", 10_000)),
             ttl_ms: env_parse("BENCH_TTL_MS", 5_000),
             target,
-            auth_token: env_string("BENCH_RAFT_AUTH_TOKEN")
+            auth_token: env_string("BENCH_HTTP_AUTH_TOKEN")
+                .or_else(|| env_string("BENCH_RAFT_AUTH_TOKEN"))
                 .or_else(|| env_string("LMX_LIVE_RAFT_AUTH_TOKEN")),
         }
     }
@@ -199,30 +241,47 @@ async fn redis_lock_cycle(
     }
 }
 
+async fn run_broker(config: Config) -> Summary {
+    let endpoint = config.broker_addr.clone();
+    run_http_target(config, "broker", endpoint).await
+}
+
 async fn run_raft(config: Config) -> Summary {
+    let endpoint = config.raft_addr.clone();
+    run_http_target(config, "raft", endpoint).await
+}
+
+async fn run_http_target(config: Config, name: &'static str, endpoint: String) -> Summary {
     let barrier = Arc::new(Barrier::new(config.workers));
     let deadline = Instant::now() + config.duration;
     let mut handles = Vec::new();
     for worker_id in 0..config.workers {
         let cfg = config.clone();
         let barrier = barrier.clone();
+        let endpoint = endpoint.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            raft_worker(cfg, worker_id, deadline).await
+            http_worker(cfg, name, endpoint, worker_id, deadline).await
         }));
     }
     collect(handles).await
 }
 
-async fn raft_worker(config: Config, worker_id: usize, deadline: Instant) -> WorkerStats {
+async fn http_worker(
+    config: Config,
+    name: &str,
+    endpoint: String,
+    worker_id: usize,
+    deadline: Instant,
+) -> WorkerStats {
     let mut stats = WorkerStats::default();
     let mut seq = 0u64;
     let mut rng = worker_id as u64 + 17;
     while Instant::now() < deadline {
         seq += 1;
-        let key = bench_key("raft", next_key(&mut rng, config.keys));
+        let key = bench_key(name, next_key(&mut rng, config.keys));
         let start = Instant::now();
-        match raft_lock_cycle(&config, &key).await {
+        match http_lock_cycle(&config, &endpoint, &key).await {
             Ok(true) => {
                 stats.ok += 1;
                 stats.latencies_us.push(start.elapsed().as_micros() as u64);
@@ -230,16 +289,16 @@ async fn raft_worker(config: Config, worker_id: usize, deadline: Instant) -> Wor
             Ok(false) => stats.not_acquired += 1,
             Err(err) => {
                 stats.errors += 1;
-                eprintln!("raft worker {worker_id} op {seq} error: {err}");
+                eprintln!("{name} worker {worker_id} op {seq} error: {err}");
             }
         }
     }
     stats
 }
 
-async fn raft_lock_cycle(config: &Config, key: &str) -> Result<bool, String> {
+async fn http_lock_cycle(config: &Config, endpoint: &str, key: &str) -> Result<bool, String> {
     let (_, acquire) = http_json(
-        &config.raft_addr,
+        endpoint,
         "POST",
         "/v1/lock",
         Some(json!({"key": key, "ttlMs": config.ttl_ms})),
@@ -253,7 +312,7 @@ async fn raft_lock_cycle(config: &Config, key: &str) -> Result<bool, String> {
         .as_str()
         .ok_or_else(|| format!("missing lockUuid in acquire response: {acquire:?}"))?;
     let (_, release) = http_json(
-        &config.raft_addr,
+        endpoint,
         "POST",
         "/v1/unlock",
         Some(json!({"key": key, "lockUuid": lock_uuid})),
@@ -301,6 +360,19 @@ fn print_summary(name: &str, summary: &Summary, duration: Duration) {
         latencies.last().copied().unwrap_or(0) as f64 / 1000.0,
         summary.not_acquired,
         summary.errors,
+    );
+}
+
+fn print_ratio(a_name: &str, a: &Summary, b_name: &str, b: &Summary) {
+    if b.ok == 0 {
+        println!("[ratio] {a_name}/{b_name}: unavailable because {b_name} completed 0 ops");
+        return;
+    }
+    println!(
+        "[ratio] {a_name}/{b_name} throughput = {:.2}x ({} / {} successful cycles)",
+        a.ok as f64 / b.ok as f64,
+        a.ok,
+        b.ok
     );
 }
 

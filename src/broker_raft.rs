@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
@@ -24,6 +24,7 @@ use crate::protocol::{Request, Response};
 const LOG_FILE: &str = "raft-log.ndjson";
 const SNAPSHOT_FILE: &str = "raft-snapshot.json";
 const HARD_STATE_FILE: &str = "raft-hard-state.json";
+const DEFAULT_RAFT_RPC_MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BrokerRaftConfig {
@@ -873,8 +874,7 @@ impl BrokerRaft {
     async fn handle_rpc_stream(&self, stream: TcpStream) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-handle-rpc-stream-1");
         let mut reader = TokioBufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes()).await?;
         let rpc: RaftRpc = serde_json::from_str(line.trim())?;
         let response = self.handle_rpc(rpc).await;
         let mut stream = reader.into_inner();
@@ -1471,8 +1471,7 @@ async fn send_rpc(
         stream.flush().await?;
 
         let mut reader = TokioBufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes()).await?;
         let response = serde_json::from_str(line.trim())?;
         Ok::<_, BrokerRaftError>(response)
     };
@@ -1486,6 +1485,72 @@ fn deadline_after(timeout: Duration) -> tokio::time::Instant {
     let now = tokio::time::Instant::now();
     now.checked_add(timeout)
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
+fn raft_rpc_max_frame_bytes() -> usize {
+    crate::routine_id!("ddl-routine-broker-raft-max-frame-bytes-1");
+    std::env::var("LMX_RAFT_MAX_FRAME_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RAFT_RPC_MAX_FRAME_BYTES)
+}
+
+async fn read_raft_frame_bounded<R>(reader: &mut R, max_bytes: usize) -> std::io::Result<String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    crate::routine_id!("ddl-routine-broker-raft-read-frame-bounded-1");
+    let mut buf = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "raft RPC frame ended before any bytes were read",
+                ));
+            }
+            break;
+        }
+        if let Some(idx) = chunk.iter().position(|byte| *byte == b'\n') {
+            let take = idx + 1;
+            if buf.len().saturating_add(take) > max_bytes {
+                reader.consume(take);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("raft RPC frame exceeds {max_bytes} bytes"),
+                ));
+            }
+            buf.extend_from_slice(&chunk[..take]);
+            reader.consume(take);
+            break;
+        }
+
+        let take = chunk.len();
+        if buf.len().saturating_add(take) > max_bytes {
+            reader.consume(take);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("raft RPC frame exceeds {max_bytes} bytes"),
+            ));
+        }
+        buf.extend_from_slice(chunk);
+        reader.consume(take);
+    }
+
+    if buf.ends_with(b"\n") {
+        buf.pop();
+        if buf.ends_with(b"\r") {
+            buf.pop();
+        }
+    }
+    String::from_utf8(buf).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("raft RPC frame is not valid UTF-8: {err}"),
+        )
+    })
 }
 
 async fn wait_for_response(
@@ -1972,5 +2037,129 @@ mod tests {
         assert!(lock_entry.index < unlock_entry.index);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn raft_rpc_frame_reader_rejects_oversized_frames() {
+        let mut bytes = vec![b'a'; 65];
+        bytes.push(b'\n');
+        let mut reader = TokioBufReader::new(&bytes[..]);
+        let err = read_raft_frame_bounded(&mut reader, 64)
+            .await
+            .expect_err("oversized frame must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn raft_rpc_frame_reader_accepts_unterminated_final_frame() {
+        let mut reader = TokioBufReader::new(&b"{\"type\":\"requestVote\"}"[..]);
+        let frame = read_raft_frame_bounded(&mut reader, 1024)
+            .await
+            .expect("unterminated EOF frame");
+        assert_eq!(frame, "{\"type\":\"requestVote\"}");
+    }
+
+    #[test]
+    fn fuzz_log_store_append_replace_and_compact_invariants() {
+        for seed in [
+            0x51D0_5EED_u64,
+            0xCAFE_BABE_u64,
+            0xDEAD_BEEF_u64,
+            0xA11C_EE55_u64,
+        ] {
+            let dir = temp_dir("raft-log-fuzz");
+            let store = RaftLogStore::open(&dir).expect("open store");
+            let mut rng = seed;
+            let mut oracle: Vec<RaftLogEntry> = Vec::new();
+
+            for step in 0..300 {
+                match next_fuzz(&mut rng) % 6 {
+                    0..=2 => {
+                        let term = 1 + (next_fuzz(&mut rng) % 17);
+                        let entry = store.append(term, RaftCommand::Noop).expect("append");
+                        let expected_index = oracle
+                            .last()
+                            .map(|last| last.index + 1)
+                            .or_else(|| {
+                                store
+                                    .latest_snapshot()
+                                    .map(|snapshot| snapshot.last_included_index + 1)
+                            })
+                            .unwrap_or(1);
+                        assert_eq!(entry.index, expected_index, "seed={seed} step={step}");
+                        oracle.push(entry);
+                    }
+                    3 => {
+                        let keep_from = if oracle.is_empty() {
+                            0
+                        } else {
+                            (next_fuzz(&mut rng) as usize) % (oracle.len() + 1)
+                        };
+                        let replacement = oracle[keep_from..].to_vec();
+                        store.replace_all(&replacement).expect("replace");
+                        oracle = replacement;
+                    }
+                    _ => {
+                        if oracle.is_empty() {
+                            continue;
+                        }
+                        let pos = (next_fuzz(&mut rng) as usize) % oracle.len();
+                        let snapshot_entry = oracle[pos].clone();
+                        store
+                            .write_snapshot(
+                                snapshot_entry.index,
+                                snapshot_entry.term,
+                                json!({ "seed": seed, "step": step }),
+                            )
+                            .expect("snapshot");
+                        store
+                            .compact_through(snapshot_entry.index)
+                            .expect("compact through snapshot");
+                        oracle.retain(|entry| entry.index > snapshot_entry.index);
+                    }
+                }
+
+                let actual = store.read_entries().expect("read entries");
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|entry| (entry.index, entry.term))
+                        .collect::<Vec<_>>(),
+                    oracle
+                        .iter()
+                        .map(|entry| (entry.index, entry.term))
+                        .collect::<Vec<_>>(),
+                    "seed={seed} step={step}"
+                );
+                let expected_last = oracle
+                    .last()
+                    .map(|entry| (entry.index, entry.term))
+                    .or_else(|| {
+                        store.latest_snapshot().map(|snapshot| {
+                            (snapshot.last_included_index, snapshot.last_included_term)
+                        })
+                    })
+                    .unwrap_or((0, 0));
+                assert_eq!(
+                    store.last_index(),
+                    expected_last.0,
+                    "seed={seed} step={step}"
+                );
+                assert_eq!(
+                    store.last_term(),
+                    expected_last.1,
+                    "seed={seed} step={step}"
+                );
+            }
+
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    fn next_fuzz(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
     }
 }
