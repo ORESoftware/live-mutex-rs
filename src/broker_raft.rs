@@ -1325,6 +1325,21 @@ impl BrokerRaft {
             return Ok(());
         }
 
+        let metrics = self.broker.metrics();
+        let broker_is_idle =
+            metrics.holders == 0 && metrics.waiters == 0 && metrics.pending_deadlines == 0;
+        if !broker_is_idle {
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                holders = metrics.holders,
+                waiters = metrics.waiters,
+                pending_deadlines = metrics.pending_deadlines,
+                "raft log compaction skipped because broker state is not idle",
+            );
+            return Ok(());
+        }
+
         let compact_through = commit_index.saturating_sub(self.config.trailing_log_entries);
         if compact_through == 0 || compact_through <= latest_snapshot_index {
             self.maintenance.lock().last_snapshot_at = Instant::now();
@@ -1336,10 +1351,9 @@ impl BrokerRaft {
             .find(|entry| entry.index == commit_index)
             .map(|entry| entry.term)
             .unwrap_or(current_term);
-        let metrics = self.broker.metrics();
         let payload = serde_json::json!({
             "nodeId": self.config.node_id,
-            "note": "Broker state restore is not implemented yet; this snapshot gates local log compaction only.",
+            "note": "Idle broker-state snapshot. Log compaction only runs while the applied broker state is idle, so restart restore can safely resume from an empty lock table.",
             "metrics": {
                 "keys": metrics.keys,
                 "holders": metrics.holders,
@@ -1839,6 +1853,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![5]
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_skips_active_broker_state_to_preserve_replay() {
+        let dir = temp_dir("raft-active-state-maintenance");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_max_log_entries = 1;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let entry = raft
+            .log
+            .append(
+                1,
+                RaftCommand::ClientRequest {
+                    client_id: 7,
+                    request: Request::Lock {
+                        uuid: "active-lock-uuid".into(),
+                        key: Some("active-key".into()),
+                        keys: None,
+                        pid: None,
+                        ttl: None,
+                        max: None,
+                        force: false,
+                        retry_count: 0,
+                        keep_locks_after_death: false,
+                        wait: None,
+                    },
+                },
+            )
+            .expect("append active lock");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = entry.index;
+        }
+        raft.apply_committed().expect("apply active lock");
+        assert_eq!(raft.broker.metrics().holders, 1);
+
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("active-state compaction check");
+
+        assert!(raft.log.latest_snapshot().is_none());
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 1);
 
         let _ = fs::remove_dir_all(dir);
     }

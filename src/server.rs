@@ -419,6 +419,7 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
             .route("/readyz", get(healthz))
             .route("/metrics", get(raft_metrics_endpoint))
             .route("/raft/status", get(raft_status))
+            .route("/raft/leaderz", get(raft_leaderz))
             .route("/v1/lock", post(raft_http_acquire))
             .route("/v1/unlock", post(raft_http_release))
             .with_state(app_state);
@@ -851,6 +852,21 @@ async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
         "lastLogIndex": state.raft.log().last_index(),
         "lastLogTerm": state.raft.log().last_term(),
     }))
+}
+
+async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-leaderz-1");
+    let body = serde_json::json!({
+        "nodeId": state.raft.config().node_id,
+        "isLeader": state.raft.is_leader(),
+        "leaderId": state.raft.leader_id(),
+        "leaderAddr": state.raft.leader_addr(),
+    });
+    if state.raft.is_leader() {
+        Json(body).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
 }
 
 async fn raft_http_acquire(

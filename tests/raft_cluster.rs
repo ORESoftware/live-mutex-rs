@@ -245,6 +245,20 @@ async fn raft_http_followers_proxy_acquire_release_after_quorum_commit() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let cluster = start_cluster().await;
     let leader = wait_for_leader(&cluster).await;
+    for (idx, port) in cluster.http_ports.iter().enumerate() {
+        let (status, body) = http_request("GET", *port, "/raft/leaderz", None)
+            .await
+            .expect("leaderz request");
+        let parsed: Value = serde_json::from_str(&body).expect("leaderz JSON");
+        if idx == leader {
+            assert_eq!(status, 200, "leader leaderz body: {parsed:?}");
+            assert_eq!(parsed["isLeader"], true);
+        } else {
+            assert_eq!(status, 503, "follower leaderz body: {parsed:?}");
+            assert_eq!(parsed["isLeader"], false);
+            assert!(parsed["leaderId"].as_str().is_some());
+        }
+    }
     let follower_a = (leader + 1) % 3;
     let follower_b = (leader + 2) % 3;
     let key = format!("raft-key-{}", uuid::Uuid::new_v4());
