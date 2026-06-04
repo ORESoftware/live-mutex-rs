@@ -113,6 +113,13 @@ fn trim_response_frame(buf: &[u8]) -> &[u8] {
     &buf[..end]
 }
 
+fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+    crate::routine_id!("ddl-routine-client-deadline-after-f6K");
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub auth_token: Option<String>,
@@ -487,7 +494,7 @@ impl Client {
         timeout: Duration,
     ) -> Result<LockGuard, ClientError> {
         crate::routine_id!("ddl-routine-rYoW6DP7XrtX17pFyY");
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -762,7 +769,7 @@ impl RwClient {
     ) -> Result<(String, Option<u64>), ClientError> {
         crate::routine_id!("ddl-routine-_VkY3EWAQzWVwMceKa");
         let timeout = self.inner.inner.config.default_request_timeout;
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {

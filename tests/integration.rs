@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use dd_rust_network_mutex::{
-    server, BrokerConfig, Client, ClientConfig, RwClient, ServerConfig,
+    server, BrokerConfig, Client, ClientConfig, LockGuard, RwClient, ServerConfig,
 };
 use tokio::net::TcpListener;
 
@@ -1162,6 +1162,68 @@ async fn release_with_wrong_lock_uuid_is_rejected_over_http() {
         serde_json::Value::Bool(false),
         "wrong-uuid unlock must report unlocked: false; got: {bogus}",
     );
+}
+
+/// A live TCP client cannot release a peer's lock just by learning the
+/// peer's `lock_uuid`. The UUID identifies the holder, but normal
+/// (`force:false`) release still has to come from the owning connection.
+#[tokio::test]
+async fn live_tcp_peer_cannot_release_another_clients_lock_uuid() {
+    let (tcp_port, _) = start_server(true, false).await;
+    let port = tcp_port.unwrap();
+
+    let owner = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+    let peer = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+    let waiter = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
+        .await
+        .unwrap();
+
+    let owner_guard = owner
+        .acquire("tcp-owned-release", Duration::from_millis(60_000))
+        .await
+        .unwrap();
+
+    let pending = tokio::spawn({
+        let waiter = waiter.clone();
+        async move {
+            waiter
+                .acquire("tcp-owned-release", Duration::from_millis(5_000))
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!pending.is_finished(), "waiter must be queued behind owner");
+
+    let forged_guard = LockGuard {
+        keys: owner_guard.keys.clone(),
+        lock_uuid: owner_guard.lock_uuid.clone(),
+        fencing_token: owner_guard.fencing_token,
+        fencing_tokens: owner_guard.fencing_tokens.clone(),
+    };
+    let err = peer
+        .release(&forged_guard)
+        .await
+        .expect_err("peer release with another live client's lock_uuid must fail");
+    assert!(
+        format!("{err}").contains("owned by another live client"),
+        "unexpected peer-release error: {err}"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !pending.is_finished(),
+        "unauthorized peer release must not grant the waiter"
+    );
+
+    owner.release(&owner_guard).await.unwrap();
+    let waiter_guard = pending
+        .await
+        .unwrap()
+        .expect("waiter should acquire after real owner release");
+    waiter.release(&waiter_guard).await.unwrap();
 }
 
 // ---- Auth tests -----------------------------------------------------------

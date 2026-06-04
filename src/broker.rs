@@ -411,7 +411,19 @@ impl BrokerState {
         if ttl.is_zero() {
             return;
         }
-        let deadline = Instant::now() + ttl;
+        let Some(deadline) = Instant::now().checked_add(ttl) else {
+            // A malicious or buggy raw client can send `ttl` values near
+            // `u64::MAX` milliseconds. Treat values outside the platform's
+            // `Instant` range as effectively permanent rather than letting
+            // request data panic the broker task.
+            tracing::warn!(
+                target: "lmx::broker",
+                lock_uuid,
+                ttl_ms = ttl.as_millis(),
+                "ttl is too large for this platform; deadline not scheduled",
+            );
+            return;
+        };
         self.deadline_seq = self.deadline_seq.wrapping_add(1);
         self.deadlines.insert(
             (deadline, self.deadline_seq),
@@ -713,9 +725,17 @@ impl Broker {
                 let target_keys = match (key, keys) {
                     (Some(k), None) => vec![k],
                     (None, Some(ks)) => ks,
-                    (Some(k), Some(mut ks)) => {
-                        ks.push(k);
-                        ks
+                    (Some(_), Some(_)) => {
+                        self.send(
+                            &state,
+                            client,
+                            Response::Error {
+                                uuid,
+                                error: "unlock request must set either `key` or `keys`, not both"
+                                    .into(),
+                            },
+                        );
+                        return;
                     }
                     (None, None) => {
                         self.send(
@@ -1101,12 +1121,31 @@ impl Broker {
         force: bool,
     ) {
         crate::routine_id!("ddl-routine-F6gViY4_MAcAx57bwL");
+        if keys.is_empty() {
+            self.send(
+                state,
+                client,
+                Response::Error {
+                    uuid,
+                    error: "unlock request requires at least one key".into(),
+                },
+            );
+            return;
+        }
+
         let mut total_unlocked = false;
         let mut last_depth: usize = 0;
+        let live_clients: std::collections::HashSet<ClientId> =
+            state.clients.keys().copied().collect();
+        let can_unlock_target =
+            |owner: ClientId| force || owner == client || !live_clients.contains(&owner);
 
         // Three legitimate unlock variants:
         //   * `lock_uuid: Some(_)` + `force: false` — release exactly that
-        //     holder. Wrong uuid is a no-op (`unlocked: false`).
+        //     holder, but only when the holder belongs to this live client.
+        //     Detached holders (HTTP / keep-after-death) have no live owning
+        //     client, so their lock_uuid remains a bearer token.
+        //     Wrong uuid is a no-op (`unlocked: false`).
         //   * `lock_uuid: Some(_)` + `force: true` — release exactly that
         //     holder, but ignore broker-side ownership/identity checks.
         //     If the uuid does not match anyone, this is a "phantom"
@@ -1145,6 +1184,8 @@ impl Broker {
         // lock_uuid) for every holder we evict so we can purge the
         // entries from each owner's `held_lock_uuids`.
         let mut wiped_holder_ownership: Vec<(ClientId, String)> = Vec::new();
+        let mut removed_holder_ownership: Vec<(ClientId, String)> = Vec::new();
+        let mut ownership_denied = false;
 
         for key in &keys {
             let Some(lock) = state.locks.get_mut(key) else {
@@ -1152,16 +1193,51 @@ impl Broker {
             };
             match &target_lock_uuid {
                 Some(target) => {
-                    let removed_exclusive =
-                        lock.exclusive_holders.remove(target).is_some();
-                    let removed_reader = lock.readers.remove(target).is_some();
-                    let removed_writer = lock
+                    let exclusive_owner =
+                        lock.exclusive_holders.get(target).map(|h| h.client);
+                    let removed_exclusive = match exclusive_owner {
+                        Some(owner) if can_unlock_target(owner) => {
+                            lock.exclusive_holders.remove(target);
+                            removed_holder_ownership.push((owner, target.clone()));
+                            true
+                        }
+                        Some(_) => {
+                            ownership_denied = true;
+                            false
+                        }
+                        None => false,
+                    };
+
+                    let reader_owner = lock.readers.get(target).map(|h| h.client);
+                    let removed_reader = match reader_owner {
+                        Some(owner) if can_unlock_target(owner) => {
+                            lock.readers.remove(target);
+                            removed_holder_ownership.push((owner, target.clone()));
+                            true
+                        }
+                        Some(_) => {
+                            ownership_denied = true;
+                            false
+                        }
+                        None => false,
+                    };
+
+                    let writer_owner = lock
                         .writer
                         .as_ref()
-                        .is_some_and(|w| w.lock_uuid == *target);
-                    if removed_writer {
-                        lock.writer = None;
-                    }
+                        .and_then(|w| (w.lock_uuid == *target).then_some(w.client));
+                    let removed_writer = match writer_owner {
+                        Some(owner) if can_unlock_target(owner) => {
+                            lock.writer = None;
+                            removed_holder_ownership.push((owner, target.clone()));
+                            true
+                        }
+                        Some(_) => {
+                            ownership_denied = true;
+                            false
+                        }
+                        None => false,
+                    };
                     if removed_exclusive || removed_reader || removed_writer {
                         total_unlocked = true;
                     }
@@ -1195,10 +1271,12 @@ impl Broker {
         // Drop the holder bookkeeping on every client whose holder we
         // just evicted.
         match &target_lock_uuid {
-            Some(target) => {
+            Some(_) => {
                 if total_unlocked {
-                    if let Some(handle) = state.clients.get_mut(&client) {
-                        handle.held_lock_uuids.remove(target);
+                    for (owner_client, lu) in &removed_holder_ownership {
+                        if let Some(handle) = state.clients.get_mut(owner_client) {
+                            handle.held_lock_uuids.remove(lu);
+                        }
                     }
                 }
             }
@@ -1220,7 +1298,13 @@ impl Broker {
         // is the "phantom" case: surface a structured error so the
         // caller can distinguish a no-op force-unlock from an honest
         // success.
-        let error = if !total_unlocked && force {
+        let error = if !total_unlocked && ownership_denied {
+            target_lock_uuid.as_deref().map(|t| {
+                format!(
+                    "unlock lock_uuid `{t}` is owned by another live client; use force=true to override"
+                )
+            })
+        } else if !total_unlocked && force {
             target_lock_uuid.as_deref().map(|t| {
                 format!(
                     "unlock(force=true) lock_uuid `{t}` did not match any current holder for the requested keys"

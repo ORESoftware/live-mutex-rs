@@ -1709,6 +1709,13 @@ async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumRespo
     }
 }
 
+fn deadline_after(timeout: Duration) -> tokio::time::Instant {
+    crate::routine_id!("ddl-routine-server-deadline-after-Jb7");
+    let now = tokio::time::Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+}
+
 async fn wait_for(
     rx: &mut mpsc::UnboundedReceiver<Response>,
     request_uuid: &str,
@@ -1722,7 +1729,7 @@ async fn wait_for(
     } else {
         wait
     };
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     let mut last_match: Option<Response> = None;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
