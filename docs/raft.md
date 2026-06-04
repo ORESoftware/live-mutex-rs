@@ -26,7 +26,7 @@ stateDiagram-v2
 
   state Leader {
     [*] --> AppendLocal
-    AppendLocal --> Replicate: append client command to local log
+    AppendLocal --> Replicate: serialized leader write lane
     Replicate --> Commit: quorum acknowledges index
     Commit --> Apply: persist commitIndex
     Apply --> Compact: apply to Broker state
@@ -65,6 +65,9 @@ If the load balancer can prefer the leader, it should use
 `GET /raft/leaderz` as the leader-only health check. That removes the proxy
 hop shown above. Correctness does not depend on leader-aware routing, because
 followers proxy writes and the leader still requires quorum before applying.
+The current leader write path is serialized and followers rewrite the full log
+on each append, so this path is intentionally correctness-first rather than
+throughput-optimized.
 
 ## Failover Event Trace
 

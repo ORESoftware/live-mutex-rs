@@ -32,9 +32,9 @@ data_dir = "./data/raft/node-1"
 # A 3-node cluster commits with 2 votes. Add node-4 and node-5 below to run a
 # 5-node cluster, which commits with 3 votes. Quorum is derived from peer count;
 # do not configure it manually.
-heartbeat_interval_ms = 50
-election_timeout_min_ms = 150
-election_timeout_max_ms = 300
+heartbeat_interval_ms = 100
+election_timeout_min_ms = 800
+election_timeout_max_ms = 1600
 
 # Snapshot every 30 minutes by default. Old log entries are compacted only
 # after a durable snapshot includes their log index.

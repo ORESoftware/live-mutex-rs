@@ -311,8 +311,10 @@ is one of:
    serves clients; the passive replica picks up if the leader's
    `Lease` lapses. Fencing tokens reset on failover, so callers
    must be prepared to see the counter restart.
-2. **Replicated state via Raft.** A future capability — see
-   `## High availability` in the readme. Not yet implemented.
+2. **Replicated state via Raft.** BrokerRaft is available as a
+   separate StatefulSet/deployment path; see `## High availability`
+   in the readme and [`docs/raft.md`](raft.md) for the state and
+   sequence diagrams.
 
 In practice, the single-replica + `Recreate` posture has been
 sufficient for our production workloads; the broker restarts in

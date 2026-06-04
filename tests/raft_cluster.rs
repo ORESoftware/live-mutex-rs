@@ -120,9 +120,9 @@ async fn start_cluster() -> RaftCluster {
         raft.bind_addr = Some(format!("127.0.0.1:{}", raft_ports[idx]).parse().unwrap());
         raft.advertise_addr = Some(format!("127.0.0.1:{}", raft_ports[idx]));
         raft.data_dir = data_dir.join(&node_id);
-        raft.heartbeat_interval = Duration::from_millis(25);
-        raft.election_timeout_min = Duration::from_millis(120);
-        raft.election_timeout_max = Duration::from_millis(260);
+        raft.heartbeat_interval = Duration::from_millis(50);
+        raft.election_timeout_min = Duration::from_millis(600);
+        raft.election_timeout_max = Duration::from_millis(1_200);
         raft.peers = peers.clone();
         raft.broker = BrokerConfig::default();
 

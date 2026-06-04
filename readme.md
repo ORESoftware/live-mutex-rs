@@ -120,29 +120,38 @@ theirs    total=  76411  throughput=   38206 ops/s  avg=   0.21ms  max=   3.69ms
 (Sample numbers from a single laptop M-class run; absolute throughput is
 hardware-dependent, but the ratio is a useful first signal.)
 
-### Redis vs. BrokerRaft benchmark
+### Redis / Broker / BrokerRaft benchmark
 
 `examples/redis_vs_raft_bench.rs` provides a rough acquire/release comparison
-between Redis locks and the BrokerRaft HTTP/LB path. It intentionally ignores
-fencing tokens: Redis uses `SET key token NX PX ttl` plus a compare-and-delete
-Lua unlock, while BrokerRaft uses `/v1/lock` and `/v1/unlock` and ignores the
-returned fencing-token fields.
+between Redis locks, the regular Broker HTTP path, and the BrokerRaft HTTP/LB
+path. It intentionally ignores fencing tokens: Redis uses
+`SET key token NX PX ttl` plus a compare-and-delete Lua unlock, while the Broker
+targets use `/v1/lock` and `/v1/unlock` and ignore the returned
+fencing-token fields.
 
 ```bash
-# Redis on 127.0.0.1:6379 and a BrokerRaft LB/service on 127.0.0.1:6971.
+# Redis on 127.0.0.1:6379, Broker HTTP on 127.0.0.1:6971,
+# and BrokerRaft LB/service on 127.0.0.1:6972.
 BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 \
+  BENCH_TARGET=all BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \
   cargo run --release --example redis_vs_raft_bench --no-default-features
 
 # Run only one side.
 BENCH_TARGET=redis cargo run --release --example redis_vs_raft_bench --no-default-features
-BENCH_TARGET=raft BENCH_RAFT=127.0.0.1:6971 \
+BENCH_TARGET=broker BENCH_BROKER=127.0.0.1:6971 \
+  cargo run --release --example redis_vs_raft_bench --no-default-features
+BENCH_TARGET=raft BENCH_RAFT=127.0.0.1:6972 \
+  cargo run --release --example redis_vs_raft_bench --no-default-features
+
+# Directly compare regular Broker and BrokerRaft.
+BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \
   cargo run --release --example redis_vs_raft_bench --no-default-features
 ```
 
-The Raft client opens one short-lived HTTP connection per request, which matches
-the simple LB-facing API but means the number is not a pure consensus-cost
-measurement. It is useful for the practical “what does the exposed lock service
-cost?” comparison.
+Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. The HTTP clients
+open one short-lived connection per request, which matches the simple LB-facing
+API but means the number is not a pure consensus-cost measurement. It is useful
+for the practical “what does the exposed lock service cost?” comparison.
 
 ## Wire protocol (TCP / UDS)
 
@@ -236,6 +245,7 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_MAX_FRAME_BYTES`  | `1048576`        | Hard cap for one TCP/UDS JSONL frame before the broker drops the connection.                              |
 | `LMX_FRAME_YIELD_EVERY` | `1024`          | Yield cooperatively after this many inbound TCP/UDS frames while draining a large already-buffered burst. |
 | `LMX_MAX_RESPONSE_FRAME_BYTES` | `1048576` | Rust client-side cap for one broker response frame. Falls back to `LMX_MAX_FRAME_BYTES` if unset.         |
+| `LMX_RAFT_MAX_FRAME_BYTES` | `134217728` | Hard cap for one Raft peer RPC JSONL frame before the peer connection is rejected.                         |
 | `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
 | `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
 | `LMX_TCP_NODELAY`       | `true`           | Apply `TCP_NODELAY` on broker-accepted sockets. Experiment from `live-mutex#22`.                 |
@@ -403,17 +413,17 @@ The repo root ships two multi-stage Dockerfiles (build with
 
 ```bash
 # Build (linux/amd64 by default; pass --platform for cross-arch).
-docker build -t oresoftware/live-mutex-rs:0.1.123 .
-docker build -f Dockerfile.raft -t oresoftware/live-mutex-rs-raft:0.1.123 .
+docker build -t oresoftware/live-mutex-rs:0.1.127 .
+docker build -f Dockerfile.raft -t oresoftware/live-mutex-rs-raft:0.1.127 .
 
 # Run (TCP 6970 + HTTP 6971 — see Environment variables for everything).
 docker run --rm -p 6970:6970 -p 6971:6971 \
-    oresoftware/live-mutex-rs:0.1.123
+    oresoftware/live-mutex-rs:0.1.127
 
 # Run BrokerRaft HTTP + Raft RPC. For real clusters, override the node id and
 # peer DNS with env/config per pod.
 docker run --rm -p 6971:6971 -p 7980:7980 \
-    oresoftware/live-mutex-rs-raft:0.1.123
+    oresoftware/live-mutex-rs-raft:0.1.127
 ```
 
 The published image at
@@ -428,6 +438,9 @@ built-in defaults, `lmx.toml`, or environment variables:
 `cargo build --release` plus the config surface above is enough.
 
 ### High availability
+
+See [`docs/raft.md`](docs/raft.md) for the state diagram, lock-commit sequence,
+failover event trace, and compaction rule.
 
 BrokerRaft uses a peer-list driven quorum: 3 nodes commit with 2 votes, and 5
 nodes commit with 3. One leader orders requests, but the leader cannot safely
@@ -444,9 +457,12 @@ log must live on the Raft nodes themselves; LB logs are not part of consensus
 recovery.
 
 Current BrokerRaft limitations: the cluster-facing API is HTTP-only and log
-replication sends the full local log on each append/heartbeat. Raft hard state
-(`currentTerm` / `votedFor` / `commitIndex`) is persisted and committed log
-entries still present on disk are replayed on startup. Old log entries are
+replication sends the full local log on each append/heartbeat. The leader write
+path is intentionally serialized, so the current implementation is much slower
+than the regular Broker under concurrent HTTP load; the next performance step
+is incremental log replication instead of whole-log follower rewrites. Raft hard
+state (`currentTerm` / `votedFor` / `commitIndex`) is persisted and committed
+log entries still present on disk are replayed on startup. Old log entries are
 compacted only after they are committed, applied, and covered by a durable
 snapshot; until full broker-state snapshot restore exists, compaction is
 conservative and only removes old log entries while the applied broker state is

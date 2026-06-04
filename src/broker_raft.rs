@@ -61,9 +61,9 @@ impl Default for BrokerRaftConfig {
             bind_addr: Some("127.0.0.1:7980".parse().expect("valid default addr")),
             advertise_addr: None,
             data_dir: PathBuf::from("./data/raft/node-1"),
-            heartbeat_interval: Duration::from_millis(50),
-            election_timeout_min: Duration::from_millis(150),
-            election_timeout_max: Duration::from_millis(300),
+            heartbeat_interval: Duration::from_millis(100),
+            election_timeout_min: Duration::from_millis(800),
+            election_timeout_max: Duration::from_millis(1_600),
             snapshot_interval: Duration::from_secs(30 * 60),
             snapshot_max_log_entries: 100_000,
             snapshot_max_log_bytes: 64 * 1024 * 1024,
@@ -393,11 +393,13 @@ impl RaftLogStore {
 
     pub fn read_entries(&self) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-read-entries-1");
+        let _state = self.state.lock();
         read_log_entries(&self.log_path)
     }
 
     pub fn log_len_bytes(&self) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-log-len-bytes-1");
+        let _state = self.state.lock();
         match fs::metadata(&self.log_path) {
             Ok(metadata) => Ok(metadata.len()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
@@ -407,11 +409,13 @@ impl RaftLogStore {
 
     fn read_hard_state(&self) -> Result<RaftHardState, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-read-hard-state-1");
+        let _state = self.state.lock();
         read_hard_state(&self.hard_state_path)
     }
 
     fn write_hard_state(&self, state: &RaftHardState) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-write-hard-state-1");
+        let _log_state = self.state.lock();
         let tmp = self.hard_state_path.with_extension("json.tmp");
         {
             let mut file = File::create(&tmp)?;
@@ -426,9 +430,9 @@ impl RaftLogStore {
 
     pub fn replace_all(&self, entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replace-all-1");
+        let mut state = self.state.lock();
         rewrite_log(&self.log_path, entries)?;
         sync_dir(&self.data_dir)?;
-        let mut state = self.state.lock();
         if let Some(last) = entries.last() {
             state.last_index = last.index;
             state.last_term = last.term;
@@ -449,6 +453,7 @@ impl RaftLogStore {
         payload: serde_json::Value,
     ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-write-snapshot-1");
+        let mut state = self.state.lock();
         let metadata = RaftSnapshotMetadata {
             last_included_index,
             last_included_term,
@@ -468,7 +473,7 @@ impl RaftLogStore {
         fs::rename(&tmp, &self.snapshot_path)?;
         sync_dir(&self.data_dir)?;
 
-        self.state.lock().latest_snapshot = Some(metadata.clone());
+        state.latest_snapshot = Some(metadata.clone());
         Ok(metadata)
     }
 
@@ -483,9 +488,8 @@ impl RaftLogStore {
         through_index: u64,
     ) -> Result<RaftCompactionReport, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-compact-through-1");
-        let snapshot_index = self
-            .state
-            .lock()
+        let mut state = self.state.lock();
+        let snapshot_index = state
             .latest_snapshot
             .as_ref()
             .map(|s| s.last_included_index)
@@ -507,7 +511,6 @@ impl RaftLogStore {
         rewrite_log(&self.log_path, &retained)?;
         sync_dir(&self.data_dir)?;
 
-        let mut state = self.state.lock();
         if let Some(last) = retained.last() {
             state.last_index = last.index;
             state.last_term = last.term;
@@ -534,6 +537,7 @@ pub struct BrokerRaft {
     log: Arc<RaftLogStore>,
     runtime: Arc<Mutex<RaftRuntimeState>>,
     maintenance: Arc<Mutex<RaftMaintenanceState>>,
+    commit_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BrokerRaft {
@@ -579,6 +583,7 @@ impl BrokerRaft {
             maintenance: Arc::new(Mutex::new(RaftMaintenanceState {
                 last_snapshot_at: now,
             })),
+            commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             config,
             log,
         };
@@ -742,6 +747,13 @@ impl BrokerRaft {
                 leader_addr: self.leader_addr(),
             });
         }
+        let _commit_guard = self.commit_lock.lock().await;
+        if !self.is_leader() {
+            return Err(BrokerRaftError::NotLeader {
+                leader_id: self.leader_id(),
+                leader_addr: self.leader_addr(),
+            });
+        }
         let term = self.runtime.lock().current_term;
         let entry = self.log.append(
             term,
@@ -773,6 +785,13 @@ impl BrokerRaft {
 
     pub async fn drop_client(&self, client: ClientId) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-drop-client-1");
+        if !self.is_leader() {
+            return Err(BrokerRaftError::NotLeader {
+                leader_id: self.leader_id(),
+                leader_addr: self.leader_addr(),
+            });
+        }
+        let _commit_guard = self.commit_lock.lock().await;
         if !self.is_leader() {
             return Err(BrokerRaftError::NotLeader {
                 leader_id: self.leader_id(),
@@ -1066,7 +1085,9 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-election-loop-1");
         loop {
             if self.is_leader() {
-                let _ = self.replicate_log_once().await;
+                if let Ok(_commit_guard) = self.commit_lock.try_lock() {
+                    let _ = self.replicate_log_once().await;
+                }
                 tokio::time::sleep(self.config.heartbeat_interval).await;
                 continue;
             }
@@ -2057,6 +2078,80 @@ mod tests {
             .await
             .expect("unterminated EOF frame");
         assert_eq!(frame, "{\"type\":\"requestVote\"}");
+    }
+
+    #[test]
+    fn log_store_serializes_concurrent_disk_operations() {
+        let dir = temp_dir("raft-log-concurrent");
+        let store = Arc::new(RaftLogStore::open(&dir).expect("open store"));
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+
+        for writer_id in 0..2 {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..250 {
+                    store
+                        .append(1 + writer_id, RaftCommand::Noop)
+                        .expect("append while concurrent readers run");
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for _ in 0..500 {
+                    let entries = store.read_entries().expect("read concurrent log");
+                    assert!(
+                        entries.windows(2).all(|pair| pair[0].index < pair[1].index),
+                        "log indexes must stay strictly ordered",
+                    );
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                for step in 0..120 {
+                    let entries = store.read_entries().expect("read for compaction");
+                    if let Some(entry) = entries.get(entries.len().saturating_sub(1) / 2) {
+                        store
+                            .write_snapshot(
+                                entry.index,
+                                entry.term,
+                                json!({ "step": step, "kind": "concurrent-test" }),
+                            )
+                            .expect("snapshot while concurrent readers run");
+                        store
+                            .compact_through(entry.index)
+                            .expect("compact while concurrent readers run");
+                    }
+                    std::thread::yield_now();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+
+        let entries = store.read_entries().expect("final read");
+        assert!(
+            entries.windows(2).all(|pair| pair[0].index < pair[1].index),
+            "final log indexes must stay strictly ordered",
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
