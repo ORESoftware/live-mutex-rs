@@ -279,14 +279,9 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                         let auth = auth_c.clone();
                         let metrics_inner = metrics_c.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_stream(
-                                sock,
-                                broker,
-                                auth,
-                                metrics_inner,
-                                AfterRead::None,
-                            )
-                            .await
+                            if let Err(err) =
+                                handle_stream(sock, broker, auth, metrics_inner, AfterRead::None)
+                                    .await
                             {
                                 warn!(target: "lmx::uds", error=%err, "client errored");
                             }
@@ -784,8 +779,7 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_owned);
-    custom.as_deref() == Some(expected.as_str())
-        || bearer.as_deref() == Some(expected.as_str())
+    custom.as_deref() == Some(expected.as_str()) || bearer.as_deref() == Some(expected.as_str())
 }
 
 /// `true` when the inbound request looks like it came from HTMX. We
@@ -1012,10 +1006,7 @@ async fn admin_log_level_post(headers: HeaderMap, body: axum::body::Bytes) -> im
             if htmx {
                 html_snippet(
                     StatusCode::OK,
-                    format!(
-                        "log-level: <strong>{}</strong>",
-                        html_escape_min(&applied)
-                    ),
+                    format!("log-level: <strong>{}</strong>", html_escape_min(&applied)),
                 )
             } else {
                 Json(serde_json::json!({
@@ -1056,10 +1047,7 @@ struct TcpToggleRequest {
 
 /// `GET /admin/tcp` — return the current TCP socket-tuning flags
 /// (live values, not the long-stale `ServerConfig` snapshot).
-async fn admin_tcp_get(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn admin_tcp_get(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-admin-tcp-get-Dp8");
     if !admin_authorized(&headers) {
         return (
@@ -1154,8 +1142,16 @@ async fn admin_tcp_post(
         }
     }
     if htmx {
-        let nodelay_str = if state.tcp_flags.nodelay() { "on" } else { "off" };
-        let quickack_str = if state.tcp_flags.quickack() { "on" } else { "off" };
+        let nodelay_str = if state.tcp_flags.nodelay() {
+            "on"
+        } else {
+            "off"
+        };
+        let quickack_str = if state.tcp_flags.quickack() {
+            "on"
+        } else {
+            "off"
+        };
         let warn_html = warning
             .map(|w| format!(" <em>({})</em>", html_escape_min(w)))
             .unwrap_or_default();
@@ -1191,7 +1187,10 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     let body = state.metrics.render(&state.broker);
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         body,
     )
 }
@@ -1286,7 +1285,10 @@ async fn metrics_endpoint_status(State(state): State<StatusAppState>) -> impl In
     let body = state.metrics.render(&state.broker);
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
         body,
     )
 }
@@ -1470,9 +1472,9 @@ async fn http_release(
     )
     .await;
     match outcome {
-        Some(Response::Unlock {
-            keys, unlocked, ..
-        }) => Json(ReleaseResponse { unlocked, keys }).into_response(),
+        Some(Response::Unlock { keys, unlocked, .. }) => {
+            Json(ReleaseResponse { unlocked, keys }).into_response()
+        }
         Some(Response::Error { error, .. }) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"unlocked": false, "error": error})),

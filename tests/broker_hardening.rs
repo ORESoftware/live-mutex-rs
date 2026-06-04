@@ -140,33 +140,15 @@ fn h1_force_lock_jumps_to_head_of_queue() {
     let _ = drain(&mut a_rx);
 
     let urgent_msgs = drain(&mut urgent_rx);
-    let urgent_granted = urgent_msgs.iter().any(|m| {
-        matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )
-    });
-    let b_granted = drain(&mut b_rx).iter().any(|m| {
-        matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )
-    });
-    let c_granted = drain(&mut c_rx).iter().any(|m| {
-        matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )
-    });
+    let urgent_granted = urgent_msgs
+        .iter()
+        .any(|m| matches!(m, Response::Lock { acquired: true, .. }));
+    let b_granted = drain(&mut b_rx)
+        .iter()
+        .any(|m| matches!(m, Response::Lock { acquired: true, .. }));
+    let c_granted = drain(&mut c_rx)
+        .iter()
+        .any(|m| matches!(m, Response::Lock { acquired: true, .. }));
     assert!(
         urgent_granted,
         "urgent (force) client should have jumped the queue; got {urgent_msgs:?}"
@@ -241,13 +223,9 @@ fn h2_drop_client_does_not_disturb_unrelated_keys() {
     // Waiter on k_d should now be promoted to holder.
     let waiter_msgs = drain(&mut waiter_rx);
     assert!(
-        waiter_msgs.iter().any(|m| matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )),
+        waiter_msgs
+            .iter()
+            .any(|m| matches!(m, Response::Lock { acquired: true, .. })),
         "waiter on k_d should be promoted after drop_client(d); got {waiter_msgs:?}"
     );
 

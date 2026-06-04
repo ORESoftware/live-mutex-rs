@@ -72,12 +72,18 @@ async fn tcp_two_clients_serialize_on_one_key() {
         .await
         .unwrap();
 
-    let g1 = a.acquire("contended", Duration::from_millis(2000)).await.unwrap();
+    let g1 = a
+        .acquire("contended", Duration::from_millis(2000))
+        .await
+        .unwrap();
     let token_1 = g1.fencing_token.unwrap();
 
     let b_clone = b.clone();
-    let acquire_b =
-        tokio::spawn(async move { b_clone.acquire("contended", Duration::from_millis(2000)).await });
+    let acquire_b = tokio::spawn(async move {
+        b_clone
+            .acquire("contended", Duration::from_millis(2000))
+            .await
+    });
 
     // B should still be queued while A holds the lock.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -86,7 +92,10 @@ async fn tcp_two_clients_serialize_on_one_key() {
     a.release(&g1).await.unwrap();
     let g2 = acquire_b.await.unwrap().unwrap();
     let token_2 = g2.fencing_token.unwrap();
-    assert!(token_2 > token_1, "fencing token must increase across handoff");
+    assert!(
+        token_2 > token_1,
+        "fencing token must increase across handoff"
+    );
     b.release(&g2).await.unwrap();
 }
 
@@ -129,7 +138,10 @@ async fn tcp_rw_locks_serialise_writers_and_let_readers_share() {
 
     read_a.release().await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!write_handle.is_finished(), "writer must wait on remaining reader");
+    assert!(
+        !write_handle.is_finished(),
+        "writer must wait on remaining reader"
+    );
     read_b.release().await.unwrap();
 
     let write_guard = write_handle.await.unwrap().unwrap();
@@ -287,7 +299,10 @@ async fn tcp_works_with_nodelay_quickack_enabled() {
     // Several round-trips so we exercise the per-read setsockopt repeatedly.
     for i in 0..10 {
         let key = format!("tuning-on-{i}");
-        let guard = client.acquire(&key, Duration::from_millis(2000)).await.unwrap();
+        let guard = client
+            .acquire(&key, Duration::from_millis(2000))
+            .await
+            .unwrap();
         client.release(&guard).await.unwrap();
     }
 }
@@ -333,9 +348,15 @@ async fn semaphore_three_holders_coexist_then_fourth_unblocks_on_release() {
         guards.push(g);
     }
     // Fencing tokens must be unique.
-    let tokens: Vec<u64> = guards.iter().map(|g| g.fencing_token.unwrap_or(0)).collect();
+    let tokens: Vec<u64> = guards
+        .iter()
+        .map(|g| g.fencing_token.unwrap_or(0))
+        .collect();
     assert_eq!(
-        tokens.iter().collect::<std::collections::HashSet<_>>().len(),
+        tokens
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
         3,
         "each semaphore slot must mint a distinct fencing token; got {tokens:?}"
     );
@@ -505,10 +526,7 @@ async fn raw_tcp_max_zero_rejected_with_error_and_no_side_effect() {
         let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
         if v.get("uuid").and_then(|u| u.as_str()) == Some("r") {
             assert_eq!(v["acquired"], serde_json::Value::Bool(false));
-            found_error = v
-                .get("error")
-                .and_then(|e| e.as_str())
-                .map(str::to_owned);
+            found_error = v.get("error").and_then(|e| e.as_str()).map(str::to_owned);
             break;
         }
     }
@@ -571,7 +589,9 @@ async fn http_max_zero_returns_400_with_error_then_normal_acquire_works() {
     // millis since epoch (see `LockState::new`), so the first grant on
     // a fresh key is roughly the wall clock — not literally 1. Just
     // assert it's present and plausibly recent.
-    let token = g.fencing_token.expect("first grant must include a fencing token");
+    let token = g
+        .fencing_token
+        .expect("first grant must include a fencing token");
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -789,7 +809,10 @@ async fn n_plus_one_race_grants_exactly_n_then_queues_one() {
         CAP + 1,
         grants.len(),
     );
-    assert_eq!(timeouts, 1, "exactly one client should have queued past the timeout");
+    assert_eq!(
+        timeouts, 1,
+        "exactly one client should have queued past the timeout"
+    );
 
     // All winners have unique fencing tokens.
     let tokens: std::collections::HashSet<u64> = grants
@@ -881,8 +904,7 @@ async fn composite_lock_stress_50_clients_overlapping_3_key_windows() {
 
     let high_water: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
         std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-    let violations =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let violations = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let mut handles = Vec::new();
     for client_idx in 0..N_CLIENTS {
@@ -971,7 +993,10 @@ async fn composite_and_single_key_mix_under_contention() {
                     let k0 = format!("mix-key-{:03}", client_idx % 8);
                     let k1 = format!("mix-key-{:03}", (client_idx + 1) % 8);
                     let g = c
-                        .acquire_composite(&[k0.as_str(), k1.as_str()], Duration::from_millis(10_000))
+                        .acquire_composite(
+                            &[k0.as_str(), k1.as_str()],
+                            Duration::from_millis(10_000),
+                        )
                         .await
                         .unwrap();
                     tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1013,8 +1038,14 @@ async fn composite_partial_grant_then_disconnect_releases_held_keys() {
         .await
         .unwrap();
 
-    let g_a = blocker_a.acquire("pa", Duration::from_millis(60_000)).await.unwrap();
-    let g_b = blocker_b.acquire("pb", Duration::from_millis(60_000)).await.unwrap();
+    let g_a = blocker_a
+        .acquire("pa", Duration::from_millis(60_000))
+        .await
+        .unwrap();
+    let g_b = blocker_b
+        .acquire("pb", Duration::from_millis(60_000))
+        .await
+        .unwrap();
 
     let composite_client = Client::connect_tcp(("127.0.0.1", port), ClientConfig::default())
         .await
@@ -1132,9 +1163,16 @@ async fn force_unlock_grants_the_next_waiter_end_to_end() {
         serde_json::json!({"key": "breakme", "force": true}),
     )
     .await;
-    assert_eq!(resp["unlocked"], serde_json::Value::Bool(true), "got: {resp}");
+    assert_eq!(
+        resp["unlocked"],
+        serde_json::Value::Bool(true),
+        "got: {resp}"
+    );
 
-    let g_b = pending.await.unwrap().expect("B should win after force-unlock");
+    let g_b = pending
+        .await
+        .unwrap()
+        .expect("B should win after force-unlock");
     b.release(&g_b).await.unwrap();
 }
 
@@ -1334,7 +1372,10 @@ async fn http_api_enforces_auth_with_either_header_form() {
         r#"{"key":"b","ttlMs":1000}"#,
     )
     .await;
-    assert!(bearer_ok.starts_with("HTTP/1.1 200"), "got: {bearer_ok:.120}");
+    assert!(
+        bearer_ok.starts_with("HTTP/1.1 200"),
+        "got: {bearer_ok:.120}"
+    );
 
     // X-LMX-Auth with the right token → 200 too.
     let custom_ok = post(
@@ -1343,7 +1384,10 @@ async fn http_api_enforces_auth_with_either_header_form() {
         r#"{"key":"c","ttlMs":1000}"#,
     )
     .await;
-    assert!(custom_ok.starts_with("HTTP/1.1 200"), "got: {custom_ok:.120}");
+    assert!(
+        custom_ok.starts_with("HTTP/1.1 200"),
+        "got: {custom_ok:.120}"
+    );
 }
 
 // ---- HTTP API validation -------------------------------------------------
@@ -1418,7 +1462,10 @@ async fn http_long_poll_grants_when_holder_releases() {
         .await
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!pending.is_finished(), "long-poll must keep the socket open");
+    assert!(
+        !pending.is_finished(),
+        "long-poll must keep the socket open"
+    );
 
     // Release: long-poll wakes up.
     a.release(&g_a).await.unwrap();
@@ -1494,9 +1541,7 @@ async fn exclusive_lock_blocks_register_read_until_release() {
         .unwrap();
     let pending = tokio::spawn({
         let r = r.clone();
-        async move {
-            tokio::time::timeout(Duration::from_millis(2000), r.acquire_read("rw-mix")).await
-        }
+        async move { tokio::time::timeout(Duration::from_millis(2000), r.acquire_read("rw-mix")).await }
     });
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(
@@ -1587,11 +1632,8 @@ async fn admin_otel_toggle_round_trip() {
 
     // Snapshot whatever the kill-switch happens to be before the test —
     // other tests run in parallel and may have left it on or off.
-    let before = http_get_json_with_headers(
-        &url_get,
-        &[("x-admin-token", "all-dogs-go-to-heaven")],
-    )
-    .await;
+    let before =
+        http_get_json_with_headers(&url_get, &[("x-admin-token", "all-dogs-go-to-heaven")]).await;
     assert!(before["enabled"].is_boolean());
     let was = before["enabled"].as_bool().unwrap();
 
@@ -1615,11 +1657,8 @@ async fn admin_otel_toggle_round_trip() {
     assert_eq!(post_body["enabled"], serde_json::Value::Bool(next));
 
     // Read-back via GET.
-    let after = http_get_json_with_headers(
-        &url_get,
-        &[("x-admin-token", "all-dogs-go-to-heaven")],
-    )
-    .await;
+    let after =
+        http_get_json_with_headers(&url_get, &[("x-admin-token", "all-dogs-go-to-heaven")]).await;
     assert_eq!(after["enabled"], serde_json::Value::Bool(next));
 
     // Confirm the in-process accessor agrees with the HTTP response.

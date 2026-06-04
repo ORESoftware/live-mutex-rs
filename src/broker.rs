@@ -643,7 +643,9 @@ impl Broker {
                 // their request was malformed. Callers who genuinely
                 // want "leave the cap as-is" should omit the field.
                 if matches!(max, Some(0)) {
-                    let err = "`max` must be >= 1; omit the field to keep the existing concurrency level".to_string();
+                    let err =
+                        "`max` must be >= 1; omit the field to keep the existing concurrency level"
+                            .to_string();
                     match (&key, &keys) {
                         (_, Some(_)) => self.send(
                             &state,
@@ -857,7 +859,13 @@ impl Broker {
             let queue_depth = lock.queue.len();
             state.observe_fencing_token(token);
             state.maybe_mark_idle(&key);
-            self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Exclusive);
+            self.track_holder(
+                state,
+                client,
+                &lock_uuid,
+                std::slice::from_ref(&key),
+                RwHoldKind::Exclusive,
+            );
             // Single shared deadline index — see upstream live-mutex#13.
             state.schedule_deadline(
                 ttl,
@@ -980,7 +988,9 @@ impl Broker {
             state
                 .locks
                 .get(k)
-                .map(|s| s.writer.is_none() && s.readers.is_empty() && s.exclusive_holders.is_empty())
+                .map(|s| {
+                    s.writer.is_none() && s.readers.is_empty() && s.exclusive_holders.is_empty()
+                })
                 .unwrap_or(true)
         });
 
@@ -1193,8 +1203,7 @@ impl Broker {
             };
             match &target_lock_uuid {
                 Some(target) => {
-                    let exclusive_owner =
-                        lock.exclusive_holders.get(target).map(|h| h.client);
+                    let exclusive_owner = lock.exclusive_holders.get(target).map(|h| h.client);
                     let removed_exclusive = match exclusive_owner {
                         Some(owner) if can_unlock_target(owner) => {
                             lock.exclusive_holders.remove(target);
@@ -1338,10 +1347,7 @@ impl Broker {
     ) {
         crate::routine_id!("ddl-routine-20EN0HnEEFCThg4PVw");
         let lock = state.lock_or_default(&key);
-        if lock.writer.is_none()
-            && lock.exclusive_holders.is_empty()
-            && lock.queue.is_empty()
-        {
+        if lock.writer.is_none() && lock.exclusive_holders.is_empty() && lock.queue.is_empty() {
             let token = lock.next_fencing_token();
             let lock_uuid = Uuid::new_v4().to_string();
             lock.readers.insert(
@@ -1355,7 +1361,13 @@ impl Broker {
             let readers = lock.readers.len() as u32;
             state.observe_fencing_token(token);
             state.maybe_mark_idle(&key);
-            self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Read);
+            self.track_holder(
+                state,
+                client,
+                &lock_uuid,
+                std::slice::from_ref(&key),
+                RwHoldKind::Read,
+            );
             self.send(
                 state,
                 client,
@@ -1422,7 +1434,13 @@ impl Broker {
             });
             state.observe_fencing_token(token);
             state.maybe_mark_idle(&key);
-            self.track_holder(state, client, &lock_uuid, std::slice::from_ref(&key), RwHoldKind::Write);
+            self.track_holder(
+                state,
+                client,
+                &lock_uuid,
+                std::slice::from_ref(&key),
+                RwHoldKind::Write,
+            );
             self.send(
                 state,
                 client,
@@ -1986,9 +2004,7 @@ impl Broker {
                     max: lock.max,
                 }
             })
-            .filter(|s| {
-                s.exclusive_holders + s.readers + s.writers + s.waiters > 0
-            })
+            .filter(|s| s.exclusive_holders + s.readers + s.writers + s.waiters > 0)
             .collect();
         snapshots.sort_by(|a, b| {
             let a_score = a.exclusive_holders + a.readers + a.writers + a.waiters;
@@ -2015,14 +2031,10 @@ impl Broker {
         // collect the keys first to avoid holding a borrow on
         // `state.deadlines` while we mutate `state.locks`.
         let cutoff = (now, u64::MAX);
-        let expired_keys: Vec<(Instant, u64)> = state
-            .deadlines
-            .range(..=cutoff)
-            .map(|(k, _)| *k)
-            .collect();
+        let expired_keys: Vec<(Instant, u64)> =
+            state.deadlines.range(..=cutoff).map(|(k, _)| *k).collect();
 
-        let mut evicted_keys: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut evicted_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut evicted_count: usize = 0;
 
         for k in expired_keys {
@@ -2039,9 +2051,7 @@ impl Broker {
                     .locks
                     .get(k)
                     .map(|s| match entry.kind {
-                        RwHoldKind::Exclusive => {
-                            s.exclusive_holders.contains_key(&entry.lock_uuid)
-                        }
+                        RwHoldKind::Exclusive => s.exclusive_holders.contains_key(&entry.lock_uuid),
                         RwHoldKind::Read => s.readers.contains_key(&entry.lock_uuid),
                         RwHoldKind::Write => s
                             .writer
@@ -2350,7 +2360,10 @@ mod tests {
                     _ => None,
                 })
                 .expect("lock not granted");
-            assert!(token > last, "fencing token went backwards: {token} <= {last}");
+            assert!(
+                token > last,
+                "fencing token went backwards: {token} <= {last}"
+            );
             last = token;
             broker.handle_request(
                 c,
@@ -2468,22 +2481,14 @@ mod tests {
         // C (next on `a`) should be granted; B should also progress (gets b
         // first, then c).
         let c_msgs = drain(&mut c_rx);
-        assert!(c_msgs.iter().any(|m| matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )));
+        assert!(c_msgs
+            .iter()
+            .any(|m| matches!(m, Response::Lock { acquired: true, .. })));
 
         let b_msgs = drain(&mut b_rx);
-        assert!(b_msgs.iter().any(|m| matches!(
-            m,
-            Response::CompositeLock {
-                acquired: true,
-                ..
-            }
-        )));
+        assert!(b_msgs
+            .iter()
+            .any(|m| matches!(m, Response::CompositeLock { acquired: true, .. })));
     }
 
     #[test]
@@ -2519,10 +2524,9 @@ mod tests {
         );
         for r in [&mut b_rx, &mut c_rx] {
             let m = drain(r);
-            assert!(m.iter().any(|m| matches!(
-                m,
-                Response::RegisterReadResult { granted: false, .. }
-            )));
+            assert!(m
+                .iter()
+                .any(|m| matches!(m, Response::RegisterReadResult { granted: false, .. })));
         }
 
         broker.handle_request(
@@ -2537,10 +2541,9 @@ mod tests {
         // Both readers should now be granted.
         for r in [&mut b_rx, &mut c_rx] {
             let m = drain(r);
-            assert!(m.iter().any(|m| matches!(
-                m,
-                Response::RegisterReadResult { granted: true, .. }
-            )));
+            assert!(m
+                .iter()
+                .any(|m| matches!(m, Response::RegisterReadResult { granted: true, .. })));
         }
     }
 
@@ -2699,13 +2702,9 @@ mod tests {
         )));
         broker.drop_client(a);
         let post = drain(&mut b_rx);
-        assert!(post.iter().any(|m| matches!(
-            m,
-            Response::Lock {
-                acquired: true,
-                ..
-            }
-        )));
+        assert!(post
+            .iter()
+            .any(|m| matches!(m, Response::Lock { acquired: true, .. })));
     }
 
     /// `tick_ttl` evicts the expired holder and grants the next waiter in
@@ -2753,18 +2752,28 @@ mod tests {
             },
         );
         let pre = drain(&mut b_rx);
-        assert!(pre.iter().any(|m| matches!(m, Response::Lock { acquired: false, .. })));
+        assert!(pre.iter().any(|m| matches!(
+            m,
+            Response::Lock {
+                acquired: false,
+                ..
+            }
+        )));
 
         // Single sweep with a synthesized future Instant — no real wall
         // time burned, no per-lock timer involved.
         let future = Instant::now() + Duration::from_secs(1);
         let evicted = broker.tick_ttl(future);
-        assert_eq!(evicted, 1, "exactly one holder should have been TTL-evicted");
+        assert_eq!(
+            evicted, 1,
+            "exactly one holder should have been TTL-evicted"
+        );
 
         // B should now hold the lock; the metric counter should reflect 1.
         let post = drain(&mut b_rx);
         assert!(
-            post.iter().any(|m| matches!(m, Response::Lock { acquired: true, .. })),
+            post.iter()
+                .any(|m| matches!(m, Response::Lock { acquired: true, .. })),
             "B should be granted after A's TTL eviction; got {post:?}"
         );
 
@@ -2903,7 +2912,8 @@ mod tests {
 
         let post = drain(&mut b_rx);
         assert!(
-            post.iter().any(|m| matches!(m, Response::Lock { acquired: true, .. })),
+            post.iter()
+                .any(|m| matches!(m, Response::Lock { acquired: true, .. })),
             "B should be granted on `x` after A's composite TTL-evicts; got {post:?}"
         );
     }
@@ -2951,14 +2961,16 @@ mod tests {
         }
 
         // First three should be granted, fourth queued.
-        assert!(grants[0].2 && grants[1].2 && grants[2].2, "first three must be granted");
+        assert!(
+            grants[0].2 && grants[1].2 && grants[2].2,
+            "first three must be granted"
+        );
         assert!(!grants[3].2, "fourth must be queued");
 
         // Each granted holder has a distinct lock_uuid and a unique
         // fencing token. Fencing tokens are monotonically increasing so
         // a downstream resource can order operations by recency.
-        let uuids: std::collections::HashSet<_> =
-            grants[..3].iter().map(|g| g.0.clone()).collect();
+        let uuids: std::collections::HashSet<_> = grants[..3].iter().map(|g| g.0.clone()).collect();
         assert_eq!(uuids.len(), 3, "lock_uuids must be unique across slots");
         let tokens: Vec<u64> = grants[..3].iter().map(|g| g.1.unwrap_or(0)).collect();
         assert!(
@@ -2986,7 +2998,8 @@ mod tests {
         let _ = drain(&mut clients[0].1);
         let post = drain(&mut clients[3].1);
         assert!(
-            post.iter().any(|m| matches!(m, Response::Lock { acquired: true, .. })),
+            post.iter()
+                .any(|m| matches!(m, Response::Lock { acquired: true, .. })),
             "fourth client should be granted after one of the three slots releases; got {post:?}"
         );
 
@@ -3125,7 +3138,9 @@ mod tests {
         // B should have been promoted to holder.
         let after = drain(&mut b_rx);
         assert!(
-            after.iter().any(|m| matches!(m, Response::Lock { acquired: true, .. })),
+            after
+                .iter()
+                .any(|m| matches!(m, Response::Lock { acquired: true, .. })),
             "after force-unlock, B should hold the lock; got {after:?}"
         );
     }
@@ -3213,7 +3228,10 @@ mod tests {
             } => Some(e.clone()),
             _ => None,
         });
-        assert!(err.is_some(), "empty composite must be rejected; got {msgs:?}");
+        assert!(
+            err.is_some(),
+            "empty composite must be rejected; got {msgs:?}"
+        );
     }
 
     /// Composite locks reject more than `MAX_COMPOSITE_KEYS` keys.
@@ -3242,7 +3260,14 @@ mod tests {
         );
         let msgs = drain(&mut a_rx);
         assert!(
-            msgs.iter().any(|m| matches!(m, Response::CompositeLock { acquired: false, error: Some(_), .. })),
+            msgs.iter().any(|m| matches!(
+                m,
+                Response::CompositeLock {
+                    acquired: false,
+                    error: Some(_),
+                    ..
+                }
+            )),
             "oversized composite must be rejected; got {msgs:?}"
         );
     }
@@ -3347,7 +3372,13 @@ mod tests {
         );
         let pre = drain(&mut c_rx);
         assert!(
-            pre.iter().any(|m| matches!(m, Response::Lock { acquired: false, .. })),
+            pre.iter().any(|m| matches!(
+                m,
+                Response::Lock {
+                    acquired: false,
+                    ..
+                }
+            )),
             "third caller must queue while cap=2; got {pre:?}"
         );
         let snapshot = broker.metrics();
@@ -3392,14 +3423,24 @@ mod tests {
             _ => None,
         });
         assert!(
-            err.as_deref().is_some_and(|e| e.contains("`max` must be >= 1")),
+            err.as_deref()
+                .is_some_and(|e| e.contains("`max` must be >= 1")),
             "max=0 must be rejected with a clear error; got {msgs:?}"
         );
         // No holder, no waiter, no per-key state — broker is untouched.
         let snapshot = broker.metrics();
-        assert_eq!(snapshot.holders, 0, "rejected request must not register a holder");
-        assert_eq!(snapshot.waiters, 0, "rejected request must not enqueue a waiter");
-        assert_eq!(snapshot.keys, 0, "rejected request must not create a per-key LockState");
+        assert_eq!(
+            snapshot.holders, 0,
+            "rejected request must not register a holder"
+        );
+        assert_eq!(
+            snapshot.waiters, 0,
+            "rejected request must not enqueue a waiter"
+        );
+        assert_eq!(
+            snapshot.keys, 0,
+            "rejected request must not create a per-key LockState"
+        );
     }
 
     /// Composite path: `keys: [...]` plus `max=Some(0)` is rejected
@@ -3439,6 +3480,10 @@ mod tests {
             )),
             "composite + max=0 must come back as compositeLock with an error; got {msgs:?}"
         );
-        assert_eq!(broker.metrics().keys, 0, "no per-key state should be created");
+        assert_eq!(
+            broker.metrics().keys,
+            0,
+            "no per-key state should be created"
+        );
     }
 }

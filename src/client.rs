@@ -285,7 +285,8 @@ impl Client {
 
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LockGuard, ClientError> {
         crate::routine_id!("ddl-routine-d2XKMm8wCgREqHR4iw");
-        self.acquire_internal(Some(key.to_string()), None, ttl, None).await
+        self.acquire_internal(Some(key.to_string()), None, ttl, None)
+            .await
     }
 
     /// Acquire a semaphore-style lock allowing up to `max` simultaneous
@@ -463,8 +464,12 @@ impl Client {
                 lock_uuid,
                 fencing_tokens.unwrap_or_default(),
             ))),
-            Ok(Response::Lock { acquired: false, .. })
-            | Ok(Response::CompositeLock { acquired: false, .. }) => Ok(None),
+            Ok(Response::Lock {
+                acquired: false, ..
+            })
+            | Ok(Response::CompositeLock {
+                acquired: false, ..
+            }) => Ok(None),
             Ok(Response::Error { error, .. }) => Err(ClientError::Broker(error)),
             Ok(other) => Err(ClientError::Broker(format!(
                 "unexpected try-acquire response: {other:?}"
@@ -563,9 +568,7 @@ impl Client {
         let outcome = self.roundtrip(request, &request_uuid, &mut rx).await;
         self.unregister_inflight(&request_uuid);
         match outcome? {
-            Response::Unlock {
-                unlocked: true, ..
-            } => Ok(()),
+            Response::Unlock { unlocked: true, .. } => Ok(()),
             Response::Unlock {
                 unlocked: false,
                 error,
