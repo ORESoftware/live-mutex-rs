@@ -669,6 +669,11 @@ Follower-side sender rejections for unknown, stale, or conflicting leaders are
 counted separately in
 `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
 `dd_rust_network_mutex_raft_follower_install_snapshot_sender_rejections_total`.
+Generic inbound Raft request/response frames rejected before JSON parsing
+because they exceed the frame cap increment
+`dd_rust_network_mutex_raft_rpc_inbound_frame_rejections_total`; generic
+outbound request/response frames rejected before socket write increment
+`dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total`.
 Followers also decode incoming `InstallSnapshot` chunks and enforce
 `raft.install_snapshot_chunk_bytes` before term/leader mutation; oversized
 chunks increment

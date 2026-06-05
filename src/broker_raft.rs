@@ -8213,13 +8213,13 @@ impl BrokerRaft {
         let mut call = RaftRpcConnectionCall::new(&mut connection);
         let result = call
             .call(
-            &peer.addr,
-            rpc,
-            timeout,
-            &self.telemetry.raft_rpc_inbound_frame_rejections_total,
-            &self.telemetry.raft_rpc_outbound_frame_rejections_total,
-            &self.telemetry.raft_rpc_response_mismatches_total,
-        )
+                &peer.addr,
+                rpc,
+                timeout,
+                &self.telemetry.raft_rpc_inbound_frame_rejections_total,
+                &self.telemetry.raft_rpc_outbound_frame_rejections_total,
+                &self.telemetry.raft_rpc_response_mismatches_total,
+            )
             .await;
         if let Err(err) = &result {
             if is_raft_rpc_frame_cap_error(err) {
@@ -8821,8 +8821,11 @@ impl RaftRpcConnection {
         crate::routine_id!("ddl-routine-broker-raft-rpc-conn-call-1");
         let request_kind = raft_rpc_kind(&rpc);
         let max_frame_bytes = raft_rpc_max_frame_bytes();
-        let body =
-            serialize_raft_rpc_frame_bounded(&rpc, max_frame_bytes, outbound_frame_rejection_counter)?;
+        let body = serialize_raft_rpc_frame_bounded(
+            &rpc,
+            max_frame_bytes,
+            outbound_frame_rejection_counter,
+        )?;
         let timeout = timeout.max(Duration::from_millis(50));
         let mut last_error = None;
 
@@ -23423,6 +23426,65 @@ mod tests {
             .await
             .expect("unterminated EOF frame");
         assert_eq!(frame, "{\"type\":\"requestVote\"}");
+    }
+
+    #[tokio::test]
+    async fn raft_rpc_frame_limit_rejections_are_counted_and_exported() {
+        let dir = temp_dir("raft-rpc-frame-limit-counters");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let request_err = serialize_raft_rpc_frame_bounded(
+            &RaftRpc::RequestVote {
+                auth_token: None,
+                term: 1,
+                candidate_id: "n2".into(),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+            1,
+            &raft.telemetry.raft_rpc_outbound_frame_rejections_total,
+        )
+        .expect_err("oversized outbound request should be rejected");
+        assert!(request_err
+            .to_string()
+            .contains("exceeding configured max frame bytes"));
+
+        let response_err = serialize_raft_rpc_response_frame_bounded(
+            &RaftRpcResponse::Error {
+                term: 1,
+                error: "oversized response".repeat(8),
+            },
+            1,
+            &raft.telemetry.raft_rpc_outbound_frame_rejections_total,
+        )
+        .expect_err("oversized outbound response should be rejected");
+        assert!(response_err
+            .to_string()
+            .contains("exceeding configured max frame bytes"));
+
+        let mut bytes = vec![b'a'; 16];
+        bytes.push(b'\n');
+        let mut reader = TokioBufReader::new(&bytes[..]);
+        let inbound_err = read_raft_frame_bounded_counted(
+            &mut reader,
+            8,
+            &raft.telemetry.raft_rpc_inbound_frame_rejections_total,
+        )
+        .await
+        .expect_err("oversized inbound frame should be rejected");
+        assert!(is_raft_frame_limit_io_error(&inbound_err));
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.raft_rpc_outbound_frame_rejections_total, 2);
+        assert_eq!(telemetry.raft_rpc_inbound_frame_rejections_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total 2")
+        );
+        assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_frame_rejections_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
