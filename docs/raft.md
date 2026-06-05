@@ -145,6 +145,9 @@ Implemented:
 - transient learner catch-up for new peer IDs before joint-consensus promotion,
 - required post-promotion catch-up so every newly promoted voter reaches the
   final membership log index before the membership change returns,
+- if the final membership removes the local leader, the API returns the committed
+  final membership index after applying the step-down instead of attempting
+  leader-only post-promotion catch-up from a removed node,
 - failed transient catch-up for a membership change removes only learners added
   for that attempt and preserves any operator-staged learner already recorded on
   disk,
@@ -176,6 +179,8 @@ Implemented:
   increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
   success responses that overreport beyond the sent batch are capped and
   increment `dd_rust_network_mutex_raft_append_capped_success_responses_total`;
+  lower-term `AppendEntries` responses are treated as stale and increment
+  `dd_rust_network_mutex_raft_append_stale_term_responses_total`;
   snapshot fallbacks from the append path increment
   `dd_rust_network_mutex_raft_append_snapshot_fallbacks_total`, split into
   `dd_rust_network_mutex_raft_append_snapshot_prev_term_misses_total` for
@@ -186,6 +191,7 @@ Implemented:
   `dd_rust_network_mutex_raft_append_entries_requests_total`,
   `dd_rust_network_mutex_raft_append_entries_heartbeats_total`,
   `dd_rust_network_mutex_raft_append_entries_sent_total`,
+  `dd_rust_network_mutex_raft_append_entries_wire_bytes_total`,
   `dd_rust_network_mutex_raft_append_entries_frame_clamps_total`,
   `dd_rust_network_mutex_raft_append_entries_successes_total`,
   `dd_rust_network_mutex_raft_append_entries_conflicts_total`, and
@@ -206,7 +212,13 @@ Implemented:
   `dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total`; under-cap
   request/response frames rejected because they cannot be decoded as the
   expected Raft JSON shape increment
-  `dd_rust_network_mutex_raft_rpc_malformed_frames_total`;
+  `dd_rust_network_mutex_raft_rpc_malformed_frames_total`; the same inbound
+  frame-cap and malformed-frame paths emit debug-level `lmx::raft` events with
+  node id, accepted peer socket address, configured frame cap, and decode error
+  context, while outbound peer-response decode failures include peer id and RPC
+  kind; logical outbound peer RPC attempts and their cumulative wait time are
+  exported as `dd_rust_network_mutex_raft_rpc_outbound_requests_total` and
+  `dd_rust_network_mutex_raft_rpc_outbound_request_us_total`;
   oversized snapshot chunks also increment
   `dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total`, while
   staged-transfer byte limit rejections increment
@@ -215,10 +227,19 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_staged_transfer_limit_rejections_total`,
 - leader quorum-wait counters for user-visible Raft write latency:
   `dd_rust_network_mutex_raft_replication_quorum_waits_total`,
+  `dd_rust_network_mutex_raft_replication_quorum_attempts_total`,
+  `dd_rust_network_mutex_raft_replication_quorum_progress_retries_total`,
+  `dd_rust_network_mutex_raft_replication_quorum_sleeps_total`,
   `dd_rust_network_mutex_raft_replication_quorum_successes_total`,
   `dd_rust_network_mutex_raft_replication_quorum_timeouts_total`,
   `dd_rust_network_mutex_raft_replication_quorum_leadership_losses_total`, and
-  `dd_rust_network_mutex_raft_replication_quorum_wait_ms_total`,
+  `dd_rust_network_mutex_raft_replication_quorum_wait_ms_total`; attempts count
+  fan-out rounds, progress retries count immediate loop turns after peer
+  `matchIndex`/`nextIndex` movement, and sleeps count heartbeat-delay waits when
+  no peer made progress; replication responses from peers removed by membership
+  churn are ignored for progress, excluded from normal success/conflict/rejection
+  counters, and counted in
+  `dd_rust_network_mutex_raft_replication_removed_peer_responses_total`,
 - BrokerRaft request-flow counters and gauges for profiling where request time
   goes before, during, and after consensus:
   `dd_rust_network_mutex_raft_client_proposals_total`,
@@ -249,6 +270,10 @@ Implemented:
   raw snapshot payload bytes, and snapshot-driven peer progress:
   `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
   `dd_rust_network_mutex_raft_install_snapshot_bytes_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_payload_prepare_us_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_payload_prepare_bytes_total`,
   `dd_rust_network_mutex_raft_install_snapshot_successes_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
@@ -265,7 +290,9 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total`;
   final success responses that overreport the installed snapshot index are
   capped to the sent snapshot boundary and counted in
-  `dd_rust_network_mutex_raft_install_snapshot_capped_success_responses_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_capped_success_responses_total`;
+  lower-term `InstallSnapshot` responses are treated as stale and counted in
+  `dd_rust_network_mutex_raft_install_snapshot_stale_term_responses_total`,
 - log-retention counters and gauges:
   `dd_rust_network_mutex_raft_log_compactions_total`,
   `dd_rust_network_mutex_raft_log_compacted_entries_total`,
@@ -310,6 +337,9 @@ Implemented:
   `dd_rust_network_mutex_raft_pre_vote_malformed_requests_total` or
   `dd_rust_network_mutex_raft_request_vote_malformed_requests_total` and emit
   debug-level `lmx::raft` rejection logs,
+- lower-term `RequestVote` responses are ignored for election quorum and
+  counted in
+  `dd_rust_network_mutex_raft_request_vote_stale_term_responses_total`,
 - cancellation-safe pooled peer RPC calls that drop a connection after an
   aborted in-flight request instead of risking stale response reuse,
 - `TCP_NODELAY` on Raft peer RPC sockets to avoid small-frame delayed
@@ -486,6 +516,10 @@ failure. Append-only and truncate-and-append log writers roll the file length
 back on write/flush/sync failure so partial suffix bytes are not left behind.
 Follower snapshot install also keeps any matching retained suffix with an
 indexed retained-log slice instead of clone-filtering the full retained cache.
+Leader snapshot fan-out prepares the snapshot payload once per replication round
+and shares the serialized bytes across peers that fall back to
+`InstallSnapshot`, so two lagging peers do not reread and reserialize the same
+snapshot independently.
 Follower snapshot staging treats duplicate already-covered non-final chunks as
 idempotent, and treats a new offset-0 chunk that is not a pure duplicate as a
 transfer restart: the older staged file is removed before the replacement chunk
@@ -523,10 +557,12 @@ commit finalization, leader step-down persistence, live `RequestVote` handling,
 and live follower-side `AppendEntries` receive handling run on Tokio's blocking
 pool, so the consensus write still waits for required disk durability but
 ordinary async workers are not occupied by blocking filesystem calls.
-`InstallSnapshot` receive handling also runs there, so large snapshot chunk
-writes, checksum verification, JSON parsing, snapshot install, and retained-log
-rewrites do not block core peer-RPC workers. Periodic snapshot/compaction
-maintenance uses the same blocking pool boundary.
+Leader-side `InstallSnapshot` payload preparation also runs there before fan-out
+chunking, so reading, checksumming, and serializing a large snapshot does not pin
+an async replication worker. `InstallSnapshot` receive handling also runs there,
+so large snapshot chunk writes, checksum verification, JSON parsing, snapshot
+install, and retained-log rewrites do not block core peer-RPC workers. Periodic
+snapshot/compaction maintenance uses the same blocking pool boundary.
 Snapshot apply emits structured `lmx::raft` tracing at the hard-state,
 membership, learner, broker-install, and final runtime-index boundaries so
 operators can see where an install stopped without inferring from files alone.
