@@ -388,6 +388,8 @@ pub enum BrokerRaftError {
     BrokerSnapshot(String),
     #[error("invalid raft append entries: {0}")]
     InvalidAppendEntries(String),
+    #[error("invalid persisted raft log: {0}")]
+    InvalidLog(String),
     #[error("raft learner `{peer_id}` did not catch up to index {target_index} before promotion")]
     LearnerCatchUpFailed { peer_id: String, target_index: u64 },
     #[error("raft RPC error: {0}")]
@@ -728,6 +730,17 @@ impl RaftLogStore {
             return Ok(Vec::new());
         }
         let mut state = self.state.lock();
+        if term == 0 {
+            return Err(BrokerRaftError::InvalidAppendEntries(
+                "local append term must be >= 1".into(),
+            ));
+        }
+        if term < state.last_term {
+            return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                "local append term {term} is older than last persisted term {}",
+                state.last_term
+            )));
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -866,6 +879,7 @@ impl RaftLogStore {
 
     pub fn replace_all(&self, entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replace-all-1");
+        validate_persisted_log_entries(entries)?;
         let mut state = self.state.lock();
         rewrite_log(&self.log_path, entries)?;
         sync_dir(&self.data_dir)?;
@@ -890,7 +904,7 @@ impl RaftLogStore {
         entries: Vec<RaftLogEntry>,
     ) -> Result<RaftAppendReport, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-append-from-leader-1");
-        validate_append_entries_shape(prev_log_index, leader_term, &entries)?;
+        validate_append_entries_shape(prev_log_index, prev_log_term, leader_term, &entries)?;
         let mut state = self.state.lock();
         let mut local = read_log_entries(&self.log_path)?;
         let snapshot_index = state
@@ -2480,23 +2494,28 @@ impl BrokerRaft {
                 .next_index
                 .max(1)
         };
-        if self
-            .log
-            .latest_snapshot()
-            .is_some_and(|snapshot| next_index <= snapshot.last_included_index)
+        let prev_log_index = next_index.saturating_sub(1);
+        let entries = self.log.entries_from_limited(
+            next_index,
+            self.config.append_entries_max_entries,
+            self.config.append_entries_max_bytes,
+        )?;
+        if entries
+            .first()
+            .is_some_and(|entry| entry.index != next_index)
         {
             debug!(
                 target: "lmx::raft",
                 node_id = %self.config.node_id,
                 peer = %peer.id,
                 next_index,
-                "replicating snapshot before compacted log suffix",
+                first_retained_index = entries.first().map(|entry| entry.index).unwrap_or(0),
+                "replicating snapshot because retained log suffix does not cover nextIndex",
             );
             return self
                 .install_snapshot_to_peer(peer, term, target_index)
                 .await;
         }
-        let prev_log_index = next_index.saturating_sub(1);
         let Some(prev_log_term) = self.log.term_at(prev_log_index)? else {
             debug!(
                 target: "lmx::raft",
@@ -2509,11 +2528,6 @@ impl BrokerRaft {
                 .install_snapshot_to_peer(peer, term, target_index)
                 .await;
         };
-        let entries = self.log.entries_from_limited(
-            next_index,
-            self.config.append_entries_max_entries,
-            self.config.append_entries_max_bytes,
-        )?;
         let rpc = RaftRpc::AppendEntries {
             term,
             leader_id: self.config.node_id.clone(),
@@ -3608,13 +3622,61 @@ fn read_log_entries(path: &Path) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
         }
         entries.push(serde_json::from_str(line)?);
     }
+    validate_persisted_log_entries(&entries)?;
     Ok(entries)
+}
+
+fn validate_persisted_log_entries(entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-log-entries-1");
+    let mut previous: Option<&RaftLogEntry> = None;
+    for entry in entries {
+        if entry.index == 0 {
+            return Err(BrokerRaftError::InvalidLog(
+                "entry index must be >= 1".into(),
+            ));
+        }
+        if entry.term == 0 {
+            return Err(BrokerRaftError::InvalidLog(format!(
+                "entry index {} has term 0",
+                entry.index
+            )));
+        }
+        if let Some(prev) = previous {
+            let expected_index = prev.index.checked_add(1).ok_or_else(|| {
+                BrokerRaftError::InvalidLog(format!(
+                    "entry index {} cannot be followed by another entry",
+                    prev.index
+                ))
+            })?;
+            if entry.index != expected_index {
+                return Err(BrokerRaftError::InvalidLog(format!(
+                    "entry index {} is not contiguous after index {}; expected {}",
+                    entry.index, prev.index, expected_index
+                )));
+            }
+            if entry.term < prev.term {
+                return Err(BrokerRaftError::InvalidLog(format!(
+                    "entry index {} has term {} older than previous term {}",
+                    entry.index, entry.term, prev.term
+                )));
+            }
+        }
+        previous = Some(entry);
+    }
+    Ok(())
 }
 
 fn term_at_index(state: &RaftLogState, entries: &[RaftLogEntry], index: u64) -> Option<u64> {
     crate::routine_id!("ddl-routine-broker-raft-term-at-index-1");
     if index == 0 {
         return Some(0);
+    }
+    if let Some(term) = entries
+        .iter()
+        .find(|entry| entry.index == index)
+        .map(|entry| entry.term)
+    {
+        return Some(term);
     }
     if let Some(snapshot) = &state.latest_snapshot {
         if snapshot.last_included_index == index {
@@ -3624,14 +3686,12 @@ fn term_at_index(state: &RaftLogState, entries: &[RaftLogEntry], index: u64) -> 
             return None;
         }
     }
-    entries
-        .iter()
-        .find(|entry| entry.index == index)
-        .map(|entry| entry.term)
+    None
 }
 
 fn validate_append_entries_shape(
     prev_log_index: u64,
+    mut prev_log_term: u64,
     leader_term: u64,
     entries: &[RaftLogEntry],
 ) -> Result<(), BrokerRaftError> {
@@ -3656,12 +3716,25 @@ fn validate_append_entries_shape(
                 entry.index, prev_log_index, expected_index
             )));
         }
+        if entry.term == 0 {
+            return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                "entry index {} has term 0",
+                entry.index
+            )));
+        }
+        if entry.term < prev_log_term {
+            return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                "entry index {} has term {} older than previous term {}",
+                entry.index, entry.term, prev_log_term
+            )));
+        }
         if entry.term > leader_term {
             return Err(BrokerRaftError::InvalidAppendEntries(format!(
                 "entry index {} has term {} greater than leader term {}",
                 entry.index, entry.term, leader_term
             )));
         }
+        prev_log_term = entry.term;
         expected_index = expected_index.saturating_add(1);
     }
     Ok(())
@@ -3742,6 +3815,16 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("live-mutex-rs-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn write_raw_log(dir: &Path, entries: &[RaftLogEntry]) {
+        fs::create_dir_all(dir).expect("create raw log dir");
+        let mut file = File::create(dir.join(LOG_FILE)).expect("create raw log");
+        for entry in entries {
+            serde_json::to_writer(&mut file, entry).expect("write raw log entry");
+            file.write_all(b"\n").expect("write raw log newline");
+        }
+        file.sync_all().expect("sync raw log");
     }
 
     fn test_raft_config(data_dir: PathBuf) -> BrokerRaftConfig {
@@ -4324,6 +4407,118 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_rejects_term_regression_inside_batch() {
+        let dir = temp_dir("raft-append-term-regression");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(3, RaftCommand::Noop).expect("append seed");
+
+        let err = store
+            .append_entries_from_leader(
+                1,
+                3,
+                4,
+                vec![RaftLogEntry {
+                    index: 2,
+                    term: 2,
+                    created_at_ms: 10,
+                    command: RaftCommand::Noop,
+                }],
+            )
+            .expect_err("batch term regression must be rejected");
+
+        assert!(matches!(err, BrokerRaftError::InvalidAppendEntries(_)));
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 3)]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_batch_rejects_local_term_regression() {
+        let dir = temp_dir("raft-local-term-regression");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(3, RaftCommand::Noop).expect("append seed");
+
+        let err = store
+            .append(2, RaftCommand::Noop)
+            .expect_err("local term regression must be rejected");
+
+        assert!(matches!(err, BrokerRaftError::InvalidAppendEntries(_)));
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 3)]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persisted_log_rejects_gapped_indexes_on_open() {
+        let dir = temp_dir("raft-log-gap-on-open");
+        write_raw_log(
+            &dir,
+            &[
+                RaftLogEntry {
+                    index: 1,
+                    term: 1,
+                    created_at_ms: 10,
+                    command: RaftCommand::Noop,
+                },
+                RaftLogEntry {
+                    index: 3,
+                    term: 1,
+                    created_at_ms: 11,
+                    command: RaftCommand::Noop,
+                },
+            ],
+        );
+
+        let err = RaftLogStore::open(&dir).expect_err("gapped log must be rejected");
+        assert!(matches!(err, BrokerRaftError::InvalidLog(_)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persisted_log_rejects_decreasing_terms_on_open() {
+        let dir = temp_dir("raft-log-term-regression-on-open");
+        write_raw_log(
+            &dir,
+            &[
+                RaftLogEntry {
+                    index: 1,
+                    term: 3,
+                    created_at_ms: 10,
+                    command: RaftCommand::Noop,
+                },
+                RaftLogEntry {
+                    index: 2,
+                    term: 2,
+                    created_at_ms: 11,
+                    command: RaftCommand::Noop,
+                },
+            ],
+        );
+
+        let err = RaftLogStore::open(&dir).expect_err("decreasing terms must be rejected");
+        assert!(matches!(err, BrokerRaftError::InvalidLog(_)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn append_entries_truncates_conflicting_suffix_and_appends_leader_entries() {
         let dir = temp_dir("raft-conflict-repair");
         let store = RaftLogStore::open(&dir).expect("open store");
@@ -4553,6 +4748,142 @@ mod tests {
             batches.lock().clone(),
             vec![vec![1, 2], vec![3, 4], vec![5]]
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_suffix_is_used_for_incremental_catchup() {
+        let dir = temp_dir("raft-retained-suffix-catchup");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let unused_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused peer addr");
+        let unused_addr = unused_listener.local_addr().expect("unused peer addr");
+        drop(unused_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(50);
+        cfg.election_timeout_max = Duration::from_millis(100);
+        cfg.append_entries_max_entries = 8;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: unused_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..6 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        raft.log
+            .write_snapshot(6, 1, idle_snapshot_payload())
+            .expect("write snapshot");
+        raft.log
+            .compact_through(3)
+            .expect("retain entries covered by snapshot");
+        assert_eq!(
+            raft.log
+                .read_entries()
+                .expect("retained entries")
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![4, 5, 6]
+        );
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 5,
+                    match_index: 4,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n3".into(),
+                RaftPeerProgress {
+                    next_index: 5,
+                    match_index: 4,
+                },
+            );
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let observed_for_server = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let (term, match_index) = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 4);
+                    assert_eq!(prev_log_term, 1);
+                    let indexes = entries.iter().map(|entry| entry.index).collect::<Vec<_>>();
+                    assert_eq!(indexes, vec![5, 6]);
+                    observed_for_server.lock().extend(indexes);
+                    (term, 6)
+                }
+                RaftRpc::InstallSnapshot { .. } => {
+                    panic!("retained suffix catch-up should not require InstallSnapshot")
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index,
+                conflict_index: None,
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let acks = raft
+            .replicate_until_quorum(6)
+            .await
+            .expect("replicate retained suffix");
+        assert!(acks.contains("n1"));
+        assert!(acks.contains("n2"));
+        server.await.expect("fake peer server");
+        assert_eq!(observed.lock().clone(), vec![5, 6]);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -5823,14 +6154,14 @@ mod tests {
         let start = Arc::new(std::sync::Barrier::new(4));
         let mut handles = Vec::new();
 
-        for writer_id in 0..2 {
+        for _writer_id in 0..2 {
             let store = Arc::clone(&store);
             let start = Arc::clone(&start);
             handles.push(std::thread::spawn(move || {
                 start.wait();
                 for _ in 0..250 {
                     store
-                        .append(1 + writer_id, RaftCommand::Noop)
+                        .append(1, RaftCommand::Noop)
                         .expect("append while concurrent readers run");
                     std::thread::yield_now();
                 }
@@ -5901,13 +6232,24 @@ mod tests {
             let dir = temp_dir("raft-log-fuzz");
             let store = RaftLogStore::open(&dir).expect("open store");
             let mut rng = seed;
+            let mut current_term = 1u64;
             let mut oracle: Vec<RaftLogEntry> = Vec::new();
 
             for step in 0..300 {
                 match next_fuzz(&mut rng) % 6 {
                     0..=2 => {
-                        let term = 1 + (next_fuzz(&mut rng) % 17);
-                        let entry = store.append(term, RaftCommand::Noop).expect("append");
+                        if let Some(snapshot) = store.latest_snapshot() {
+                            current_term = current_term.max(snapshot.last_included_term);
+                        }
+                        if let Some(last) = oracle.last() {
+                            current_term = current_term.max(last.term);
+                        }
+                        if next_fuzz(&mut rng) % 5 == 0 {
+                            current_term = current_term.saturating_add(1 + next_fuzz(&mut rng) % 3);
+                        }
+                        let entry = store
+                            .append(current_term, RaftCommand::Noop)
+                            .expect("append");
                         let expected_index = oracle
                             .last()
                             .map(|last| last.index + 1)
@@ -5921,12 +6263,12 @@ mod tests {
                         oracle.push(entry);
                     }
                     3 => {
-                        let keep_from = if oracle.is_empty() {
+                        let keep_len = if oracle.is_empty() {
                             0
                         } else {
                             (next_fuzz(&mut rng) as usize) % (oracle.len() + 1)
                         };
-                        let replacement = oracle[keep_from..].to_vec();
+                        let replacement = oracle[..keep_len].to_vec();
                         store.replace_all(&replacement).expect("replace");
                         oracle = replacement;
                     }

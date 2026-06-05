@@ -21,9 +21,11 @@ Implemented:
 - a current-term no-op barrier appended and committed after a leader election,
 - leader-ordered lock operations,
 - quorum commit based on peer count, such as 2-of-3 or 3-of-5,
-- durable local hard state and append-only logs,
+- durable local hard state and append-only logs with persisted-log gap and
+  term-regression validation on read,
 - incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
-  `nextIndex`, `matchIndex`, and bounded catch-up batches,
+  `nextIndex`, `matchIndex`, bounded catch-up batches, and retained
+  snapshot-suffix catch-up before falling back to `InstallSnapshot`,
 - follower log conflict detection and truncation repair,
 - durable term persistence before replying to higher-term append failures,
 - malformed `AppendEntries` rejection for non-contiguous indexes and
@@ -112,8 +114,11 @@ operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
-reuse open TCP connections. The leader can coalesce concurrent client requests
-into bounded append/replicate/commit batches, but the commit lane is still
+reuse open TCP connections. If a follower is only slightly behind a snapshot
+boundary, the leader first uses retained trailing log entries for incremental
+catch-up; it sends `InstallSnapshot` only after the required previous-log term
+has been compacted away. The leader can coalesce concurrent client requests into
+bounded append/replicate/commit batches, but the commit lane is still
 correctness-first and not yet pipelined.
 
 ## Membership Change Sequence
