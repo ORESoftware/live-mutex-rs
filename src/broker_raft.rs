@@ -276,6 +276,10 @@ pub struct RaftTelemetrySnapshot {
     pub install_snapshot_chunks_total: u64,
     pub install_snapshot_bytes_total: u64,
     pub install_snapshot_progress_updates_total: u64,
+    pub install_snapshot_staged_chunks_total: u64,
+    pub install_snapshot_staged_bytes_total: u64,
+    pub install_snapshot_duplicate_chunks_total: u64,
+    pub install_snapshot_offset_mismatches_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -871,6 +875,10 @@ struct BrokerRaftTelemetry {
     install_snapshot_chunks_total: AtomicU64,
     install_snapshot_bytes_total: AtomicU64,
     install_snapshot_progress_updates_total: AtomicU64,
+    install_snapshot_staged_chunks_total: AtomicU64,
+    install_snapshot_staged_bytes_total: AtomicU64,
+    install_snapshot_duplicate_chunks_total: AtomicU64,
+    install_snapshot_offset_mismatches_total: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -2102,6 +2110,22 @@ impl BrokerRaft {
                 .telemetry
                 .install_snapshot_progress_updates_total
                 .load(Ordering::Relaxed),
+            install_snapshot_staged_chunks_total: self
+                .telemetry
+                .install_snapshot_staged_chunks_total
+                .load(Ordering::Relaxed),
+            install_snapshot_staged_bytes_total: self
+                .telemetry
+                .install_snapshot_staged_bytes_total
+                .load(Ordering::Relaxed),
+            install_snapshot_duplicate_chunks_total: self
+                .telemetry
+                .install_snapshot_duplicate_chunks_total
+                .load(Ordering::Relaxed),
+            install_snapshot_offset_mismatches_total: self
+                .telemetry
+                .install_snapshot_offset_mismatches_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2131,6 +2155,18 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_progress_updates_total Leader-side peer progress changes applied after InstallSnapshot acknowledgement.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_progress_updates_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_progress_updates_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total Follower-side InstallSnapshot chunks appended to a staged snapshot transfer file.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_staged_bytes_total Raw snapshot payload bytes appended to follower-side staged snapshot transfer files.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_staged_bytes_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_staged_bytes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_duplicate_chunks_total Follower-side duplicate non-final InstallSnapshot chunks acknowledged without appending bytes.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_duplicate_chunks_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_duplicate_chunks_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_offset_mismatches_total Follower-side InstallSnapshot chunks rejected because offsets did not match staged bytes.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_offset_mismatches_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_offset_mismatches_total {}\n",
             ),
             snapshot.append_progress_updates_total,
             snapshot.append_conflict_repairs_total,
@@ -2139,6 +2175,10 @@ impl BrokerRaft {
             snapshot.install_snapshot_chunks_total,
             snapshot.install_snapshot_bytes_total,
             snapshot.install_snapshot_progress_updates_total,
+            snapshot.install_snapshot_staged_chunks_total,
+            snapshot.install_snapshot_staged_bytes_total,
+            snapshot.install_snapshot_duplicate_chunks_total,
+            snapshot.install_snapshot_offset_mismatches_total,
         )
     }
 
@@ -2696,6 +2736,13 @@ impl BrokerRaft {
             .iter()
             .map(|peer| peer.id.clone())
             .collect::<Vec<_>>();
+        let preserved_staged_learner_ids = self
+            .runtime
+            .lock()
+            .staged_learners
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let initial_next_index = self
             .log
             .latest_snapshot()
@@ -2731,12 +2778,20 @@ impl BrokerRaft {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     catchup_tasks.abort_all();
-                    self.discard_staged_learners(&learner_ids, &old_ids);
+                    self.discard_staged_learners(
+                        &learner_ids,
+                        &old_ids,
+                        &preserved_staged_learner_ids,
+                    );
                     return Err(err);
                 }
                 Err(err) => {
                     catchup_tasks.abort_all();
-                    self.discard_staged_learners(&learner_ids, &old_ids);
+                    self.discard_staged_learners(
+                        &learner_ids,
+                        &old_ids,
+                        &preserved_staged_learner_ids,
+                    );
                     return Err(BrokerRaftError::Rpc(format!(
                         "raft learner catch-up task failed: {err}"
                     )));
@@ -2841,25 +2896,36 @@ impl BrokerRaft {
         Ok(())
     }
 
-    fn discard_staged_learners(&self, learner_ids: &[String], old_ids: &BTreeSet<String>) {
+    fn discard_staged_learners(
+        &self,
+        learner_ids: &[String],
+        old_ids: &BTreeSet<String>,
+        preserved_staged_learner_ids: &BTreeSet<String>,
+    ) {
         crate::routine_id!("ddl-routine-broker-raft-discard-staged-learners-1");
         let learner_ids = learner_ids.iter().cloned().collect::<BTreeSet<_>>();
         {
             let mut runtime = self.runtime.lock();
             let before_progress = runtime.leader_progress.clone();
-            runtime
-                .leader_progress
-                .retain(|peer_id, _| old_ids.contains(peer_id) || !learner_ids.contains(peer_id));
-            runtime
-                .staged_learners
-                .retain(|peer_id, _| old_ids.contains(peer_id) || !learner_ids.contains(peer_id));
+            runtime.leader_progress.retain(|peer_id, _| {
+                old_ids.contains(peer_id)
+                    || !learner_ids.contains(peer_id)
+                    || preserved_staged_learner_ids.contains(peer_id)
+            });
+            runtime.staged_learners.retain(|peer_id, _| {
+                old_ids.contains(peer_id)
+                    || !learner_ids.contains(peer_id)
+                    || preserved_staged_learner_ids.contains(peer_id)
+            });
             if runtime.leader_progress != before_progress {
                 self.note_leader_progress_changed();
             }
         }
-        self.rpc_connections
-            .lock()
-            .retain(|peer_id, _| old_ids.contains(peer_id) || !learner_ids.contains(peer_id));
+        self.rpc_connections.lock().retain(|peer_id, _| {
+            old_ids.contains(peer_id)
+                || !learner_ids.contains(peer_id)
+                || preserved_staged_learner_ids.contains(peer_id)
+        });
     }
 
     async fn append_replicate_commit_apply(
@@ -4974,6 +5040,8 @@ impl BrokerRaft {
         target_index: Option<u64>,
     ) -> Result<RaftPeerReplicationOutcome, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-peer-1");
+        let local_last_index = self.log.last_index();
+        let max_next_index = local_last_index.saturating_add(1).max(1);
         let next_index = {
             let mut runtime = self.runtime.lock();
             if runtime.role != RaftRole::Leader || runtime.current_term != term {
@@ -4981,17 +5049,35 @@ impl BrokerRaft {
             }
             let fallback = self.initial_replication_next_index();
             let inserted = !runtime.leader_progress.contains_key(&peer.id);
-            let next_index = runtime
+            let progress = runtime
                 .leader_progress
                 .entry(peer.id.clone())
-                .or_insert(RaftPeerProgress {
+                .or_insert_with(|| RaftPeerProgress {
                     next_index: fallback,
                     match_index: 0,
-                })
-                .next_index
-                .max(1);
-            if inserted {
+                });
+            let before = *progress;
+            if progress.match_index > local_last_index {
+                progress.match_index = local_last_index;
+            }
+            let min_next_index = progress.match_index.saturating_add(1).max(1);
+            progress.next_index = progress.next_index.clamp(min_next_index, max_next_index);
+            let next_index = progress.next_index;
+            if inserted || *progress != before {
                 self.note_leader_progress_changed();
+                if !inserted {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        prev_match_index = before.match_index,
+                        prev_next_index = before.next_index,
+                        match_index = progress.match_index,
+                        next_index = progress.next_index,
+                        local_last_index,
+                        "raft leader progress clamped to local log tail",
+                    );
+                }
             }
             next_index
         };
@@ -5710,7 +5796,7 @@ impl BrokerRaft {
         );
         let path = self.snapshot_transfer_path(&key);
         let mut transfers = self.snapshot_transfers.lock();
-        if offset == 0 {
+        if offset == 0 && !transfers.contains_key(&key) {
             let _ = fs::remove_file(&path);
             transfers.insert(
                 key.clone(),
@@ -5732,15 +5818,43 @@ impl BrokerRaft {
             let duplicate_end = offset.saturating_add(chunk_len);
             if duplicate_end <= expected_offset && !done {
                 pending.updated_at_ms = unix_ms();
+                self.telemetry
+                    .install_snapshot_duplicate_chunks_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    %leader_id,
+                    snapshot_index = last_included_index,
+                    snapshot_term = last_included_term,
+                    offset,
+                    expected_offset,
+                    chunk_len,
+                    "duplicate InstallSnapshot chunk acknowledged",
+                );
                 return Ok(None);
             }
         }
         if expected_offset != offset {
+            self.telemetry
+                .install_snapshot_offset_mismatches_total
+                .fetch_add(1, Ordering::Relaxed);
             let stale_path = transfers.remove(&key).map(|pending| pending.path);
             drop(transfers);
             if let Some(path) = stale_path {
                 let _ = fs::remove_file(path);
             }
+            warn!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                %leader_id,
+                snapshot_index = last_included_index,
+                snapshot_term = last_included_term,
+                expected_offset,
+                offset,
+                chunk_len,
+                "InstallSnapshot chunk offset mismatch; discarding staged transfer",
+            );
             return Err(BrokerRaftError::Rpc(format!(
                 "snapshot chunk offset mismatch for index {last_included_index}; expected={} got={offset}",
                 expected_offset
@@ -5758,6 +5872,12 @@ impl BrokerRaft {
         }
         pending.bytes_written = pending.bytes_written.saturating_add(chunk_len);
         pending.updated_at_ms = unix_ms();
+        self.telemetry
+            .install_snapshot_staged_chunks_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .install_snapshot_staged_bytes_total
+            .fetch_add(chunk_len, Ordering::Relaxed);
         if done {
             Ok(transfers.remove(&key).map(|pending| pending.path))
         } else {
@@ -8735,6 +8855,59 @@ mod tests {
                 Some(1)
             );
         }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_membership_catchup_preserves_preexisting_staged_learner() {
+        let dir = temp_dir("raft-membership-catchup-preserves-staged-learner");
+        let cfg = test_raft_config(dir.clone());
+        let old_peers = cfg.peers.clone();
+        let raft = BrokerRaft::open(cfg.clone()).expect("open raft");
+        let staged_learner = test_peer("n4", 7983);
+        let transient_learner = test_peer("n5", 7984);
+        commit_local_entry(
+            &raft,
+            2,
+            RaftCommand::SetStagedLearners {
+                learners: vec![staged_learner.clone()],
+            },
+        );
+        assert_eq!(raft.staged_learners(), vec![staged_learner.clone()]);
+        assert!(dir.join(LEARNERS_FILE).exists());
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+
+        let new_peers = vec![
+            old_peers[0].clone(),
+            old_peers[1].clone(),
+            old_peers[2].clone(),
+            staged_learner.clone(),
+            transient_learner.clone(),
+        ];
+        let err = raft
+            .catch_up_new_membership_peers(&old_peers, &new_peers)
+            .await
+            .expect_err("leader loss should fail catch-up and trigger cleanup");
+
+        assert!(matches!(err, BrokerRaftError::NotLeader { .. }));
+        assert_eq!(
+            raft.staged_learners(),
+            vec![staged_learner.clone()],
+            "failed transient membership catch-up must not remove operator-staged learners"
+        );
+        assert!(!raft
+            .runtime
+            .lock()
+            .leader_progress
+            .contains_key(&transient_learner.id));
+        assert!(dir.join(LEARNERS_FILE).exists());
+        let reopened = BrokerRaft::open(cfg).expect("reopen after failed catch-up cleanup");
+        assert_eq!(reopened.staged_learners(), vec![staged_learner]);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -11750,6 +11923,114 @@ mod tests {
         assert!(outcome.target_reached);
         assert_eq!(raft.leader_progress_generation(), before);
         server.await.expect("fake peer server");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn replicate_to_peer_clamps_next_index_above_local_tail() {
+        let dir = temp_dir("raft-progress-clamps-next-index-above-tail");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log.append(1, RaftCommand::Noop).expect("append one");
+        raft.log.append(1, RaftCommand::Noop).expect("append two");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 99,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(
+                        prev_log_index, 2,
+                        "leader should clamp stale nextIndex to the local tail"
+                    );
+                    assert!(entries.is_empty());
+                    term
+                }
+                RaftRpc::InstallSnapshot { .. } => {
+                    panic!("stale high nextIndex must not force snapshot fallback")
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let body = serde_json::to_vec(&RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index: 2,
+                conflict_index: None,
+                conflict_term: None,
+            })
+            .expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            raft.replicate_to_peer(peer, 1, 0, Some(2)),
+        )
+        .await
+        .expect("replication should not stall after clamping nextIndex")
+        .expect("replicate to peer");
+        assert!(outcome.contacted);
+        assert!(outcome.target_reached);
+        server.await.expect("fake peer server");
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 2);
+        assert_eq!(progress.next_index, 3);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -15127,6 +15408,14 @@ mod tests {
         assert!(
             matches!(bad, RaftRpcResponse::Error { ref error, .. } if error.contains("offset mismatch"))
         );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_staged_chunks_total, 1);
+        assert_eq!(telemetry.install_snapshot_staged_bytes_total, split as u64);
+        assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 0);
+        assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 1);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_install_snapshot_offset_mismatches_total 1"));
         assert!(raft.snapshot_transfers.lock().is_empty());
         assert!(!staged_path.exists());
         assert!(snapshot_part_files(&dir).is_empty());
@@ -15181,6 +15470,48 @@ mod tests {
             fs::metadata(&staged_path).expect("staged file").len(),
             second_end as u64
         );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_staged_chunks_total, 2);
+        assert_eq!(
+            telemetry.install_snapshot_staged_bytes_total,
+            second_end as u64
+        );
+        assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 0);
+        assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
+
+        let duplicate_first = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            0,
+            false,
+            BASE64.encode(&bytes[..first_end]),
+        );
+        assert!(matches!(
+            duplicate_first,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+        assert_eq!(
+            fs::metadata(&staged_path)
+                .expect("staged file after duplicate first chunk")
+                .len(),
+            second_end as u64,
+            "duplicate first chunk must not restart or truncate a later staged transfer"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_staged_chunks_total, 2);
+        assert_eq!(
+            telemetry.install_snapshot_staged_bytes_total,
+            second_end as u64
+        );
+        assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 1);
+        assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
 
         let duplicate = raft.handle_install_snapshot(
             2,
@@ -15207,6 +15538,14 @@ mod tests {
             second_end as u64,
             "duplicate chunk must not be appended twice"
         );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_staged_chunks_total, 2);
+        assert_eq!(
+            telemetry.install_snapshot_staged_bytes_total,
+            second_end as u64
+        );
+        assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 2);
+        assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
 
         let final_chunk = raft.handle_install_snapshot(
             2,
@@ -15235,6 +15574,24 @@ mod tests {
                 .last_included_index,
             7
         );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_staged_chunks_total, 3);
+        assert_eq!(
+            telemetry.install_snapshot_staged_bytes_total,
+            bytes.len() as u64
+        );
+        assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 2);
+        assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total 3")
+        );
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_install_snapshot_staged_bytes_total {}",
+            bytes.len()
+        )));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_install_snapshot_duplicate_chunks_total 2"));
 
         let _ = fs::remove_dir_all(dir);
     }

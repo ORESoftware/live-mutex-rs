@@ -597,8 +597,10 @@ cannot apply a membership transition. After promotion, every newly promoted
 voter must catch up to the final membership log index before the membership
 change returns; learner/new-voter catch-up now runs peers concurrently and
 retries each peer immediately after bounded-batch progress instead of sleeping
-for the heartbeat interval between batches, and
-`GET /raft/progress` exposes staged learner progress.
+for the heartbeat interval between batches. Failed transient membership catch-up
+cleanup preserves any operator-staged learner already recorded on disk and
+removes only learners added for that failed attempt, and `GET /raft/progress`
+exposes staged learner progress.
 `GET/POST/DELETE /raft/learners` provides consensus-replicated staged-learner
 management for operator add/remove workflows, with a local restart cache and
 snapshot coverage. Promotion remains log-backed through the joint-consensus
@@ -606,7 +608,9 @@ membership endpoint.
 If leader progress for a peer is missing, catch-up starts from the retained
 snapshot/log boundary instead of assuming the peer already has the leader's
 tail. Stale conflict responses cannot rewind a peer's `nextIndex` below its
-known `matchIndex + 1`, and debug-level `lmx::raft` append-progress events
+known `matchIndex + 1`; stale in-memory `nextIndex` values above the local log
+tail are clamped to `lastLogIndex + 1` before replication so they do not force
+unnecessary snapshot fallback. Debug-level `lmx::raft` append-progress events
 include the sent batch boundary plus conflict-repair/clamp details. Raft
 `/metrics` also exposes
 `dd_rust_network_mutex_raft_append_progress_updates_total`,
@@ -619,8 +623,10 @@ Leader-side `InstallSnapshot` catch-up exposes
 `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
 `dd_rust_network_mutex_raft_install_snapshot_bytes_total`, and
 `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`.
-Follower snapshot staging idempotently accepts duplicate non-final chunks, so a
-lost intermediate chunk response does not force the whole transfer to restart.
+Follower snapshot staging idempotently accepts duplicate non-final chunks,
+including delayed duplicate first chunks, so a lost chunk response does not
+force the whole transfer to restart; `/metrics` also exposes follower-side
+staged chunks/bytes, duplicate chunks, and offset mismatches.
 Old log entries are compacted only after they are committed, applied, and
 covered by a durable snapshot. Snapshots now carry active holders, queued
 waiters, fencing counters, and TTL deadlines, so `InstallSnapshot` can catch up

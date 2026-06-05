@@ -81,6 +81,9 @@ Implemented:
 - stale or delayed conflict responses cannot rewind a peer's `nextIndex` below
   its known `matchIndex + 1`, preserving the leader progress invariant under
   overlapping catch-up retries,
+- volatile leader progress with `nextIndex` beyond the local log tail is
+  clamped back to `lastLogIndex + 1` before replication so a bad in-memory
+  progress value does not trigger unnecessary snapshot fallback,
 - bounded leader-local client request batching for the HTTP write path,
 - proposal-quorum failure demotion: if a leader appends a client entry but
   cannot commit that target index, it returns unavailable and steps down so load
@@ -96,9 +99,11 @@ Implemented:
 - stale staged `InstallSnapshot` part cleanup, including orphaned transfer-file
   cleanup on restart, so abandoned chunk transfers do not leak disk
   indefinitely,
-- duplicate non-final `InstallSnapshot` chunks are idempotently acknowledged
-  without appending bytes twice or clearing the staged transfer, while real
-  offset gaps still reset the transfer,
+- duplicate non-final `InstallSnapshot` chunks, including delayed duplicate
+  first chunks, are idempotently acknowledged without appending bytes twice or
+  clearing the staged transfer, while real offset gaps still reset the transfer;
+  follower-side staged chunks, staged bytes, duplicate chunks, and offset
+  mismatches are exposed in `/metrics`,
 - SHA-256 snapshot payload checksums verified before snapshot install,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
@@ -118,6 +123,9 @@ Implemented:
 - transient learner catch-up for new peer IDs before joint-consensus promotion,
 - required post-promotion catch-up so every newly promoted voter reaches the
   final membership log index before the membership change returns,
+- failed transient catch-up for a membership change removes only learners added
+  for that attempt and preserves any operator-staged learner already recorded on
+  disk,
 - learner and new-voter catch-up runs peers concurrently and retries each peer
   immediately after bounded-batch progress instead of sleeping for the heartbeat
   interval between every batch,
