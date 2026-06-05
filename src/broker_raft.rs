@@ -1377,7 +1377,10 @@ impl BrokerRaft {
         Ok(())
     }
 
-    async fn replicate_log_once(&self, target_index: Option<u64>) -> Result<usize, BrokerRaftError> {
+    async fn replicate_log_once(
+        &self,
+        target_index: Option<u64>,
+    ) -> Result<usize, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-once-1");
         let (term, leader_commit) = {
             let runtime = self.runtime.lock();
@@ -1438,14 +1441,12 @@ impl BrokerRaft {
                     }
                     if success {
                         let mut runtime = self.runtime.lock();
-                        let progress =
-                            runtime
-                                .leader_progress
-                                .entry(peer.id.clone())
-                                .or_insert(RaftPeerProgress {
-                                    next_index: match_index.saturating_add(1),
-                                    match_index: 0,
-                                });
+                        let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
+                            RaftPeerProgress {
+                                next_index: match_index.saturating_add(1),
+                                match_index: 0,
+                            },
+                        );
                         progress.match_index = progress.match_index.max(match_index);
                         progress.next_index = progress
                             .next_index
@@ -1460,14 +1461,12 @@ impl BrokerRaft {
                             next_index,
                         )?;
                         let mut runtime = self.runtime.lock();
-                        let progress =
-                            runtime
-                                .leader_progress
-                                .entry(peer.id.clone())
-                                .or_insert(RaftPeerProgress {
-                                    next_index,
-                                    match_index: 0,
-                                });
+                        let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
+                            RaftPeerProgress {
+                                next_index,
+                                match_index: 0,
+                            },
+                        );
                         progress.next_index = next_index.max(1);
                     }
                 }
@@ -1979,11 +1978,7 @@ fn term_at_index(state: &RaftLogState, entries: &[RaftLogEntry], index: u64) -> 
         .map(|entry| entry.term)
 }
 
-fn first_index_for_term(
-    state: &RaftLogState,
-    entries: &[RaftLogEntry],
-    term: u64,
-) -> Option<u64> {
+fn first_index_for_term(state: &RaftLogState, entries: &[RaftLogEntry], term: u64) -> Option<u64> {
     crate::routine_id!("ddl-routine-broker-raft-first-index-for-term-1");
     let snapshot_match = state
         .latest_snapshot
