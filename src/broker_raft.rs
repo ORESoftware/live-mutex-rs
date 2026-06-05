@@ -202,6 +202,13 @@ enum RaftRpc {
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     },
+    InstallSnapshot {
+        term: u64,
+        leader_id: String,
+        last_included_index: u64,
+        last_included_term: u64,
+        payload: serde_json::Value,
+    },
     ProxyRequest {
         request: Request,
         request_uuid: String,
@@ -227,6 +234,11 @@ enum RaftRpcResponse {
         match_index: u64,
         conflict_index: Option<u64>,
         conflict_term: Option<u64>,
+    },
+    InstallSnapshot {
+        term: u64,
+        success: bool,
+        last_included_index: u64,
     },
     ProxyResponse {
         term: u64,
@@ -409,6 +421,12 @@ impl RaftLogStore {
     pub fn latest_snapshot(&self) -> Option<RaftSnapshotMetadata> {
         crate::routine_id!("ddl-routine-broker-raft-latest-snapshot-1");
         self.state.lock().latest_snapshot.clone()
+    }
+
+    fn latest_snapshot_file(&self) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-latest-snapshot-file-1");
+        let _state = self.state.lock();
+        read_snapshot_file(&self.snapshot_path)
     }
 
     pub fn read_entries(&self) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
@@ -622,6 +640,64 @@ impl RaftLogStore {
         sync_dir(&self.data_dir)?;
 
         state.latest_snapshot = Some(metadata.clone());
+        Ok(metadata)
+    }
+
+    fn install_snapshot_from_leader(
+        &self,
+        last_included_index: u64,
+        last_included_term: u64,
+        payload: serde_json::Value,
+    ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-install-snapshot-log-1");
+        let mut state = self.state.lock();
+        if let Some(existing) = state
+            .latest_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.last_included_index >= last_included_index)
+        {
+            return Ok(existing.clone());
+        }
+
+        let entries = read_log_entries(&self.log_path)?;
+        let retain_suffix =
+            term_at_index(&state, &entries, last_included_index) == Some(last_included_term);
+        let retained: Vec<RaftLogEntry> = if retain_suffix {
+            entries
+                .into_iter()
+                .filter(|entry| entry.index > last_included_index)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let metadata = RaftSnapshotMetadata {
+            last_included_index,
+            last_included_term,
+            created_at_ms: unix_ms(),
+        };
+        let snapshot = RaftSnapshotFile {
+            metadata: metadata.clone(),
+            payload,
+        };
+        let tmp = self.snapshot_path.with_extension("json.tmp");
+        {
+            let mut file = File::create(&tmp)?;
+            serde_json::to_writer_pretty(&mut file, &snapshot)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &self.snapshot_path)?;
+        rewrite_log(&self.log_path, &retained)?;
+        sync_dir(&self.data_dir)?;
+
+        state.latest_snapshot = Some(metadata.clone());
+        if let Some(last) = retained.last() {
+            state.last_index = last.index;
+            state.last_term = last.term;
+        } else {
+            state.last_index = metadata.last_included_index;
+            state.last_term = metadata.last_included_term;
+        }
         Ok(metadata)
     }
 
@@ -1957,12 +2033,17 @@ fn granted_lock_uuid(resp: &Response) -> Option<String> {
 
 fn read_snapshot_metadata(path: &Path) -> Result<Option<RaftSnapshotMetadata>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-snapshot-meta-1");
+    Ok(read_snapshot_file(path)?.map(|snapshot| snapshot.metadata))
+}
+
+fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-read-snapshot-file-1");
     if !path.exists() {
         return Ok(None);
     }
     let file = File::open(path)?;
     let snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
-    Ok(Some(snapshot.metadata))
+    Ok(Some(snapshot))
 }
 
 fn read_hard_state(path: &Path) -> Result<RaftHardState, BrokerRaftError> {

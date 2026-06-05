@@ -2027,6 +2027,49 @@ impl Broker {
         }
     }
 
+    pub(crate) fn validate_idle_snapshot_payload(
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-broker-validate-idle-snapshot-1");
+        let metrics = payload
+            .get("metrics")
+            .ok_or_else(|| "idle broker snapshot is missing metrics".to_string())?;
+        for field in ["holders", "waiters", "pendingDeadlines"] {
+            let value = metrics
+                .get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("idle broker snapshot missing numeric metrics.{field}"))?;
+            if value != 0 {
+                return Err(format!(
+                    "cannot install non-idle broker snapshot: metrics.{field}={value}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_idle_snapshot(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-broker-install-idle-snapshot-1");
+        Self::validate_idle_snapshot_payload(payload)?;
+        let metrics = payload
+            .get("metrics")
+            .ok_or_else(|| "idle broker snapshot is missing metrics".to_string())?;
+        let mut state = self.state.lock();
+        let config = state.config.clone();
+        let started_at = state.started_at;
+        let mut next = BrokerState::new(config);
+        next.started_at = started_at;
+        next.ttl_evictions_total = metrics_u64(metrics, "ttlEvictionsTotal");
+        next.concurrency_cap_clamps_total = metrics_u64(metrics, "concurrencyCapClampsTotal");
+        next.fencing_watermark = metrics_u64(metrics, "fencingWatermark");
+        next.idle_keys_pruned_total = metrics_u64(metrics, "idleKeysPrunedTotal");
+        *state = next;
+        Ok(())
+    }
+
     /// `Instant` at which this broker started accepting requests. Used by
     /// the HTML status page (upstream `live-mutex#108`) to render an
     /// uptime string. Cheap — single mutex + copy.
@@ -2233,6 +2276,14 @@ impl Broker {
             }
         })
     }
+}
+
+fn metrics_u64(metrics: &serde_json::Value, field: &str) -> u64 {
+    crate::routine_id!("ddl-routine-broker-snapshot-metric-u64-1");
+    metrics
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Default)]
