@@ -4,7 +4,7 @@
 //! leader election, quorum replication, durable append-only logs, snapshot
 //! metadata, and compaction-by-snapshot-index.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
@@ -32,6 +32,8 @@ const DEFAULT_RAFT_RPC_MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_APPEND_ENTRIES_MAX_ENTRIES: usize = 256;
 const DEFAULT_APPEND_ENTRIES_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
+const DEFAULT_CLIENT_BATCH_MAX_ENTRIES: usize = 32;
+const DEFAULT_CLIENT_BATCH_MAX_DELAY: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone)]
 pub struct BrokerRaftConfig {
@@ -66,6 +68,11 @@ pub struct BrokerRaftConfig {
     /// Serialized snapshot payload bytes per `InstallSnapshot` chunk. Base64
     /// encoding makes the wire frame larger than this raw byte budget.
     pub install_snapshot_chunk_bytes: usize,
+    /// Max leader-local client requests to append and replicate in one commit
+    /// batch. Membership changes and client-drop cleanup stay serialized.
+    pub client_batch_max_entries: usize,
+    /// Small coalescing window for leader-local client request batches.
+    pub client_batch_max_delay: Duration,
     pub peers: Vec<RaftPeerConfig>,
 }
 
@@ -89,6 +96,8 @@ impl Default for BrokerRaftConfig {
             append_entries_max_entries: DEFAULT_APPEND_ENTRIES_MAX_ENTRIES,
             append_entries_max_bytes: DEFAULT_APPEND_ENTRIES_MAX_BYTES,
             install_snapshot_chunk_bytes: DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES,
+            client_batch_max_entries: DEFAULT_CLIENT_BATCH_MAX_ENTRIES,
+            client_batch_max_delay: DEFAULT_CLIENT_BATCH_MAX_DELAY,
             peers: Vec::new(),
         }
     }
@@ -151,6 +160,11 @@ impl BrokerRaftConfig {
         if self.install_snapshot_chunk_bytes == 0 {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.install_snapshot_chunk_bytes must be greater than 0".into(),
+            ));
+        }
+        if self.client_batch_max_entries == 0 {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.client_batch_max_entries must be greater than 0".into(),
             ));
         }
         Ok(())
