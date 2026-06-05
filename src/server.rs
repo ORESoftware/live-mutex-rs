@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::broker::{Broker, BrokerConfig};
-use crate::broker_raft::{BrokerRaft, BrokerRaftConfig, BrokerRaftError};
+use crate::broker_raft::{BrokerRaft, BrokerRaftConfig, BrokerRaftError, RaftPeerConfig};
 use crate::protocol::{
     http::{
         AcquireRequest, AcquireResponse, LockInfoResponse, ReleaseRequest, ReleaseResponse,
@@ -398,6 +398,11 @@ struct RaftAppState {
     metrics: Arc<crate::metrics::Metrics>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RaftMembershipRequest {
+    peers: Vec<RaftPeerConfig>,
+}
+
 pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> std::io::Result<()> {
     crate::routine_id!("ddl-routine-server-run-raft-1");
     let raft = BrokerRaft::open(raft_config).map_err(raft_io_error)?;
@@ -420,6 +425,10 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
             .route("/metrics", get(raft_metrics_endpoint))
             .route("/raft/status", get(raft_status))
             .route("/raft/leaderz", get(raft_leaderz))
+            .route(
+                "/raft/membership",
+                get(raft_membership).post(raft_change_membership),
+            )
             .route("/v1/lock", post(raft_http_acquire))
             .route("/v1/unlock", post(raft_http_release))
             .with_state(app_state);
@@ -847,11 +856,54 @@ async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
         "isLeader": state.raft.is_leader(),
         "leaderId": state.raft.leader_id(),
         "leaderAddr": state.raft.leader_addr(),
-        "clusterSize": state.raft.config().cluster_size(),
-        "quorumSize": state.raft.config().quorum_size(),
+        "clusterSize": state.raft.active_cluster_size(),
+        "quorumSize": state.raft.active_quorum_size(),
+        "membershipJoint": state.raft.membership_is_joint(),
+        "membership": state.raft.membership(),
         "lastLogIndex": state.raft.log().last_index(),
         "lastLogTerm": state.raft.log().last_term(),
     }))
+}
+
+async fn raft_membership(State(state): State<RaftAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-server-raft-membership-1");
+    Json(serde_json::json!({
+        "nodeId": state.raft.config().node_id,
+        "isLeader": state.raft.is_leader(),
+        "leaderId": state.raft.leader_id(),
+        "leaderAddr": state.raft.leader_addr(),
+        "clusterSize": state.raft.active_cluster_size(),
+        "quorumSize": state.raft.active_quorum_size(),
+        "membershipJoint": state.raft.membership_is_joint(),
+        "membership": state.raft.membership(),
+    }))
+}
+
+async fn raft_change_membership(
+    State(state): State<RaftAppState>,
+    headers: HeaderMap,
+    Json(req): Json<RaftMembershipRequest>,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-change-membership-1");
+    if !raft_http_authorized(&state, &headers) {
+        return http_unauthorized();
+    }
+    match state.raft.change_membership(req.peers).await {
+        Ok(index) => Json(serde_json::json!({
+            "index": index,
+            "membership": state.raft.membership(),
+            "clusterSize": state.raft.active_cluster_size(),
+            "quorumSize": state.raft.active_quorum_size(),
+        }))
+        .into_response(),
+        Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
+        Err(err @ BrokerRaftError::InvalidConfig(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(err) => raft_unavailable(err),
+    }
 }
 
 async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {

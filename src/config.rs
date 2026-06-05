@@ -95,6 +95,8 @@ struct RaftFileConfig {
     snapshot_max_log_entries: Option<u64>,
     snapshot_max_log_bytes: Option<u64>,
     trailing_log_entries: Option<u64>,
+    append_entries_max_entries: Option<usize>,
+    append_entries_max_bytes: Option<usize>,
     peers: Vec<RaftPeerConfig>,
 }
 
@@ -298,6 +300,12 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.trailing_log_entries = env_parse("LMX_RAFT_TRAILING_LOG_ENTRIES")
         .or(file.trailing_log_entries)
         .unwrap_or(cfg.trailing_log_entries);
+    cfg.append_entries_max_entries = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES")
+        .or(file.append_entries_max_entries)
+        .unwrap_or(cfg.append_entries_max_entries);
+    cfg.append_entries_max_bytes = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES")
+        .or(file.append_entries_max_bytes)
+        .unwrap_or(cfg.append_entries_max_bytes);
     cfg.peers = file.peers.clone();
     Ok(cfg)
 }
@@ -372,6 +380,8 @@ mod tests {
             [raft]
             enabled = false
             node_id = "node-1"
+            append_entries_max_entries = 17
+            append_entries_max_bytes = 12345
 
             [[raft.peers]]
             id = "node-1"
@@ -391,5 +401,7 @@ mod tests {
         let raft = build_raft_config(&cfg.raft).expect("valid raft config");
         assert_eq!(raft.cluster_size(), 3);
         assert_eq!(raft.quorum_size(), 2);
+        assert_eq!(raft.append_entries_max_entries, 17);
+        assert_eq!(raft.append_entries_max_bytes, 12345);
     }
 }

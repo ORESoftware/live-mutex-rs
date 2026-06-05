@@ -40,6 +40,11 @@ snapshot_max_log_entries = 100000
 snapshot_max_log_bytes = 67108864
 trailing_log_entries = 10000
 
+# Bound one AppendEntries batch so lagging followers catch up incrementally
+# instead of receiving an unbounded log suffix in one JSON frame.
+append_entries_max_entries = 256
+append_entries_max_bytes = 1048576
+
 [[raft.peers]]
 id = "node-1"
 addr = "node-1:7980"

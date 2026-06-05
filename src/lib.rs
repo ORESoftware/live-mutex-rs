@@ -42,7 +42,7 @@ pub mod status;
 pub use broker::{Broker, BrokerConfig, BrokerMetrics};
 pub use broker_raft::{
     BrokerRaft, BrokerRaftConfig, BrokerRaftError, RaftCommand, RaftCompactionReport, RaftLogEntry,
-    RaftLogStore, RaftPeerConfig, RaftSnapshotMetadata,
+    RaftLogStore, RaftMembership, RaftPeerConfig, RaftSnapshotMetadata,
 };
 pub use client::{Client, ClientConfig, ClientError, LockGuard, LockInfo, RwClient};
 pub use config::{load_runtime_config, ConfigError, RuntimeConfig};

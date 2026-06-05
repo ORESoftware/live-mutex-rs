@@ -2048,10 +2048,7 @@ impl Broker {
         Ok(())
     }
 
-    pub(crate) fn install_idle_snapshot(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<(), String> {
+    pub(crate) fn install_idle_snapshot(&self, payload: &serde_json::Value) -> Result<(), String> {
         crate::routine_id!("ddl-routine-broker-install-idle-snapshot-1");
         Self::validate_idle_snapshot_payload(payload)?;
         let metrics = payload

@@ -22,18 +22,24 @@ Implemented:
 - quorum commit based on peer count, such as 2-of-3 or 3-of-5,
 - durable local hard state and append-only logs,
 - incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
-  `nextIndex`, and `matchIndex`,
+  `nextIndex`, `matchIndex`, and bounded catch-up batches,
 - follower log conflict detection and truncation repair,
+- `InstallSnapshot` catch-up for followers behind the compacted prefix, limited
+  to the current idle-broker snapshot format,
+- log-backed dynamic membership changes through joint consensus via
+  `GET/POST /raft/membership`,
+- persistent Raft peer connection reuse for vote, append, and snapshot RPCs,
 - leader-aware HTTP routing support via `/raft/leaderz`,
 - conservative local snapshot/compaction for disk control.
 
 Still missing:
 
-- `InstallSnapshot` RPC for followers that fall behind the compacted prefix,
-- dynamic membership changes and joint consensus,
-- persistent connection pooling/batching for the hot path,
+- full non-idle broker state snapshots and restore,
+- learner/staging workflows for adding a cold node before it is promoted to a
+  voter,
+- request batching and pipelining for the hot path,
 - production hardening comparable to etcd or ZooKeeper,
-- recovery from non-idle broker snapshots.
+- broader snapshot transfer mechanics such as chunking and checksums.
 
 That means BrokerRaft should currently be treated as an experimental
 high-availability broker backend, not as a finished distributed lock service.
@@ -95,8 +101,42 @@ hop shown above. Correctness does not depend on leader-aware routing, because
 followers proxy writes and the leader still requires quorum before applying.
 The current leader write path is still serialized, and each committed lock
 operation is durably written before applying. Followers now receive incremental
-log suffixes instead of a full-log rewrite on every append, but this path is
-still correctness-first rather than throughput-optimized.
+log suffixes instead of a full-log rewrite on every append. Lagging followers
+receive bounded `AppendEntries` batches, controlled by
+`append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
+reuse open TCP connections. This path is still correctness-first rather than
+throughput-optimized because writes are serialized and not yet batched or
+pipelined.
+
+## Membership Change Sequence
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Op as "Operator"
+  participant L as "Current leader"
+  participant Old as "Old config quorum"
+  participant New as "New config quorum"
+  participant Disk as "Raft log + snapshot"
+
+  Op->>L: POST /raft/membership { peers }
+  L->>Disk: append SetMembership(joint old,new)
+  L->>Old: AppendEntries(joint entry)
+  Old-->>L: old majority acknowledges
+  L->>Disk: commit joint config
+  L->>Disk: append SetMembership(simple new)
+  L->>Old: AppendEntries(simple new)
+  L->>New: AppendEntries(simple new)
+  Old-->>L: old majority acknowledges
+  New-->>L: new majority acknowledges
+  L->>Disk: commit simple new config
+  L-->>Op: index + active membership
+```
+
+The joint entry is committed using the old config. Once that entry is applied,
+the final simple config must be acknowledged by a majority of both the old and
+new configs. This is Raft's quorum safety rule; it does not remove the leader's
+job of ordering operations.
 
 ## Failover Event Trace
 
