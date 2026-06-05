@@ -1417,12 +1417,11 @@ impl RaftLogStore {
             }
             let retained_prefix_len =
                 retained_entry_lower_bound(&state.retained_log_entries, rewrite_index);
-            let truncated_entries = state
+            truncated_entries = state
                 .retained_log_entries
                 .len()
                 .saturating_sub(retained_prefix_len);
             rewritten_entries = incoming.len().saturating_sub(pos);
-            truncated_entries = truncated_entries;
             let mut local = state.retained_log_entries[..retained_prefix_len].to_vec();
             local.extend(incoming[pos..].iter().cloned());
             validate_log_entries_for_snapshot(&local, state.latest_snapshot.as_ref())?;
@@ -2148,6 +2147,26 @@ impl BrokerRaft {
                 .telemetry
                 .append_snapshot_suffix_gaps_total
                 .load(Ordering::Relaxed),
+            follower_append_conflicts_total: self
+                .telemetry
+                .follower_append_conflicts_total
+                .load(Ordering::Relaxed),
+            follower_append_rewrites_total: self
+                .telemetry
+                .follower_append_rewrites_total
+                .load(Ordering::Relaxed),
+            follower_append_appended_entries_total: self
+                .telemetry
+                .follower_append_appended_entries_total
+                .load(Ordering::Relaxed),
+            follower_append_rewritten_entries_total: self
+                .telemetry
+                .follower_append_rewritten_entries_total
+                .load(Ordering::Relaxed),
+            follower_append_truncated_entries_total: self
+                .telemetry
+                .follower_append_truncated_entries_total
+                .load(Ordering::Relaxed),
             install_snapshot_chunks_total: self
                 .telemetry
                 .install_snapshot_chunks_total
@@ -2205,6 +2224,21 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total Snapshot fallbacks caused by a retained log suffix that did not cover nextIndex.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total counter\n",
                 "dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_conflicts_total Follower-side AppendEntries prevLogIndex or prevLogTerm conflict responses returned to leaders.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_conflicts_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_conflicts_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_rewrites_total Follower-side AppendEntries suffix rewrite repairs applied after a leader conflict repair.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_rewrites_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_rewrites_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_appended_entries_total Follower-side AppendEntries log entries appended without rewriting an existing suffix.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_appended_entries_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_appended_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_rewritten_entries_total Leader-supplied entries written during follower-side suffix rewrite repairs.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_rewritten_entries_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_rewritten_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_truncated_entries_total Local retained log entries truncated during follower-side suffix rewrite repairs.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_truncated_entries_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_truncated_entries_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_chunks_total Leader-side InstallSnapshot chunk RPCs attempted for lagging peer catch-up.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_chunks_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_chunks_total {}\n",
@@ -2234,6 +2268,11 @@ impl BrokerRaft {
             snapshot.append_snapshot_fallbacks_total,
             snapshot.append_snapshot_prev_term_misses_total,
             snapshot.append_snapshot_suffix_gaps_total,
+            snapshot.follower_append_conflicts_total,
+            snapshot.follower_append_rewrites_total,
+            snapshot.follower_append_appended_entries_total,
+            snapshot.follower_append_rewritten_entries_total,
+            snapshot.follower_append_truncated_entries_total,
             snapshot.install_snapshot_chunks_total,
             snapshot.install_snapshot_bytes_total,
             snapshot.install_snapshot_progress_updates_total,
@@ -3752,7 +3791,75 @@ impl BrokerRaft {
                 };
             }
         };
+        self.record_follower_append_report(
+            term,
+            &leader_id,
+            prev_log_index,
+            prev_log_term,
+            leader_commit,
+            &append_report,
+        );
         self.finish_append_entries(term, &leader_id, append_report, leader_commit)
+    }
+
+    fn record_follower_append_report(
+        &self,
+        term: u64,
+        leader_id: &str,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        leader_commit: u64,
+        append_report: &RaftAppendReport,
+    ) {
+        crate::routine_id!("ddl-routine-broker-raft-record-follower-append-report-1");
+        if !append_report.success {
+            self.telemetry
+                .follower_append_conflicts_total
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                leader = %leader_id,
+                term,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                match_index = append_report.match_index,
+                conflict_index = ?append_report.conflict_index,
+                conflict_term = ?append_report.conflict_term,
+                "raft follower append conflict response",
+            );
+            return;
+        }
+        if append_report.appended_entries > 0 {
+            self.telemetry
+                .follower_append_appended_entries_total
+                .fetch_add(append_report.appended_entries as u64, Ordering::Relaxed);
+        }
+        if append_report.rewritten_entries > 0 || append_report.truncated_entries > 0 {
+            self.telemetry
+                .follower_append_rewrites_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .follower_append_rewritten_entries_total
+                .fetch_add(append_report.rewritten_entries as u64, Ordering::Relaxed);
+            self.telemetry
+                .follower_append_truncated_entries_total
+                .fetch_add(append_report.truncated_entries as u64, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                leader = %leader_id,
+                term,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                match_index = append_report.match_index,
+                rewritten_entries = append_report.rewritten_entries,
+                truncated_entries = append_report.truncated_entries,
+                "raft follower append rewrote conflicting suffix",
+            );
+        }
     }
 
     async fn handle_append_entries_rpc(
