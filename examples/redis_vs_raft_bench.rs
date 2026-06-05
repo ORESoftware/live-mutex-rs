@@ -17,9 +17,11 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
+use tokio::time::timeout;
 
 const REDIS_UNLOCK_LUA: &str =
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+const DEFAULT_IO_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -40,6 +42,7 @@ struct Config {
     keys: usize,
     duration: Duration,
     ttl_ms: u64,
+    io_timeout: Duration,
     target: Target,
     auth_token: Option<String>,
 }
@@ -80,13 +83,22 @@ enum RedisValue {
 
 #[tokio::main]
 async fn main() {
+    if env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        print_usage();
+        return;
+    }
+
     let config = Config::from_env();
     println!(
-        "workers={} keys={} duration_ms={} ttl_ms={} redis={} broker={} raft={}",
+        "workers={} keys={} duration_ms={} ttl_ms={} io_timeout_ms={} redis={} broker={} raft={}",
         config.workers,
         config.keys,
         config.duration.as_millis(),
         config.ttl_ms,
+        config.io_timeout.as_millis(),
         config.redis_addr,
         config.broker_addr,
         config.raft_addr
@@ -156,6 +168,10 @@ impl Config {
             keys: env_parse("BENCH_KEYS", workers * 16).max(1),
             duration: Duration::from_millis(env_parse("BENCH_DURATION_MS", 10_000)),
             ttl_ms: env_parse("BENCH_TTL_MS", 5_000),
+            io_timeout: Duration::from_millis(env_parse(
+                "BENCH_IO_TIMEOUT_MS",
+                DEFAULT_IO_TIMEOUT_MS,
+            )),
             target,
             auth_token: env_string("BENCH_HTTP_AUTH_TOKEN")
                 .or_else(|| env_string("BENCH_RAFT_AUTH_TOKEN"))
@@ -181,7 +197,7 @@ async fn run_redis(config: Config) -> Summary {
 
 async fn redis_worker(config: Config, worker_id: usize, deadline: Instant) -> WorkerStats {
     let mut stats = WorkerStats::default();
-    let mut conn = match RedisConn::connect(&config.redis_addr).await {
+    let mut conn = match RedisConn::connect(&config.redis_addr, config.io_timeout).await {
         Ok(conn) => conn,
         Err(err) => {
             eprintln!("redis worker {worker_id} connect error: {err}");
@@ -196,7 +212,7 @@ async fn redis_worker(config: Config, worker_id: usize, deadline: Instant) -> Wo
         let key = bench_key("redis", next_key(&mut rng, config.keys));
         let token = format!("{worker_id}-{seq}-{rng}");
         let start = Instant::now();
-        match redis_lock_cycle(&mut conn, &key, &token, config.ttl_ms).await {
+        match redis_lock_cycle(&mut conn, &key, &token, config.ttl_ms, config.io_timeout).await {
             Ok(true) => {
                 stats.ok += 1;
                 stats.latencies_us.push(start.elapsed().as_micros() as u64);
@@ -205,7 +221,7 @@ async fn redis_worker(config: Config, worker_id: usize, deadline: Instant) -> Wo
             Err(err) => {
                 stats.errors += 1;
                 eprintln!("redis worker {worker_id} error: {err}");
-                match RedisConn::connect(&config.redis_addr).await {
+                match RedisConn::connect(&config.redis_addr, config.io_timeout).await {
                     Ok(new_conn) => conn = new_conn,
                     Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
@@ -220,9 +236,13 @@ async fn redis_lock_cycle(
     key: &str,
     token: &str,
     ttl_ms: u64,
+    io_timeout: Duration,
 ) -> Result<bool, String> {
     let set = conn
-        .command(&["SET", key, token, "NX", "PX", &ttl_ms.to_string()])
+        .command(
+            &["SET", key, token, "NX", "PX", &ttl_ms.to_string()],
+            io_timeout,
+        )
         .await?;
     match set {
         RedisValue::Simple(s) if s == "OK" => {}
@@ -231,7 +251,7 @@ async fn redis_lock_cycle(
         other => return Err(format!("unexpected SET response: {other:?}")),
     }
     let unlock = conn
-        .command(&["EVAL", REDIS_UNLOCK_LUA, "1", key, token])
+        .command(&["EVAL", REDIS_UNLOCK_LUA, "1", key, token], io_timeout)
         .await?;
     match unlock {
         RedisValue::Integer(1) => Ok(true),
@@ -303,6 +323,7 @@ async fn http_lock_cycle(config: &Config, endpoint: &str, key: &str) -> Result<b
         "/v1/lock",
         Some(json!({"key": key, "ttlMs": config.ttl_ms})),
         config.auth_token.as_deref(),
+        config.io_timeout,
     )
     .await?;
     if acquire["acquired"] != true {
@@ -317,6 +338,7 @@ async fn http_lock_cycle(config: &Config, endpoint: &str, key: &str) -> Result<b
         "/v1/unlock",
         Some(json!({"key": key, "lockUuid": lock_uuid})),
         config.auth_token.as_deref(),
+        config.io_timeout,
     )
     .await?;
     if release["unlocked"] == true {
@@ -411,14 +433,42 @@ where
         .unwrap_or(default)
 }
 
+fn print_usage() {
+    println!(
+        "Rough Redis / Broker / BrokerRaft acquire+release benchmark.\n\
+\n\
+Configuration is environment driven:\n\
+  BENCH_TARGET=redis|broker|raft|broker-raft|both|all\n\
+  BENCH_REDIS=127.0.0.1:6379\n\
+  BENCH_BROKER=127.0.0.1:6971\n\
+  BENCH_RAFT=127.0.0.1:6972\n\
+  BENCH_WORKERS=8\n\
+  BENCH_KEYS=128\n\
+  BENCH_DURATION_MS=10000\n\
+  BENCH_TTL_MS=5000\n\
+  BENCH_IO_TIMEOUT_MS=5000\n\
+  BENCH_HTTP_AUTH_TOKEN=<token>\n\
+\n\
+Example:\n\
+  BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
+    cargo run --release --no-default-features --example redis_vs_raft_bench"
+    );
+}
+
 async fn http_json(
     endpoint: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
     auth_token: Option<&str>,
+    io_timeout: Duration,
 ) -> Result<(u16, Value), String> {
-    let (status, text) = http_request(endpoint, method, path, body, auth_token).await?;
+    let (status, text) = timeout(
+        io_timeout,
+        http_request(endpoint, method, path, body, auth_token),
+    )
+    .await
+    .map_err(|_| format!("HTTP {method} {path} to {endpoint} timed out after {io_timeout:?}"))??;
     let parsed = serde_json::from_str(&text).map_err(|err| {
         format!("failed to parse HTTP JSON status={status}: {err}; body={text:?}")
     })?;
@@ -504,28 +554,33 @@ struct RedisConn {
 }
 
 impl RedisConn {
-    async fn connect(addr: &str) -> Result<Self, String> {
-        let stream = TcpStream::connect(addr)
+    async fn connect(addr: &str, io_timeout: Duration) -> Result<Self, String> {
+        let stream = timeout(io_timeout, TcpStream::connect(addr))
             .await
+            .map_err(|_| format!("connect {addr} timed out after {io_timeout:?}"))?
             .map_err(|err| format!("connect {addr}: {err}"))?;
         Ok(Self {
             reader: BufReader::new(stream),
         })
     }
 
-    async fn command(&mut self, args: &[&str]) -> Result<RedisValue, String> {
+    async fn command(&mut self, args: &[&str], io_timeout: Duration) -> Result<RedisValue, String> {
         let encoded = encode_resp(args);
-        self.reader
-            .get_mut()
-            .write_all(&encoded)
-            .await
-            .map_err(|err| err.to_string())?;
-        self.reader
-            .get_mut()
-            .flush()
-            .await
-            .map_err(|err| err.to_string())?;
-        read_redis_value(&mut self.reader).await
+        timeout(io_timeout, async {
+            self.reader
+                .get_mut()
+                .write_all(&encoded)
+                .await
+                .map_err(|err| err.to_string())?;
+            self.reader
+                .get_mut()
+                .flush()
+                .await
+                .map_err(|err| err.to_string())?;
+            read_redis_value(&mut self.reader).await
+        })
+        .await
+        .map_err(|_| format!("Redis command timed out after {io_timeout:?}"))?
     }
 }
 

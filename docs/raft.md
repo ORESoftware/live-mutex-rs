@@ -17,38 +17,151 @@ path, but it is not yet an etcd/ZooKeeper-grade consensus system.
 
 Implemented:
 
-- leader election with `RequestVote`,
+- leader election with `PreVote`, parallel `RequestVote` RPCs, and early quorum
+  completion,
+- PreVote and RequestVote term-disruption hardening: stale or partitioned nodes
+  must prove a quorum would vote before incrementing/persisting their term, and
+  fresh known-leader hints suppress disruptive higher-term vote requests while
+  expired leader hints do not block liveness,
+- check-quorum leader demotion: if the current leader cannot observe an active
+  quorum for an election-timeout window, it steps down so `/raft/leaderz` stops
+  advertising a partitioned leader,
+- quorum-fresh leader readiness: write admission and `/raft/leaderz` require
+  the leader role plus a recent quorum observation, so stale leaders reject
+  writes before appending new log entries,
 - a current-term no-op barrier appended and committed after a leader election,
 - leader-ordered lock operations,
 - quorum commit based on peer count, such as 2-of-3 or 3-of-5,
-- durable local hard state and append-only logs with persisted-log gap and
-  term-regression validation on read,
+- leader commit advancement from `matchIndex` with Raft's current-term and
+  still-leader commit restrictions,
+- durable local term/vote hard state and append-only logs with persisted-log gap
+  and term-regression validation on read, including
+  latest-snapshot/log-boundary consistency checks,
+- leader and follower commit advancement persist `commitIndex` before applying
+  committed entries, so restart replay cannot lose a locally committed operation,
+- durable snapshots are treated as committed through `lastIncludedIndex` on
+  startup, and live `InstallSnapshot` advances durable hard state before broker
+  state observes the snapshot payload,
+- synced atomic renames for hard state, snapshot files, sidecar learner state,
+  and rewritten log segments; snapshot install fsyncs the new snapshot before
+  rewriting the retained log suffix so restart recovery can trust the snapshot
+  boundary,
 - incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
   `nextIndex`, `matchIndex`, bounded catch-up batches, and retained
   snapshot-suffix catch-up before falling back to `InstallSnapshot`,
+- progress-aware catch-up retries so successful bounded batches or conflict
+  repairs advance immediately instead of waiting for the heartbeat cadence,
 - follower log conflict detection and truncation repair,
+- retained-log term indexing so leader conflict-hint repair can jump
+  `nextIndex` without rereading the whole retained log file,
+- follower `leaderCommit` advancement capped at the matched leader log index,
+- post-commit `AppendEntries` fan-out so followers learn the updated
+  `leaderCommit` promptly after quorum commit,
+- non-quorum `AppendEntries` RPCs are detached instead of cancelled once a
+  target write reaches quorum, so slow followers can still advance progress
+  without delaying the client response,
 - durable term persistence before replying to higher-term append failures,
 - malformed `AppendEntries` rejection for non-contiguous indexes and
   impossible future-term entries,
+- membership-gated Raft RPC handling so unknown or removed peer IDs cannot
+  advance local term, reset election timers, or install snapshots,
+- optional shared peer-token authentication on Raft RPC frames before term,
+  log, snapshot, or proxy handling,
+- same-term leader conflict rejection for vote, append, and snapshot RPC paths,
+- leader progress updates capped to the AppendEntries batch or snapshot actually
+  sent, rather than trusting inflated follower response indexes,
 - bounded leader-local client request batching for the HTTP write path,
+- proposal-quorum failure demotion: if a leader appends a client entry but
+  cannot commit that target index, it returns unavailable and steps down so load
+  balancers stop routing fresh writes to it,
 - deterministic lock UUID and fencing-token grant metadata in client-request log
   entries,
+- Raft client IDs namespaced by a stable node-derived prefix, so `DropClient`
+  cleanup entries from a new leader cannot collide with client IDs logged by a
+  previous leader,
 - chunked `InstallSnapshot` catch-up for followers behind the compacted prefix,
-- active broker-state snapshots for holders, fencing counters, and TTL deadlines,
-  staged on receiver disk before install,
+- active broker-state snapshots for holders, queued waiters, fencing counters,
+  and TTL deadlines, staged on receiver disk before install,
+- stale staged `InstallSnapshot` part cleanup, including orphaned transfer-file
+  cleanup on restart, so abandoned chunk transfers do not leak disk
+  indefinitely,
 - SHA-256 snapshot payload checksums verified before snapshot install,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
+- joint config entries commit under the joint old+new quorum, so an old
+  majority alone cannot apply a membership transition,
+- validation of replicated, persisted, and snapshotted membership payloads before
+  they can alter quorum state,
+- removed local nodes clear leader state, staged learners, progress, and pooled
+  peer RPC connections when applying the new membership,
+- same-id peer address changes drop the old pooled RPC connection immediately
+  when applying the new membership,
+- surviving local nodes clear any known leader or persisted vote target that is
+  no longer active in the new membership before exposing the config change,
+- startup recovery rechecks persisted votes after applying snapshot and committed
+  membership state, so stale votes from removed peers are not carried across
+  restart,
 - transient learner catch-up for new peer IDs before joint-consensus promotion,
-- persistent Raft peer connection reuse for vote, append, and snapshot RPCs,
-- leader-aware HTTP routing support via `/raft/leaderz`,
-- conservative local snapshot/compaction for disk control.
+- required post-promotion catch-up so every newly promoted voter reaches the
+  final membership log index before the membership change returns,
+- interrupted joint-consensus membership changes can be finished by reposting
+  the exact joint config's new peer set, while different peer sets remain
+  rejected until the final simple config is committed,
+- operator progress inspection via `GET /raft/progress`, including per-peer
+  `nextIndex`, `matchIndex`, lag, and staged-learner visibility,
+- consensus-replicated staged-learner management via `GET/POST/DELETE
+  /raft/learners`, with a local restart cache and snapshot coverage; promotion
+  still goes through log-backed joint consensus,
+- staged learner additions/removals are blocked while joint consensus is active,
+  so operator membership-management commands cannot interleave with an unfinished
+  voter transition,
+- conservative missing-progress repair: if leader progress for a peer is absent,
+  catch-up starts from the retained snapshot/log boundary instead of assuming
+  the follower already has the leader's tail,
+- persistent Raft peer connection reuse for vote, append, snapshot, and follower
+  proxy RPCs,
+- cancellation-safe pooled peer RPC calls that drop a connection after an
+  aborted in-flight request instead of risking stale response reuse,
+- `TCP_NODELAY` on Raft peer RPC sockets to avoid small-frame delayed
+  request/response stalls,
+- buffered JSON serialization for append-log, rewritten-log, and snapshot file
+  writes before the same fsync/atomic-rename durability steps,
+- explicit `raft.sync_log` / `LMX_RAFT_SYNC_LOG` durability policy: the default
+  keeps append-log fsyncs enabled, while `false` is reserved for unsafe
+  throughput experiments that accept loss of the latest unsynced log writes
+  after a crash,
+- leader-local durable append/fsync work is offloaded from the async runtime's
+  core workers before quorum replication begins, preserving durable-before-ack
+  ordering without stalling unrelated HTTP and Raft RPC tasks on that worker,
+- follower-side `AppendEntries` append/truncate/repair work is also offloaded
+  to Tokio's blocking pool, so durable follower catch-up does not occupy Raft
+  peer RPC async workers while it waits on filesystem writes,
+- leader-local request batching with an early wake when the pending queue reaches
+  the configured batch size,
+- bounded leader-local client admission through `client_batch_max_pending`, so a
+  stalled quorum rejects before appending new log entries instead of growing the
+  pending queue without bound,
+- bounded replicated HTTP request-id response caching for idempotent retries:
+  repeated `/v1/lock` or `/v1/unlock` calls with the same `requestId` or
+  idempotency header and the same payload return the cached response instead of
+  appending a duplicate command; in-flight duplicate retries are suppressed
+  before append, failed pre-append reservations are released, and the applied
+  cache is rebuilt from committed identity log entries and carried in Raft
+  snapshots, while mismatched payload reuse is rejected,
+- coalesced post-commit `AppendEntries` fan-out, so bursty commits wake lagging
+  peers promptly without spawning one background replication task per commit,
+- leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
+  exposing `currentTerm`, `commitIndex`, `lastApplied`, `isLeaderReady`,
+  `leaderQuorumAgeMs`, and `leaderQuorumTimeoutMs` for convergence and stale
+  leader checks,
+- conservative local snapshot/compaction for disk control,
+- overdue snapshot cadence is honored opportunistically from the commit/apply
+  path as well as the maintenance loop, while retained-suffix settings still
+  block unsafe deletion.
 
 Still missing:
 
-- queued-waiter snapshots and restore,
-- a persistent learner API for operators to inspect and manage staged nodes,
-- request pipelining for the hot path,
+- deeper hot-path pipelining beyond the serialized commit/apply lane,
 - production hardening comparable to etcd or ZooKeeper.
 
 That means BrokerRaft should currently be treated as an experimental
@@ -72,7 +185,7 @@ stateDiagram-v2
     [*] --> AppendLocal
     AppendLocal --> Replicate: serialized leader write lane
     Replicate --> Commit: quorum acknowledges index
-    Commit --> Apply: persist commitIndex
+    Commit --> Apply: advance commitIndex
     Apply --> Compact: apply to Broker state
     Compact --> [*]: snapshot/compact only when safe
   }
@@ -97,7 +210,7 @@ sequenceDiagram
   L->>Disk: append ClientRequest
   L->>P: AppendEntries(entries, leader_commit)
   P-->>L: success from quorum
-  L->>Disk: persist commitIndex
+  L->>B: advance leader commitIndex
   L->>B: apply committed request
   B-->>L: lock response
   L-->>F: ProxyResponse(response)
@@ -109,17 +222,137 @@ If the load balancer can prefer the leader, it should use
 `GET /raft/leaderz` as the leader-only health check. That removes the proxy
 hop shown above. Correctness does not depend on leader-aware routing, because
 followers proxy writes and the leader still requires quorum before applying.
+An old leader that cannot observe quorum for an election-timeout window steps
+down, causing `/raft/leaderz` to return 503 instead of keeping a partitioned
+leader in the preferred LB target set.
+Likewise, a leader that can still contact peers but cannot commit a specific
+client proposal steps down before returning `QuorumUnavailable`; that response
+means the request was not applied locally, but, as with normal Raft client
+semantics, a caller should treat the final outcome as unknown if another future
+leader had already received the entry.
+HTTP callers can reduce duplicate retries by supplying `requestId`,
+`X-LMX-Request-Id`, `Idempotency-Key`, or `X-Idempotency-Key`. BrokerRaft records
+identity-bearing HTTP write commands in the replicated log and caches a bounded
+set of responses by request id and request fingerprint. While the first request
+is still queued in the leader batch, duplicate retries observe the in-flight
+reservation instead of appending another command. Once applied, the cache is
+rebuilt during committed-log replay and included in Raft snapshots, so recent
+completed retries can survive restart, compaction, and leadership transfer.
+This is still a bounded retry hardening layer, not a full etcd-style
+client-session lease or unbounded exactly-once ledger.
+The raw Raft role is still exposed in status as `isLeader`, while
+`isLeaderReady` is the load-balancer/write-admission signal. The
+`leaderQuorumAgeMs` and `leaderQuorumTimeoutMs` fields show how recently the
+leader observed an active quorum and when that readiness expires.
 The current leader write path is still serialized, and each committed lock
 operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
-reuse open TCP connections. If a follower is only slightly behind a snapshot
+reuse open TCP connections, including follower-to-leader proxy requests. The
+leader serves `prevLogTerm`, bounded entry
+batches, commit-range reads, and retained-term conflict hints from a validated
+in-memory retained-log cache, avoiding repeated filesystem parsing in the hot
+replication/apply path. If a follower is only slightly behind a snapshot
 boundary, the leader first uses retained trailing log entries for incremental
 catch-up; it sends `InstallSnapshot` only after the required previous-log term
 has been compacted away. The leader can coalesce concurrent client requests into
-bounded append/replicate/commit batches, but the commit lane is still
-correctness-first and not yet pipelined.
+bounded append/replicate/commit batches. Under load, the serialized write lane
+drains up to `client_batch_max_entries * client_pipeline_max_batches` pending
+requests into one quorum round, and the coalescer wakes early when a batch fills
+instead of always paying the full coalescing delay. The leader-local waiting
+queue is bounded by `client_batch_max_pending`; overflow requests fail before
+log append, so they do not create partially replicated lock operations.
+Committed
+entries are applied from `lastApplied + 1` through `commitIndex`, so uncommitted
+tail entries are not materialized during apply. Compaction maintenance uses
+retained-entry metadata and log file size before parsing retained entries, so
+ordinary commits below snapshot thresholds do not scan the whole log.
+After a quorum commits a write, slow non-quorum peers do not block the
+successful client path. Any in-flight replication to those peers is allowed to
+finish in the background, and the heartbeat loop handles anything still lagging.
+The commit lane still applies committed entries in order, but bursty client
+writes no longer require one quorum round per configured request batch.
+Post-commit follower wakeups are coalesced through one active fan-out worker:
+additional commits while that worker is running schedule another round instead
+of spawning overlapping background replication tasks.
+Local append-log and snapshot serialization is buffered before fsync, reducing
+small write syscall churn. With the default `raft.sync_log = true`,
+leader-local append/fsync work and follower-side `AppendEntries`
+append/truncate/repair work run on Tokio's blocking pool, so the consensus write
+still waits for required disk durability but ordinary async workers are not
+occupied by blocking filesystem calls. Setting `raft.sync_log = false` skips
+append-log fsyncs and parent-directory syncs on append/rewrite paths; it can be
+useful for isolating disk-sync cost in benchmarks, but it weakens crash
+durability and should not be used for etcd/ZooKeeper-style safety claims.
+When a replication round changes a peer's `nextIndex` or `matchIndex`, the
+leader retries immediately; it sleeps for the heartbeat interval only when the
+round made no progress.
+
+## Profiling
+
+BrokerRaft has a symbol-preserving Cargo profile for CPU profiling:
+
+```bash
+cargo test --no-default-features --profile profiling --test raft_cluster --no-run
+```
+
+The helper script profiles the local Raft cluster workload used by the failover
+tests:
+
+```bash
+scripts/profile-raft.sh sample
+scripts/profile-raft.sh perf
+scripts/profile-raft.sh flamegraph
+```
+
+`sample` is the macOS fallback. It requires Apple profiling permissions and may
+require full Xcode/Instruments or `sudo` on some hosts. Linux production-like
+profiling should use `perf` or `cargo flamegraph` on the EC2/k8s node:
+
+```bash
+cargo install flamegraph
+TEST_FILTER=raft_lb_seeded_lock_model_fuzz scripts/profile-raft.sh perf
+TEST_FILTER=raft_lb_seeded_lock_model_fuzz scripts/profile-raft.sh flamegraph
+```
+
+The script sets frame pointers and uses the `profiling` profile so optimized
+builds still produce useful symbols. The default target is
+`tests/raft_cluster.rs::raft_lb_seeded_lock_model_fuzz`, because it exercises
+leader election, follower proxying, quorum commit, and load-balanced failover.
+
+The regular single-node Broker can be profiled as the baseline too. This script
+builds the profiling binary, starts a local HTTP Broker, runs the
+`redis_vs_raft_bench` workload with `BENCH_TARGET=broker`, and profiles the
+Broker server process rather than the benchmark client:
+
+```bash
+scripts/profile-broker.sh sample
+scripts/profile-broker.sh perf
+scripts/profile-broker.sh flamegraph
+```
+
+Use the same benchmark knobs for both scripts, for example:
+
+```bash
+BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
+```
+
+Local loopback benchmark evidence from 2026-06-05, using a leader-preferred
+3-node cluster, 8 workers, 256 keys, and short-lived HTTP connections per
+request: the default `raft.sync_log = true` path completed about 319 successful
+acquire/release cycles/sec with p50 cycle latency near 24.031 ms. Re-running the
+same benchmark with unsafe `raft.sync_log = false` completed about 1,072
+cycles/sec with p50 near 6.832 ms. That gap is expected: the safe path waits for
+leader and follower durable log syncs, while the unsafe path is only useful to
+isolate disk-sync cost and does not make etcd/ZooKeeper-style crash-durability
+claims.
+
+Leader-side `commitIndex` advancement and follower `leaderCommit` advancement
+are persisted before applying committed entries, so a restarted node can replay
+locally committed operations from hard state. With the default
+`raft.sync_log = true`, entries are durable before acknowledgement and commit
+progress is persisted before local state-machine apply.
 
 ## Membership Change Sequence
 
@@ -135,7 +368,9 @@ sequenceDiagram
   Op->>L: POST /raft/membership { peers }
   L->>Disk: append SetMembership(joint old,new)
   L->>Old: AppendEntries(joint entry)
+  L->>New: AppendEntries(joint entry)
   Old-->>L: old majority acknowledges
+  New-->>L: new majority acknowledges
   L->>Disk: commit joint config
   L->>Disk: append SetMembership(simple new)
   L->>Old: AppendEntries(simple new)
@@ -146,10 +381,15 @@ sequenceDiagram
   L-->>Op: index + active membership
 ```
 
-The joint entry is committed using the old config. Once that entry is applied,
-the final simple config must be acknowledged by a majority of both the old and
-new configs. This is Raft's quorum safety rule; it does not remove the leader's
-job of ordering operations.
+The joint entry is committed using the joint old+new config. Both the old and
+new configs must acknowledge it before the leader applies the transition, and
+the final simple config must also be acknowledged by a majority of both configs.
+This is Raft's quorum safety rule; it does not remove the leader's job of
+ordering operations.
+If a leader dies after committing the joint config but before committing the
+final simple config, the next leader can finish the in-flight change by
+submitting the same new peer set again. A different peer set is rejected until
+the joint config is closed.
 
 ## Failover Event Trace
 
@@ -164,7 +404,7 @@ flowchart TD
   F -- "yes" --> G["Candidate becomes leader"]
   G --> H["New leader accepts proxied /v1/lock requests"]
   H --> I["AppendEntries reaches quorum"]
-  I --> J["Commit index is persisted"]
+  I --> J["Commit index advances"]
   J --> K["Operation applies to local Broker state"]
   K --> L["Old leader replacement rejoins as follower"]
 ```
@@ -177,11 +417,10 @@ compacts entries only when all of these are true:
 
 - the entries are committed,
 - the entries are applied,
-- the snapshot covers the compacted index,
-- the local Broker has no queued waiters.
+- the snapshot covers the compacted index.
 
-The snapshot stores active holders, fencing counters, and TTL deadlines, so a
-node can restart or receive `InstallSnapshot` without losing active HTTP-held
-locks. Queued waiters are still kept behind the replay boundary because their
-receivers are transport-local; while waiters exist, BrokerRaft retains the log
-entries needed to rebuild that state.
+The snapshot stores active holders, queued waiters, fencing counters, and TTL
+deadlines, so a node can restart or receive `InstallSnapshot` without losing
+the deterministic lock/queue state. Restored waiters keep their original client
+ids for later replicated `DropClient` cleanup, but their old HTTP response
+channels are not resurrected after restart or snapshot install.

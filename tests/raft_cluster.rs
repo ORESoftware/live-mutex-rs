@@ -320,12 +320,59 @@ async fn raft_http_followers_proxy_acquire_release_after_quorum_commit() {
         if idx == leader {
             assert_eq!(status, 200, "leader leaderz body: {parsed:?}");
             assert_eq!(parsed["isLeader"], true);
+            assert_eq!(parsed["isLeaderReady"], true);
+            assert!(
+                parsed["leaderQuorumAgeMs"].as_u64().is_some(),
+                "leader should expose quorum freshness age: {parsed:?}"
+            );
+            assert!(
+                parsed["leaderQuorumTimeoutMs"]
+                    .as_u64()
+                    .is_some_and(|timeout| timeout > 0),
+                "leader should expose quorum freshness timeout: {parsed:?}"
+            );
         } else {
             assert_eq!(status, 503, "follower leaderz body: {parsed:?}");
             assert_eq!(parsed["isLeader"], false);
+            assert_eq!(parsed["isLeaderReady"], false);
+            assert_eq!(parsed["leaderQuorumAgeMs"], Value::Null);
             assert!(parsed["leaderId"].as_str().is_some());
+            assert!(
+                parsed["leaderQuorumTimeoutMs"]
+                    .as_u64()
+                    .is_some_and(|timeout| timeout > 0),
+                "follower should expose quorum freshness timeout: {parsed:?}"
+            );
         }
     }
+    let progress = http_get_json(cluster.http_ports[leader], "/raft/progress")
+        .await
+        .expect("leader progress");
+    assert_eq!(progress["isLeader"], true, "progress body: {progress:?}");
+    assert_eq!(
+        progress["peers"].as_array().map(Vec::len),
+        Some(3),
+        "progress should list all active peers: {progress:?}"
+    );
+    assert!(
+        progress["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| peer["isSelf"] == true
+                && peer["caughtUp"] == true
+                && peer["membershipRole"] == "voter"),
+        "progress should include caught-up self voter: {progress:?}"
+    );
+    let learners = http_get_json(cluster.http_ports[leader], "/raft/learners")
+        .await
+        .expect("leader learners");
+    assert_eq!(learners["isLeader"], true, "learners body: {learners:?}");
+    assert_eq!(
+        learners["learners"].as_array().map(Vec::len),
+        Some(0),
+        "fresh cluster should not have staged learners: {learners:?}"
+    );
     let follower_a = (leader + 1) % 3;
     let follower_b = (leader + 2) % 3;
     let key = format!("raft-key-{}", uuid::Uuid::new_v4());

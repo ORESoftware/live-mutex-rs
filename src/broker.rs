@@ -37,6 +37,7 @@ use crate::queue::LinkedQueue;
 
 pub type ClientId = u64;
 pub type Sender = mpsc::UnboundedSender<Response>;
+type ResponseObserver = Arc<dyn Fn(&Response) + Send + Sync + 'static>;
 const SNAPSHOT_DETACHED_CLIENT: ClientId = 0;
 
 /// Public construction options.
@@ -371,6 +372,8 @@ struct BrokerRaftLockSnapshot {
     exclusive_holders: Vec<BrokerRaftExclusiveHolderSnapshot>,
     readers: Vec<BrokerRaftRwHolderSnapshot>,
     writer: Option<BrokerRaftRwHolderSnapshot>,
+    #[serde(default)]
+    queue: Vec<BrokerRaftPendingRequestSnapshot>,
     idle: bool,
 }
 
@@ -389,6 +392,38 @@ struct BrokerRaftExclusiveHolderSnapshot {
 struct BrokerRaftRwHolderSnapshot {
     lock_uuid: String,
     fencing_token: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftPendingRequestSnapshot {
+    request_uuid: String,
+    client_id: ClientId,
+    pid: Option<i64>,
+    ttl_ms: Option<u64>,
+    grant_lock_uuid: Option<String>,
+    grant_fencing_seed: Option<u64>,
+    keep_locks_after_death: bool,
+    kind: BrokerRaftPendingKindSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum BrokerRaftPendingKindSnapshot {
+    Exclusive,
+    Reader,
+    Writer,
+    Composite {
+        all_keys: Vec<String>,
+        remaining_keys: Vec<String>,
+        granted_keys: Vec<String>,
+        granted_tokens: BTreeMap<String, u64>,
+        composite_lock_uuid: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +624,7 @@ impl BrokerState {
 #[derive(Clone)]
 pub struct Broker {
     state: Arc<Mutex<BrokerState>>,
+    response_observer: Option<ResponseObserver>,
 }
 
 impl Broker {
@@ -596,6 +632,18 @@ impl Broker {
         crate::routine_id!("ddl-routine-V4_qGcXJ5Hjo8hOHBJ");
         Self {
             state: Arc::new(Mutex::new(BrokerState::new(config))),
+            response_observer: None,
+        }
+    }
+
+    pub(crate) fn with_response_observer(
+        config: BrokerConfig,
+        response_observer: ResponseObserver,
+    ) -> Self {
+        crate::routine_id!("ddl-routine-broker-with-response-observer-1");
+        Self {
+            state: Arc::new(Mutex::new(BrokerState::new(config))),
+            response_observer: Some(response_observer),
         }
     }
 
@@ -606,23 +654,47 @@ impl Broker {
         crate::routine_id!("ddl-routine-DlZgZB0LiJJZNP7VSQ");
         let (tx, rx) = mpsc::unbounded_channel();
         let mut state = self.state.lock();
-        let id = state.next_client_id;
-        // `wrapping_add` to defend against a debug-mode panic if a
-        // very long-lived broker exhausts u64 (~1 client/ns for ~580
-        // years). The next id of 0 is harmless: 0 has no special
-        // meaning, just a hash-map key. We never reuse a *currently
-        // live* id — `clients` is keyed on `ClientId` and we'd
-        // collide on insert before that happens, so this is safe.
-        state.next_client_id = state.next_client_id.wrapping_add(1);
+        let id = Self::next_available_client_id(&state, state.next_client_id);
+        Self::insert_client_handle(&mut state, id, tx);
+        (id, rx)
+    }
+
+    pub(crate) fn register_client_with_id(
+        &self,
+        preferred_id: ClientId,
+    ) -> (ClientId, mpsc::UnboundedReceiver<Response>) {
+        crate::routine_id!("ddl-routine-broker-register-client-with-id-1");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut state = self.state.lock();
+        let id = Self::next_available_client_id(&state, preferred_id);
+        Self::insert_client_handle(&mut state, id, tx);
+        (id, rx)
+    }
+
+    fn next_available_client_id(state: &BrokerState, preferred_id: ClientId) -> ClientId {
+        crate::routine_id!("ddl-routine-broker-next-available-client-id-1");
+        let mut id = preferred_id.max(1);
+        while id == SNAPSHOT_DETACHED_CLIENT || state.clients.contains_key(&id) {
+            id = id.wrapping_add(1).max(1);
+        }
+        id
+    }
+
+    fn insert_client_handle(state: &mut BrokerState, id: ClientId, sender: Sender) {
+        crate::routine_id!("ddl-routine-broker-insert-client-handle-1");
+        // `wrapping_add` to defend against a debug-mode panic if a very
+        // long-lived broker exhausts u64 (~1 client/ns for ~580 years).
+        // Client id 0 is reserved for detached Raft snapshot holders, so both
+        // the chosen id and next local id skip it.
+        state.next_client_id = id.wrapping_add(1).max(1);
         state.clients.insert(
             id,
             ClientHandle {
-                sender: tx,
+                sender,
                 held_lock_uuids: HashMap::new(),
                 pending_request_uuids: Vec::new(),
             },
         );
-        (id, rx)
     }
 
     /// Drop a client, releasing every lock it held and pruning every queued
@@ -633,24 +705,61 @@ impl Broker {
         let mut state = self.state.lock();
         let Some(mut handle) = state.clients.remove(&client) else {
             // Raft followers replay leader-side ephemeral client IDs without
-            // registering transport handles for them. They can still have
-            // queued work for that client, so remove waiters by scanning
-            // queues. Do not release holders here: detached HTTP locks also
-            // have no live client handle and must survive until lockUuid
-            // unlock.
+            // registering transport handles for them. A replicated DropClient
+            // means the leader decided this client is gone, so followers must
+            // remove both queued work and any holder that may have been granted
+            // just before the cleanup entry committed.
             let mut touched_keys: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            let mut removals: Vec<(String, String)> = Vec::new();
+            let mut queued_removals: Vec<(String, String)> = Vec::new();
+            let mut exclusive_removals: Vec<(String, String)> = Vec::new();
+            let mut reader_removals: Vec<(String, String)> = Vec::new();
+            let mut writer_removals: Vec<String> = Vec::new();
             for (key, lock) in state.locks.iter() {
                 for (request_uuid, pending) in lock.queue.iter() {
                     if pending.client == client {
-                        removals.push((key.clone(), request_uuid.clone()));
+                        queued_removals.push((key.clone(), request_uuid.clone()));
                     }
                 }
+                for (lock_uuid, holder) in lock.exclusive_holders.iter() {
+                    if holder.client == client {
+                        exclusive_removals.push((key.clone(), lock_uuid.clone()));
+                    }
+                }
+                for (lock_uuid, holder) in lock.readers.iter() {
+                    if holder.client == client {
+                        reader_removals.push((key.clone(), lock_uuid.clone()));
+                    }
+                }
+                if lock
+                    .writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.client == client)
+                {
+                    writer_removals.push(key.clone());
+                }
             }
-            for (key, request_uuid) in removals {
+            for (key, request_uuid) in queued_removals {
                 if let Some(lock) = state.locks.get_mut(&key) {
                     lock.queue.remove(&request_uuid);
+                }
+                touched_keys.insert(key);
+            }
+            for (key, lock_uuid) in exclusive_removals {
+                if let Some(lock) = state.locks.get_mut(&key) {
+                    lock.exclusive_holders.remove(&lock_uuid);
+                }
+                touched_keys.insert(key);
+            }
+            for (key, lock_uuid) in reader_removals {
+                if let Some(lock) = state.locks.get_mut(&key) {
+                    lock.readers.remove(&lock_uuid);
+                }
+                touched_keys.insert(key);
+            }
+            for key in writer_removals {
+                if let Some(lock) = state.locks.get_mut(&key) {
+                    lock.writer = None;
                 }
                 touched_keys.insert(key);
             }
@@ -2121,6 +2230,9 @@ impl Broker {
 
     fn send(&self, state: &BrokerState, client: ClientId, response: Response) {
         crate::routine_id!("ddl-routine-u2hHnsw12uVIwzoDO9");
+        if let Some(observer) = &self.response_observer {
+            observer(&response);
+        }
         if let Some(handle) = state.clients.get(&client) {
             let _ = handle.sender.send(response);
         }
@@ -2163,12 +2275,6 @@ impl Broker {
         crate::routine_id!("ddl-routine-broker-snapshot-for-raft-1");
         let state = self.state.lock();
         let metrics = broker_metrics_from_state(&state);
-        if metrics.waiters != 0 {
-            return Err(format!(
-                "cannot snapshot broker with queued waiters; waiters={}",
-                metrics.waiters
-            ));
-        }
         let now = Instant::now();
         let mut locks = state
             .locks
@@ -2210,6 +2316,20 @@ impl Broker {
                             lock_uuid: holder.lock_uuid.clone(),
                             fencing_token: holder.fencing_token,
                         }),
+                    queue: lock
+                        .queue
+                        .iter()
+                        .map(|(_, pending)| BrokerRaftPendingRequestSnapshot {
+                            request_uuid: pending.request_uuid.clone(),
+                            client_id: pending.client,
+                            pid: pending.pid,
+                            ttl_ms: pending.ttl.map(duration_ms_u64),
+                            grant_lock_uuid: pending.grant_lock_uuid.clone(),
+                            grant_fencing_seed: pending.grant_fencing_seed,
+                            keep_locks_after_death: pending.keep_locks_after_death,
+                            kind: pending_kind_snapshot_from(&pending.kind),
+                        })
+                        .collect(),
                     idle: lock.is_idle(),
                 }
             })
@@ -2350,8 +2470,25 @@ impl Broker {
                     lock_uuid: holder.lock_uuid,
                 });
             }
+            for waiter in lock_snapshot.queue {
+                next.next_client_id = next.next_client_id.max(waiter.client_id.saturating_add(1));
+                let request_uuid = waiter.request_uuid;
+                lock.queue.push_back(
+                    request_uuid.clone(),
+                    PendingRequest {
+                        request_uuid,
+                        client: waiter.client_id,
+                        pid: waiter.pid,
+                        ttl: waiter.ttl_ms.map(Duration::from_millis),
+                        grant_lock_uuid: waiter.grant_lock_uuid,
+                        grant_fencing_seed: waiter.grant_fencing_seed,
+                        keep_locks_after_death: waiter.keep_locks_after_death,
+                        kind: pending_kind_from_snapshot(waiter.kind),
+                    },
+                );
+            }
             next.fencing_watermark = next.fencing_watermark.max(lock.fencing_counter);
-            if lock.is_idle() || lock_snapshot.idle {
+            if lock.is_idle() && lock_snapshot.idle {
                 lock.timestamp_emptied = Some(now);
             }
             next.locks.insert(lock_snapshot.key, lock);
@@ -2646,6 +2783,50 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+fn pending_kind_snapshot_from(kind: &PendingKind) -> BrokerRaftPendingKindSnapshot {
+    crate::routine_id!("ddl-routine-broker-pending-kind-snapshot-from-1");
+    match kind {
+        PendingKind::Exclusive => BrokerRaftPendingKindSnapshot::Exclusive,
+        PendingKind::Reader => BrokerRaftPendingKindSnapshot::Reader,
+        PendingKind::Writer => BrokerRaftPendingKindSnapshot::Writer,
+        PendingKind::Composite {
+            all_keys,
+            remaining_keys,
+            granted_keys,
+            granted_tokens,
+            composite_lock_uuid,
+        } => BrokerRaftPendingKindSnapshot::Composite {
+            all_keys: all_keys.clone(),
+            remaining_keys: remaining_keys.clone(),
+            granted_keys: granted_keys.clone(),
+            granted_tokens: granted_tokens.clone(),
+            composite_lock_uuid: composite_lock_uuid.clone(),
+        },
+    }
+}
+
+fn pending_kind_from_snapshot(kind: BrokerRaftPendingKindSnapshot) -> PendingKind {
+    crate::routine_id!("ddl-routine-broker-pending-kind-from-snapshot-1");
+    match kind {
+        BrokerRaftPendingKindSnapshot::Exclusive => PendingKind::Exclusive,
+        BrokerRaftPendingKindSnapshot::Reader => PendingKind::Reader,
+        BrokerRaftPendingKindSnapshot::Writer => PendingKind::Writer,
+        BrokerRaftPendingKindSnapshot::Composite {
+            all_keys,
+            remaining_keys,
+            granted_keys,
+            granted_tokens,
+            composite_lock_uuid,
+        } => PendingKind::Composite {
+            all_keys,
+            remaining_keys,
+            granted_keys,
+            granted_tokens,
+            composite_lock_uuid,
+        },
+    }
+}
+
 fn deadline_entry_is_still_held(state: &BrokerState, entry: &DeadlineEntry) -> bool {
     crate::routine_id!("ddl-routine-broker-deadline-entry-held-1");
     entry.keys.iter().any(|key| {
@@ -2677,13 +2858,8 @@ fn validate_broker_raft_snapshot(snapshot: &BrokerRaftSnapshot) -> Result<(), St
             snapshot.schema_version
         ));
     }
-    if snapshot.metrics.waiters != 0 {
-        return Err(format!(
-            "cannot install broker snapshot with queued waiters; waiters={}",
-            snapshot.metrics.waiters
-        ));
-    }
     let mut keys = std::collections::BTreeSet::new();
+    let mut total_waiters = 0u64;
     for lock in &snapshot.locks {
         if lock.key.is_empty() {
             return Err("broker snapshot contains an empty lock key".into());
@@ -2743,6 +2919,34 @@ fn validate_broker_raft_snapshot(snapshot: &BrokerRaftSnapshot) -> Result<(), St
                 ));
             }
         }
+        if lock.idle
+            && (!lock.exclusive_holders.is_empty()
+                || !lock.readers.is_empty()
+                || lock.writer.is_some()
+                || !lock.queue.is_empty())
+        {
+            return Err(format!(
+                "broker snapshot lock `{}` is marked idle while it has active state",
+                lock.key
+            ));
+        }
+        let mut request_uuids = std::collections::BTreeSet::new();
+        for waiter in &lock.queue {
+            total_waiters = total_waiters.saturating_add(1);
+            validate_broker_raft_waiter_snapshot(&lock.key, waiter)?;
+            if !request_uuids.insert(waiter.request_uuid.clone()) {
+                return Err(format!(
+                    "broker snapshot lock `{}` repeats queued request uuid `{}`",
+                    lock.key, waiter.request_uuid
+                ));
+            }
+        }
+    }
+    if snapshot.metrics.waiters != total_waiters {
+        return Err(format!(
+            "broker snapshot waiters metric mismatch: metrics.waiters={} queued={}",
+            snapshot.metrics.waiters, total_waiters
+        ));
     }
     for deadline in &snapshot.deadlines {
         if deadline.lock_uuid.is_empty() {
@@ -2762,6 +2966,84 @@ fn validate_broker_raft_snapshot(snapshot: &BrokerRaftSnapshot) -> Result<(), St
         }
     }
     Ok(())
+}
+
+fn validate_broker_raft_waiter_snapshot(
+    lock_key: &str,
+    waiter: &BrokerRaftPendingRequestSnapshot,
+) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-validate-broker-raft-waiter-snapshot-1");
+    if waiter.request_uuid.is_empty() {
+        return Err(format!(
+            "broker snapshot lock `{lock_key}` has an empty queued request uuid"
+        ));
+    }
+    if waiter
+        .grant_lock_uuid
+        .as_ref()
+        .is_some_and(|lock_uuid| lock_uuid.is_empty())
+    {
+        return Err(format!(
+            "broker snapshot lock `{lock_key}` has an empty queued grant lock uuid"
+        ));
+    }
+    match &waiter.kind {
+        BrokerRaftPendingKindSnapshot::Exclusive
+        | BrokerRaftPendingKindSnapshot::Reader
+        | BrokerRaftPendingKindSnapshot::Writer => Ok(()),
+        BrokerRaftPendingKindSnapshot::Composite {
+            all_keys,
+            remaining_keys,
+            granted_keys,
+            granted_tokens,
+            composite_lock_uuid,
+        } => {
+            if composite_lock_uuid.is_empty() {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` has an empty composite lock uuid"
+                ));
+            }
+            if all_keys.is_empty() || all_keys.len() > MAX_COMPOSITE_KEYS {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` has invalid composite key count {}",
+                    all_keys.len()
+                ));
+            }
+            if remaining_keys.is_empty() {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` has a composite waiter with no remaining keys"
+                ));
+            }
+            let mut all = std::collections::BTreeSet::new();
+            for key in all_keys {
+                if key.is_empty() {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` has an empty composite key"
+                    ));
+                }
+                if !all.insert(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` repeats composite key `{key}`"
+                    ));
+                }
+            }
+            for key in remaining_keys.iter().chain(granted_keys.iter()) {
+                if !all.contains(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` has composite sub-key `{key}` outside allKeys"
+                    ));
+                }
+            }
+            for key in granted_tokens.keys() {
+                if !all.contains(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` has granted token for unknown key `{key}`"
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn snapshot_deadline_matches_state(
@@ -2843,6 +3125,28 @@ mod tests {
     }
 
     #[test]
+    fn register_client_with_preferred_id_does_not_reset_normal_sequence() {
+        crate::routine_id!("ddl-routine-broker-test-preferred-client-id-sequence-1");
+        let broker = Broker::new(BrokerConfig::default());
+        let (first, _first_rx) = broker.register_client();
+        let (second, _second_rx) = broker.register_client();
+        assert_eq!(first, 1);
+        assert_eq!(second, 2);
+
+        broker.drop_client(first);
+        let (preferred, _preferred_rx) = broker.register_client_with_id(first);
+        assert_eq!(preferred, first);
+
+        let (skipped_live, _skipped_live_rx) = broker.register_client_with_id(second);
+        assert_ne!(skipped_live, second);
+
+        let (next, _next_rx) = broker.register_client();
+        assert_ne!(next, first);
+        assert_ne!(next, second);
+        assert!(next > second);
+    }
+
+    #[test]
     fn raft_snapshot_restores_active_detached_holder_and_deadline() {
         crate::routine_id!("ddl-routine-broker-test-raft-snapshot-active-holder-1");
         let broker = Broker::new(BrokerConfig::default());
@@ -2912,6 +3216,163 @@ mod tests {
             [Response::Unlock { unlocked: true, .. }]
         ));
         assert_eq!(restored.metrics().holders, 0);
+    }
+
+    #[test]
+    fn raft_snapshot_restores_queued_waiter_and_grants_after_unlock() {
+        crate::routine_id!("ddl-routine-broker-test-raft-snapshot-queued-waiter-1");
+        let broker = Broker::new(BrokerConfig::default());
+        let (holder, mut holder_rx) = broker.register_client();
+        let (waiter, mut waiter_rx) = broker.register_client();
+        broker.handle_request(
+            holder,
+            Request::Lock {
+                uuid: "snapshot-holder-request".into(),
+                key: Some("snapshot-wait-key".into()),
+                keys: None,
+                pid: None,
+                ttl: None,
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        let holder_lock_uuid = drain(&mut holder_rx)
+            .into_iter()
+            .find_map(|response| match response {
+                Response::Lock {
+                    acquired: true,
+                    lock_uuid,
+                    ..
+                } => lock_uuid,
+                _ => None,
+            })
+            .expect("holder lock granted");
+        broker.handle_request(
+            waiter,
+            Request::Lock {
+                uuid: "snapshot-waiter-request".into(),
+                key: Some("snapshot-wait-key".into()),
+                keys: None,
+                pid: Some(456),
+                ttl: Some(5_000),
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert!(matches!(
+            drain(&mut waiter_rx).as_slice(),
+            [Response::Lock {
+                acquired: false,
+                ..
+            }]
+        ));
+        assert_eq!(broker.metrics().holders, 1);
+        assert_eq!(broker.metrics().waiters, 1);
+
+        let payload = serde_json::json!({
+            "broker": broker.snapshot_for_raft().expect("broker snapshot with waiter"),
+        });
+        Broker::validate_raft_snapshot_payload(&payload).expect("valid waiter snapshot payload");
+
+        let restored = Broker::new(BrokerConfig::default());
+        restored
+            .install_raft_snapshot(&payload)
+            .expect("install waiter snapshot");
+        let metrics = restored.metrics();
+        assert_eq!(metrics.holders, 1);
+        assert_eq!(metrics.waiters, 1);
+
+        let (unlocker, mut unlock_rx) = restored.register_client();
+        restored.handle_request(
+            unlocker,
+            Request::Unlock {
+                uuid: "snapshot-waiter-unlock".into(),
+                key: Some("snapshot-wait-key".into()),
+                keys: None,
+                lock_uuid: Some(holder_lock_uuid),
+                force: false,
+            },
+        );
+        assert!(matches!(
+            drain(&mut unlock_rx).as_slice(),
+            [Response::Unlock { unlocked: true, .. }]
+        ));
+        let metrics = restored.metrics();
+        assert_eq!(metrics.holders, 1);
+        assert_eq!(metrics.waiters, 0);
+        let top = restored.top_keys(1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].key, "snapshot-wait-key");
+        assert_eq!(top[0].exclusive_holders, 1);
+        assert_eq!(top[0].waiters, 0);
+    }
+
+    #[test]
+    fn raft_snapshot_restored_waiter_keeps_client_id_for_drop_cleanup() {
+        crate::routine_id!("ddl-routine-broker-test-raft-snapshot-waiter-drop-client-1");
+        let broker = Broker::new(BrokerConfig::default());
+        let (holder, mut holder_rx) = broker.register_client();
+        let (waiter, mut waiter_rx) = broker.register_client();
+        broker.handle_request(
+            holder,
+            Request::Lock {
+                uuid: "snapshot-drop-holder".into(),
+                key: Some("snapshot-drop-key".into()),
+                keys: None,
+                pid: None,
+                ttl: None,
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert!(drain(&mut holder_rx)
+            .iter()
+            .any(|response| { matches!(response, Response::Lock { acquired: true, .. }) }));
+        broker.handle_request(
+            waiter,
+            Request::Lock {
+                uuid: "snapshot-drop-waiter".into(),
+                key: Some("snapshot-drop-key".into()),
+                keys: None,
+                pid: None,
+                ttl: None,
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert!(matches!(
+            drain(&mut waiter_rx).as_slice(),
+            [Response::Lock {
+                acquired: false,
+                ..
+            }]
+        ));
+
+        let payload = serde_json::json!({
+            "broker": broker.snapshot_for_raft().expect("broker snapshot with waiter"),
+        });
+        let restored = Broker::new(BrokerConfig::default());
+        restored
+            .install_raft_snapshot(&payload)
+            .expect("install waiter snapshot");
+        assert_eq!(restored.metrics().waiters, 1);
+
+        restored.drop_client(waiter);
+        let metrics = restored.metrics();
+        assert_eq!(metrics.holders, 1);
+        assert_eq!(metrics.waiters, 0);
     }
 
     #[test]
@@ -3380,6 +3841,33 @@ mod tests {
         assert!(post
             .iter()
             .any(|m| matches!(m, Response::Lock { acquired: true, .. })));
+    }
+
+    #[test]
+    fn drop_client_without_handle_releases_replayed_holder() {
+        crate::routine_id!("ddl-routine-broker-test-drop-replayed-holder-1");
+        let broker = Broker::new(BrokerConfig::default());
+        broker.handle_request(
+            42,
+            Request::Lock {
+                uuid: "replayed-holder".into(),
+                key: Some("k".into()),
+                keys: None,
+                pid: None,
+                ttl: Some(1000),
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert_eq!(broker.metrics().holders, 1);
+
+        broker.drop_client(42);
+        let metrics = broker.metrics();
+        assert_eq!(metrics.holders, 0);
+        assert_eq!(metrics.waiters, 0);
     }
 
     /// `tick_ttl` evicts the expired holder and grants the next waiter in

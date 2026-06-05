@@ -33,6 +33,10 @@ fn cfg(tcp: std::net::SocketAddr) -> ServerConfig {
     }
 }
 
+fn cfg_with_broker(tcp: std::net::SocketAddr, broker: BrokerConfig) -> ServerConfig {
+    ServerConfig { broker, ..cfg(tcp) }
+}
+
 async fn ephemeral_addr() -> std::net::SocketAddr {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
@@ -60,6 +64,23 @@ where
         .expect("broker did not reply within 3s")
         .expect("read_line failed");
     line
+}
+
+#[tokio::test]
+async fn disabled_ttl_sweeper_does_not_stop_server() {
+    let addr = ephemeral_addr().await;
+    let broker = BrokerConfig {
+        ttl_sweep_interval: Duration::ZERO,
+        ..BrokerConfig::default()
+    };
+    let server = tokio::spawn(run_server(cfg_with_broker(addr, broker)));
+    wait_listening(addr).await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(
+        !server.is_finished(),
+        "disabling the TTL sweeper must not make server::run return"
+    );
+    server.abort();
 }
 
 #[tokio::test]

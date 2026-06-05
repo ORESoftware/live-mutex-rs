@@ -48,8 +48,8 @@ Headline features:
 - **HTTP transport** for callers that can't hold a long-lived TCP connection
   (Lambda, Cloudflare Workers, Vercel functions). Long-poll via `waitMs`.
 - **Experimental BrokerRaft HA backend** — an HTTP-only three- or five-node
-  Raft path with leader election, quorum commit, incremental log replication,
-  chunked snapshot catch-up, and joint-consensus membership changes. See
+  Raft path with PreVote leader election, quorum commit, incremental log
+  replication, chunked snapshot catch-up, and joint-consensus membership changes. See
   [High availability](#high-availability).
 - **Single TTL sweeper** instead of a per-request timer. Originally tracked
   at [`live-mutex#13`](https://github.com/ORESoftware/live-mutex/issues/13);
@@ -157,7 +157,27 @@ BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \
 Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. The HTTP clients
 open one short-lived connection per request, which matches the simple LB-facing
 API but means the number is not a pure consensus-cost measurement. It is useful
-for the practical “what does the exposed lock service cost?” comparison.
+for the practical “what does the exposed lock service cost?” comparison. Set
+`BENCH_IO_TIMEOUT_MS` to cap each network operation when an endpoint is missing
+or unhealthy.
+
+For CPU profiles, use `scripts/profile-broker.sh` to launch and profile a
+regular Broker server under the benchmark, and `scripts/profile-raft.sh` for
+the Raft integration-test workload. Both scripts build with the `profiling`
+profile and force frame pointers so `perf`, `sample`, or flamegraph output has
+usable stacks.
+
+Local loopback measurement on 2026-06-05 with 8 workers, 256 keys, a
+leader-preferred 3-node BrokerRaft cluster, and 3-second runs:
+
+| Target | Raft log sync | Successful cycles/sec | p50 cycle latency |
+| --- | --- | ---: | ---: |
+| BrokerRaft | `sync_log=true` | 319 | 24.031 ms |
+| BrokerRaft | `sync_log=false` | 1,072 | 6.832 ms |
+
+`sync_log=false` is intentionally unsafe: it skips append-log fsyncs to expose
+the disk-sync ceiling, but a process or host crash can lose the latest unsynced
+Raft entries. Keep the default `sync_log=true` for crash-safe failover tests.
 
 ## Wire protocol (TCP / UDS)
 
@@ -222,16 +242,34 @@ multiple responses per correlation UUID.
 | GET    | `/v1/lock-info/:key`  | —                                                                     | —                                                                           |
 | GET    | `/v1/locks`           | —                                                                     | List all known keys.                                                        |
 
-When BrokerRaft is enabled, the HTTP listener also exposes `/raft/status` and
-`/raft/leaderz`. `/raft/leaderz` returns 200 only on the current leader and 503
-on followers, which lets an HTTP-aware load balancer prefer the leader without
-making follower proxying part of the hot path.
+When BrokerRaft is enabled, the HTTP listener also exposes `/raft/status`,
+`/raft/progress`, `/raft/learners`, and `/raft/leaderz`. `/raft/progress`
+reports per-peer `nextIndex`, `matchIndex`, lag, and staged-learner state.
+`GET/POST/DELETE /raft/learners` lets an operator inspect, consensus-stage, and
+remove non-voting learners before promoting them through membership change.
+`/raft/leaderz` returns 200 only when the current leader has recently observed
+quorum and 503 otherwise, which lets an HTTP-aware load balancer prefer a
+quorum-fresh leader without making follower proxying part of the hot path.
+`/raft/status`, `/raft/progress`, `/raft/learners`, and `/raft/leaderz` expose
+`isLeaderReady`, `leaderQuorumAgeMs`, and `leaderQuorumTimeoutMs` so operators
+can distinguish the raw Raft leader from a leader still fresh enough to accept
+writes.
 
 `waitMs` is HTTP long-poll: the broker holds the request open up to that many
 milliseconds while waiting for a queued lock to be granted. The default is no
 wait; the caller should retry on `acquired:false`. BrokerRaft logs no-wait HTTP
 acquires as fail-fast lock attempts, so a contended `waitMs=0` request does not
 create a queued waiter or a follow-up cleanup log entry.
+
+HTTP `/v1/lock` and `/v1/unlock` accept an optional `requestId` body field, or
+`X-LMX-Request-Id`, `Idempotency-Key`, / `X-Idempotency-Key` headers. BrokerRaft
+uses that value as the Raft request UUID, logs HTTP writes with request identity,
+and reserves in-flight request IDs before append. A retry with the same request
+id and same payload will not append a second command while the first proposal is
+pending, and can return the original result after the response is known. Reusing
+a request id with a different payload returns `409 Conflict`. The bounded applied
+cache is rebuilt from committed log replay and included in Raft snapshots; it is
+not an unbounded etcd-style client-session ledger.
 
 If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 `Authorization: Bearer <token>` or `X-LMX-Auth: <token>` header.
@@ -258,7 +296,12 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_RAFT_APPEND_ENTRIES_MAX_BYTES` | `1048576` | Approximate serialized entry byte budget for one Raft `AppendEntries` catch-up batch.             |
 | `LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES` | `1048576` | Serialized snapshot bytes sent per `InstallSnapshot` RPC chunk.                                  |
 | `LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES` | `32` | Max leader-local client requests appended and committed in one Raft write batch.                  |
+| `LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES` | `4` | Max configured client batches drained into one append/replicate/commit cycle under leader load.  |
+| `LMX_RAFT_CLIENT_BATCH_MAX_PENDING` | `8192` | Max leader-local client requests allowed to wait for the Raft write lane before new requests are rejected. |
 | `LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS` | `1` | Coalescing window before a leader-local client request batch is drained.                          |
+| `LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES` | `8192` | Max recent BrokerRaft HTTP request-id responses retained for bounded idempotent retries.          |
+| `LMX_RAFT_SYNC_LOG` | `true` | Flush Raft append-log writes to stable storage before acknowledging them. Set `false` only for explicit unsafe throughput/benchmark experiments; crash durability is weakened. |
+| `LMX_RAFT_PEER_TOKEN` | unset | Optional shared secret required on Raft peer RPC frames. Use a Kubernetes Secret or equivalent in multi-node deployments. |
 | `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
 | `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
 | `LMX_TCP_NODELAY`       | `true`           | Apply `TCP_NODELAY` on broker-accepted sockets. Experiment from `live-mutex#22`.                 |
@@ -459,9 +502,20 @@ BrokerRaft uses a peer-list driven quorum: 3 nodes commit with 2 votes, and 5
 nodes commit with 3. One leader orders requests, but the leader cannot safely
 grant locks alone. Followers proxy HTTP lock/unlock calls to the current
 leader, so a load balancer can round-robin across all healthy nodes. The leader
-also exposes `GET /raft/membership` and authenticated `POST /raft/membership`
-for log-backed membership changes; a change commits a joint old/new config and
-then the final simple config.
+election path uses PreVote so a stale or partitioned node has to prove a quorum
+would vote before it increments and persists a new term.
+The leader also tracks check-quorum heartbeats; if it cannot observe quorum for
+an election-timeout window, it steps down so `/raft/leaderz` stops advertising
+a partitioned leader. Write admission uses the same quorum-fresh readiness check
+and rejects stale leaders before appending new log entries.
+The leader also exposes `GET /raft/membership` and authenticated
+`POST /raft/membership` for log-backed membership changes; a change commits a
+joint old/new config and
+then the final simple config. Use `GET /raft/progress` to inspect lagging
+followers, newly added voters, and transient staged learners during membership
+changes. Use `POST /raft/learners` to commit non-voting peers into the
+replicated staged-learner set and
+`DELETE /raft/learners` to remove staged learner IDs before promotion.
 
 If a load balancer sits in front, it can round-robin to all nodes and let
 followers proxy to the leader, or it can prefer the current leader by health
@@ -478,22 +532,65 @@ still performs durable log work before applying. Replication now sends increment
 `AppendEntries` suffixes with `prevLogIndex` / `prevLogTerm`, `nextIndex`, and
 `matchIndex` instead of whole-log follower rewrites. Lagging followers receive
 bounded `AppendEntries` batches, and Raft peer RPCs reuse open TCP connections
-instead of reconnecting for every heartbeat/append. The current implementation
-is still slower than the regular Broker under concurrent HTTP load because
-writes are batched but not yet pipelined. Raft hard state
-(`currentTerm` / `votedFor` / `commitIndex`) is
-persisted and committed log entries still present on disk are replayed on
-startup. Dynamic membership is implemented with joint-consensus log entries, and
-new peer IDs are first caught up as transient learners before they are promoted
-to voters. There is not yet a persistent learner-management API for operators.
+instead of reconnecting for every heartbeat/append or follower-to-leader proxy
+request. Leader conflict-hint repair
+uses a retained-log term index to move `nextIndex` without rereading the whole
+retained log file; `prevLogTerm`, bounded replication batches, and committed
+apply ranges also use the validated retained-log cache instead of reparsing the
+log file on each hot-path read. Leader-local appends and follower-side
+`AppendEntries` append/truncate/repair work are offloaded to Tokio's blocking
+pool so disk durability does not occupy core async workers. Raft client IDs are
+namespaced with a stable node-derived prefix, so replicated `DropClient` cleanup
+from one leader cannot collide with client IDs created by another leader.
+Committed writes trigger an
+immediate background `AppendEntries` fan-out so followers learn the updated
+`leaderCommit` without waiting for the next heartbeat tick. The current
+implementation is still slower
+than the regular Broker under concurrent HTTP load, but the leader now drains
+up to `client_batch_max_entries * client_pipeline_max_batches` pending requests
+into one append/replicate/commit cycle before applying responses in log order.
+The leader coalescer wakes early when the pending queue reaches the configured
+batch size, and the leader-local pending queue is capped by
+`client_batch_max_pending` so a stalled quorum rejects new admissions before
+they are appended to the log instead of growing memory without bound. Lagging
+peer catch-up retries immediately when a bounded batch or conflict repair moves
+`nextIndex`/`matchIndex`. `/raft/status` exposes `currentTerm`, `commitIndex`,
+`lastApplied`, and the leader quorum freshness fields to help spot convergence
+lag or a stale partitioned leader. Post-commit follower wakeups are coalesced
+through one active fan-out worker instead of spawning one background replication
+task per commit. Append-log and snapshot JSON serialization is
+buffered before the same fsync/atomic-rename durability steps, reducing small
+write syscall churn without changing durable-before-ack ordering. Raft term/vote
+hard state and log entries are persisted; leader-side `commitIndex` advancement
+and follower `leaderCommit` advancement are also persisted before applying
+committed entries. A durable snapshot also normalizes startup `commitIndex` to at
+least its `lastIncludedIndex`, and live `InstallSnapshot` persists that hard
+state before applying the snapshot payload to broker state. Dynamic membership
+is implemented with joint-consensus log entries, and new peer IDs are first
+caught up as transient learners before they are promoted to voters. The joint
+config entry itself requires the joint old+new quorum, so an old majority alone
+cannot apply a membership transition. After promotion, every newly promoted
+voter must catch up to the final membership log index before the membership
+change returns, and
+`GET /raft/progress` exposes staged learner progress.
+`GET/POST/DELETE /raft/learners` provides consensus-replicated staged-learner
+management for operator add/remove workflows, with a local restart cache and
+snapshot coverage. Promotion remains log-backed through the joint-consensus
+membership endpoint.
+If leader progress for a peer is missing, catch-up starts from the retained
+snapshot/log boundary instead of assuming the peer already has the leader's
+tail.
 Old log entries are compacted only after they are committed, applied, and
-covered by a durable snapshot. Snapshots now carry active holders, fencing
-counters, and TTL deadlines, so `InstallSnapshot` can catch up followers that
-fall behind a compacted prefix using chunked transfer staged on receiver disk.
-Followers verify the snapshot payload SHA-256 checksum before installing it.
-Queued waiters are not snapshotted yet, so BrokerRaft keeps the replay log
-while waiters exist. Lock UUID and fencing-token replay are deterministic across
-nodes because committed client-request log entries carry grant metadata.
+covered by a durable snapshot. Snapshots now carry active holders, queued
+waiters, fencing counters, and TTL deadlines, so `InstallSnapshot` can catch up
+followers that fall behind a compacted prefix using chunked transfer staged on
+receiver disk. Followers verify the snapshot payload SHA-256 checksum before
+installing it, and stale staged snapshot parts are removed when later snapshot
+traffic resumes or when a node reopens its Raft data directory. Restored waiters
+keep their original client ids for later replicated cleanup, but old HTTP
+response channels are not resurrected after restart or snapshot install. Lock
+UUID and fencing-token replay are deterministic across nodes because committed
+client-request log entries carry grant metadata.
 BrokerRaft should be treated as experimental, not as an etcd/ZooKeeper-grade
 consensus service.
 

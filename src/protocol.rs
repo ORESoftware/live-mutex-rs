@@ -266,6 +266,11 @@ pub mod http {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct AcquireRequest {
+        /// Optional client-provided idempotency/correlation key. BrokerRaft
+        /// uses this to replay a recent response instead of appending a
+        /// duplicate command when callers retry the same HTTP operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,6 +304,11 @@ pub mod http {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ReleaseRequest {
+        /// Optional client-provided idempotency/correlation key. BrokerRaft
+        /// uses this to replay a recent response instead of appending a
+        /// duplicate command when callers retry the same HTTP operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub request_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -99,7 +99,12 @@ struct RaftFileConfig {
     append_entries_max_bytes: Option<usize>,
     install_snapshot_chunk_bytes: Option<usize>,
     client_batch_max_entries: Option<usize>,
+    client_pipeline_max_batches: Option<usize>,
+    client_batch_max_pending: Option<usize>,
     client_batch_max_delay_ms: Option<u64>,
+    client_response_cache_max_entries: Option<usize>,
+    sync_log: Option<bool>,
+    peer_token: Option<String>,
     peers: Vec<RaftPeerConfig>,
 }
 
@@ -315,11 +320,25 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.client_batch_max_entries = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES")
         .or(file.client_batch_max_entries)
         .unwrap_or(cfg.client_batch_max_entries);
+    cfg.client_pipeline_max_batches = env_parse("LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES")
+        .or(file.client_pipeline_max_batches)
+        .unwrap_or(cfg.client_pipeline_max_batches);
+    cfg.client_batch_max_pending = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_PENDING")
+        .or(file.client_batch_max_pending)
+        .unwrap_or(cfg.client_batch_max_pending);
     cfg.client_batch_max_delay = Duration::from_millis(
         env_parse("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS")
             .or(file.client_batch_max_delay_ms)
             .unwrap_or(cfg.client_batch_max_delay.as_millis() as u64),
     );
+    cfg.client_response_cache_max_entries = env_parse("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES")
+        .or(file.client_response_cache_max_entries)
+        .unwrap_or(cfg.client_response_cache_max_entries);
+    cfg.sync_log = env_bool("LMX_RAFT_SYNC_LOG")
+        .or(file.sync_log)
+        .unwrap_or(cfg.sync_log);
+    cfg.peer_token =
+        env_string("LMX_RAFT_PEER_TOKEN").or_else(|| non_empty(file.peer_token.clone()));
     cfg.peers = file.peers.clone();
     Ok(cfg)
 }
@@ -398,7 +417,12 @@ mod tests {
             append_entries_max_bytes = 12345
             install_snapshot_chunk_bytes = 54321
             client_batch_max_entries = 19
+            client_pipeline_max_batches = 3
+            client_batch_max_pending = 77
             client_batch_max_delay_ms = 7
+            client_response_cache_max_entries = 55
+            sync_log = false
+            peer_token = "cluster-secret"
 
             [[raft.peers]]
             id = "node-1"
@@ -422,6 +446,11 @@ mod tests {
         assert_eq!(raft.append_entries_max_bytes, 12345);
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
         assert_eq!(raft.client_batch_max_entries, 19);
+        assert_eq!(raft.client_pipeline_max_batches, 3);
+        assert_eq!(raft.client_batch_max_pending, 77);
         assert_eq!(raft.client_batch_max_delay, Duration::from_millis(7));
+        assert_eq!(raft.client_response_cache_max_entries, 55);
+        assert!(!raft.sync_log);
+        assert_eq!(raft.peer_token.as_deref(), Some("cluster-secret"));
     }
 }

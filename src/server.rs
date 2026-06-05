@@ -161,7 +161,9 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     // Single periodic TTL sweep instead of per-request timers — see
     // upstream `live-mutex#13`. The sweeper is owned by `tasks` so it
     // is cancelled together with the listeners on shutdown.
-    tasks.push(broker.spawn_ttl_sweeper());
+    if !config.broker.ttl_sweep_interval.is_zero() {
+        tasks.push(broker.spawn_ttl_sweeper());
+    }
 
     if let Some(addr) = config.tcp_bind {
         let listener = TcpListener::bind(addr).await?;
@@ -403,6 +405,16 @@ struct RaftMembershipRequest {
     peers: Vec<RaftPeerConfig>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RaftLearnersRequest {
+    peers: Vec<RaftPeerConfig>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RaftLearnerRemovalRequest {
+    ids: Vec<String>,
+}
+
 pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> std::io::Result<()> {
     crate::routine_id!("ddl-routine-server-run-raft-1");
     let raft = BrokerRaft::open(raft_config).map_err(raft_io_error)?;
@@ -424,7 +436,14 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
             .route("/readyz", get(healthz))
             .route("/metrics", get(raft_metrics_endpoint))
             .route("/raft/status", get(raft_status))
+            .route("/raft/progress", get(raft_progress))
             .route("/raft/leaderz", get(raft_leaderz))
+            .route(
+                "/raft/learners",
+                get(raft_learners)
+                    .post(raft_stage_learners)
+                    .delete(raft_remove_learners),
+            )
             .route(
                 "/raft/membership",
                 get(raft_membership).post(raft_change_membership),
@@ -836,6 +855,46 @@ fn raft_http_authorized(state: &RaftAppState, headers: &HeaderMap) -> bool {
     bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
 }
 
+fn http_request_id(
+    headers: &HeaderMap,
+    body_request_id: Option<&str>,
+) -> Result<String, AxumResponse> {
+    crate::routine_id!("ddl-routine-server-http-request-id-1");
+    const MAX_REQUEST_ID_LEN: usize = 256;
+    let header_request_id = ["x-lmx-request-id", "idempotency-key", "x-idempotency-key"]
+        .iter()
+        .filter_map(|name| headers.get(*name))
+        .find_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let body_request_id = body_request_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let request_id = match (body_request_id, header_request_id) {
+        (Some(body), Some(header)) if body != header => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "requestId and idempotency header disagree"
+                })),
+            )
+                .into_response());
+        }
+        (Some(value), _) | (_, Some(value)) => value.to_string(),
+        (None, None) => Uuid::new_v4().to_string(),
+    };
+    if request_id.len() > MAX_REQUEST_ID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("requestId must be at most {MAX_REQUEST_ID_LEN} bytes")
+            })),
+        )
+            .into_response());
+    }
+    Ok(request_id)
+}
+
 async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-server-raft-metrics-1");
     let body = state.metrics.render(state.raft.broker());
@@ -851,17 +910,24 @@ async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoRe
 
 async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-server-raft-status-1");
+    let progress = state.raft.progress_snapshot();
     Json(serde_json::json!({
-        "nodeId": state.raft.config().node_id,
-        "isLeader": state.raft.is_leader(),
-        "leaderId": state.raft.leader_id(),
-        "leaderAddr": state.raft.leader_addr(),
+        "nodeId": progress.node_id,
+        "isLeader": progress.is_leader,
+        "isLeaderReady": progress.is_leader_ready,
+        "leaderId": progress.leader_id,
+        "leaderAddr": progress.leader_addr,
+        "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
+        "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
         "clusterSize": state.raft.active_cluster_size(),
         "quorumSize": state.raft.active_quorum_size(),
-        "membershipJoint": state.raft.membership_is_joint(),
-        "membership": state.raft.membership(),
-        "lastLogIndex": state.raft.log().last_index(),
-        "lastLogTerm": state.raft.log().last_term(),
+        "membershipJoint": progress.membership_joint,
+        "membership": progress.membership,
+        "currentTerm": progress.current_term,
+        "commitIndex": progress.commit_index,
+        "lastApplied": progress.last_applied,
+        "lastLogIndex": progress.last_log_index,
+        "lastLogTerm": progress.last_log_term,
     }))
 }
 
@@ -877,6 +943,82 @@ async fn raft_membership(State(state): State<RaftAppState>) -> impl IntoResponse
         "membershipJoint": state.raft.membership_is_joint(),
         "membership": state.raft.membership(),
     }))
+}
+
+async fn raft_progress(State(state): State<RaftAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-server-raft-progress-1");
+    Json(state.raft.progress_snapshot())
+}
+
+async fn raft_learners(State(state): State<RaftAppState>) -> impl IntoResponse {
+    crate::routine_id!("ddl-routine-server-raft-learners-1");
+    let progress = state.raft.progress_snapshot();
+    let learners = progress
+        .peers
+        .into_iter()
+        .filter(|peer| peer.staged_learner)
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "nodeId": progress.node_id,
+        "isLeader": progress.is_leader,
+        "isLeaderReady": progress.is_leader_ready,
+        "leaderId": progress.leader_id,
+        "leaderAddr": progress.leader_addr,
+        "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
+        "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
+        "lastLogIndex": progress.last_log_index,
+        "learners": learners,
+    }))
+}
+
+async fn raft_stage_learners(
+    State(state): State<RaftAppState>,
+    headers: HeaderMap,
+    Json(req): Json<RaftLearnersRequest>,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-stage-learners-1");
+    if !raft_http_authorized(&state, &headers) {
+        return http_unauthorized();
+    }
+    match state.raft.stage_learners(req.peers).await {
+        Ok(learners) => Json(serde_json::json!({
+            "learners": learners,
+            "progress": state.raft.progress_snapshot(),
+        }))
+        .into_response(),
+        Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
+        Err(err @ BrokerRaftError::InvalidConfig(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(err) => raft_unavailable(err),
+    }
+}
+
+async fn raft_remove_learners(
+    State(state): State<RaftAppState>,
+    headers: HeaderMap,
+    Json(req): Json<RaftLearnerRemovalRequest>,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-remove-learners-1");
+    if !raft_http_authorized(&state, &headers) {
+        return http_unauthorized();
+    }
+    match state.raft.remove_staged_learners(req.ids).await {
+        Ok(learners) => Json(serde_json::json!({
+            "learners": learners,
+            "progress": state.raft.progress_snapshot(),
+        }))
+        .into_response(),
+        Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
+        Err(err @ BrokerRaftError::InvalidConfig(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": err.to_string()})),
+        )
+            .into_response(),
+        Err(err) => raft_unavailable(err),
+    }
 }
 
 async fn raft_change_membership(
@@ -908,13 +1050,17 @@ async fn raft_change_membership(
 
 async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-leaderz-1");
+    let progress = state.raft.progress_snapshot();
     let body = serde_json::json!({
-        "nodeId": state.raft.config().node_id,
-        "isLeader": state.raft.is_leader(),
-        "leaderId": state.raft.leader_id(),
-        "leaderAddr": state.raft.leader_addr(),
+        "nodeId": progress.node_id,
+        "isLeader": progress.is_leader,
+        "isLeaderReady": progress.is_leader_ready,
+        "leaderId": progress.leader_id,
+        "leaderAddr": progress.leader_addr,
+        "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
+        "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
     });
-    if state.raft.is_leader() {
+    if progress.is_leader_ready {
         Json(body).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
@@ -931,7 +1077,10 @@ async fn raft_http_acquire(
         return http_unauthorized();
     }
     state.metrics.requests_total.inc();
-    let request_uuid = Uuid::new_v4().to_string();
+    let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let request = Request::Lock {
         uuid: request_uuid.clone(),
         key: req.key.clone(),
@@ -1028,7 +1177,10 @@ async fn raft_http_release(
         return http_unauthorized();
     }
     state.metrics.requests_total.inc();
-    let request_uuid = Uuid::new_v4().to_string();
+    let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let outcome = state
         .raft
         .run_ephemeral(
@@ -1075,6 +1227,14 @@ fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
                 "error": "raft leader unavailable",
                 "leaderId": leader_id,
                 "leaderAddr": leader_addr,
+            })),
+        )
+            .into_response(),
+        BrokerRaftError::IdempotencyKeyConflict { request_id } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "request id reused with different payload",
+                "requestId": request_id,
             })),
         )
             .into_response(),
@@ -1690,7 +1850,10 @@ async fn http_acquire(
         return http_unauthorized();
     }
     state.metrics.requests_total.inc();
-    let request_uuid = Uuid::new_v4().to_string();
+    let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let request = Request::Lock {
         uuid: request_uuid.clone(),
         key: req.key.clone(),
@@ -1793,7 +1956,10 @@ async fn http_release(
         return http_unauthorized();
     }
     state.metrics.requests_total.inc();
-    let request_uuid = Uuid::new_v4().to_string();
+    let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
+        Ok(request_id) => request_id,
+        Err(response) => return response,
+    };
     let outcome = run_ephemeral(
         &state,
         Request::Unlock {
