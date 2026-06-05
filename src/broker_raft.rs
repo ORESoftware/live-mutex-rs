@@ -4,6 +4,7 @@
 //! leader election, quorum replication, durable append-only logs, snapshot
 //! metadata, and compaction-by-snapshot-index.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -196,6 +197,8 @@ enum RaftRpc {
     AppendEntries {
         term: u64,
         leader_id: String,
+        prev_log_index: u64,
+        prev_log_term: u64,
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     },
@@ -222,6 +225,8 @@ enum RaftRpcResponse {
         term: u64,
         success: bool,
         match_index: u64,
+        conflict_index: Option<u64>,
+        conflict_term: Option<u64>,
     },
     ProxyResponse {
         term: u64,
@@ -250,6 +255,7 @@ struct RaftRuntimeState {
     commit_index: u64,
     last_applied: u64,
     election_deadline: Instant,
+    leader_progress: BTreeMap<String, RaftPeerProgress>,
 }
 
 impl RaftRuntimeState {
@@ -261,6 +267,20 @@ impl RaftRuntimeState {
             commit_index: self.commit_index,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RaftPeerProgress {
+    next_index: u64,
+    match_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RaftAppendReport {
+    success: bool,
+    match_index: u64,
+    conflict_index: Option<u64>,
+    conflict_term: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +417,29 @@ impl RaftLogStore {
         read_log_entries(&self.log_path)
     }
 
+    pub fn entries_from(&self, index: u64) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-entries-from-1");
+        let _state = self.state.lock();
+        Ok(read_log_entries(&self.log_path)?
+            .into_iter()
+            .filter(|entry| entry.index >= index)
+            .collect())
+    }
+
+    pub fn term_at(&self, index: u64) -> Result<Option<u64>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-term-at-1");
+        let state = self.state.lock();
+        let entries = read_log_entries(&self.log_path)?;
+        Ok(term_at_index(&state, &entries, index))
+    }
+
+    pub fn last_index_for_term(&self, term: u64) -> Result<Option<u64>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-last-index-for-term-1");
+        let state = self.state.lock();
+        let entries = read_log_entries(&self.log_path)?;
+        Ok(last_index_for_term(&state, &entries, term))
+    }
+
     pub fn log_len_bytes(&self) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-log-len-bytes-1");
         let _state = self.state.lock();
@@ -444,6 +487,105 @@ impl RaftLogStore {
             state.last_term = 0;
         }
         Ok(())
+    }
+
+    fn append_entries_from_leader(
+        &self,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        entries: Vec<RaftLogEntry>,
+    ) -> Result<RaftAppendReport, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-append-from-leader-1");
+        let mut state = self.state.lock();
+        let mut local = read_log_entries(&self.log_path)?;
+        let snapshot_index = state
+            .latest_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_included_index)
+            .unwrap_or(0);
+        let local_last_index = local
+            .last()
+            .map(|entry| entry.index)
+            .or_else(|| {
+                state
+                    .latest_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.last_included_index)
+            })
+            .unwrap_or(0);
+
+        if prev_log_index > local_last_index {
+            return Ok(RaftAppendReport {
+                success: false,
+                match_index: local_last_index,
+                conflict_index: Some(local_last_index.saturating_add(1)),
+                conflict_term: None,
+            });
+        }
+
+        match term_at_index(&state, &local, prev_log_index) {
+            Some(term) if term == prev_log_term => {}
+            Some(term) => {
+                return Ok(RaftAppendReport {
+                    success: false,
+                    match_index: local_last_index.min(prev_log_index.saturating_sub(1)),
+                    conflict_index: first_index_for_term(&state, &local, term),
+                    conflict_term: Some(term),
+                });
+            }
+            None => {
+                return Ok(RaftAppendReport {
+                    success: false,
+                    match_index: local_last_index.min(prev_log_index.saturating_sub(1)),
+                    conflict_index: Some(snapshot_index.saturating_add(1)),
+                    conflict_term: None,
+                });
+            }
+        }
+
+        let mut changed = false;
+        let mut match_index = prev_log_index;
+        for entry in entries
+            .into_iter()
+            .filter(|entry| entry.index > snapshot_index && entry.index > prev_log_index)
+        {
+            match_index = match_index.max(entry.index);
+            if let Some(pos) = local.iter().position(|local| local.index == entry.index) {
+                if local[pos].term != entry.term {
+                    local.truncate(pos);
+                    local.push(entry);
+                    changed = true;
+                }
+            } else {
+                if let Some(pos) = local.iter().position(|local| local.index > entry.index) {
+                    local.truncate(pos);
+                }
+                local.push(entry);
+                changed = true;
+            }
+        }
+
+        if changed {
+            rewrite_log(&self.log_path, &local)?;
+            sync_dir(&self.data_dir)?;
+        }
+        if let Some(last) = local.last() {
+            state.last_index = last.index;
+            state.last_term = last.term;
+        } else if let Some(snapshot) = state.latest_snapshot.clone() {
+            state.last_index = snapshot.last_included_index;
+            state.last_term = snapshot.last_included_term;
+        } else {
+            state.last_index = 0;
+            state.last_term = 0;
+        }
+
+        Ok(RaftAppendReport {
+            success: true,
+            match_index,
+            conflict_index: None,
+            conflict_term: None,
+        })
     }
 
     pub fn write_snapshot(
@@ -579,6 +721,7 @@ impl BrokerRaft {
                 commit_index: hard_state.commit_index,
                 last_applied: snapshot_index.min(hard_state.commit_index),
                 election_deadline,
+                leader_progress: BTreeMap::new(),
             })),
             maintenance: Arc::new(Mutex::new(RaftMaintenanceState {
                 last_snapshot_at: now,
@@ -762,7 +905,7 @@ impl BrokerRaft {
                 request: request.clone(),
             },
         )?;
-        let votes = self.replicate_until_quorum().await?;
+        let votes = self.replicate_until_quorum(entry.index).await?;
         let quorum = self.config.quorum_size();
         if votes < quorum {
             return Err(BrokerRaftError::QuorumUnavailable {
@@ -779,7 +922,7 @@ impl BrokerRaft {
         self.log.write_hard_state(&hard_state)?;
         self.apply_committed()?;
         self.snapshot_and_compact_if_needed(false)?;
-        let _ = self.replicate_log_once().await;
+        let _ = self.replicate_log_once(None).await;
         Ok(entry.index)
     }
 
@@ -802,7 +945,7 @@ impl BrokerRaft {
         let entry = self
             .log
             .append(term, RaftCommand::DropClient { client_id: client })?;
-        let votes = self.replicate_until_quorum().await?;
+        let votes = self.replicate_until_quorum(entry.index).await?;
         let quorum = self.config.quorum_size();
         if votes < quorum {
             return Err(BrokerRaftError::QuorumUnavailable {
@@ -819,7 +962,7 @@ impl BrokerRaft {
         self.log.write_hard_state(&hard_state)?;
         self.apply_committed()?;
         self.snapshot_and_compact_if_needed(false)?;
-        let _ = self.replicate_log_once().await;
+        let _ = self.replicate_log_once(None).await;
         Ok(entry.index)
     }
 
@@ -917,9 +1060,18 @@ impl BrokerRaft {
             RaftRpc::AppendEntries {
                 term,
                 leader_id,
+                prev_log_index,
+                prev_log_term,
                 entries,
                 leader_commit,
-            } => self.handle_append_entries(term, leader_id, entries, leader_commit),
+            } => self.handle_append_entries(
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            ),
             RaftRpc::ProxyRequest {
                 request,
                 request_uuid,
@@ -1010,6 +1162,8 @@ impl BrokerRaft {
         &self,
         term: u64,
         leader_id: String,
+        prev_log_index: u64,
+        prev_log_term: u64,
         entries: Vec<RaftLogEntry>,
         leader_commit: u64,
     ) -> RaftRpcResponse {
@@ -1022,6 +1176,8 @@ impl BrokerRaft {
                     term: runtime.current_term,
                     success: false,
                     match_index: self.log.last_index(),
+                    conflict_index: None,
+                    conflict_term: None,
                 };
             }
             if term > runtime.current_term {
@@ -1034,13 +1190,27 @@ impl BrokerRaft {
             runtime.election_deadline = self.next_election_deadline();
         }
 
-        if !entries.is_empty() {
-            if let Err(err) = self.log.replace_all(&entries) {
-                return RaftRpcResponse::Error {
-                    term: self.runtime.lock().current_term,
-                    error: err.to_string(),
-                };
-            }
+        let append_report =
+            match self
+                .log
+                .append_entries_from_leader(prev_log_index, prev_log_term, entries)
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    return RaftRpcResponse::Error {
+                        term: self.runtime.lock().current_term,
+                        error: err.to_string(),
+                    };
+                }
+            };
+        if !append_report.success {
+            return RaftRpcResponse::AppendEntries {
+                term: self.runtime.lock().current_term,
+                success: false,
+                match_index: append_report.match_index,
+                conflict_index: append_report.conflict_index,
+                conflict_term: append_report.conflict_term,
+            };
         }
 
         {
@@ -1077,7 +1247,9 @@ impl BrokerRaft {
         RaftRpcResponse::AppendEntries {
             term: self.runtime.lock().current_term,
             success: true,
-            match_index: self.log.last_index(),
+            match_index: append_report.match_index,
+            conflict_index: None,
+            conflict_term: None,
         }
     }
 
@@ -1086,7 +1258,7 @@ impl BrokerRaft {
         loop {
             if self.is_leader() {
                 if let Ok(_commit_guard) = self.commit_lock.try_lock() {
-                    let _ = self.replicate_log_once().await;
+                    let _ = self.replicate_log_once(None).await;
                 }
                 tokio::time::sleep(self.config.heartbeat_interval).await;
                 continue;
@@ -1174,10 +1346,24 @@ impl BrokerRaft {
         }
 
         if votes >= self.config.quorum_size() {
+            let remote_peers = self.remote_peers();
+            let next_index = self.log.last_index().saturating_add(1);
             let mut runtime = self.runtime.lock();
             if runtime.current_term == term && runtime.role == RaftRole::Candidate {
                 runtime.role = RaftRole::Leader;
                 runtime.leader_id = Some(self.config.node_id.clone());
+                runtime.leader_progress = remote_peers
+                    .into_iter()
+                    .map(|peer| {
+                        (
+                            peer.id,
+                            RaftPeerProgress {
+                                next_index,
+                                match_index: 0,
+                            },
+                        )
+                    })
+                    .collect();
                 info!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
@@ -1191,17 +1377,45 @@ impl BrokerRaft {
         Ok(())
     }
 
-    async fn replicate_log_once(&self) -> Result<usize, BrokerRaftError> {
+    async fn replicate_log_once(&self, target_index: Option<u64>) -> Result<usize, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-once-1");
-        let term = self.runtime.lock().current_term;
-        let leader_commit = self.runtime.lock().commit_index;
-        let entries = self.log.read_entries()?;
+        let (term, leader_commit) = {
+            let runtime = self.runtime.lock();
+            (runtime.current_term, runtime.commit_index)
+        };
         let mut votes = 1usize;
         for peer in self.remote_peers() {
+            let next_index = {
+                let mut runtime = self.runtime.lock();
+                let fallback = self.log.last_index().saturating_add(1);
+                runtime
+                    .leader_progress
+                    .entry(peer.id.clone())
+                    .or_insert(RaftPeerProgress {
+                        next_index: fallback,
+                        match_index: 0,
+                    })
+                    .next_index
+                    .max(1)
+            };
+            let prev_log_index = next_index.saturating_sub(1);
+            let Some(prev_log_term) = self.log.term_at(prev_log_index)? else {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    peer = %peer.id,
+                    prev_log_index,
+                    "cannot replicate incremental entries before local snapshot boundary",
+                );
+                continue;
+            };
+            let entries = self.log.entries_from(next_index)?;
             let rpc = RaftRpc::AppendEntries {
                 term,
                 leader_id: self.config.node_id.clone(),
-                entries: entries.clone(),
+                prev_log_index,
+                prev_log_term,
+                entries,
                 leader_commit,
             };
             let timeout = self
@@ -1213,6 +1427,9 @@ impl BrokerRaft {
                 Ok(RaftRpcResponse::AppendEntries {
                     term: peer_term,
                     success,
+                    match_index,
+                    conflict_index,
+                    conflict_term,
                     ..
                 }) => {
                     if peer_term > term {
@@ -1220,7 +1437,38 @@ impl BrokerRaft {
                         return Ok(votes);
                     }
                     if success {
-                        votes += 1;
+                        let mut runtime = self.runtime.lock();
+                        let progress =
+                            runtime
+                                .leader_progress
+                                .entry(peer.id.clone())
+                                .or_insert(RaftPeerProgress {
+                                    next_index: match_index.saturating_add(1),
+                                    match_index: 0,
+                                });
+                        progress.match_index = progress.match_index.max(match_index);
+                        progress.next_index = progress
+                            .next_index
+                            .max(progress.match_index.saturating_add(1));
+                        if target_index.is_none_or(|target| progress.match_index >= target) {
+                            votes += 1;
+                        }
+                    } else {
+                        let next_index = self.next_index_after_conflict(
+                            conflict_term,
+                            conflict_index,
+                            next_index,
+                        )?;
+                        let mut runtime = self.runtime.lock();
+                        let progress =
+                            runtime
+                                .leader_progress
+                                .entry(peer.id.clone())
+                                .or_insert(RaftPeerProgress {
+                                    next_index,
+                                    match_index: 0,
+                                });
+                        progress.next_index = next_index.max(1);
                     }
                 }
                 Ok(RaftRpcResponse::Error {
@@ -1253,7 +1501,7 @@ impl BrokerRaft {
         Ok(votes)
     }
 
-    async fn replicate_until_quorum(&self) -> Result<usize, BrokerRaftError> {
+    async fn replicate_until_quorum(&self, target_index: u64) -> Result<usize, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-until-quorum-1");
         let quorum = self.config.quorum_size();
         let timeout = self
@@ -1264,7 +1512,7 @@ impl BrokerRaft {
         let deadline = deadline_after(timeout);
         let mut best_votes = 0usize;
         loop {
-            let votes = self.replicate_log_once().await?;
+            let votes = self.replicate_log_once(Some(target_index)).await?;
             best_votes = best_votes.max(votes);
             if votes >= quorum || !self.is_leader() {
                 return Ok(votes);
@@ -1441,6 +1689,23 @@ impl BrokerRaft {
             .filter(|peer| peer.id != self.config.node_id)
             .cloned()
             .collect()
+    }
+
+    fn next_index_after_conflict(
+        &self,
+        conflict_term: Option<u64>,
+        conflict_index: Option<u64>,
+        current_next_index: u64,
+    ) -> Result<u64, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-next-index-conflict-1");
+        if let Some(term) = conflict_term {
+            if let Some(last_index) = self.log.last_index_for_term(term)? {
+                return Ok(last_index.saturating_add(1).max(1));
+            }
+        }
+        Ok(conflict_index
+            .unwrap_or_else(|| current_next_index.saturating_sub(1))
+            .max(1))
     }
 
     fn next_election_deadline(&self) -> Instant {
@@ -1693,6 +1958,59 @@ fn read_log_entries(path: &Path) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
         entries.push(serde_json::from_str(line)?);
     }
     Ok(entries)
+}
+
+fn term_at_index(state: &RaftLogState, entries: &[RaftLogEntry], index: u64) -> Option<u64> {
+    crate::routine_id!("ddl-routine-broker-raft-term-at-index-1");
+    if index == 0 {
+        return Some(0);
+    }
+    if let Some(snapshot) = &state.latest_snapshot {
+        if snapshot.last_included_index == index {
+            return Some(snapshot.last_included_term);
+        }
+        if index < snapshot.last_included_index {
+            return None;
+        }
+    }
+    entries
+        .iter()
+        .find(|entry| entry.index == index)
+        .map(|entry| entry.term)
+}
+
+fn first_index_for_term(
+    state: &RaftLogState,
+    entries: &[RaftLogEntry],
+    term: u64,
+) -> Option<u64> {
+    crate::routine_id!("ddl-routine-broker-raft-first-index-for-term-1");
+    let snapshot_match = state
+        .latest_snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.last_included_term == term)
+        .map(|snapshot| snapshot.last_included_index);
+    entries
+        .iter()
+        .find(|entry| entry.term == term)
+        .map(|entry| entry.index)
+        .or(snapshot_match)
+}
+
+fn last_index_for_term(state: &RaftLogState, entries: &[RaftLogEntry], term: u64) -> Option<u64> {
+    crate::routine_id!("ddl-routine-broker-raft-last-index-for-term-1");
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.term == term)
+        .map(|entry| entry.index)
+        .or_else(|| {
+            state
+                .latest_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.last_included_term == term)
+                .map(|snapshot| snapshot.last_included_index)
+        })
 }
 
 fn rewrite_log(path: &Path, entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
