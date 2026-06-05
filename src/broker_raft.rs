@@ -580,6 +580,18 @@ struct PendingSnapshotTransfer {
     updated_at_ms: u64,
 }
 
+struct PendingClientRequest {
+    client_id: ClientId,
+    request: Request,
+    result_tx: oneshot::Sender<Result<u64, String>>,
+}
+
+#[derive(Default)]
+struct ClientRequestBatchState {
+    pending: VecDeque<PendingClientRequest>,
+    driver_active: bool,
+}
+
 #[derive(Debug)]
 pub struct RaftLogStore {
     data_dir: PathBuf,
@@ -621,25 +633,46 @@ impl RaftLogStore {
 
     pub fn append(&self, term: u64, command: RaftCommand) -> Result<RaftLogEntry, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-log-append-1");
-        let mut state = self.state.lock();
-        let entry = RaftLogEntry {
-            index: state.last_index.saturating_add(1),
-            term,
-            created_at_ms: unix_ms(),
-            command,
-        };
+        let mut entries = self.append_batch(term, vec![command])?;
+        entries.pop().ok_or_else(|| {
+            BrokerRaftError::Rpc("raft log append produced no entry for one command".into())
+        })
+    }
 
+    pub fn append_batch(
+        &self,
+        term: u64,
+        commands: Vec<RaftCommand>,
+    ) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-log-append-batch-1");
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut state = self.state.lock();
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
-        serde_json::to_writer(&mut file, &entry)?;
-        file.write_all(b"\n")?;
+        let created_at_ms = unix_ms();
+        let mut entries = Vec::with_capacity(commands.len());
+        for command in commands {
+            let entry = RaftLogEntry {
+                index: state.last_index.saturating_add(entries.len() as u64 + 1),
+                term,
+                created_at_ms,
+                command,
+            };
+            serde_json::to_writer(&mut file, &entry)?;
+            file.write_all(b"\n")?;
+            entries.push(entry);
+        }
         file.sync_data()?;
 
-        state.last_index = entry.index;
-        state.last_term = entry.term;
-        Ok(entry)
+        if let Some(last) = entries.last() {
+            state.last_index = last.index;
+            state.last_term = last.term;
+        }
+        Ok(entries)
     }
 
     pub fn last_index(&self) -> u64 {
@@ -1033,6 +1066,7 @@ pub struct BrokerRaft {
     commit_lock: Arc<tokio::sync::Mutex<()>>,
     rpc_connections: Arc<Mutex<BTreeMap<String, Arc<AsyncMutex<RaftRpcConnection>>>>>,
     snapshot_transfers: Arc<Mutex<BTreeMap<String, PendingSnapshotTransfer>>>,
+    client_request_batch: Arc<Mutex<ClientRequestBatchState>>,
 }
 
 impl BrokerRaft {
@@ -1083,6 +1117,7 @@ impl BrokerRaft {
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             rpc_connections: Arc::new(Mutex::new(BTreeMap::new())),
             snapshot_transfers: Arc::new(Mutex::new(BTreeMap::new())),
+            client_request_batch: Arc::new(Mutex::new(ClientRequestBatchState::default())),
             config,
             log,
         };
