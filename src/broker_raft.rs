@@ -1345,6 +1345,9 @@ impl RaftLogStore {
                 match_index: local_last_index,
                 conflict_index: Some(local_last_index.saturating_add(1)),
                 conflict_term: None,
+                appended_entries: 0,
+                rewritten_entries: 0,
+                truncated_entries: 0,
             });
         }
 
@@ -1356,6 +1359,9 @@ impl RaftLogStore {
                     match_index: local_last_index.min(prev_log_index.saturating_sub(1)),
                     conflict_index: first_index_for_term(&state, term),
                     conflict_term: Some(term),
+                    appended_entries: 0,
+                    rewritten_entries: 0,
+                    truncated_entries: 0,
                 });
             }
             None => {
@@ -1364,6 +1370,9 @@ impl RaftLogStore {
                     match_index: local_last_index.min(prev_log_index.saturating_sub(1)),
                     conflict_index: Some(snapshot_index.saturating_add(1)),
                     conflict_term: None,
+                    appended_entries: 0,
+                    rewritten_entries: 0,
+                    truncated_entries: 0,
                 });
             }
         }
@@ -1378,6 +1387,9 @@ impl RaftLogStore {
             .unwrap_or(prev_log_index);
         let mut append_from = None;
         let mut rewrite_from = None;
+        let mut appended_entries = 0usize;
+        let mut rewritten_entries = 0usize;
+        let mut truncated_entries = 0usize;
         for (pos, entry) in incoming.iter().enumerate() {
             match state.term_by_index.get(&entry.index).copied() {
                 Some(local_term) if local_term == entry.term => {}
@@ -1403,12 +1415,15 @@ impl RaftLogStore {
                     "refusing to rewrite committed follower log entry at index {rewrite_index}; local commitIndex is {local_commit_index}"
                 )));
             }
-            let mut local = state
+            let retained_prefix_len =
+                retained_entry_lower_bound(&state.retained_log_entries, rewrite_index);
+            let truncated_entries = state
                 .retained_log_entries
-                .iter()
-                .take_while(|entry| entry.index < rewrite_index)
-                .cloned()
-                .collect::<Vec<_>>();
+                .len()
+                .saturating_sub(retained_prefix_len);
+            rewritten_entries = incoming.len().saturating_sub(pos);
+            truncated_entries = truncated_entries;
+            let mut local = state.retained_log_entries[..retained_prefix_len].to_vec();
             local.extend(incoming[pos..].iter().cloned());
             validate_log_entries_for_snapshot(&local, state.latest_snapshot.as_ref())?;
             rewrite_log(&self.log_path, &local, self.sync_log)?;
@@ -1444,6 +1459,7 @@ impl RaftLogStore {
                 state.last_index = last.index;
                 state.last_term = last.term;
             }
+            appended_entries = append_only.len();
             for entry in append_only {
                 state.term_by_index.insert(entry.index, entry.term);
                 state
@@ -1462,6 +1478,9 @@ impl RaftLogStore {
             match_index,
             conflict_index: None,
             conflict_term: None,
+            appended_entries,
+            rewritten_entries,
+            truncated_entries,
         })
     }
 
