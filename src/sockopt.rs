@@ -99,7 +99,8 @@ mod tests {
         // (Ok(false)) — the function MUST NOT fail just because the
         // option doesn't exist there, otherwise the broker can't run on
         // dev laptops.
-        let applied = apply_quickack(fd).expect("apply_quickack must not error on supported builds");
+        let applied =
+            apply_quickack(fd).expect("apply_quickack must not error on supported builds");
         assert_eq!(applied, quickack_supported());
     }
 }

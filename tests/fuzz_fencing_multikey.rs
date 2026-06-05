@@ -84,8 +84,16 @@ fn composite_req(uuid: &str, keys: &[String], wait: bool) -> Request {
 fn unlock_req(uuid: &str, keys: &[String], lock_uuid: &str) -> Request {
     Request::Unlock {
         uuid: uuid.into(),
-        key: if keys.len() == 1 { Some(keys[0].clone()) } else { None },
-        keys: if keys.len() > 1 { Some(keys.to_vec()) } else { None },
+        key: if keys.len() == 1 {
+            Some(keys[0].clone())
+        } else {
+            None
+        },
+        keys: if keys.len() > 1 {
+            Some(keys.to_vec())
+        } else {
+            None
+        },
         lock_uuid: Some(lock_uuid.into()),
         force: false,
     }
@@ -163,7 +171,10 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
                 check_token(&key, tok, &mut last_token);
                 let lu = lock_uuid.expect("granted single lock has lock_uuid");
                 held_by_key.insert(key.clone(), ci);
-                held[ci].push(HeldLock { lock_uuid: lu, keys: vec![key] });
+                held[ci].push(HeldLock {
+                    lock_uuid: lu,
+                    keys: vec![key],
+                });
             }
         } else if roll < 70 {
             // ---- composite no-wait acquire (2..=4 distinct keys) ----
@@ -213,7 +224,10 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
                     held_by_key.insert(k.clone(), ci);
                 }
                 let lu = lock_uuid.expect("granted composite has lock_uuid");
-                held[ci].push(HeldLock { lock_uuid: lu, keys: chosen });
+                held[ci].push(HeldLock {
+                    lock_uuid: lu,
+                    keys: chosen,
+                });
             }
         } else {
             // ---- release a randomly chosen held lock ----
@@ -226,7 +240,9 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
             let uuid = format!("u{req_seq}");
             broker.handle_request(cid, unlock_req(&uuid, &lock.keys, &lock.lock_uuid));
             let msgs = drain(&mut rxs[ci]);
-            let unlocked = msgs.iter().any(|m| matches!(m, Response::Unlock { unlocked: true, .. }));
+            let unlocked = msgs
+                .iter()
+                .any(|m| matches!(m, Response::Unlock { unlocked: true, .. }));
             assert!(
                 unlocked,
                 "release of {:?} (lock_uuid={}) was rejected: {msgs:?} (seed={seed})",
@@ -234,7 +250,11 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
             );
             for k in &lock.keys {
                 let owner = held_by_key.remove(k);
-                assert_eq!(owner, Some(ci), "model: {k} freed by wrong owner (seed={seed})");
+                assert_eq!(
+                    owner,
+                    Some(ci),
+                    "model: {k} freed by wrong owner (seed={seed})"
+                );
             }
         }
     }
@@ -245,14 +265,20 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
         let locks = std::mem::take(&mut held[ci]);
         for lock in locks {
             req_seq += 1;
-            broker.handle_request(cids[ci], unlock_req(&format!("fu{req_seq}"), &lock.keys, &lock.lock_uuid));
+            broker.handle_request(
+                cids[ci],
+                unlock_req(&format!("fu{req_seq}"), &lock.keys, &lock.lock_uuid),
+            );
             let _ = drain(&mut rxs[ci]);
             for k in &lock.keys {
                 held_by_key.remove(k);
             }
         }
     }
-    assert!(held_by_key.is_empty(), "model still holds keys after teardown (seed={seed})");
+    assert!(
+        held_by_key.is_empty(),
+        "model still holds keys after teardown (seed={seed})"
+    );
 
     // Prove nothing leaked: every key must be individually grabbable, no-wait.
     // (Composite cap is 5 keys, so we probe per key rather than all at once.)
@@ -261,7 +287,11 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
         broker.handle_request(cids[0], lock_req(&format!("final{req_seq}"), k, false));
         let msgs = drain(&mut rxs[0]);
         let got = msgs.iter().find_map(|m| match m {
-            Response::Lock { acquired, lock_uuid, .. } => Some((*acquired, lock_uuid.clone())),
+            Response::Lock {
+                acquired,
+                lock_uuid,
+                ..
+            } => Some((*acquired, lock_uuid.clone())),
             _ => None,
         });
         let (acquired, lu) = got.expect("final probe reply");
@@ -305,9 +335,12 @@ fn wait_queue_grants_are_fencing_monotonic_fifo() {
         let (tok, lu) = msgs
             .iter()
             .find_map(|m| match m {
-                Response::Lock { acquired: true, fencing_token: Some(t), lock_uuid: Some(u), .. } => {
-                    Some((*t, u.clone()))
-                }
+                Response::Lock {
+                    acquired: true,
+                    fencing_token: Some(t),
+                    lock_uuid: Some(u),
+                    ..
+                } => Some((*t, u.clone())),
                 _ => None,
             })
             .expect("h0 grant");
@@ -320,22 +353,36 @@ fn wait_queue_grants_are_fencing_monotonic_fifo() {
     for i in 1..4 {
         broker.handle_request(cids[i], lock_req(&format!("h{i}"), key, true));
         let msgs = drain(&mut rxs[i]);
-        let queued = msgs.iter().any(|m| matches!(m, Response::Lock { acquired: false, .. }));
+        let queued = msgs.iter().any(|m| {
+            matches!(
+                m,
+                Response::Lock {
+                    acquired: false,
+                    ..
+                }
+            )
+        });
         assert!(queued, "h{i} should be queued");
     }
 
     // Cascade releases; each successive holder must grant with a strictly
     // greater fencing token, in FIFO order.
     for i in 1..4 {
-        broker.handle_request(cids[i - 1], unlock_req(&format!("rel{i}"), &[key.to_string()], &held_uuid));
+        broker.handle_request(
+            cids[i - 1],
+            unlock_req(&format!("rel{i}"), &[key.to_string()], &held_uuid),
+        );
         let _ = drain(&mut rxs[i - 1]);
         let msgs = drain(&mut rxs[i]);
         let (tok, lu) = msgs
             .iter()
             .find_map(|m| match m {
-                Response::Lock { acquired: true, fencing_token: Some(t), lock_uuid: Some(u), .. } => {
-                    Some((*t, u.clone()))
-                }
+                Response::Lock {
+                    acquired: true,
+                    fencing_token: Some(t),
+                    lock_uuid: Some(u),
+                    ..
+                } => Some((*t, u.clone())),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("h{i} did not get a grant after release; got {msgs:?}"));

@@ -163,7 +163,10 @@ async fn admin_log_level_round_trip() {
         "POST",
         http,
         "/admin/log-level",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"directive":"debug"}"#,
     )
     .await;
@@ -184,7 +187,10 @@ async fn admin_log_level_round_trip() {
         "POST",
         http,
         "/admin/log-level",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"directive":"=== nonsense ==="}"#,
     )
     .await;
@@ -197,7 +203,10 @@ async fn admin_log_level_round_trip() {
         "POST",
         http,
         "/admin/log-level",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{}"#,
     )
     .await;
@@ -238,13 +247,19 @@ async fn admin_log_level_still_returns_json_without_htmx() {
         "POST",
         http,
         "/admin/log-level",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"directive":"info"}"#,
     )
     .await;
     assert_eq!(status, 200);
     let ct = header_value(&head, "Content-Type").unwrap_or("");
-    assert!(ct.starts_with("application/json"), "expected JSON, got `{ct}`");
+    assert!(
+        ct.starts_with("application/json"),
+        "expected JSON, got `{ct}`"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["directive"], "info");
 }
@@ -266,7 +281,10 @@ async fn admin_tcp_round_trip() {
         "POST",
         http,
         "/admin/tcp",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"nodelay":false}"#,
     )
     .await;
@@ -275,8 +293,7 @@ async fn admin_tcp_round_trip() {
     assert_eq!(v["nodelay"], false);
 
     // GET reflects the flip.
-    let (_status, _head, body) =
-        http_request("GET", http, "/admin/tcp", &auth_header(), b"").await;
+    let (_status, _head, body) = http_request("GET", http, "/admin/tcp", &auth_header(), b"").await;
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["nodelay"], false);
 
@@ -285,7 +302,10 @@ async fn admin_tcp_round_trip() {
         "POST",
         http,
         "/admin/tcp",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         b"{}",
     )
     .await;
@@ -347,13 +367,19 @@ async fn admin_tcp_still_returns_json_without_htmx() {
         "POST",
         http,
         "/admin/tcp",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"nodelay":true}"#,
     )
     .await;
     assert_eq!(status, 200);
     let ct = header_value(&head, "Content-Type").unwrap_or("");
-    assert!(ct.starts_with("application/json"), "expected JSON, got `{ct}`");
+    assert!(
+        ct.starts_with("application/json"),
+        "expected JSON, got `{ct}`"
+    );
     assert!(serde_json::from_str::<serde_json::Value>(&body).is_ok());
 }
 
@@ -389,13 +415,19 @@ async fn admin_otel_still_returns_json_without_htmx() {
         "POST",
         http,
         "/admin/otel",
-        &[("X-Admin-Token", ADMIN_TOKEN), ("Content-Type", "application/json")],
+        &[
+            ("X-Admin-Token", ADMIN_TOKEN),
+            ("Content-Type", "application/json"),
+        ],
         br#"{"enabled":false}"#,
     )
     .await;
     assert_eq!(status, 200);
     let ct = header_value(&head, "Content-Type").unwrap_or("");
-    assert!(ct.starts_with("application/json"), "expected JSON, got `{ct}`");
+    assert!(
+        ct.starts_with("application/json"),
+        "expected JSON, got `{ct}`"
+    );
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(v["enabled"].is_boolean());
 }

@@ -333,8 +333,16 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
         ttl_evictions_total = snapshot.ttl_evictions_total,
         concurrency_cap_clamps_total = snapshot.concurrency_cap_clamps_total,
         waiters_class = if snapshot.waiters > 0 { " warn" } else { "" },
-        evict_class = if snapshot.ttl_evictions_total > 0 { " warn" } else { "" },
-        clamp_class = if snapshot.concurrency_cap_clamps_total > 0 { " warn" } else { "" },
+        evict_class = if snapshot.ttl_evictions_total > 0 {
+            " warn"
+        } else {
+            ""
+        },
+        clamp_class = if snapshot.concurrency_cap_clamps_total > 0 {
+            " warn"
+        } else {
+            ""
+        },
         top_rows = top_rows,
         status_url_line = status_url_line,
         tcp = info

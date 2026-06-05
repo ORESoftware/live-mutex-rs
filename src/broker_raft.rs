@@ -1393,117 +1393,151 @@ impl BrokerRaft {
             (runtime.current_term, runtime.commit_index)
         };
         let mut votes = 1usize;
+        let mut tasks = JoinSet::new();
         for peer in self.remote_peers() {
-            let next_index = {
-                let mut runtime = self.runtime.lock();
-                let fallback = self.log.last_index().saturating_add(1);
-                runtime
-                    .leader_progress
-                    .entry(peer.id.clone())
-                    .or_insert(RaftPeerProgress {
-                        next_index: fallback,
-                        match_index: 0,
-                    })
-                    .next_index
-                    .max(1)
-            };
-            let prev_log_index = next_index.saturating_sub(1);
-            let Some(prev_log_term) = self.log.term_at(prev_log_index)? else {
-                debug!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    peer = %peer.id,
-                    prev_log_index,
-                    "cannot replicate incremental entries before local snapshot boundary",
-                );
-                continue;
-            };
-            let entries = self.log.entries_from(next_index)?;
-            let rpc = RaftRpc::AppendEntries {
-                term,
-                leader_id: self.config.node_id.clone(),
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
-            };
-            let timeout = self
-                .config
-                .election_timeout_min
-                .max(self.config.heartbeat_interval.saturating_mul(2))
-                .max(Duration::from_millis(250));
-            match send_rpc(&peer.addr, rpc, timeout).await {
-                Ok(RaftRpcResponse::AppendEntries {
-                    term: peer_term,
-                    success,
-                    match_index,
-                    conflict_index,
-                    conflict_term,
-                    ..
-                }) => {
-                    if peer_term > term {
-                        self.step_down(peer_term, None);
-                        return Ok(votes);
-                    }
-                    if success {
-                        let mut runtime = self.runtime.lock();
-                        let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
-                            RaftPeerProgress {
-                                next_index: match_index.saturating_add(1),
-                                match_index: 0,
-                            },
-                        );
-                        progress.match_index = progress.match_index.max(match_index);
-                        progress.next_index = progress
-                            .next_index
-                            .max(progress.match_index.saturating_add(1));
-                        if target_index.is_none_or(|target| progress.match_index >= target) {
-                            votes += 1;
-                        }
-                    } else {
-                        let next_index = self.next_index_after_conflict(
-                            conflict_term,
-                            conflict_index,
-                            next_index,
-                        )?;
-                        let mut runtime = self.runtime.lock();
-                        let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
-                            RaftPeerProgress {
-                                next_index,
-                                match_index: 0,
-                            },
-                        );
-                        progress.next_index = next_index.max(1);
-                    }
-                }
-                Ok(RaftRpcResponse::Error {
-                    term: peer_term,
-                    error,
-                }) => {
-                    if peer_term > term {
-                        self.step_down(peer_term, None);
-                    }
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        peer = %peer.id,
-                        error,
-                        "append entries rejected",
-                    );
-                }
-                Ok(_) => {}
+            let node = self.clone();
+            tasks.spawn(async move {
+                node.replicate_to_peer(peer, term, leader_commit, target_index)
+                    .await
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(true)) => votes += 1,
+                Ok(Ok(false)) => {}
+                Ok(Err(err)) => return Err(err),
                 Err(err) => {
                     debug!(
                         target: "lmx::raft",
                         node_id = %self.config.node_id,
-                        peer = %peer.id,
                         error = %err,
-                        "append entries failed",
+                        "append entries task failed",
                     );
                 }
             }
+            if !self.is_leader() {
+                tasks.abort_all();
+                return Ok(votes);
+            }
         }
         Ok(votes)
+    }
+
+    async fn replicate_to_peer(
+        &self,
+        peer: RaftPeerConfig,
+        term: u64,
+        leader_commit: u64,
+        target_index: Option<u64>,
+    ) -> Result<bool, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-replicate-peer-1");
+        let next_index = {
+            let mut runtime = self.runtime.lock();
+            let fallback = self.log.last_index().saturating_add(1);
+            runtime
+                .leader_progress
+                .entry(peer.id.clone())
+                .or_insert(RaftPeerProgress {
+                    next_index: fallback,
+                    match_index: 0,
+                })
+                .next_index
+                .max(1)
+        };
+        let prev_log_index = next_index.saturating_sub(1);
+        let Some(prev_log_term) = self.log.term_at(prev_log_index)? else {
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                peer = %peer.id,
+                prev_log_index,
+                "cannot replicate incremental entries before local snapshot boundary",
+            );
+            return Ok(false);
+        };
+        let entries = self.log.entries_from(next_index)?;
+        let rpc = RaftRpc::AppendEntries {
+            term,
+            leader_id: self.config.node_id.clone(),
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        };
+        let timeout = self
+            .config
+            .election_timeout_min
+            .max(self.config.heartbeat_interval.saturating_mul(2))
+            .max(Duration::from_millis(250));
+        match send_rpc(&peer.addr, rpc, timeout).await {
+            Ok(RaftRpcResponse::AppendEntries {
+                term: peer_term,
+                success,
+                match_index,
+                conflict_index,
+                conflict_term,
+                ..
+            }) => {
+                if peer_term > term {
+                    self.step_down(peer_term, None);
+                    return Ok(false);
+                }
+                if success {
+                    let mut runtime = self.runtime.lock();
+                    let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
+                        RaftPeerProgress {
+                            next_index: match_index.saturating_add(1),
+                            match_index: 0,
+                        },
+                    );
+                    progress.match_index = progress.match_index.max(match_index);
+                    progress.next_index = progress
+                        .next_index
+                        .max(progress.match_index.saturating_add(1));
+                    Ok(target_index.is_none_or(|target| progress.match_index >= target))
+                } else {
+                    let next_index =
+                        self.next_index_after_conflict(conflict_term, conflict_index, next_index)?;
+                    let mut runtime = self.runtime.lock();
+                    let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
+                        RaftPeerProgress {
+                            next_index,
+                            match_index: 0,
+                        },
+                    );
+                    progress.next_index = next_index.max(1);
+                    Ok(false)
+                }
+            }
+            Ok(RaftRpcResponse::Error {
+                term: peer_term,
+                error,
+            }) => {
+                if peer_term > term {
+                    self.step_down(peer_term, None);
+                }
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    peer = %peer.id,
+                    error,
+                    "append entries rejected",
+                );
+                Ok(false)
+            }
+            Ok(_) => Ok(false),
+            Err(err) => {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    peer = %peer.id,
+                    error = %err,
+                    "append entries failed",
+                );
+                Ok(false)
+            }
+        }
     }
 
     async fn replicate_until_quorum(&self, target_index: u64) -> Result<usize, BrokerRaftError> {

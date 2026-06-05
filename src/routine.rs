@@ -194,9 +194,7 @@ pub fn set_log_level(directive: &str) -> Result<String, String> {
     let handle = RELOAD_HANDLE
         .get()
         .ok_or_else(|| "tracing reload handle not installed (init_tracing not run)".to_string())?;
-    handle
-        .modify(|f| *f = new)
-        .map_err(|err| err.to_string())?;
+    handle.modify(|f| *f = new).map_err(|err| err.to_string())?;
     *current_directive_slot().write() = directive.to_string();
     tracing::info!(
         target: "lmx.routine",
@@ -260,8 +258,8 @@ pub fn init_tracing() {
     // back to "info" — the same default `EnvFilter::try_new` would
     // produce.
     let initial_directive = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let env_filter = EnvFilter::try_new(&initial_directive)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_new(&initial_directive).unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Build the stdout fmt layer. `with_filter` would attach a per-layer
     // filter, but the global `EnvFilter` we register below is fine and
@@ -370,10 +368,7 @@ mod otel {
     /// [`super::set_otel_enabled`] without restarting the broker.
     pub(super) fn build_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync>>
     where
-        S: tracing::Subscriber
-            + Send
-            + Sync
-            + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        S: tracing::Subscriber + Send + Sync + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     {
         crate::routine_id!("ddl-routine-otel-build-layer-3kP");
 
@@ -407,8 +402,7 @@ mod otel {
         let tracer = provider.tracer("dd-rust-network-mutex");
         let _ = PROVIDER.set(provider);
 
-        let kill_switch =
-            FilterFn::new(|_metadata| super::OTEL_ENABLED.load(Ordering::Relaxed));
+        let kill_switch = FilterFn::new(|_metadata| super::OTEL_ENABLED.load(Ordering::Relaxed));
         Some(Box::new(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)

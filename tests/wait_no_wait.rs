@@ -66,7 +66,9 @@ fn composite_req(uuid: &str, keys: &[&str], wait: bool) -> Request {
 fn single_grant(msgs: &[Response]) -> Option<(bool, Option<String>)> {
     msgs.iter().find_map(|m| match m {
         Response::Lock {
-            acquired, lock_uuid, ..
+            acquired,
+            lock_uuid,
+            ..
         } => Some((*acquired, lock_uuid.clone())),
         _ => None,
     })
@@ -75,7 +77,9 @@ fn single_grant(msgs: &[Response]) -> Option<(bool, Option<String>)> {
 fn composite_grant(msgs: &[Response]) -> Option<(bool, Option<String>)> {
     msgs.iter().find_map(|m| match m {
         Response::CompositeLock {
-            acquired, lock_uuid, ..
+            acquired,
+            lock_uuid,
+            ..
         } => Some((*acquired, lock_uuid.clone())),
         _ => None,
     })
@@ -119,7 +123,10 @@ fn w1_no_wait_single_key_fails_fast_without_enqueue() {
     // A fresh no-wait acquire now succeeds because nothing is queued ahead.
     broker.handle_request(b, lock_req("b2", "k", false));
     let (acquired_b2, _) = single_grant(&drain(&mut b_rx)).expect("B retry reply");
-    assert!(acquired_b2, "B no-wait should succeed once k is free and unqueued");
+    assert!(
+        acquired_b2,
+        "B no-wait should succeed once k is free and unqueued"
+    );
 }
 
 #[test]
@@ -137,7 +144,10 @@ fn w2_no_wait_composite_fails_fast_and_leaves_no_partial_state() {
     // B no-wait composite [y, z] overlaps on `y` (held) → immediate false.
     broker.handle_request(b, composite_req("b1", &["y", "z"], false));
     let (acquired_b, _) = composite_grant(&drain(&mut b_rx)).expect("B composite reply");
-    assert!(!acquired_b, "B no-wait composite must fail fast when y is held");
+    assert!(
+        !acquired_b,
+        "B no-wait composite must fail fast when y is held"
+    );
 
     // The failed no-wait attempt must NOT have left `z` partially locked.
     // A different client can grab `z` alone, no-wait, right now.
@@ -198,15 +208,9 @@ fn w3_wait_composite_is_queued_and_granted_after_release() {
         },
     );
     let b_after = drain(&mut b_rx);
-    let granted = b_after.iter().any(|m| {
-        matches!(
-            m,
-            Response::CompositeLock {
-                acquired: true,
-                ..
-            }
-        )
-    });
+    let granted = b_after
+        .iter()
+        .any(|m| matches!(m, Response::CompositeLock { acquired: true, .. }));
     assert!(
         granted,
         "waiting B must receive acquired:true after A releases; got {b_after:?}"

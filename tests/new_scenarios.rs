@@ -74,14 +74,20 @@ async fn semaphore_allows_max_holders_then_queues() {
         .iter()
         .map(|g| g.fencing_token.unwrap())
         .collect();
-    assert_eq!(tokens.len(), 3, "each semaphore slot needs a unique fencing token");
+    assert_eq!(
+        tokens.len(),
+        3,
+        "each semaphore slot needs a unique fencing token"
+    );
 
     // Fourth acquire must queue while the semaphore is saturated.
     let d_clone = d.clone();
-    let acquire_d =
-        tokio::spawn(async move { d_clone.acquire_with_max(key, 3, ttl).await });
+    let acquire_d = tokio::spawn(async move { d_clone.acquire_with_max(key, 3, ttl).await });
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!acquire_d.is_finished(), "4th holder must wait while 3/3 slots are held");
+    assert!(
+        !acquire_d.is_finished(),
+        "4th holder must wait while 3/3 slots are held"
+    );
 
     a.release(&ga).await.unwrap();
     let gd = acquire_d.await.unwrap().unwrap();
@@ -124,7 +130,10 @@ async fn mutual_exclusion_invariant_under_contention() {
         handles.push(tokio::spawn(async move {
             let mut tokens = Vec::with_capacity(ITERS);
             for _ in 0..ITERS {
-                let g = client.acquire(key, Duration::from_millis(5000)).await.unwrap();
+                let g = client
+                    .acquire(key, Duration::from_millis(5000))
+                    .await
+                    .unwrap();
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 // Record the high-water mark of concurrent holders.
                 max_seen.fetch_max(now, Ordering::SeqCst);
@@ -143,7 +152,11 @@ async fn mutual_exclusion_invariant_under_contention() {
         all_tokens.extend(h.await.unwrap());
     }
 
-    assert_eq!(max_seen.load(Ordering::SeqCst), 1, "mutual exclusion violated");
+    assert_eq!(
+        max_seen.load(Ordering::SeqCst),
+        1,
+        "mutual exclusion violated"
+    );
     assert_eq!(all_tokens.len(), WORKERS * ITERS, "lost acquisitions");
     let unique: BTreeSet<u64> = all_tokens.iter().copied().collect();
     assert_eq!(
@@ -161,7 +174,10 @@ async fn fencing_tokens_strictly_increase_across_handoffs() {
     let key = "mono-key";
     let mut last = 0u64;
     for i in 0..12 {
-        let g = client.acquire(key, Duration::from_millis(2000)).await.unwrap();
+        let g = client
+            .acquire(key, Duration::from_millis(2000))
+            .await
+            .unwrap();
         let t = g.fencing_token.unwrap();
         assert!(t > last, "token must increase: iter {i}, {t} !> {last}");
         last = t;
@@ -191,7 +207,10 @@ async fn composite_reversed_order_serialises_without_deadlock() {
             .await
     });
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(!acquire_b.is_finished(), "B must wait for A's composite hold");
+    assert!(
+        !acquire_b.is_finished(),
+        "B must wait for A's composite hold"
+    );
 
     a.release(&ga).await.unwrap();
     let gb = acquire_b.await.unwrap().unwrap();
@@ -213,13 +232,19 @@ async fn lock_info_and_ls_reflect_state() {
     let client = connect(port).await;
     let key = "introspect-key";
 
-    let g = client.acquire(key, Duration::from_millis(5000)).await.unwrap();
+    let g = client
+        .acquire(key, Duration::from_millis(5000))
+        .await
+        .unwrap();
     let info = client.lock_info(key).await.unwrap();
     assert!(info.is_locked, "lock_info should report held");
     assert_eq!(info.lockholder_uuids.len(), 1);
 
     let listed = client.ls().await.unwrap();
-    assert!(listed.iter().any(|k| k == key), "ls should include held key");
+    assert!(
+        listed.iter().any(|k| k == key),
+        "ls should include held key"
+    );
 
     client.release(&g).await.unwrap();
     let info_after = client.lock_info(key).await.unwrap();

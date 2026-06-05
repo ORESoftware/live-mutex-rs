@@ -52,7 +52,10 @@ struct Model {
 
 impl Model {
     fn new() -> Self {
-        Model { keys: Mutex::new(HashMap::new()), violations: AtomicUsize::new(0) }
+        Model {
+            keys: Mutex::new(HashMap::new()),
+            violations: AtomicUsize::new(0),
+        }
     }
 
     /// Called immediately after the broker grants `keys` with `tokens`.
@@ -143,7 +146,10 @@ async fn stress_fencing_and_multikey_over_wire() {
             // hold-and-wait, so under heavy contention an individual grant can
             // lag well past the 5s default. We still bound each op with a 30s
             // tokio guard below, which would catch a genuine deadlock/livelock.
-            let cfg = ClientConfig { default_request_timeout: Duration::from_secs(45), ..Default::default() };
+            let cfg = ClientConfig {
+                default_request_timeout: Duration::from_secs(45),
+                ..Default::default()
+            };
             let client = Client::connect_tcp(("127.0.0.1", port), cfg)
                 .await
                 .expect("connect");
@@ -171,7 +177,9 @@ async fn stress_fencing_and_multikey_over_wire() {
                     {
                         Ok(Ok(g)) => g,
                         Ok(Err(e)) => panic!("task {task_id} composite acquire failed: {e:?}"),
-                        Err(_) => panic!("task {task_id} composite acquire timed out (possible deadlock)"),
+                        Err(_) => {
+                            panic!("task {task_id} composite acquire timed out (possible deadlock)")
+                        }
                     };
                     let mut toks: HashMap<String, u64> = HashMap::new();
                     for (k, t) in &guard.fencing_tokens {
@@ -194,7 +202,9 @@ async fn stress_fencing_and_multikey_over_wire() {
                     {
                         Ok(Ok(g)) => g,
                         Ok(Err(e)) => panic!("task {task_id} acquire({key}) failed: {e:?}"),
-                        Err(_) => panic!("task {task_id} acquire({key}) timed out (possible deadlock)"),
+                        Err(_) => {
+                            panic!("task {task_id} acquire({key}) timed out (possible deadlock)")
+                        }
                     };
                     let mut toks: HashMap<String, u64> = HashMap::new();
                     toks.insert(key.clone(), guard.fencing_token.unwrap_or(0));
@@ -210,7 +220,8 @@ async fn stress_fencing_and_multikey_over_wire() {
     }
 
     for (i, h) in handles.into_iter().enumerate() {
-        h.await.unwrap_or_else(|e| panic!("task {i} panicked: {e:?}"));
+        h.await
+            .unwrap_or_else(|e| panic!("task {i} panicked: {e:?}"));
     }
 
     assert_eq!(
@@ -218,5 +229,8 @@ async fn stress_fencing_and_multikey_over_wire() {
         0,
         "stress run recorded mutual-exclusion / fencing violations"
     );
-    assert!(model.all_free(), "some keys still marked held after all tasks finished");
+    assert!(
+        model.all_free(),
+        "some keys still marked held after all tasks finished"
+    );
 }

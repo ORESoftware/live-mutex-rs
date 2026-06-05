@@ -1,0 +1,41 @@
+[server]
+bind_host = "127.0.0.1"
+tcp_port = 19170
+http_port = 19182
+disable_tcp = true
+disable_http = false
+tcp_nodelay = true
+tcp_quickack = true
+
+[broker]
+default_ttl_ms = 4000
+max_lock_holders = 1
+max_concurrency_cap = 1000
+ttl_sweep_interval_ms = 10
+idle_key_grace_ms = 60000
+
+[raft]
+enabled = true
+node_id = "node-1"
+bind_addr = "127.0.0.1:19201"
+advertise_addr = "127.0.0.1:19201"
+data_dir = "/private/tmp/live-mutex-rs-bench/raft/node-1"
+heartbeat_interval_ms = 50
+election_timeout_min_ms = 150
+election_timeout_max_ms = 300
+snapshot_interval_ms = 1800000
+snapshot_max_log_entries = 100000
+snapshot_max_log_bytes = 67108864
+trailing_log_entries = 10000
+
+[[raft.peers]]
+id = "node-1"
+addr = "127.0.0.1:19201"
+
+[[raft.peers]]
+id = "node-2"
+addr = "127.0.0.1:19202"
+
+[[raft.peers]]
+id = "node-3"
+addr = "127.0.0.1:19203"

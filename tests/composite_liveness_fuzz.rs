@@ -39,8 +39,15 @@ impl Rng {
 #[allow(dead_code)] // some fields are retained for clarity / future assertions
 enum Agent {
     Idle,
-    Waiting { req_uuid: String, keys: Vec<String> },
-    Holding { req_uuid: String, lock_uuid: String, keys: Vec<String> },
+    Waiting {
+        req_uuid: String,
+        keys: Vec<String>,
+    },
+    Holding {
+        req_uuid: String,
+        lock_uuid: String,
+        keys: Vec<String>,
+    },
 }
 
 fn lock_req(uuid: &str, key: &str) -> Request {
@@ -76,8 +83,16 @@ fn composite_req(uuid: &str, keys: &[String]) -> Request {
 fn unlock_req(uuid: &str, keys: &[String], lock_uuid: &str) -> Request {
     Request::Unlock {
         uuid: uuid.into(),
-        key: if keys.len() == 1 { Some(keys[0].clone()) } else { None },
-        keys: if keys.len() > 1 { Some(keys.to_vec()) } else { None },
+        key: if keys.len() == 1 {
+            Some(keys[0].clone())
+        } else {
+            None
+        },
+        keys: if keys.len() > 1 {
+            Some(keys.to_vec())
+        } else {
+            None
+        },
         lock_uuid: Some(lock_uuid.into()),
         force: false,
     }
@@ -90,8 +105,16 @@ fn drain_and_promote(rxs: &mut [UnboundedReceiver<Response>], agents: &mut [Agen
         let mut grant: Option<String> = None; // lock_uuid if granted
         while let Ok(msg) = rxs[i].try_recv() {
             match msg {
-                Response::Lock { acquired: true, lock_uuid: Some(lu), .. } => grant = Some(lu),
-                Response::CompositeLock { acquired: true, lock_uuid: Some(lu), .. } => grant = Some(lu),
+                Response::Lock {
+                    acquired: true,
+                    lock_uuid: Some(lu),
+                    ..
+                } => grant = Some(lu),
+                Response::CompositeLock {
+                    acquired: true,
+                    lock_uuid: Some(lu),
+                    ..
+                } => grant = Some(lu),
                 _ => {}
             }
         }
@@ -133,7 +156,10 @@ fn run_seed(seed: u64, rounds: usize, ops_per_round: usize) {
                         let key = keys[rng.below(keys.len())].clone();
                         let uuid = format!("a{seq}");
                         broker.handle_request(cids[i], lock_req(&uuid, &key));
-                        agents[i] = Agent::Waiting { req_uuid: uuid, keys: vec![key] };
+                        agents[i] = Agent::Waiting {
+                            req_uuid: uuid,
+                            keys: vec![key],
+                        };
                     } else {
                         let want = 2 + rng.below(2);
                         let mut pool = keys.clone();
@@ -147,13 +173,19 @@ fn run_seed(seed: u64, rounds: usize, ops_per_round: usize) {
                         chosen.sort();
                         let uuid = format!("a{seq}");
                         broker.handle_request(cids[i], composite_req(&uuid, &chosen));
-                        agents[i] = Agent::Waiting { req_uuid: uuid, keys: chosen };
+                        agents[i] = Agent::Waiting {
+                            req_uuid: uuid,
+                            keys: chosen,
+                        };
                     }
                 }
-                Agent::Holding { keys, lock_uuid, .. } => {
+                Agent::Holding {
+                    keys, lock_uuid, ..
+                } => {
                     // Release.
                     seq += 1;
-                    broker.handle_request(cids[i], unlock_req(&format!("u{seq}"), &keys, &lock_uuid));
+                    broker
+                        .handle_request(cids[i], unlock_req(&format!("u{seq}"), &keys, &lock_uuid));
                     agents[i] = Agent::Idle;
                 }
                 Agent::Waiting { .. } => { /* can't act while queued */ }
@@ -169,10 +201,18 @@ fn run_seed(seed: u64, rounds: usize, ops_per_round: usize) {
         let mut guard = 0;
         loop {
             guard += 1;
-            assert!(guard < 100_000, "drain loop runaway (seed={seed}, round={round})");
-            let holder = agents.iter().position(|a| matches!(a, Agent::Holding { .. }));
+            assert!(
+                guard < 100_000,
+                "drain loop runaway (seed={seed}, round={round})"
+            );
+            let holder = agents
+                .iter()
+                .position(|a| matches!(a, Agent::Holding { .. }));
             let Some(i) = holder else { break };
-            if let Agent::Holding { keys, lock_uuid, .. } = agents[i].clone() {
+            if let Agent::Holding {
+                keys, lock_uuid, ..
+            } = agents[i].clone()
+            {
                 seq += 1;
                 broker.handle_request(cids[i], unlock_req(&format!("d{seq}"), &keys, &lock_uuid));
                 agents[i] = Agent::Idle;
@@ -197,11 +237,18 @@ fn run_seed(seed: u64, rounds: usize, ops_per_round: usize) {
                 seq += 1;
                 broker.handle_request(
                     cids[0],
-                    Request::LockInfo { uuid: format!("li{seq}"), key: k.clone() },
+                    Request::LockInfo {
+                        uuid: format!("li{seq}"),
+                        key: k.clone(),
+                    },
                 );
                 while let Ok(msg) = rxs[0].try_recv() {
                     if let Response::LockInfo {
-                        key, is_locked, lockholder_uuids, lock_request_count, ..
+                        key,
+                        is_locked,
+                        lockholder_uuids,
+                        lock_request_count,
+                        ..
                     } = msg
                     {
                         eprintln!(
@@ -222,13 +269,23 @@ fn run_seed(seed: u64, rounds: usize, ops_per_round: usize) {
             broker.handle_request(cids[0], lock_req(&format!("p{seq}"), k));
             let mut lu = None;
             while let Ok(msg) = rxs[0].try_recv() {
-                if let Response::Lock { acquired: true, lock_uuid: Some(u), .. } = msg {
+                if let Response::Lock {
+                    acquired: true,
+                    lock_uuid: Some(u),
+                    ..
+                } = msg
+                {
                     lu = Some(u);
                 }
             }
-            let lu = lu.unwrap_or_else(|| panic!("post-drain key {k} not free (seed={seed}, round={round})"));
+            let lu = lu.unwrap_or_else(|| {
+                panic!("post-drain key {k} not free (seed={seed}, round={round})")
+            });
             seq += 1;
-            broker.handle_request(cids[0], unlock_req(&format!("pu{seq}"), std::slice::from_ref(k), &lu));
+            broker.handle_request(
+                cids[0],
+                unlock_req(&format!("pu{seq}"), std::slice::from_ref(k), &lu),
+            );
             let _ = rxs[0].try_recv();
         }
     }

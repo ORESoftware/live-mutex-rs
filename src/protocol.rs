@@ -45,19 +45,17 @@ pub const DEFAULT_MAX_CONCURRENCY_CAP: u32 = 1_000;
 /// mirror this exactly. The Rust source uses snake_case identifiers; serde
 /// does the rename automatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Request {
     /// Initial protocol handshake. The broker rejects clients whose major
     /// version disagrees.
-    Version {
-        uuid: String,
-        value: String,
-    },
+    Version { uuid: String, value: String },
     /// Optional auth handshake when `LMX_AUTH_TOKEN` is configured.
-    Auth {
-        uuid: String,
-        token: String,
-    },
+    Auth { uuid: String, token: String },
     /// Acquire an exclusive lock on a single `key`, OR a composite lock on up
     /// to `MAX_COMPOSITE_KEYS` keys via `keys` (mutually exclusive with `key`).
     Lock {
@@ -101,45 +99,30 @@ pub enum Request {
     },
     /// Reader-writer: register a reader, blocking until any active writer is
     /// done. On grant the reader counter is incremented atomically.
-    RegisterRead {
-        uuid: String,
-        key: String,
-    },
+    RegisterRead { uuid: String, key: String },
     /// Reader-writer: register a writer, blocking until readers and other
     /// writers are zero. On grant `writer_flag` is set true.
-    RegisterWrite {
-        uuid: String,
-        key: String,
-    },
+    RegisterWrite { uuid: String, key: String },
     /// Reader-writer: end a read (decrement reader count).
-    EndRead {
-        uuid: String,
-        key: String,
-    },
+    EndRead { uuid: String, key: String },
     /// Reader-writer: end a write (clear writer flag and broadcast).
-    EndWrite {
-        uuid: String,
-        key: String,
-    },
+    EndWrite { uuid: String, key: String },
     /// Inspect the broker's current locks (debug / admin).
-    LockInfo {
-        uuid: String,
-        key: String,
-    },
+    LockInfo { uuid: String, key: String },
     /// List all known lock keys.
-    Ls {
-        uuid: String,
-    },
+    Ls { uuid: String },
     /// Heartbeat for HTTP long-poll continuation; not used over TCP/UDS.
-    Heartbeat {
-        uuid: String,
-    },
+    Heartbeat { uuid: String },
 }
 
 /// Envelope for broker → client responses. camelCase wire format; see
 /// [`Request`] for the cross-runtime contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Response {
     Version {
         uuid: String,

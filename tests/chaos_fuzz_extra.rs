@@ -186,10 +186,7 @@ async fn high_contention_fairness_is_fifo() {
     let holder = Client::connect_tcp(("127.0.0.1", port), client_cfg(15_000))
         .await
         .unwrap();
-    let holder_guard = holder
-        .acquire(key, Duration::from_secs(60))
-        .await
-        .unwrap();
+    let holder_guard = holder.acquire(key, Duration::from_secs(60)).await.unwrap();
 
     // Inspector verifies "ready to wait next" before the next waiter starts.
     let inspector = Client::connect_tcp(("127.0.0.1", port), client_cfg(5_000))
@@ -214,8 +211,7 @@ async fn high_contention_fairness_is_fifo() {
             // The acquire call enqueues this waiter. We can't synchronously
             // know "I'm enqueued" but the inspector loop below polls
             // `lock_request_count` to wait for it.
-            let acquire_fut =
-                client.acquire(&key_owned, Duration::from_millis(500));
+            let acquire_fut = client.acquire(&key_owned, Duration::from_millis(500));
             let guard = acquire_fut.await.expect("queued acquire");
             granted_order.lock().await.push(waiter_id);
             if let Some(tok) = guard.fencing_token {

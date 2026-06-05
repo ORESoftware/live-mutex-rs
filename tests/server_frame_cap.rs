@@ -239,7 +239,10 @@ async fn broker_reports_malformed_final_frame_without_trailing_newline_on_eof() 
     assert_eq!(reply["type"], "error");
     assert_eq!(reply["uuid"], "malformed");
     assert!(
-        reply["error"].as_str().unwrap_or("").contains("malformed request"),
+        reply["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("malformed request"),
         "malformed final frame should produce a structured parser error, got {reply:?}"
     );
 

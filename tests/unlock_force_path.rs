@@ -387,7 +387,11 @@ fn r5_force_unlock_with_valid_uuid_releases_only_that_semaphore_slot() {
         Response::Unlock { unlocked, .. } => Some(*unlocked),
         _ => None,
     });
-    assert_eq!(unlocked, Some(true), "force-unlock with valid uuid should report true; got {msgs:?}");
+    assert_eq!(
+        unlocked,
+        Some(true),
+        "force-unlock with valid uuid should report true; got {msgs:?}"
+    );
 
     // The peer slot must survive.
     let snapshot = broker.metrics();

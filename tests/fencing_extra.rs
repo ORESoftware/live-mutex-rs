@@ -54,8 +54,16 @@ fn lock_req(uuid: &str, key: &str) -> Request {
 fn unlock_req(uuid: &str, keys: &[String], lock_uuid: &str) -> Request {
     Request::Unlock {
         uuid: uuid.into(),
-        key: if keys.len() == 1 { Some(keys[0].clone()) } else { None },
-        keys: if keys.len() > 1 { Some(keys.to_vec()) } else { None },
+        key: if keys.len() == 1 {
+            Some(keys[0].clone())
+        } else {
+            None
+        },
+        keys: if keys.len() > 1 {
+            Some(keys.to_vec())
+        } else {
+            None
+        },
         lock_uuid: Some(lock_uuid.into()),
         force: false,
     }
@@ -120,8 +128,14 @@ fn composite_reacquire_tokens_strictly_increase() {
     let bcd: Vec<String> = vec!["fe-b".into(), "fe-c".into(), "fe-d".into()];
     broker.handle_request(cid, composite_req("c3", &bcd));
     let (t3, lu3) = composite_grant(&drain(&mut rx));
-    assert!(t3["fe-b"] > t2["fe-b"], "overlap key b must keep increasing");
-    assert!(t3["fe-c"] > t2["fe-c"], "overlap key c must keep increasing");
+    assert!(
+        t3["fe-b"] > t2["fe-b"],
+        "overlap key b must keep increasing"
+    );
+    assert!(
+        t3["fe-c"] > t2["fe-c"],
+        "overlap key c must keep increasing"
+    );
     assert!(t3["fe-d"] >= 1, "fresh key d must have a positive token");
     broker.handle_request(cid, unlock_req("u3", &bcd, &lu3));
     let _ = drain(&mut rx);
@@ -156,7 +170,10 @@ fn single_key_fencing_is_monotonic_and_per_key_independent() {
     for i in 0..5 {
         broker.handle_request(cid, lock_req(&format!("y{i}"), "fe-y"));
         let (tok, lu) = single_grant(&drain(&mut rx));
-        assert!(tok > last_y, "fe-y token must strictly increase: {tok} !> {last_y}");
+        assert!(
+            tok > last_y,
+            "fe-y token must strictly increase: {tok} !> {last_y}"
+        );
         if i == 0 {
             first_y = tok;
         }
@@ -166,7 +183,18 @@ fn single_key_fencing_is_monotonic_and_per_key_independent() {
     }
     // Each key advanced once per cycle (50 / 5 strictly-increasing grants), and
     // the two counters are independent (fe-x advanced more than fe-y did).
-    assert!(last_x - first_x >= 49, "fe-x must advance ~once per cycle (span={})", last_x - first_x);
-    assert!(last_y - first_y >= 4, "fe-y must advance ~once per cycle (span={})", last_y - first_y);
-    assert!(last_x - first_x > last_y - first_y, "per-key counters must be independent");
+    assert!(
+        last_x - first_x >= 49,
+        "fe-x must advance ~once per cycle (span={})",
+        last_x - first_x
+    );
+    assert!(
+        last_y - first_y >= 4,
+        "fe-y must advance ~once per cycle (span={})",
+        last_y - first_y
+    );
+    assert!(
+        last_x - first_x > last_y - first_y,
+        "per-key counters must be independent"
+    );
 }

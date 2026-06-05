@@ -180,11 +180,13 @@ impl Oracle {
     }
 
     fn assert_fencing_unique(&mut self, key: &str, token: u64) {
-        let set = self.seen_fencing_per_key.entry(key.to_string()).or_default();
+        let set = self
+            .seen_fencing_per_key
+            .entry(key.to_string())
+            .or_default();
         if !set.insert(token) {
-            self.violations.push(format!(
-                "duplicate-fencing-token key={key} token={token}",
-            ));
+            self.violations
+                .push(format!("duplicate-fencing-token key={key} token={token}",));
         }
     }
 
@@ -195,9 +197,8 @@ impl Oracle {
         // Cross-check: no overlap with RW writer / readers / composite.
         if let Some(w) = self.write_holders.get(key) {
             if !w.is_empty() {
-                self.violations.push(format!(
-                    "exclusive-while-rw-writer key={key} writers={w:?}",
-                ));
+                self.violations
+                    .push(format!("exclusive-while-rw-writer key={key} writers={w:?}",));
             }
         }
         if let Some(r) = self.read_holders.get(key) {
@@ -234,16 +235,14 @@ impl Oracle {
     fn record_read_grant(&mut self, key: &str, lock_uuid: &str, fencing: Option<u64>) {
         if let Some(w) = self.write_holders.get(key) {
             if !w.is_empty() {
-                self.violations.push(format!(
-                    "rw-read-while-writer key={key} writers={w:?}",
-                ));
+                self.violations
+                    .push(format!("rw-read-while-writer key={key} writers={w:?}",));
             }
         }
         if let Some(e) = self.exclusive_holders.get(key) {
             if !e.is_empty() {
-                self.violations.push(format!(
-                    "rw-read-while-exclusive key={key} excl={e:?}",
-                ));
+                self.violations
+                    .push(format!("rw-read-while-exclusive key={key} excl={e:?}",));
             }
         }
         self.read_holders
@@ -264,23 +263,20 @@ impl Oracle {
     fn record_write_grant(&mut self, key: &str, lock_uuid: &str, fencing: Option<u64>) {
         if let Some(r) = self.read_holders.get(key) {
             if !r.is_empty() {
-                self.violations.push(format!(
-                    "rw-write-while-readers key={key} readers={r:?}",
-                ));
+                self.violations
+                    .push(format!("rw-write-while-readers key={key} readers={r:?}",));
             }
         }
         if let Some(w) = self.write_holders.get(key) {
             if !w.is_empty() {
-                self.violations.push(format!(
-                    "rw-write-while-writer key={key} writers={w:?}",
-                ));
+                self.violations
+                    .push(format!("rw-write-while-writer key={key} writers={w:?}",));
             }
         }
         if let Some(e) = self.exclusive_holders.get(key) {
             if !e.is_empty() {
-                self.violations.push(format!(
-                    "rw-write-while-exclusive key={key} excl={e:?}",
-                ));
+                self.violations
+                    .push(format!("rw-write-while-exclusive key={key} excl={e:?}",));
             }
         }
         self.write_holders
@@ -309,30 +305,26 @@ impl Oracle {
             // reader, writer, or another composite on the same key.
             if let Some(e) = self.exclusive_holders.get(key) {
                 if !e.is_empty() {
-                    self.violations.push(format!(
-                        "composite-while-exclusive key={key} excl={e:?}",
-                    ));
+                    self.violations
+                        .push(format!("composite-while-exclusive key={key} excl={e:?}",));
                 }
             }
             if let Some(r) = self.read_holders.get(key) {
                 if !r.is_empty() {
-                    self.violations.push(format!(
-                        "composite-while-readers key={key} readers={r:?}",
-                    ));
+                    self.violations
+                        .push(format!("composite-while-readers key={key} readers={r:?}",));
                 }
             }
             if let Some(w) = self.write_holders.get(key) {
                 if !w.is_empty() {
-                    self.violations.push(format!(
-                        "composite-while-writer key={key} writers={w:?}",
-                    ));
+                    self.violations
+                        .push(format!("composite-while-writer key={key} writers={w:?}",));
                 }
             }
             if let Some(c) = self.composite_holders.get(key) {
                 if !c.is_empty() {
-                    self.violations.push(format!(
-                        "composite-while-composite key={key} others={c:?}",
-                    ));
+                    self.violations
+                        .push(format!("composite-while-composite key={key} others={c:?}",));
                 }
             }
             self.composite_holders
@@ -545,11 +537,10 @@ async fn fuzz_rw_lock_safety() {
                     match rw.acquire_read(key).await {
                         Ok(g) => {
                             let lock_uuid = g.lock_uuid.clone();
-                            oracle.lock().await.record_read_grant(
-                                key,
-                                &lock_uuid,
-                                g.fencing_token,
-                            );
+                            oracle
+                                .lock()
+                                .await
+                                .record_read_grant(key, &lock_uuid, g.fencing_token);
                             let hold = my_rng.gen_u32(4) as u64;
                             if hold > 0 {
                                 tokio::time::sleep(Duration::from_millis(hold)).await;
@@ -624,10 +615,8 @@ async fn fuzz_composite_atomicity() {
                 while chosen.len() < n {
                     chosen.insert(my_rng.gen_range(0, keys.len()));
                 }
-                let chosen_keys: Vec<String> =
-                    chosen.iter().map(|i| keys[*i].clone()).collect();
-                let chosen_refs: Vec<&str> =
-                    chosen_keys.iter().map(|s| s.as_str()).collect();
+                let chosen_keys: Vec<String> = chosen.iter().map(|i| keys[*i].clone()).collect();
+                let chosen_refs: Vec<&str> = chosen_keys.iter().map(|s| s.as_str()).collect();
                 let ttl = Duration::from_millis(2_500 + my_rng.gen_u32(1_500) as u64);
                 match client.acquire_composite(&chosen_refs, ttl).await {
                     Ok(guard) => {
@@ -698,10 +687,11 @@ async fn fuzz_mixed_workload_invariants() {
                 let ttl = Duration::from_millis(2_000 + my_rng.gen_u32(1_500) as u64);
                 if r < 35 {
                     if let Ok(g) = excl.acquire(key, ttl).await {
-                        oracle
-                            .lock()
-                            .await
-                            .record_exclusive_grant(key, &g.lock_uuid, g.fencing_token);
+                        oracle.lock().await.record_exclusive_grant(
+                            key,
+                            &g.lock_uuid,
+                            g.fencing_token,
+                        );
                         oracle
                             .lock()
                             .await
@@ -711,22 +701,20 @@ async fn fuzz_mixed_workload_invariants() {
                 } else if r < 65 {
                     if let Ok(g) = rw.acquire_read(key).await {
                         let id = g.lock_uuid.clone();
-                        oracle.lock().await.record_read_grant(
-                            key,
-                            &id,
-                            g.fencing_token,
-                        );
+                        oracle
+                            .lock()
+                            .await
+                            .record_read_grant(key, &id, g.fencing_token);
                         oracle.lock().await.record_read_release(key, &id);
                         g.release().await.ok();
                     }
                 } else if r < 85 {
                     if let Ok(g) = rw.acquire_write(key).await {
                         let id = g.lock_uuid.clone();
-                        oracle.lock().await.record_write_grant(
-                            key,
-                            &id,
-                            g.fencing_token,
-                        );
+                        oracle
+                            .lock()
+                            .await
+                            .record_write_grant(key, &id, g.fencing_token);
                         oracle.lock().await.record_write_release(key, &id);
                         g.release().await.ok();
                     }
@@ -744,7 +732,10 @@ async fn fuzz_mixed_workload_invariants() {
                             &g.lock_uuid,
                             &g.fencing_tokens,
                         );
-                        oracle.lock().await.record_composite_release(&ck, &g.lock_uuid);
+                        oracle
+                            .lock()
+                            .await
+                            .record_composite_release(&ck, &g.lock_uuid);
                         excl.release(&g).await.ok();
                     }
                 }
@@ -788,10 +779,7 @@ async fn fuzz_fencing_strictly_monotonic_per_key() {
                 .unwrap();
             for _ in 0..cycles_per_client {
                 let key = &keys[my_rng.gen_range(0, keys.len())];
-                let g = c
-                    .acquire(key, Duration::from_millis(2_000))
-                    .await
-                    .unwrap();
+                let g = c.acquire(key, Duration::from_millis(2_000)).await.unwrap();
                 let token = g.fencing_token.expect("single-key grant must carry token");
                 let now = std::time::Instant::now();
                 collected
@@ -889,9 +877,7 @@ async fn chaos_random_drops_recover_to_clean_state() {
                         chosen.insert(my_rng.gen_range(0, pool.len()));
                     }
                     let ck: Vec<&str> = chosen.iter().map(|i| pool[*i]).collect();
-                    if let Ok(g) =
-                        c.acquire_composite(&ck, Duration::from_millis(1_500)).await
-                    {
+                    if let Ok(g) = c.acquire_composite(&ck, Duration::from_millis(1_500)).await {
                         if my_rng.pct(50) {
                             c.release(&g).await.ok();
                         }
@@ -974,7 +960,9 @@ async fn chaos_composite_partial_grant_drops_no_leak() {
             let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
             // This will block — the inner await is what we want
             // interrupted by the JoinHandle abort below.
-            let _ = c.acquire_composite(&refs, Duration::from_millis(60_000)).await;
+            let _ = c
+                .acquire_composite(&refs, Duration::from_millis(60_000))
+                .await;
         });
     }
 

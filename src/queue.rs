@@ -24,9 +24,9 @@
 
 use std::hash::Hash;
 
-use linked_queue::LinkedQueue as Inner;
 /// Borrowing head-to-tail iterator, re-exported from the `linked-queue` crate.
 pub use linked_queue::Iter;
+use linked_queue::LinkedQueue as Inner;
 
 /// FIFO queue keyed by `K`. Each `K` is unique within the queue; pushing the
 /// same `K` again is a no-op (matching upstream `notify.contains` semantics).
