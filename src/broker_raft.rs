@@ -2723,7 +2723,8 @@ impl BrokerRaft {
         let mut catchup_tasks = JoinSet::new();
         for peer in learners {
             let node = self.clone();
-            catchup_tasks.spawn(async move { node.catch_up_learner_peer(peer, target_index).await });
+            catchup_tasks
+                .spawn(async move { node.catch_up_learner_peer(peer, target_index).await });
         }
         while let Some(result) = catchup_tasks.join_next().await {
             match result {
@@ -2819,7 +2820,8 @@ impl BrokerRaft {
         let mut catchup_tasks = JoinSet::new();
         for peer in new_voters {
             let node = self.clone();
-            catchup_tasks.spawn(async move { node.catch_up_learner_peer(peer, target_index).await });
+            catchup_tasks
+                .spawn(async move { node.catch_up_learner_peer(peer, target_index).await });
         }
         while let Some(result) = catchup_tasks.join_next().await {
             match result {
@@ -5725,6 +5727,14 @@ impl BrokerRaft {
             )));
         };
         let expected_offset = pending.bytes_written;
+        let chunk_len = chunk.len() as u64;
+        if offset < expected_offset {
+            let duplicate_end = offset.saturating_add(chunk_len);
+            if duplicate_end <= expected_offset && !done {
+                pending.updated_at_ms = unix_ms();
+                return Ok(None);
+            }
+        }
         if expected_offset != offset {
             let stale_path = transfers.remove(&key).map(|pending| pending.path);
             drop(transfers);
@@ -5746,7 +5756,7 @@ impl BrokerRaft {
                 file.sync_data()?;
             }
         }
-        pending.bytes_written = pending.bytes_written.saturating_add(chunk.len() as u64);
+        pending.bytes_written = pending.bytes_written.saturating_add(chunk_len);
         pending.updated_at_ms = unix_ms();
         if done {
             Ok(transfers.remove(&key).map(|pending| pending.path))
@@ -8654,7 +8664,11 @@ mod tests {
             .expect("bind learner n5");
         let addr_n5 = listener_n5.local_addr().expect("learner n5 addr");
 
-        let old_peers = vec![test_peer("n1", 7980), test_peer("n2", 7981), test_peer("n3", 7982)];
+        let old_peers = vec![
+            test_peer("n1", 7980),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ];
         let learner_n4 = RaftPeerConfig {
             id: "n4".into(),
             addr: addr_n4.to_string(),
@@ -15117,6 +15131,110 @@ mod tests {
         assert!(!staged_path.exists());
         assert!(snapshot_part_files(&dir).is_empty());
         assert!(raft.log.latest_snapshot().is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_install_snapshot_duplicate_staged_chunk_is_idempotent() {
+        let dir = temp_dir("raft-handle-install-snapshot-duplicate-chunk");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let mut payload = idle_snapshot_payload();
+        payload["note"] = json!("x".repeat(512));
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = sha256_hex(&bytes);
+        let first_end = bytes.len() / 3;
+        let second_end = bytes.len() * 2 / 3;
+
+        for (offset, done, range) in [
+            (0, false, 0..first_end),
+            (first_end as u64, false, first_end..second_end),
+        ] {
+            let response = raft.handle_install_snapshot(
+                2,
+                "n2".into(),
+                7,
+                2,
+                Some(checksum.clone()),
+                offset,
+                done,
+                BASE64.encode(&bytes[range]),
+            );
+            assert!(matches!(
+                response,
+                RaftRpcResponse::InstallSnapshot {
+                    term: 2,
+                    success: true,
+                    last_included_index: 0,
+                }
+            ));
+        }
+        let staged_path = {
+            let transfers = raft.snapshot_transfers.lock();
+            assert_eq!(transfers.len(), 1);
+            let pending = transfers.values().next().expect("pending transfer");
+            assert_eq!(pending.bytes_written, second_end as u64);
+            pending.path.clone()
+        };
+        assert_eq!(
+            fs::metadata(&staged_path).expect("staged file").len(),
+            second_end as u64
+        );
+
+        let duplicate = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            first_end as u64,
+            false,
+            BASE64.encode(&bytes[first_end..second_end]),
+        );
+        assert!(matches!(
+            duplicate,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+        assert_eq!(
+            fs::metadata(&staged_path)
+                .expect("staged file after duplicate")
+                .len(),
+            second_end as u64,
+            "duplicate chunk must not be appended twice"
+        );
+
+        let final_chunk = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            second_end as u64,
+            true,
+            BASE64.encode(&bytes[second_end..]),
+        );
+        assert!(matches!(
+            final_chunk,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 7,
+            }
+        ));
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert!(!staged_path.exists());
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("installed snapshot")
+                .last_included_index,
+            7
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

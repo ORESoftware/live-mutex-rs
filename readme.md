@@ -619,6 +619,8 @@ Leader-side `InstallSnapshot` catch-up exposes
 `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
 `dd_rust_network_mutex_raft_install_snapshot_bytes_total`, and
 `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`.
+Follower snapshot staging idempotently accepts duplicate non-final chunks, so a
+lost intermediate chunk response does not force the whole transfer to restart.
 Old log entries are compacted only after they are committed, applied, and
 covered by a durable snapshot. Snapshots now carry active holders, queued
 waiters, fencing counters, and TTL deadlines, so `InstallSnapshot` can catch up

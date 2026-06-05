@@ -96,6 +96,9 @@ Implemented:
 - stale staged `InstallSnapshot` part cleanup, including orphaned transfer-file
   cleanup on restart, so abandoned chunk transfers do not leak disk
   indefinitely,
+- duplicate non-final `InstallSnapshot` chunks are idempotently acknowledged
+  without appending bytes twice or clearing the staged transfer, while real
+  offset gaps still reset the transfer,
 - SHA-256 snapshot payload checksums verified before snapshot install,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
