@@ -140,7 +140,13 @@ Implemented:
   `dd_rust_network_mutex_raft_append_conflict_repairs_total`, and
   `dd_rust_network_mutex_raft_append_conflict_clamps_total`; invalid
   `AppendEntries(success=true)` responses that underreport the matched boundary
-  increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`,
+  increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
+  snapshot fallbacks from the append path increment
+  `dd_rust_network_mutex_raft_append_snapshot_fallbacks_total`, split into
+  `dd_rust_network_mutex_raft_append_snapshot_prev_term_misses_total` for
+  compacted/missing `prevLogTerm` and
+  `dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total` for retained
+  suffix coverage gaps,
 - Raft `/metrics` counters for leader-side `InstallSnapshot` chunk attempts,
   raw snapshot payload bytes, and snapshot-driven peer progress:
   `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
@@ -307,11 +313,16 @@ receive bounded `AppendEntries` batches, controlled by
 reuse open TCP connections, including follower-to-leader proxy requests. The
 leader serves `prevLogTerm`, bounded entry
 batches, commit-range reads, and retained-term conflict hints from a validated
-in-memory retained-log cache, avoiding repeated filesystem parsing in the hot
-replication/apply path. If a follower is only slightly behind a snapshot
+in-memory retained-log cache, using index lower-bound lookups for retained
+suffix/range selection plus exact retained-index lookup for `prevLogTerm`,
+avoiding repeated filesystem parsing in the hot replication/apply path. If a
+follower is only slightly behind a snapshot
 boundary, the leader first uses retained trailing log entries for incremental
 catch-up; it sends `InstallSnapshot` only after the required previous-log term
-has been compacted away. The leader can coalesce concurrent client requests into
+has been compacted away. Debug-level `lmx::raft` snapshot-fallback logs include
+peer, `nextIndex`, previous index, local tail, snapshot boundary, and target
+index so flamegraph/perf runs can be correlated with replication state. The
+leader can coalesce concurrent client requests into
 bounded append/replicate/commit batches. Under load, the serialized write lane
 drains up to `client_batch_max_entries * client_pipeline_max_batches` pending
 requests into one quorum round, and the coalescer wakes early when a batch fills

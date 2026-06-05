@@ -544,8 +544,10 @@ instead of reconnecting for every heartbeat/append or follower-to-leader proxy
 request. Leader conflict-hint repair
 uses a retained-log term index to move `nextIndex` without rereading the whole
 retained log file; `prevLogTerm`, bounded replication batches, and committed
-apply ranges also use the validated retained-log cache instead of reparsing the
-log file on each hot-path read. Leader-local appends, candidate self-vote
+apply ranges also use index lower-bound lookups over the validated retained-log
+cache, including exact retained-index lookup for `prevLogTerm`, instead of
+reparsing the log file or scanning from the prefix on each hot-path read.
+Leader-local appends, candidate self-vote
 persistence, leader-side commit finalization, leader step-down persistence, live
 `RequestVote` handling, and live follower-side `AppendEntries` receive handling
 are offloaded to Tokio's blocking pool so disk durability, commit advancement,
@@ -619,6 +621,13 @@ include the sent batch boundary plus conflict-repair/clamp details. Raft
 `AppendEntries(success=true)` replies that report a `matchIndex` below the
 matched previous entry or sent batch are treated as non-progress and increment
 `dd_rust_network_mutex_raft_append_invalid_success_responses_total`.
+Append-path `InstallSnapshot` fallbacks increment
+`dd_rust_network_mutex_raft_append_snapshot_fallbacks_total`, split into
+`dd_rust_network_mutex_raft_append_snapshot_prev_term_misses_total` for
+compacted/missing `prevLogTerm` and
+`dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total` for retained
+suffix coverage gaps; debug-level `lmx::raft` logs include peer, `nextIndex`,
+local tail, snapshot boundary, and target index.
 Leader-side `InstallSnapshot` catch-up exposes
 `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
 `dd_rust_network_mutex_raft_install_snapshot_bytes_total`, and
