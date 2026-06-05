@@ -543,7 +543,8 @@ impl RaftLogStore {
             }
         }
 
-        let mut changed = false;
+        let mut rewrite_required = false;
+        let mut append_only = Vec::new();
         let mut match_index = prev_log_index;
         for entry in entries
             .into_iter()
@@ -554,20 +555,25 @@ impl RaftLogStore {
                 if local[pos].term != entry.term {
                     local.truncate(pos);
                     local.push(entry);
-                    changed = true;
+                    rewrite_required = true;
                 }
             } else {
                 if let Some(pos) = local.iter().position(|local| local.index > entry.index) {
                     local.truncate(pos);
+                    rewrite_required = true;
+                }
+                if !rewrite_required {
+                    append_only.push(entry.clone());
                 }
                 local.push(entry);
-                changed = true;
             }
         }
 
-        if changed {
+        if rewrite_required {
             rewrite_log(&self.log_path, &local)?;
             sync_dir(&self.data_dir)?;
+        } else if !append_only.is_empty() {
+            append_log_entries(&self.log_path, &append_only)?;
         }
         if let Some(last) = local.last() {
             state.last_index = last.index;
@@ -2008,6 +2014,20 @@ fn last_index_for_term(state: &RaftLogState, entries: &[RaftLogEntry], term: u64
         })
 }
 
+fn append_log_entries(path: &Path, entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-append-log-entries-1");
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry)?;
+        file.write_all(b"\n")?;
+    }
+    file.sync_data()?;
+    Ok(())
+}
+
 fn rewrite_log(path: &Path, entries: &[RaftLogEntry]) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-rewrite-log-1");
     let tmp = path.with_extension("ndjson.tmp");
@@ -2136,6 +2156,89 @@ mod tests {
                 snapshot_index: 1
             }
         ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_reports_conflict_term_and_first_index() {
+        let dir = temp_dir("raft-conflict-report");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        for term in [1, 1, 2, 2, 3] {
+            store.append(term, RaftCommand::Noop).expect("append");
+        }
+
+        let report = store
+            .append_entries_from_leader(4, 99, Vec::new())
+            .expect("append entries check");
+
+        assert!(!report.success);
+        assert_eq!(report.conflict_term, Some(2));
+        assert_eq!(report.conflict_index, Some(3));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_truncates_conflicting_suffix_and_appends_leader_entries() {
+        let dir = temp_dir("raft-conflict-repair");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        for term in [1, 1, 3, 3] {
+            store.append(term, RaftCommand::Noop).expect("append");
+        }
+        let leader_entries = vec![
+            RaftLogEntry {
+                index: 3,
+                term: 2,
+                created_at_ms: 10,
+                command: RaftCommand::Noop,
+            },
+            RaftLogEntry {
+                index: 4,
+                term: 2,
+                created_at_ms: 11,
+                command: RaftCommand::Noop,
+            },
+        ];
+
+        let report = store
+            .append_entries_from_leader(2, 1, leader_entries)
+            .expect("append entries repair");
+
+        assert!(report.success);
+        assert_eq!(report.match_index, 4);
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1), (3, 2), (4, 2)]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leader_conflict_hint_jumps_to_last_local_index_for_term() {
+        let dir = temp_dir("raft-conflict-next-index");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for term in [1, 2, 2, 3] {
+            raft.log.append(term, RaftCommand::Noop).expect("append");
+        }
+
+        assert_eq!(
+            raft.next_index_after_conflict(Some(2), Some(1), 5)
+                .expect("known term jump"),
+            4
+        );
+        assert_eq!(
+            raft.next_index_after_conflict(Some(9), Some(2), 5)
+                .expect("unknown term jump"),
+            2
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
