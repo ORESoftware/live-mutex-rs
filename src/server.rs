@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Path, State},
@@ -730,6 +730,8 @@ where
             if payload.is_empty() {
                 continue;
             }
+            let frame_started = Instant::now();
+            metrics.observe_request_payload_bytes("stream_frame", payload.len());
             metrics.requests_total.inc();
             let request: Request = match serde_json::from_slice(payload) {
                 Ok(r) => r,
@@ -742,6 +744,7 @@ where
                             error: format!("malformed request: {err}"),
                         },
                     );
+                    metrics.observe_request_duration("stream_frame", frame_started.elapsed());
                     continue;
                 }
             };
@@ -757,6 +760,7 @@ where
                                 error: None,
                             },
                         );
+                        metrics.observe_request_duration("stream_frame", frame_started.elapsed());
                         continue;
                     }
                     metrics.auth_failures_total.inc();
@@ -768,6 +772,7 @@ where
                             error: Some("invalid auth token".into()),
                         },
                     );
+                    metrics.observe_request_duration("stream_frame", frame_started.elapsed());
                     break;
                 }
                 metrics.auth_failures_total.inc();
@@ -778,9 +783,20 @@ where
                         error: "auth handshake required".into(),
                     },
                 );
+                metrics.observe_request_duration("stream_frame", frame_started.elapsed());
                 break;
             }
             broker.handle_request(client_id, request);
+            let elapsed = frame_started.elapsed();
+            metrics.observe_request_duration("stream_frame", elapsed);
+            if elapsed >= Duration::from_millis(25) {
+                debug!(
+                    target: "lmx::stream",
+                    client=%client_id,
+                    elapsed_ms = elapsed.as_millis(),
+                    "stream frame handled slowly"
+                );
+            }
         }
         Ok::<(), std::io::Error>(())
     }
@@ -819,6 +835,27 @@ async fn _ensure_uds_handler_compiles(
 fn http_unauthorized() -> AxumResponse {
     crate::routine_id!("ddl-routine-KaHmdHGpsEcVCMn-TA");
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+}
+
+fn observe_http_response(
+    metrics: &crate::metrics::Metrics,
+    route: &'static str,
+    started: Instant,
+    response: AxumResponse,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-observe-http-response-1");
+    let elapsed = started.elapsed();
+    metrics.observe_request_duration(route, elapsed);
+    if elapsed >= Duration::from_millis(250) {
+        debug!(
+            target: "lmx::http",
+            route,
+            status = response.status().as_u16(),
+            elapsed_ms = elapsed.as_millis(),
+            "HTTP request completed slowly"
+        );
+    }
+    response
 }
 
 fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -1074,13 +1111,21 @@ async fn raft_http_acquire(
     Json(req): Json<AcquireRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-acquire-1");
+    let started = Instant::now();
     if !raft_http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(
+            &state.metrics,
+            "raft_http_acquire",
+            started,
+            http_unauthorized(),
+        );
     }
     state.metrics.requests_total.inc();
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(response) => {
+            return observe_http_response(&state.metrics, "raft_http_acquire", started, response);
+        }
     };
     let request = Request::Lock {
         uuid: request_uuid.clone(),
@@ -1099,7 +1144,7 @@ async fn raft_http_acquire(
         .raft
         .run_ephemeral(request, &request_uuid, wait, true)
         .await;
-    match outcome {
+    let response = match outcome {
         Ok(Some(Response::Lock {
             acquired,
             key,
@@ -1165,7 +1210,8 @@ async fn raft_http_acquire(
         .into_response(),
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
-    }
+    };
+    observe_http_response(&state.metrics, "raft_http_acquire", started, response)
 }
 
 async fn raft_http_release(
@@ -1174,13 +1220,21 @@ async fn raft_http_release(
     Json(req): Json<ReleaseRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-release-1");
+    let started = Instant::now();
     if !raft_http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(
+            &state.metrics,
+            "raft_http_release",
+            started,
+            http_unauthorized(),
+        );
     }
     state.metrics.requests_total.inc();
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(response) => {
+            return observe_http_response(&state.metrics, "raft_http_release", started, response);
+        }
     };
     let outcome = state
         .raft
@@ -1197,7 +1251,7 @@ async fn raft_http_release(
             false,
         )
         .await;
-    match outcome {
+    let response = match outcome {
         Ok(Some(Response::Unlock { keys, unlocked, .. })) => {
             Json(ReleaseResponse { unlocked, keys }).into_response()
         }
@@ -1213,7 +1267,8 @@ async fn raft_http_release(
             .into_response(),
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
-    }
+    };
+    observe_http_response(&state.metrics, "raft_http_release", started, response)
 }
 
 fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
@@ -1847,13 +1902,16 @@ async fn http_acquire(
     Json(req): Json<AcquireRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-T5EHOY2NmST_NSzimj");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(&state.metrics, "http_acquire", started, http_unauthorized());
     }
     state.metrics.requests_total.inc();
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(response) => {
+            return observe_http_response(&state.metrics, "http_acquire", started, response);
+        }
     };
     let request = Request::Lock {
         uuid: request_uuid.clone(),
@@ -1874,7 +1932,7 @@ async fn http_acquire(
     };
     let wait = req.wait_ms.map(Duration::from_millis).unwrap_or_default();
     let outcome = run_ephemeral(&state, request, &request_uuid, wait, true).await;
-    match outcome {
+    let response = match outcome {
         Some(Response::Lock {
             acquired,
             key,
@@ -1944,7 +2002,8 @@ async fn http_acquire(
             error: None,
         })
         .into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_acquire", started, response)
 }
 
 async fn http_release(
@@ -1953,13 +2012,16 @@ async fn http_release(
     Json(req): Json<ReleaseRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-PMtoSZPDfVphM8N9Bz");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(&state.metrics, "http_release", started, http_unauthorized());
     }
     state.metrics.requests_total.inc();
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
-        Err(response) => return response,
+        Err(response) => {
+            return observe_http_response(&state.metrics, "http_release", started, response);
+        }
     };
     let outcome = run_ephemeral(
         &state,
@@ -1975,7 +2037,7 @@ async fn http_release(
         false,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::Unlock { keys, unlocked, .. }) => {
             Json(ReleaseResponse { unlocked, keys }).into_response()
         }
@@ -1989,7 +2051,8 @@ async fn http_release(
             Json(serde_json::json!({"unlocked": false, "error": "broker timed out"})),
         )
             .into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_release", started, response)
 }
 
 async fn http_rw_read(
@@ -1998,8 +2061,9 @@ async fn http_rw_read(
     Json(req): Json<RwAcquireRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-48iX_Lmr3tl95p__v_");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(&state.metrics, "http_rw_read", started, http_unauthorized());
     }
     state.metrics.requests_total.inc();
     let request_uuid = Uuid::new_v4().to_string();
@@ -2015,7 +2079,7 @@ async fn http_rw_read(
         true,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::RegisterReadResult {
             granted,
             key,
@@ -2042,7 +2106,8 @@ async fn http_rw_read(
             fencing_token: None,
         })
         .into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_rw_read", started, response)
 }
 
 async fn http_rw_read_end(
@@ -2051,8 +2116,14 @@ async fn http_rw_read_end(
     Json(req): Json<RwReleaseRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-X1MXPfJCWk8TxUSU5S");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(
+            &state.metrics,
+            "http_rw_read_end",
+            started,
+            http_unauthorized(),
+        );
     }
     state.metrics.requests_total.inc();
     let request_uuid = Uuid::new_v4().to_string();
@@ -2070,7 +2141,7 @@ async fn http_rw_read_end(
         false,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::Unlock { unlocked, .. }) if unlocked => Json(RwReleaseResponse {
             key: req.key,
             readers_count: 0,
@@ -2082,7 +2153,8 @@ async fn http_rw_read_end(
             Json(serde_json::json!({"unlocked": false})),
         )
             .into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_rw_read_end", started, response)
 }
 
 async fn http_rw_write(
@@ -2091,8 +2163,14 @@ async fn http_rw_write(
     Json(req): Json<RwAcquireRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-6Uk8OjI7dBoBeZKwgK");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(
+            &state.metrics,
+            "http_rw_write",
+            started,
+            http_unauthorized(),
+        );
     }
     state.metrics.requests_total.inc();
     let request_uuid = Uuid::new_v4().to_string();
@@ -2108,7 +2186,7 @@ async fn http_rw_write(
         true,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::RegisterWriteResult {
             granted,
             key,
@@ -2135,7 +2213,8 @@ async fn http_rw_write(
             fencing_token: None,
         })
         .into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_rw_write", started, response)
 }
 
 async fn http_rw_write_end(
@@ -2144,7 +2223,45 @@ async fn http_rw_write_end(
     Json(req): Json<RwReleaseRequest>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-yiL_jYhCPvqvrCLT8q");
-    http_rw_read_end(State(state), headers, Json(req)).await
+    let started = Instant::now();
+    if !http_authorized(&state, &headers) {
+        return observe_http_response(
+            &state.metrics,
+            "http_rw_write_end",
+            started,
+            http_unauthorized(),
+        );
+    }
+    state.metrics.requests_total.inc();
+    let request_uuid = Uuid::new_v4().to_string();
+    let outcome = run_ephemeral(
+        &state,
+        Request::Unlock {
+            uuid: request_uuid.clone(),
+            key: Some(req.key.clone()),
+            keys: None,
+            lock_uuid: Some(req.lock_uuid.clone()),
+            force: false,
+        },
+        &request_uuid,
+        Duration::from_millis(2000),
+        false,
+    )
+    .await;
+    let response = match outcome {
+        Some(Response::Unlock { unlocked, .. }) if unlocked => Json(RwReleaseResponse {
+            key: req.key,
+            readers_count: 0,
+            writer_flag: false,
+        })
+        .into_response(),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"unlocked": false})),
+        )
+            .into_response(),
+    };
+    observe_http_response(&state.metrics, "http_rw_write_end", started, response)
 }
 
 async fn http_lock_info(
@@ -2153,8 +2270,14 @@ async fn http_lock_info(
     Path(key): Path<String>,
 ) -> AxumResponse {
     crate::routine_id!("ddl-routine-PR-FIDcsqi_1KmgjpN");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(
+            &state.metrics,
+            "http_lock_info",
+            started,
+            http_unauthorized(),
+        );
     }
     state.metrics.requests_total.inc();
     let request_uuid = Uuid::new_v4().to_string();
@@ -2169,7 +2292,7 @@ async fn http_lock_info(
         false,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::LockInfo {
             is_locked,
             lockholder_uuids,
@@ -2187,13 +2310,15 @@ async fn http_lock_info(
         })
         .into_response(),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "broker did not respond").into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_lock_info", started, response)
 }
 
 async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumResponse {
     crate::routine_id!("ddl-routine-81lPAudjnSt0pV3DSg");
+    let started = Instant::now();
     if !http_authorized(&state, &headers) {
-        return http_unauthorized();
+        return observe_http_response(&state.metrics, "http_ls", started, http_unauthorized());
     }
     state.metrics.requests_total.inc();
     let request_uuid = Uuid::new_v4().to_string();
@@ -2207,12 +2332,13 @@ async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumRespo
         false,
     )
     .await;
-    match outcome {
+    let response = match outcome {
         Some(Response::LsResult { keys, .. }) => {
             Json(serde_json::json!({"keys": keys})).into_response()
         }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "broker did not respond").into_response(),
-    }
+    };
+    observe_http_response(&state.metrics, "http_ls", started, response)
 }
 
 fn deadline_after(timeout: Duration) -> tokio::time::Instant {

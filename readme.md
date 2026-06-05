@@ -669,6 +669,13 @@ Leader quorum-wait counters expose the Raft portion of write latency:
 `dd_rust_network_mutex_raft_replication_quorum_wait_ms_total`.
 BrokerRaft request-flow metrics help separate broker work from consensus and
 load-balancer proxy work during perf runs:
+`dd_rust_network_mutex_request_duration_seconds` exposes fixed-route latency
+buckets for both regular Broker HTTP routes (`http_acquire`, `http_release`,
+etc.), BrokerRaft HTTP routes (`raft_http_acquire`, `raft_http_release`), and
+the synchronous persistent socket hot path (`stream_frame`).
+`dd_rust_network_mutex_request_payload_bytes` buckets persistent TCP/UDS JSON
+frame payload sizes for CPU/profiling correlation without labelling on lock
+keys or request ids.
 `dd_rust_network_mutex_raft_client_proposals_total`,
 `dd_rust_network_mutex_raft_client_queue_full_total`,
 `dd_rust_network_mutex_raft_client_batches_total`,
@@ -751,9 +758,11 @@ rollback failures also emit warn-level `lmx::raft` events with path, entry
 count, target byte length, and sync policy fields. Unbounded full-log read/replace
 helpers are test-only; production replication uses bounded suffix or exact range
 reads. Followers verify the snapshot payload SHA-256 checksum before installing
-it, and stale staged snapshot parts are removed when later snapshot traffic
-resumes or when a node reopens its Raft data directory; removed staged snapshot
-files increment `dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`.
+it, and stale or invalid staged snapshot parts are removed when later snapshot
+traffic resumes, when offsets mismatch, when validation rejects the staged
+payload, or when a node reopens its Raft data directory; removed staged snapshot
+files sync the parent directory and discarded transfers increment
+`dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`.
 Restored waiters
 keep their original client ids for later replicated cleanup, but old HTTP
 response channels are not resurrected after restart or snapshot install. Lock

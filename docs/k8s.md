@@ -337,6 +337,11 @@ The most useful Prometheus series for sizing decisions are:
 
 - `dd_rust_network_mutex_concurrent_clients` — open TCP/UDS
   connections.
+- `dd_rust_network_mutex_request_duration_seconds` — fixed-route latency
+  buckets for Broker HTTP, BrokerRaft HTTP, and synchronous persistent
+  socket-frame handling.
+- `dd_rust_network_mutex_request_payload_bytes` — persistent TCP/UDS JSON
+  frame-size buckets for correlating CPU profiles with payload pressure.
 - `dd_rust_network_mutex_pending_deadlines` — outstanding TTL
   deadlines (a backlog here means callers are dying without
   releasing).

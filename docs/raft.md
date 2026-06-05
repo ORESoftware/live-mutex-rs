@@ -100,8 +100,10 @@ Implemented:
 - active broker-state snapshots for holders, queued waiters, fencing counters,
   and TTL deadlines, staged on receiver disk before install,
 - stale staged `InstallSnapshot` part cleanup, including orphaned transfer-file
-  cleanup on restart, so abandoned chunk transfers do not leak disk
-  indefinitely; removed files increment
+  cleanup on restart plus invalid transfer discards such as offset mismatches,
+  checksum failures, and staged byte-limit rejections, so abandoned chunk
+  transfers do not leak disk indefinitely; successful removals sync the parent
+  directory, and discarded files increment
   `dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`,
 - duplicate non-final `InstallSnapshot` chunks, including delayed duplicate
   first chunks, are idempotently acknowledged without appending bytes twice or
@@ -153,6 +155,11 @@ Implemented:
   `old-majority && new-majority`,
 - operator progress inspection via `GET /raft/progress`, including per-peer
   `nextIndex`, `matchIndex`, lag, and staged-learner visibility,
+- shared Broker/BrokerRaft latency histograms for perf runs:
+  `dd_rust_network_mutex_request_duration_seconds` uses fixed route labels such
+  as `http_acquire`, `raft_http_acquire`, and `stream_frame`, while
+  `dd_rust_network_mutex_request_payload_bytes` buckets persistent TCP/UDS JSON
+  frame sizes without key or request-id labels,
 - Raft `/metrics` counters for append progress updates, conflict repairs, and
   conflict clamps:
   `dd_rust_network_mutex_raft_append_progress_updates_total`,

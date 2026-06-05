@@ -322,6 +322,8 @@ async fn healthz_and_metrics_exposed() {
     // Periodic-sweeper bookkeeping (upstream live-mutex#13).
     assert!(metrics.contains("dd_rust_network_mutex_pending_deadlines"));
     assert!(metrics.contains("dd_rust_network_mutex_ttl_evictions_total"));
+    assert!(metrics.contains("dd_rust_network_mutex_request_duration_seconds_bucket"));
+    assert!(metrics.contains("dd_rust_network_mutex_request_payload_bytes_bucket"));
 }
 
 /// Semaphore semantics on a real broker over real loopback TCP. Three

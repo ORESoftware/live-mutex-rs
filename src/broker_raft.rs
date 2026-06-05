@@ -2838,7 +2838,7 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total Failed attempts to truncate an unterminated malformed trailing Raft log record during recovery.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total counter\n",
                 "dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed during startup orphan cleanup, stale cleanup, offset-zero restart, or staged byte-limit rejection.\n",
+                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed during startup orphan cleanup, stale cleanup, offset-zero restart/orphan cleanup, offset mismatch, staged byte-limit rejection, or invalid transfer discard.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_retained_entries Current retained local Raft log entries after compaction.\n",
@@ -5147,10 +5147,7 @@ impl BrokerRaft {
                 ))
                 .map(|pending| pending.path);
             if let Some(path) = path {
-                self.telemetry
-                    .snapshot_transfer_cleanups_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = fs::remove_file(path);
+                self.remove_snapshot_transfer_file(path, "staged-byte-limit-precheck");
             }
             warn!(
                 target: "lmx::raft",
@@ -5380,7 +5377,7 @@ impl BrokerRaft {
             &payload_path,
             payload_sha256.clone(),
         ) {
-            let _ = fs::remove_file(&payload_path);
+            self.remove_snapshot_transfer_file(payload_path, "checksum-verification-failed");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err.to_string(),
@@ -5391,12 +5388,9 @@ impl BrokerRaft {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
             })
         }) {
-            Ok(payload) => {
-                let _ = fs::remove_file(&payload_path);
-                payload
-            }
+            Ok(payload) => payload,
             Err(err) => {
-                let _ = fs::remove_file(&payload_path);
+                self.remove_snapshot_transfer_file(payload_path, "payload-json-parse-failed");
                 return RaftRpcResponse::Error {
                     term: self.runtime.lock().current_term,
                     error: err.to_string(),
@@ -5404,29 +5398,34 @@ impl BrokerRaft {
             }
         };
         if let Err(err) = membership_from_snapshot_payload(&payload) {
+            self.remove_snapshot_transfer_file(payload_path, "invalid-membership-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err.to_string(),
             };
         }
         if let Err(err) = staged_learners_from_snapshot_payload(&payload) {
+            self.remove_snapshot_transfer_file(payload_path, "invalid-staged-learners-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err.to_string(),
             };
         }
         if let Err(err) = client_responses_from_snapshot_payload(&payload) {
+            self.remove_snapshot_transfer_file(payload_path, "invalid-client-responses-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err.to_string(),
             };
         }
         if let Err(err) = Broker::validate_raft_snapshot_payload(&payload) {
+            self.remove_snapshot_transfer_file(payload_path, "invalid-broker-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err,
             };
         }
+        self.remove_consumed_snapshot_transfer_file(payload_path);
         let mut installed_index = current_snapshot_index;
         if last_included_index > current_snapshot_index {
             if let Err(response) = self.ensure_current_snapshot_sender(term, &leader_id) {
@@ -7349,20 +7348,7 @@ impl BrokerRaft {
             let restart_path = transfers.remove(&key).map(|pending| pending.path);
             drop(transfers);
             if let Some(path) = restart_path {
-                self.telemetry
-                    .snapshot_transfer_cleanups_total
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Err(err) = fs::remove_file(&path) {
-                    if err.kind() != std::io::ErrorKind::NotFound {
-                        debug!(
-                            target: "lmx::raft",
-                            node_id = %self.config.node_id,
-                            path = %path.display(),
-                            error = %err,
-                            "failed to remove restarted staged snapshot transfer",
-                        );
-                    }
-                }
+                self.remove_snapshot_transfer_file(path, "offset-zero-restart");
                 debug!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
@@ -7374,7 +7360,7 @@ impl BrokerRaft {
                     "restarting InstallSnapshot transfer from offset zero",
                 );
             } else {
-                let _ = fs::remove_file(&path);
+                self.remove_snapshot_transfer_file(path.clone(), "offset-zero-orphan");
             }
             transfers = self.snapshot_transfers.lock();
             if !transfers.contains_key(&key)
@@ -7441,7 +7427,7 @@ impl BrokerRaft {
             let stale_path = transfers.remove(&key).map(|pending| pending.path);
             drop(transfers);
             if let Some(path) = stale_path {
-                let _ = fs::remove_file(path);
+                self.remove_snapshot_transfer_file(path, "offset-mismatch");
             }
             warn!(
                 target: "lmx::raft",
@@ -7467,10 +7453,7 @@ impl BrokerRaft {
             let stale_path = transfers.remove(&key).map(|pending| pending.path);
             drop(transfers);
             if let Some(path) = stale_path {
-                self.telemetry
-                    .snapshot_transfer_cleanups_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = fs::remove_file(path);
+                self.remove_snapshot_transfer_file(path, "staged-byte-limit");
             }
             warn!(
                 target: "lmx::raft",
@@ -7543,7 +7526,85 @@ impl BrokerRaft {
             ))
             .map(|pending| pending.path);
         if let Some(path) = path {
-            let _ = fs::remove_file(path);
+            self.remove_snapshot_transfer_file(path, "discard-transfer");
+        }
+    }
+
+    fn remove_consumed_snapshot_transfer_file(&self, path: PathBuf) {
+        crate::routine_id!("ddl-routine-broker-raft-remove-consumed-snapshot-transfer-1");
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(err) = sync_dir(parent) {
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            path = %path.display(),
+                            error = %err,
+                            "failed to sync consumed InstallSnapshot transfer removal directory",
+                        );
+                    }
+                }
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    path = %path.display(),
+                    "removed consumed staged InstallSnapshot file",
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    path = %path.display(),
+                    error = %err,
+                    "failed to remove consumed staged InstallSnapshot file",
+                );
+            }
+        }
+    }
+
+    fn remove_snapshot_transfer_file(&self, path: PathBuf, reason: &'static str) -> bool {
+        crate::routine_id!("ddl-routine-broker-raft-remove-snapshot-transfer-file-1");
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(err) = sync_dir(parent) {
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            path = %path.display(),
+                            reason,
+                            error = %err,
+                            "failed to sync staged InstallSnapshot removal directory",
+                        );
+                    }
+                }
+                self.telemetry
+                    .snapshot_transfer_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    path = %path.display(),
+                    reason,
+                    "removed staged InstallSnapshot file",
+                );
+                true
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    path = %path.display(),
+                    reason,
+                    error = %err,
+                    "failed to remove staged InstallSnapshot file",
+                );
+                false
+            }
         }
     }
 
@@ -7566,23 +7627,10 @@ impl BrokerRaft {
                 .filter_map(|key| transfers.remove(&key).map(|pending| pending.path))
                 .collect::<Vec<_>>()
         };
-        let removed = paths.len();
-        if removed > 0 {
-            self.telemetry
-                .snapshot_transfer_cleanups_total
-                .fetch_add(removed as u64, Ordering::Relaxed);
-        }
+        let mut removed = 0usize;
         for path in paths {
-            if let Err(err) = fs::remove_file(&path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        path = %path.display(),
-                        error = %err,
-                        "failed to remove stale staged snapshot transfer",
-                    );
-                }
+            if self.remove_snapshot_transfer_file(path, "stale-transfer") {
+                removed += 1;
             }
         }
         removed
@@ -18407,6 +18455,11 @@ mod tests {
         assert!(raft.log.latest_snapshot().is_none());
         assert_eq!(raft.log.last_index(), 0);
         assert!(snapshot_part_files(&dir).is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 1"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -19073,9 +19126,13 @@ mod tests {
         assert_eq!(telemetry.install_snapshot_staged_bytes_total, split as u64);
         assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 0);
         assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 1);
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
         assert!(raft
             .raft_metrics_text()
             .contains("dd_rust_network_mutex_raft_install_snapshot_offset_mismatches_total 1"));
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 1"));
         assert!(raft.snapshot_transfers.lock().is_empty());
         assert!(!staged_path.exists());
         assert!(snapshot_part_files(&dir).is_empty());
@@ -19242,6 +19299,7 @@ mod tests {
         );
         assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 2);
         assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
         let metrics = raft.raft_metrics_text();
         assert!(
             metrics.contains("dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total 3")

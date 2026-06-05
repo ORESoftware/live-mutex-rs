@@ -3,9 +3,27 @@
 //! to the broker (key count, holder count, queue depth) are pulled on-render
 //! to keep metric writes off the broker's hot path.
 
-use prometheus::{IntCounter, Registry, TextEncoder};
+use std::time::Duration;
+
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, Registry, TextEncoder};
 
 use crate::broker::Broker;
+
+const REQUEST_DURATION_ROUTES: &[&str] = &[
+    "stream_frame",
+    "http_acquire",
+    "http_release",
+    "http_rw_read",
+    "http_rw_read_end",
+    "http_rw_write",
+    "http_rw_write_end",
+    "http_lock_info",
+    "http_ls",
+    "raft_http_acquire",
+    "raft_http_release",
+];
+
+const REQUEST_PAYLOAD_ROUTES: &[&str] = &["stream_frame"];
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -24,6 +42,13 @@ pub struct Metrics {
     /// is enabled; remains 0 on macOS / BSD where the syscall is
     /// a no-op.
     pub tcp_quickack_applied_total: IntCounter,
+    /// End-to-end request latency for HTTP handlers and synchronous
+    /// per-frame handling time for persistent TCP/UDS clients. Labels are
+    /// deliberately fixed route names, never user-supplied keys or UUIDs.
+    pub request_duration_seconds: HistogramVec,
+    /// Newline-delimited JSON frame payload sizes seen on persistent
+    /// TCP/UDS connections, labelled by the fixed transport route.
+    pub request_payload_bytes: HistogramVec,
 }
 
 impl Metrics {
@@ -65,6 +90,40 @@ impl Metrics {
             "Reads after which TCP_QUICKACK was successfully (re-)applied (Linux only).",
         )
         .unwrap();
+        let request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "dd_rust_network_mutex_request_duration_seconds",
+                "Request handling latency by fixed route name.",
+            )
+            .buckets(vec![
+                0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+                0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["route"],
+        )
+        .unwrap();
+        let request_payload_bytes = HistogramVec::new(
+            HistogramOpts::new(
+                "dd_rust_network_mutex_request_payload_bytes",
+                "Persistent TCP/UDS JSON frame payload size by fixed route name.",
+            )
+            .buckets(vec![
+                64.0,
+                128.0,
+                256.0,
+                512.0,
+                1024.0,
+                2048.0,
+                4096.0,
+                8192.0,
+                16_384.0,
+                65_536.0,
+                262_144.0,
+                1_048_576.0,
+            ]),
+            &["route"],
+        )
+        .unwrap();
         registry.register(Box::new(requests_total.clone())).ok();
         registry
             .register(Box::new(malformed_requests_total.clone()))
@@ -84,6 +143,18 @@ impl Metrics {
         registry
             .register(Box::new(tcp_quickack_applied_total.clone()))
             .ok();
+        registry
+            .register(Box::new(request_duration_seconds.clone()))
+            .ok();
+        registry
+            .register(Box::new(request_payload_bytes.clone()))
+            .ok();
+        for route in REQUEST_DURATION_ROUTES {
+            request_duration_seconds.with_label_values(&[route]);
+        }
+        for route in REQUEST_PAYLOAD_ROUTES {
+            request_payload_bytes.with_label_values(&[route]);
+        }
         Self {
             registry,
             requests_total,
@@ -93,7 +164,23 @@ impl Metrics {
             uds_connections_total,
             tcp_nodelay_applied_total,
             tcp_quickack_applied_total,
+            request_duration_seconds,
+            request_payload_bytes,
         }
+    }
+
+    pub fn observe_request_duration(&self, route: &'static str, elapsed: Duration) {
+        crate::routine_id!("ddl-routine-metrics-observe-request-duration-1");
+        self.request_duration_seconds
+            .with_label_values(&[route])
+            .observe(elapsed.as_secs_f64());
+    }
+
+    pub fn observe_request_payload_bytes(&self, route: &'static str, bytes: usize) {
+        crate::routine_id!("ddl-routine-metrics-observe-request-payload-bytes-1");
+        self.request_payload_bytes
+            .with_label_values(&[route])
+            .observe(bytes as f64);
     }
 
     pub fn render(&self, broker: &Broker) -> String {
