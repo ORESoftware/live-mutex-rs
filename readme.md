@@ -4,9 +4,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 
 A Rust port of the Node.js [`live-mutex`](https://github.com/ORESoftware/live-mutex)
-networked-mutex library. A single-process broker that synchronizes access to a
-per-key lock state, plus a Rust client library that talks to it over TCP, Unix
-domain sockets, or HTTP (for serverless / Lambda callers).
+networked-mutex library. The default deployment is a single-process broker that
+synchronizes access to per-key lock state, plus a Rust client library that talks
+to it over TCP, Unix domain sockets, or HTTP (for serverless / Lambda callers).
+An experimental HTTP-only `BrokerRaft` backend adds a replicated Raft log,
+leader election, quorum commit, and follower failover for three- or five-node
+clusters.
 
 This crate is what we run in production at ORE Software (internally as
 `dd-rust-network-mutex`); the binary name still reflects that history. The
@@ -44,6 +47,10 @@ Headline features:
   [Semaphore-style locks](#semaphore-style-locks-concurrency--1) below.
 - **HTTP transport** for callers that can't hold a long-lived TCP connection
   (Lambda, Cloudflare Workers, Vercel functions). Long-poll via `waitMs`.
+- **Experimental BrokerRaft HA backend** — an HTTP-only three- or five-node
+  Raft path with leader election, quorum commit, incremental log replication,
+  chunked snapshot catch-up, and joint-consensus membership changes. See
+  [High availability](#high-availability).
 - **Single TTL sweeper** instead of a per-request timer. Originally tracked
   at [`live-mutex#13`](https://github.com/ORESoftware/live-mutex/issues/13);
   now also landed in upstream Node.js.
@@ -124,10 +131,9 @@ hardware-dependent, but the ratio is a useful first signal.)
 
 `examples/redis_vs_raft_bench.rs` provides a rough acquire/release comparison
 between Redis locks, the regular Broker HTTP path, and the BrokerRaft HTTP/LB
-path. It intentionally ignores fencing tokens: Redis uses
+path. It normalizes away each system's fencing-token format: Redis uses
 `SET key token NX PX ttl` plus a compare-and-delete Lua unlock, while the Broker
-targets use `/v1/lock` and `/v1/unlock` and ignore the returned
-fencing-token fields.
+targets use `/v1/lock` and `/v1/unlock`.
 
 ```bash
 # Redis on 127.0.0.1:6379, Broker HTTP on 127.0.0.1:6971,
@@ -223,7 +229,9 @@ making follower proxying part of the hot path.
 
 `waitMs` is HTTP long-poll: the broker holds the request open up to that many
 milliseconds while waiting for a queued lock to be granted. The default is no
-wait; the caller should retry on `acquired:false`.
+wait; the caller should retry on `acquired:false`. BrokerRaft logs no-wait HTTP
+acquires as fail-fast lock attempts, so a contended `waitMs=0` request does not
+create a queued waiter or a follow-up cleanup log entry.
 
 If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 `Authorization: Bearer <token>` or `X-LMX-Auth: <token>` header.
@@ -249,6 +257,8 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES` | `256` | Max log entries sent in one Raft `AppendEntries` catch-up batch.                                 |
 | `LMX_RAFT_APPEND_ENTRIES_MAX_BYTES` | `1048576` | Approximate serialized entry byte budget for one Raft `AppendEntries` catch-up batch.             |
 | `LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES` | `1048576` | Serialized snapshot bytes sent per `InstallSnapshot` RPC chunk.                                  |
+| `LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES` | `32` | Max leader-local client requests appended and committed in one Raft write batch.                  |
+| `LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS` | `1` | Coalescing window before a leader-local client request batch is drained.                          |
 | `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
 | `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
 | `LMX_TCP_NODELAY`       | `true`           | Apply `TCP_NODELAY` on broker-accepted sockets. Experiment from `live-mutex#22`.                 |
@@ -463,30 +473,29 @@ log must live on the Raft nodes themselves; LB logs are not part of consensus
 recovery.
 
 Current BrokerRaft limitations: the cluster-facing API is HTTP-only, the leader
-write path is intentionally serialized, and each lock operation still performs
-durable log work before applying. Replication now sends incremental
+commit lane is intentionally serialized, and each committed client-request batch
+still performs durable log work before applying. Replication now sends incremental
 `AppendEntries` suffixes with `prevLogIndex` / `prevLogTerm`, `nextIndex`, and
 `matchIndex` instead of whole-log follower rewrites. Lagging followers receive
 bounded `AppendEntries` batches, and Raft peer RPCs reuse open TCP connections
 instead of reconnecting for every heartbeat/append. The current implementation
-is still much slower than the regular Broker under concurrent HTTP load because
-writes are serialized and not yet batched or pipelined. Raft hard state
+is still slower than the regular Broker under concurrent HTTP load because
+writes are batched but not yet pipelined. Raft hard state
 (`currentTerm` / `votedFor` / `commitIndex`) is
 persisted and committed log entries still present on disk are replayed on
-startup. Dynamic membership is implemented with joint-consensus log entries, but
-there is no learner/staging workflow yet for automatically catching up a cold
-new node before promoting it to a voter. Old log entries are compacted only
-after they are committed, applied, and covered by a durable snapshot; until full
-broker-state snapshot restore and non-idle snapshots exist, compaction is
-conservative and only removes old log entries while the applied broker state is
-idle. `InstallSnapshot` can catch up followers that fall behind this idle
-compacted prefix using chunked transfer, and followers verify the snapshot
-payload SHA-256 checksum before installing it, but snapshots do not yet transfer
-arbitrary live broker state. Lock UUID replay is deterministic across nodes;
-fencing tokens are still generated by each broker instance, so performance
-comparisons should ignore fencing tokens until the committed log also carries
-deterministic fencing-token results. BrokerRaft should be treated as
-experimental, not as an etcd/ZooKeeper-grade consensus service.
+startup. Dynamic membership is implemented with joint-consensus log entries, and
+new peer IDs are first caught up as transient learners before they are promoted
+to voters. There is not yet a persistent learner-management API for operators.
+Old log entries are compacted only after they are committed, applied, and
+covered by a durable snapshot. Snapshots now carry active holders, fencing
+counters, and TTL deadlines, so `InstallSnapshot` can catch up followers that
+fall behind a compacted prefix using chunked transfer staged on receiver disk.
+Followers verify the snapshot payload SHA-256 checksum before installing it.
+Queued waiters are not snapshotted yet, so BrokerRaft keeps the replay log
+while waiters exist. Lock UUID and fencing-token replay are deterministic across
+nodes because committed client-request log entries carry grant metadata.
+BrokerRaft should be treated as experimental, not as an etcd/ZooKeeper-grade
+consensus service.
 
 ## HTML status page (`live-mutex#108`)
 

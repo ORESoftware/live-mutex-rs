@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -36,6 +37,7 @@ use crate::queue::LinkedQueue;
 
 pub type ClientId = u64;
 pub type Sender = mpsc::UnboundedSender<Response>;
+const SNAPSHOT_DETACHED_CLIENT: ClientId = 0;
 
 /// Public construction options.
 #[derive(Debug, Clone)]
@@ -108,7 +110,8 @@ struct KeysOfLock {
     rw_kind: RwHoldKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 enum RwHoldKind {
     Exclusive,
     Read,
@@ -184,6 +187,17 @@ impl LockState {
         self.fencing_counter = self.fencing_counter.wrapping_add(1).max(1);
         self.fencing_counter
     }
+
+    fn next_or_forced_fencing_token(&mut self, forced: Option<u64>) -> u64 {
+        crate::routine_id!("ddl-routine-broker-next-or-forced-fencing-token-1");
+        match forced {
+            Some(token) => {
+                self.fencing_counter = self.fencing_counter.max(token);
+                token
+            }
+            None => self.next_fencing_token(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -213,8 +227,22 @@ struct PendingRequest {
     pid: Option<i64>,
     ttl: Option<Duration>,
     grant_lock_uuid: Option<String>,
+    grant_fencing_seed: Option<u64>,
     keep_locks_after_death: bool,
     kind: PendingKind,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrantOverrides {
+    pub lock_uuid: Option<String>,
+    pub fencing_seed: Option<u64>,
+}
+
+impl GrantOverrides {
+    fn token(&self, offset: u64) -> Option<u64> {
+        crate::routine_id!("ddl-routine-broker-grant-overrides-token-1");
+        self.fencing_seed.map(|seed| seed.saturating_add(offset))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +336,86 @@ struct BrokerState {
     /// with churning keys; a flat value means no key has been idle
     /// past the grace window.
     idle_keys_pruned_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftSnapshot {
+    schema_version: u32,
+    metrics: BrokerRaftSnapshotMetrics,
+    locks: Vec<BrokerRaftLockSnapshot>,
+    deadlines: Vec<BrokerRaftDeadlineSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftSnapshotMetrics {
+    keys: u64,
+    holders: u64,
+    waiters: u64,
+    clients: u64,
+    pending_deadlines: u64,
+    ttl_evictions_total: u64,
+    max_concurrency_cap: u32,
+    concurrency_cap_clamps_total: u64,
+    fencing_watermark: u64,
+    idle_keys_pruned_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftLockSnapshot {
+    key: String,
+    max: u32,
+    fencing_counter: u64,
+    exclusive_holders: Vec<BrokerRaftExclusiveHolderSnapshot>,
+    readers: Vec<BrokerRaftRwHolderSnapshot>,
+    writer: Option<BrokerRaftRwHolderSnapshot>,
+    idle: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftExclusiveHolderSnapshot {
+    lock_uuid: String,
+    pid: Option<i64>,
+    fencing_token: u64,
+    keep_locks_after_death: bool,
+    composite_member: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftRwHolderSnapshot {
+    lock_uuid: String,
+    fencing_token: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerRaftDeadlineSnapshot {
+    lock_uuid: String,
+    keys: Vec<String>,
+    kind: RwHoldKind,
+    remaining_ms: u64,
+}
+
+impl From<BrokerMetrics> for BrokerRaftSnapshotMetrics {
+    fn from(metrics: BrokerMetrics) -> Self {
+        crate::routine_id!("ddl-routine-broker-raft-snapshot-metrics-from-1");
+        Self {
+            keys: metrics.keys,
+            holders: metrics.holders,
+            waiters: metrics.waiters,
+            clients: metrics.clients,
+            pending_deadlines: metrics.pending_deadlines,
+            ttl_evictions_total: metrics.ttl_evictions_total,
+            max_concurrency_cap: metrics.max_concurrency_cap,
+            concurrency_cap_clamps_total: metrics.concurrency_cap_clamps_total,
+            fencing_watermark: metrics.fencing_watermark,
+            idle_keys_pruned_total: metrics.idle_keys_pruned_total,
+        }
+    }
 }
 
 impl BrokerState {
@@ -625,6 +733,23 @@ impl Broker {
         request: Request,
         grant_lock_uuid: Option<String>,
     ) {
+        crate::routine_id!("ddl-routine-broker-handle-request-with-grant-uuid-1");
+        self.handle_request_with_grant_overrides(
+            client,
+            request,
+            GrantOverrides {
+                lock_uuid: grant_lock_uuid,
+                fencing_seed: None,
+            },
+        );
+    }
+
+    pub(crate) fn handle_request_with_grant_overrides(
+        &self,
+        client: ClientId,
+        request: Request,
+        grant_overrides: GrantOverrides,
+    ) {
         crate::routine_id!("ddl-routine-0GBKaWmx2RzXgUnbEr");
         let mut state = self.state.lock();
         match request {
@@ -726,7 +851,7 @@ impl Broker {
                             keep_locks_after_death,
                             force,
                             wait,
-                            grant_lock_uuid,
+                            grant_overrides,
                         );
                     }
                     (None, Some(ks)) => {
@@ -738,7 +863,7 @@ impl Broker {
                             pid,
                             ttl,
                             wait,
-                            grant_lock_uuid,
+                            grant_overrides,
                         );
                     }
                     (Some(_), Some(_)) => {
@@ -801,10 +926,10 @@ impl Broker {
                 self.handle_unlock(&mut state, client, uuid, target_keys, lock_uuid, force);
             }
             Request::RegisterRead { uuid, key } => {
-                self.handle_register_read(&mut state, client, uuid, key);
+                self.handle_register_read(&mut state, client, uuid, key, grant_overrides);
             }
             Request::RegisterWrite { uuid, key } => {
-                self.handle_register_write(&mut state, client, uuid, key);
+                self.handle_register_write(&mut state, client, uuid, key, grant_overrides);
             }
             Request::EndRead { uuid, key } => {
                 self.handle_end_read(&mut state, client, uuid, key);
@@ -875,7 +1000,7 @@ impl Broker {
         keep_locks_after_death: bool,
         force: bool,
         wait: bool,
-        grant_lock_uuid: Option<String>,
+        grant_overrides: GrantOverrides,
     ) {
         crate::routine_id!("ddl-routine--MjJFOFOY7fGYtsmOT");
         // Resolve & clamp the requested concurrency level *before* we
@@ -892,8 +1017,9 @@ impl Broker {
         lock.max = effective_max;
         let cap = lock.max as usize;
         if lock.writer.is_none() && lock.readers.is_empty() && lock.exclusive_holders.len() < cap {
-            let token = lock.next_fencing_token();
-            let lock_uuid = grant_lock_uuid
+            let token = lock.next_or_forced_fencing_token(grant_overrides.token(0));
+            let lock_uuid = grant_overrides
+                .lock_uuid
                 .clone()
                 .unwrap_or_else(|| Uuid::new_v4().to_string());
             lock.exclusive_holders.insert(
@@ -973,7 +1099,8 @@ impl Broker {
             client,
             pid,
             ttl,
-            grant_lock_uuid,
+            grant_lock_uuid: grant_overrides.lock_uuid,
+            grant_fencing_seed: grant_overrides.fencing_seed,
             keep_locks_after_death,
             kind: PendingKind::Exclusive,
         };
@@ -1012,7 +1139,7 @@ impl Broker {
         pid: Option<i64>,
         ttl: Option<Duration>,
         wait: bool,
-        grant_lock_uuid: Option<String>,
+        grant_overrides: GrantOverrides,
     ) {
         crate::routine_id!("ddl-routine-UD_1TQ6n72nYb_GRcW");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
@@ -1046,15 +1173,16 @@ impl Broker {
                 .unwrap_or(true)
         });
 
-        let composite_lock_uuid = grant_lock_uuid
+        let composite_lock_uuid = grant_overrides
+            .lock_uuid
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         if all_free {
             let mut tokens: BTreeMap<String, u64> = BTreeMap::new();
             let mut max_token: u64 = 0;
-            for k in &keys {
+            for (idx, k) in keys.iter().enumerate() {
                 let lock = state.lock_or_default(k);
-                let token = lock.next_fencing_token();
+                let token = lock.next_or_forced_fencing_token(grant_overrides.token(idx as u64));
                 tokens.insert(k.clone(), token);
                 lock.exclusive_holders.insert(
                     composite_lock_uuid.clone(),
@@ -1130,6 +1258,7 @@ impl Broker {
             pid,
             ttl,
             grant_lock_uuid: None,
+            grant_fencing_seed: grant_overrides.fencing_seed,
             keep_locks_after_death: false,
             kind: PendingKind::Composite {
                 all_keys: keys.clone(),
@@ -1399,12 +1528,16 @@ impl Broker {
         client: ClientId,
         uuid: String,
         key: String,
+        grant_overrides: GrantOverrides,
     ) {
         crate::routine_id!("ddl-routine-20EN0HnEEFCThg4PVw");
         let lock = state.lock_or_default(&key);
         if lock.writer.is_none() && lock.exclusive_holders.is_empty() && lock.queue.is_empty() {
-            let token = lock.next_fencing_token();
-            let lock_uuid = Uuid::new_v4().to_string();
+            let token = lock.next_or_forced_fencing_token(grant_overrides.token(0));
+            let lock_uuid = grant_overrides
+                .lock_uuid
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             lock.readers.insert(
                 lock_uuid.clone(),
                 RwHolder {
@@ -1447,7 +1580,8 @@ impl Broker {
                 client,
                 pid: None,
                 ttl: None,
-                grant_lock_uuid: None,
+                grant_lock_uuid: grant_overrides.lock_uuid,
+                grant_fencing_seed: grant_overrides.fencing_seed,
                 keep_locks_after_death: false,
                 kind: PendingKind::Reader,
             },
@@ -1477,12 +1611,16 @@ impl Broker {
         client: ClientId,
         uuid: String,
         key: String,
+        grant_overrides: GrantOverrides,
     ) {
         crate::routine_id!("ddl-routine-jtFimB2SzQApojR-Xt");
         let lock = state.lock_or_default(&key);
         if lock.writer.is_none() && lock.readers.is_empty() && lock.exclusive_holders.is_empty() {
-            let token = lock.next_fencing_token();
-            let lock_uuid = Uuid::new_v4().to_string();
+            let token = lock.next_or_forced_fencing_token(grant_overrides.token(0));
+            let lock_uuid = grant_overrides
+                .lock_uuid
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
             lock.writer = Some(RwHolder {
                 client,
                 fencing_token: token,
@@ -1519,7 +1657,8 @@ impl Broker {
                 client,
                 pid: None,
                 ttl: None,
-                grant_lock_uuid: None,
+                grant_lock_uuid: grant_overrides.lock_uuid,
+                grant_fencing_seed: grant_overrides.fencing_seed,
                 keep_locks_after_death: false,
                 kind: PendingKind::Writer,
             },
@@ -1656,7 +1795,7 @@ impl Broker {
                     return false;
                 }
                 let head = lock.queue.pop_front().expect("just peeked").1;
-                let token = lock.next_fencing_token();
+                let token = lock.next_or_forced_fencing_token(head.grant_fencing_seed);
                 let lock_uuid = head
                     .grant_lock_uuid
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -1708,8 +1847,10 @@ impl Broker {
                     return false;
                 }
                 let head = lock.queue.pop_front().expect("just peeked").1;
-                let token = lock.next_fencing_token();
-                let lock_uuid = Uuid::new_v4().to_string();
+                let token = lock.next_or_forced_fencing_token(head.grant_fencing_seed);
+                let lock_uuid = head
+                    .grant_lock_uuid
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
                 lock.readers.insert(
                     lock_uuid.clone(),
                     RwHolder {
@@ -1751,8 +1892,10 @@ impl Broker {
                     return false;
                 }
                 let head = lock.queue.pop_front().expect("just peeked").1;
-                let token = lock.next_fencing_token();
-                let lock_uuid = Uuid::new_v4().to_string();
+                let token = lock.next_or_forced_fencing_token(head.grant_fencing_seed);
+                let lock_uuid = head
+                    .grant_lock_uuid
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
                 lock.writer = Some(RwHolder {
                     client: head.client,
                     fencing_token: token,
@@ -1831,7 +1974,14 @@ impl Broker {
             return false;
         };
 
-        let token = lock.next_fencing_token();
+        let token_offset = all_keys
+            .iter()
+            .position(|candidate| candidate == key)
+            .unwrap_or(0) as u64;
+        let token = lock.next_or_forced_fencing_token(
+            pop.grant_fencing_seed
+                .map(|seed| seed.saturating_add(token_offset)),
+        );
         lock.exclusive_holders.insert(
             composite_lock_uuid.clone(),
             ExclusiveHolder {
@@ -1900,6 +2050,7 @@ impl Broker {
                 pid: pop.pid,
                 ttl: pop.ttl,
                 grant_lock_uuid: None,
+                grant_fencing_seed: pop.grant_fencing_seed,
                 keep_locks_after_death: pop.keep_locks_after_death,
                 kind: PendingKind::Composite {
                     all_keys,
@@ -2005,25 +2156,118 @@ impl Broker {
     pub fn metrics(&self) -> BrokerMetrics {
         crate::routine_id!("ddl-routine-oQmRZkKSUjdFlC2hsV");
         let state = self.state.lock();
-        let mut total_holders = 0u64;
-        let mut total_waiters = 0u64;
-        for lock in state.locks.values() {
-            total_holders += (lock.exclusive_holders.len()
-                + lock.readers.len()
-                + lock.writer.iter().count()) as u64;
-            total_waiters += lock.queue.len() as u64;
+        broker_metrics_from_state(&state)
+    }
+
+    pub(crate) fn snapshot_for_raft(&self) -> Result<serde_json::Value, String> {
+        crate::routine_id!("ddl-routine-broker-snapshot-for-raft-1");
+        let state = self.state.lock();
+        let metrics = broker_metrics_from_state(&state);
+        if metrics.waiters != 0 {
+            return Err(format!(
+                "cannot snapshot broker with queued waiters; waiters={}",
+                metrics.waiters
+            ));
         }
-        BrokerMetrics {
-            keys: state.locks.len() as u64,
-            holders: total_holders,
-            waiters: total_waiters,
-            clients: state.clients.len() as u64,
-            pending_deadlines: state.deadlines.len() as u64,
-            ttl_evictions_total: state.ttl_evictions_total,
-            max_concurrency_cap: state.config.max_concurrency_cap,
-            concurrency_cap_clamps_total: state.concurrency_cap_clamps_total,
-            fencing_watermark: state.fencing_watermark,
-            idle_keys_pruned_total: state.idle_keys_pruned_total,
+        let now = Instant::now();
+        let mut locks = state
+            .locks
+            .iter()
+            .map(|(key, lock)| {
+                let mut exclusive_holders = lock
+                    .exclusive_holders
+                    .iter()
+                    .map(|(lock_uuid, holder)| BrokerRaftExclusiveHolderSnapshot {
+                        lock_uuid: lock_uuid.clone(),
+                        pid: holder.pid,
+                        fencing_token: holder.fencing_token,
+                        keep_locks_after_death: holder.keep_locks_after_death,
+                        composite_member: holder.composite_member,
+                    })
+                    .collect::<Vec<_>>();
+                exclusive_holders.sort_by(|a, b| a.lock_uuid.cmp(&b.lock_uuid));
+
+                let mut readers = lock
+                    .readers
+                    .iter()
+                    .map(|(lock_uuid, holder)| BrokerRaftRwHolderSnapshot {
+                        lock_uuid: lock_uuid.clone(),
+                        fencing_token: holder.fencing_token,
+                    })
+                    .collect::<Vec<_>>();
+                readers.sort_by(|a, b| a.lock_uuid.cmp(&b.lock_uuid));
+
+                BrokerRaftLockSnapshot {
+                    key: key.clone(),
+                    max: lock.max,
+                    fencing_counter: lock.fencing_counter,
+                    exclusive_holders,
+                    readers,
+                    writer: lock
+                        .writer
+                        .as_ref()
+                        .map(|holder| BrokerRaftRwHolderSnapshot {
+                            lock_uuid: holder.lock_uuid.clone(),
+                            fencing_token: holder.fencing_token,
+                        }),
+                    idle: lock.is_idle(),
+                }
+            })
+            .collect::<Vec<_>>();
+        locks.sort_by(|a, b| a.key.cmp(&b.key));
+
+        let mut deadlines = state
+            .deadlines
+            .iter()
+            .filter_map(|((deadline, _), entry)| {
+                if !deadline_entry_is_still_held(&state, entry) {
+                    return None;
+                }
+                Some(BrokerRaftDeadlineSnapshot {
+                    lock_uuid: entry.lock_uuid.clone(),
+                    keys: entry.keys.clone(),
+                    kind: entry.kind.clone(),
+                    remaining_ms: duration_ms_u64(deadline.saturating_duration_since(now)),
+                })
+            })
+            .collect::<Vec<_>>();
+        deadlines.sort_by(|a, b| {
+            a.lock_uuid
+                .cmp(&b.lock_uuid)
+                .then_with(|| a.keys.cmp(&b.keys))
+        });
+
+        serde_json::to_value(BrokerRaftSnapshot {
+            schema_version: 1,
+            metrics: metrics.into(),
+            locks,
+            deadlines,
+        })
+        .map_err(|err| err.to_string())
+    }
+
+    pub(crate) fn validate_raft_snapshot_payload(
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-broker-validate-raft-snapshot-1");
+        if let Some(snapshot) = payload.get("broker") {
+            let snapshot: BrokerRaftSnapshot =
+                serde_json::from_value(snapshot.clone()).map_err(|err| err.to_string())?;
+            validate_broker_raft_snapshot(&snapshot)
+        } else {
+            Self::validate_idle_snapshot_payload(payload)
+        }
+    }
+
+    pub(crate) fn install_raft_snapshot(&self, payload: &serde_json::Value) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-broker-install-raft-snapshot-1");
+        if let Some(snapshot) = payload.get("broker") {
+            let snapshot: BrokerRaftSnapshot =
+                serde_json::from_value(snapshot.clone()).map_err(|err| err.to_string())?;
+            validate_broker_raft_snapshot(&snapshot)?;
+            self.install_broker_raft_snapshot(snapshot)
+        } else {
+            self.install_idle_snapshot(payload)
         }
     }
 
@@ -2045,6 +2289,97 @@ impl Broker {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn install_broker_raft_snapshot(&self, snapshot: BrokerRaftSnapshot) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-broker-install-broker-raft-snapshot-1");
+        let mut state = self.state.lock();
+        let config = state.config.clone();
+        let started_at = state.started_at;
+        let now = Instant::now();
+        let mut next = BrokerState::new(config);
+        next.started_at = started_at;
+        next.ttl_evictions_total = snapshot.metrics.ttl_evictions_total;
+        next.concurrency_cap_clamps_total = snapshot.metrics.concurrency_cap_clamps_total;
+        next.fencing_watermark = snapshot.metrics.fencing_watermark;
+        next.idle_keys_pruned_total = snapshot.metrics.idle_keys_pruned_total;
+
+        for lock_snapshot in snapshot.locks {
+            let mut lock = LockState::new(
+                lock_snapshot
+                    .max
+                    .max(1)
+                    .min(next.config.max_concurrency_cap.max(1)),
+            );
+            lock.fencing_counter = lock_snapshot.fencing_counter;
+            lock.timestamp_emptied = None;
+
+            for holder in lock_snapshot.exclusive_holders {
+                lock.fencing_counter = lock.fencing_counter.max(holder.fencing_token);
+                next.fencing_watermark = next.fencing_watermark.max(holder.fencing_token);
+                lock.exclusive_holders.insert(
+                    holder.lock_uuid,
+                    ExclusiveHolder {
+                        client: SNAPSHOT_DETACHED_CLIENT,
+                        pid: holder.pid,
+                        fencing_token: holder.fencing_token,
+                        keep_locks_after_death: holder.keep_locks_after_death,
+                        composite_member: holder.composite_member,
+                    },
+                );
+            }
+            for holder in lock_snapshot.readers {
+                lock.fencing_counter = lock.fencing_counter.max(holder.fencing_token);
+                next.fencing_watermark = next.fencing_watermark.max(holder.fencing_token);
+                lock.readers.insert(
+                    holder.lock_uuid.clone(),
+                    RwHolder {
+                        client: SNAPSHOT_DETACHED_CLIENT,
+                        fencing_token: holder.fencing_token,
+                        lock_uuid: holder.lock_uuid,
+                    },
+                );
+            }
+            if let Some(holder) = lock_snapshot.writer {
+                lock.fencing_counter = lock.fencing_counter.max(holder.fencing_token);
+                next.fencing_watermark = next.fencing_watermark.max(holder.fencing_token);
+                lock.writer = Some(RwHolder {
+                    client: SNAPSHOT_DETACHED_CLIENT,
+                    fencing_token: holder.fencing_token,
+                    lock_uuid: holder.lock_uuid,
+                });
+            }
+            next.fencing_watermark = next.fencing_watermark.max(lock.fencing_counter);
+            if lock.is_idle() || lock_snapshot.idle {
+                lock.timestamp_emptied = Some(now);
+            }
+            next.locks.insert(lock_snapshot.key, lock);
+        }
+
+        for deadline in snapshot.deadlines {
+            if !snapshot_deadline_matches_state(&next, &deadline) {
+                return Err(format!(
+                    "broker snapshot deadline for `{}` does not match restored holder state",
+                    deadline.lock_uuid
+                ));
+            }
+            next.deadline_seq = next.deadline_seq.wrapping_add(1);
+            let deadline_at = now
+                .checked_add(Duration::from_millis(deadline.remaining_ms))
+                .unwrap_or(now);
+            next.deadlines.insert(
+                (deadline_at, next.deadline_seq),
+                DeadlineEntry {
+                    lock_uuid: deadline.lock_uuid,
+                    keys: deadline.keys,
+                    kind: deadline.kind,
+                    client: SNAPSHOT_DETACHED_CLIENT,
+                },
+            );
+        }
+
+        *state = next;
         Ok(())
     }
 
@@ -2283,6 +2618,166 @@ fn metrics_u64(metrics: &serde_json::Value, field: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn broker_metrics_from_state(state: &BrokerState) -> BrokerMetrics {
+    crate::routine_id!("ddl-routine-broker-metrics-from-state-1");
+    let mut total_holders = 0u64;
+    let mut total_waiters = 0u64;
+    for lock in state.locks.values() {
+        total_holders +=
+            (lock.exclusive_holders.len() + lock.readers.len() + lock.writer.iter().count()) as u64;
+        total_waiters += lock.queue.len() as u64;
+    }
+    BrokerMetrics {
+        keys: state.locks.len() as u64,
+        holders: total_holders,
+        waiters: total_waiters,
+        clients: state.clients.len() as u64,
+        pending_deadlines: state.deadlines.len() as u64,
+        ttl_evictions_total: state.ttl_evictions_total,
+        max_concurrency_cap: state.config.max_concurrency_cap,
+        concurrency_cap_clamps_total: state.concurrency_cap_clamps_total,
+        fencing_watermark: state.fencing_watermark,
+        idle_keys_pruned_total: state.idle_keys_pruned_total,
+    }
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    crate::routine_id!("ddl-routine-broker-duration-ms-u64-1");
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn deadline_entry_is_still_held(state: &BrokerState, entry: &DeadlineEntry) -> bool {
+    crate::routine_id!("ddl-routine-broker-deadline-entry-held-1");
+    entry.keys.iter().any(|key| {
+        state
+            .locks
+            .get(key)
+            .map(|lock| lock_contains_uuid_for_kind(lock, &entry.lock_uuid, &entry.kind))
+            .unwrap_or(false)
+    })
+}
+
+fn lock_contains_uuid_for_kind(lock: &LockState, lock_uuid: &str, kind: &RwHoldKind) -> bool {
+    crate::routine_id!("ddl-routine-broker-lock-contains-kind-1");
+    match kind {
+        RwHoldKind::Exclusive => lock.exclusive_holders.contains_key(lock_uuid),
+        RwHoldKind::Read => lock.readers.contains_key(lock_uuid),
+        RwHoldKind::Write => lock
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.lock_uuid == lock_uuid),
+    }
+}
+
+fn validate_broker_raft_snapshot(snapshot: &BrokerRaftSnapshot) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-validate-broker-raft-snapshot-1");
+    if snapshot.schema_version != 1 {
+        return Err(format!(
+            "unsupported broker snapshot schema version {}",
+            snapshot.schema_version
+        ));
+    }
+    if snapshot.metrics.waiters != 0 {
+        return Err(format!(
+            "cannot install broker snapshot with queued waiters; waiters={}",
+            snapshot.metrics.waiters
+        ));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for lock in &snapshot.locks {
+        if lock.key.is_empty() {
+            return Err("broker snapshot contains an empty lock key".into());
+        }
+        if !keys.insert(lock.key.clone()) {
+            return Err(format!(
+                "broker snapshot contains duplicate lock key `{}`",
+                lock.key
+            ));
+        }
+        if lock.max == 0 {
+            return Err(format!(
+                "broker snapshot lock `{}` has invalid max=0",
+                lock.key
+            ));
+        }
+        let mut lock_uuids = std::collections::BTreeSet::new();
+        for holder in &lock.exclusive_holders {
+            if holder.lock_uuid.is_empty() {
+                return Err(format!(
+                    "broker snapshot lock `{}` has an empty exclusive holder uuid",
+                    lock.key
+                ));
+            }
+            if !lock_uuids.insert(holder.lock_uuid.clone()) {
+                return Err(format!(
+                    "broker snapshot lock `{}` repeats holder uuid `{}`",
+                    lock.key, holder.lock_uuid
+                ));
+            }
+        }
+        for holder in &lock.readers {
+            if holder.lock_uuid.is_empty() {
+                return Err(format!(
+                    "broker snapshot lock `{}` has an empty reader uuid",
+                    lock.key
+                ));
+            }
+            if !lock_uuids.insert(holder.lock_uuid.clone()) {
+                return Err(format!(
+                    "broker snapshot lock `{}` repeats holder uuid `{}`",
+                    lock.key, holder.lock_uuid
+                ));
+            }
+        }
+        if let Some(writer) = &lock.writer {
+            if writer.lock_uuid.is_empty() {
+                return Err(format!(
+                    "broker snapshot lock `{}` has an empty writer uuid",
+                    lock.key
+                ));
+            }
+            if !lock_uuids.insert(writer.lock_uuid.clone()) {
+                return Err(format!(
+                    "broker snapshot lock `{}` repeats holder uuid `{}`",
+                    lock.key, writer.lock_uuid
+                ));
+            }
+        }
+    }
+    for deadline in &snapshot.deadlines {
+        if deadline.lock_uuid.is_empty() {
+            return Err("broker snapshot deadline has an empty lock uuid".into());
+        }
+        if deadline.keys.is_empty() {
+            return Err(format!(
+                "broker snapshot deadline for `{}` has no keys",
+                deadline.lock_uuid
+            ));
+        }
+        if deadline.keys.iter().any(|key| key.is_empty()) {
+            return Err(format!(
+                "broker snapshot deadline for `{}` contains an empty key",
+                deadline.lock_uuid
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_deadline_matches_state(
+    state: &BrokerState,
+    deadline: &BrokerRaftDeadlineSnapshot,
+) -> bool {
+    crate::routine_id!("ddl-routine-broker-snapshot-deadline-matches-1");
+    deadline.keys.iter().all(|key| {
+        state
+            .locks
+            .get(key)
+            .map(|lock| lock_contains_uuid_for_kind(lock, &deadline.lock_uuid, &deadline.kind))
+            .unwrap_or(false)
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrokerMetrics {
     pub keys: u64,
@@ -2345,6 +2840,78 @@ mod tests {
             out.push(msg);
         }
         out
+    }
+
+    #[test]
+    fn raft_snapshot_restores_active_detached_holder_and_deadline() {
+        crate::routine_id!("ddl-routine-broker-test-raft-snapshot-active-holder-1");
+        let broker = Broker::new(BrokerConfig::default());
+        let (client, mut rx) = broker.register_client();
+        broker.handle_request(
+            client,
+            Request::Lock {
+                uuid: "snapshot-lock-request".into(),
+                key: Some("snapshot-key".into()),
+                keys: None,
+                pid: Some(123),
+                ttl: Some(10_000),
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        let lock_uuid = drain(&mut rx)
+            .into_iter()
+            .find_map(|response| match response {
+                Response::Lock {
+                    acquired: true,
+                    lock_uuid,
+                    ..
+                } => lock_uuid,
+                _ => None,
+            })
+            .expect("lock granted");
+        broker.detach_lock_from_client(client, &lock_uuid);
+        broker.drop_client(client);
+        assert_eq!(broker.metrics().holders, 1);
+        assert_eq!(broker.metrics().pending_deadlines, 1);
+
+        let payload = serde_json::json!({
+            "broker": broker.snapshot_for_raft().expect("broker snapshot"),
+        });
+        Broker::validate_raft_snapshot_payload(&payload).expect("valid snapshot payload");
+
+        let restored = Broker::new(BrokerConfig::default());
+        restored
+            .install_raft_snapshot(&payload)
+            .expect("install broker snapshot");
+        let metrics = restored.metrics();
+        assert_eq!(metrics.holders, 1);
+        assert_eq!(metrics.waiters, 0);
+        assert_eq!(metrics.pending_deadlines, 1);
+        let top = restored.top_keys(1);
+        assert_eq!(top.len(), 1);
+        assert_eq!(top[0].key, "snapshot-key");
+        assert_eq!(top[0].exclusive_holders, 1);
+
+        let (unlocker, mut unlock_rx) = restored.register_client();
+        restored.handle_request(
+            unlocker,
+            Request::Unlock {
+                uuid: "snapshot-unlock".into(),
+                key: Some("snapshot-key".into()),
+                keys: None,
+                lock_uuid: Some(lock_uuid),
+                force: false,
+            },
+        );
+        assert!(matches!(
+            drain(&mut unlock_rx).as_slice(),
+            [Response::Unlock { unlocked: true, .. }]
+        ));
+        assert_eq!(restored.metrics().holders, 0);
     }
 
     #[test]

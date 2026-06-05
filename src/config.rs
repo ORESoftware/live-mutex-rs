@@ -98,6 +98,8 @@ struct RaftFileConfig {
     append_entries_max_entries: Option<usize>,
     append_entries_max_bytes: Option<usize>,
     install_snapshot_chunk_bytes: Option<usize>,
+    client_batch_max_entries: Option<usize>,
+    client_batch_max_delay_ms: Option<u64>,
     peers: Vec<RaftPeerConfig>,
 }
 
@@ -310,6 +312,14 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.install_snapshot_chunk_bytes = env_parse("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES")
         .or(file.install_snapshot_chunk_bytes)
         .unwrap_or(cfg.install_snapshot_chunk_bytes);
+    cfg.client_batch_max_entries = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES")
+        .or(file.client_batch_max_entries)
+        .unwrap_or(cfg.client_batch_max_entries);
+    cfg.client_batch_max_delay = Duration::from_millis(
+        env_parse("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS")
+            .or(file.client_batch_max_delay_ms)
+            .unwrap_or(cfg.client_batch_max_delay.as_millis() as u64),
+    );
     cfg.peers = file.peers.clone();
     Ok(cfg)
 }
@@ -387,6 +397,8 @@ mod tests {
             append_entries_max_entries = 17
             append_entries_max_bytes = 12345
             install_snapshot_chunk_bytes = 54321
+            client_batch_max_entries = 19
+            client_batch_max_delay_ms = 7
 
             [[raft.peers]]
             id = "node-1"
@@ -409,5 +421,7 @@ mod tests {
         assert_eq!(raft.append_entries_max_entries, 17);
         assert_eq!(raft.append_entries_max_bytes, 12345);
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
+        assert_eq!(raft.client_batch_max_entries, 19);
+        assert_eq!(raft.client_batch_max_delay, Duration::from_millis(7));
     }
 }

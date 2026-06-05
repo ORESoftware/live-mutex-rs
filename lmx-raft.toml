@@ -45,6 +45,8 @@ trailing_log_entries = 10000
 append_entries_max_entries = 256
 append_entries_max_bytes = 1048576
 install_snapshot_chunk_bytes = 1048576
+client_batch_max_entries = 32
+client_batch_max_delay_ms = 1
 
 [[raft.peers]]
 id = "node-1"

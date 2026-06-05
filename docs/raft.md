@@ -12,35 +12,41 @@ leader.
 
 ## Implementation Status
 
-BrokerRaft is a real Raft-shaped broker path, but it is not yet an
-etcd/ZooKeeper-grade consensus system.
+BrokerRaft implements the core Raft consensus mechanics used by this broker
+path, but it is not yet an etcd/ZooKeeper-grade consensus system.
 
 Implemented:
 
 - leader election with `RequestVote`,
+- a current-term no-op barrier appended and committed after a leader election,
 - leader-ordered lock operations,
 - quorum commit based on peer count, such as 2-of-3 or 3-of-5,
 - durable local hard state and append-only logs,
 - incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
   `nextIndex`, `matchIndex`, and bounded catch-up batches,
 - follower log conflict detection and truncation repair,
+- durable term persistence before replying to higher-term append failures,
+- malformed `AppendEntries` rejection for non-contiguous indexes and
+  impossible future-term entries,
+- bounded leader-local client request batching for the HTTP write path,
+- deterministic lock UUID and fencing-token grant metadata in client-request log
+  entries,
 - chunked `InstallSnapshot` catch-up for followers behind the compacted prefix,
-  limited to the current idle-broker snapshot format,
+- active broker-state snapshots for holders, fencing counters, and TTL deadlines,
+  staged on receiver disk before install,
 - SHA-256 snapshot payload checksums verified before snapshot install,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
+- transient learner catch-up for new peer IDs before joint-consensus promotion,
 - persistent Raft peer connection reuse for vote, append, and snapshot RPCs,
 - leader-aware HTTP routing support via `/raft/leaderz`,
 - conservative local snapshot/compaction for disk control.
 
 Still missing:
 
-- full non-idle broker state snapshots and restore,
-- learner/staging workflows for adding a cold node before it is promoted to a
-  voter,
-- request batching and pipelining for the hot path,
-- streaming snapshots directly to disk instead of staging one assembled snapshot
-  payload in memory,
+- queued-waiter snapshots and restore,
+- a persistent learner API for operators to inspect and manage staged nodes,
+- request pipelining for the hot path,
 - production hardening comparable to etcd or ZooKeeper.
 
 That means BrokerRaft should currently be treated as an experimental
@@ -106,9 +112,9 @@ operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
-reuse open TCP connections. This path is still correctness-first rather than
-throughput-optimized because writes are serialized and not yet batched or
-pipelined.
+reuse open TCP connections. The leader can coalesce concurrent client requests
+into bounded append/replicate/commit batches, but the commit lane is still
+correctness-first and not yet pipelined.
 
 ## Membership Change Sequence
 
@@ -167,7 +173,10 @@ compacts entries only when all of these are true:
 - the entries are committed,
 - the entries are applied,
 - the snapshot covers the compacted index,
-- the local Broker state is idle.
+- the local Broker has no queued waiters.
 
-That conservative rule saves disk during idle periods while preserving replay
-safety for live locks and waiters.
+The snapshot stores active holders, fencing counters, and TTL deadlines, so a
+node can restart or receive `InstallSnapshot` without losing active HTTP-held
+locks. Queued waiters are still kept behind the replay boundary because their
+receivers are transport-local; while waiters exist, BrokerRaft retains the log
+entries needed to rebuild that state.

@@ -281,40 +281,43 @@ the in-broker TLS is rarely needed.
 
 ## Scaling, durability, and HA
 
-### Why single-replica
+### Regular Broker: why single-replica
 
-All lock state lives in `Broker` process memory: holders, queues,
-fencing-token counters, deadline BTreeMap, and the partial-grant
-tracker. Two replicas would each have their own state, so:
+For the regular non-Raft Broker, all lock state lives in one process memory:
+holders, queues, fencing-token counters, deadline BTreeMap, and the
+partial-grant tracker. Two regular Broker replicas would each have their own
+state, so:
 
 - A client connecting to replica A and a client connecting to
   replica B would never see each other's locks (split brain).
 - Service-level mutual exclusion would silently degrade, which is
   the worst possible failure mode for a locking service.
 
-Therefore: 1 replica, `Recreate` strategy, no `HorizontalPodAutoscaler`.
+Therefore the regular Broker deployment uses 1 replica, `Recreate` strategy,
+and no `HorizontalPodAutoscaler`.
 
-### Pod restarts and lock loss
+### Regular Broker pod restarts and lock loss
 
-A pod restart drops all in-memory state. Holders that were holding
-locks at the moment of restart get a `connection reset` on their
-TCP socket; they are responsible for re-acquiring on reconnect, and
-the broker will mint **new** fencing tokens. Use TTLs (default
-4 s) so callers that don't reconnect promptly free up their slots
-naturally.
+A regular Broker pod restart drops all in-memory state. Holders that were
+holding locks at the moment of restart get a `connection reset` on their TCP
+socket; they are responsible for re-acquiring on reconnect, and the regular
+broker will mint **new** fencing tokens. Use TTLs (default 4 s) so callers that
+don't reconnect promptly free up their slots naturally.
 
-If you need the broker to survive its own crash, the right answer
-is one of:
+If you need the lock service to survive a broker crash, the right answer is one
+of:
 
-1. **Active-passive HA** behind a single-leader gate (e.g. a
+1. **BrokerRaft** as a separate three- or five-node StatefulSet/deployment path.
+   BrokerRaft uses leader election, quorum commit, replicated logs, and
+   deterministic grant metadata for lock UUID/fencing-token replay; see
+   `## High availability` in the readme and [`docs/raft.md`](raft.md) for the
+   state and sequence diagrams.
+2. **Active-passive HA** behind a single-leader gate (e.g. a
    Postgres advisory lock or a Kubernetes `Lease`). Only the leader
    serves clients; the passive replica picks up if the leader's
-   `Lease` lapses. Fencing tokens reset on failover, so callers
-   must be prepared to see the counter restart.
-2. **Replicated state via Raft.** BrokerRaft is available as a
-   separate StatefulSet/deployment path; see `## High availability`
-   in the readme and [`docs/raft.md`](raft.md) for the state and
-   sequence diagrams.
+   `Lease` lapses. This is a legacy design option for the regular Broker:
+   fencing tokens reset on failover, so callers must be prepared to see the
+   counter restart.
 
 In practice, the single-replica + `Recreate` posture has been
 sufficient for our production workloads; the broker restarts in
