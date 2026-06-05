@@ -42,6 +42,8 @@ snapshot_interval_ms = 1800000
 snapshot_max_log_entries = 100000
 snapshot_max_log_bytes = 67108864
 trailing_log_entries = 10000
+install_snapshot_max_staged_bytes = 134217728
+install_snapshot_max_staged_transfers = 4
 
 [[raft.peers]]
 id = "node-1"
