@@ -673,7 +673,10 @@ Generic inbound Raft request/response frames rejected before JSON parsing
 because they exceed the frame cap increment
 `dd_rust_network_mutex_raft_rpc_inbound_frame_rejections_total`; generic
 outbound request/response frames rejected before socket write increment
-`dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total`.
+`dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total`. Under-cap
+request/response frames rejected because they cannot be decoded as the expected
+Raft JSON shape increment
+`dd_rust_network_mutex_raft_rpc_malformed_frames_total`.
 Followers also decode incoming `InstallSnapshot` chunks and enforce
 `raft.install_snapshot_chunk_bytes` before term/leader mutation; oversized
 chunks increment

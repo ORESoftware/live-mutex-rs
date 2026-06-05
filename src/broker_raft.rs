@@ -336,6 +336,7 @@ pub struct RaftTelemetrySnapshot {
     pub raft_rpc_response_mismatches_total: u64,
     pub raft_rpc_inbound_frame_rejections_total: u64,
     pub raft_rpc_outbound_frame_rejections_total: u64,
+    pub raft_rpc_malformed_frames_total: u64,
     pub pre_vote_malformed_requests_total: u64,
     pub request_vote_malformed_requests_total: u64,
     pub client_proposals_total: u64,
@@ -1022,6 +1023,7 @@ struct BrokerRaftTelemetry {
     raft_rpc_response_mismatches_total: AtomicU64,
     raft_rpc_inbound_frame_rejections_total: AtomicU64,
     raft_rpc_outbound_frame_rejections_total: AtomicU64,
+    raft_rpc_malformed_frames_total: AtomicU64,
     pre_vote_malformed_requests_total: AtomicU64,
     request_vote_malformed_requests_total: AtomicU64,
     client_proposals_total: AtomicU64,
@@ -2618,6 +2620,10 @@ impl BrokerRaft {
                 .telemetry
                 .raft_rpc_outbound_frame_rejections_total
                 .load(Ordering::Relaxed),
+            raft_rpc_malformed_frames_total: self
+                .telemetry
+                .raft_rpc_malformed_frames_total
+                .load(Ordering::Relaxed),
             pre_vote_malformed_requests_total: self
                 .telemetry
                 .pre_vote_malformed_requests_total
@@ -2837,6 +2843,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total Raft peer RPC request or response frames rejected locally before socket write because serialized bytes exceeded the configured frame cap.\n",
                 "# TYPE dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total counter\n",
                 "dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_rpc_malformed_frames_total Raft peer RPC request or response frames rejected after frame-size checks because they could not be decoded as the expected Raft JSON shape.\n",
+                "# TYPE dd_rust_network_mutex_raft_rpc_malformed_frames_total counter\n",
+                "dd_rust_network_mutex_raft_rpc_malformed_frames_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_pre_vote_malformed_requests_total Malformed PreVote requests rejected before term or vote mutation.\n",
                 "# TYPE dd_rust_network_mutex_raft_pre_vote_malformed_requests_total counter\n",
                 "dd_rust_network_mutex_raft_pre_vote_malformed_requests_total {}\n",
@@ -2875,6 +2884,7 @@ impl BrokerRaft {
             snapshot.raft_rpc_response_mismatches_total,
             snapshot.raft_rpc_inbound_frame_rejections_total,
             snapshot.raft_rpc_outbound_frame_rejections_total,
+            snapshot.raft_rpc_malformed_frames_total,
             snapshot.pre_vote_malformed_requests_total,
             snapshot.request_vote_malformed_requests_total,
         );
@@ -4522,7 +4532,21 @@ impl BrokerRaft {
                     return Err(err.into());
                 }
             };
-            let rpc: RaftRpc = serde_json::from_str(line.trim())?;
+            let rpc = match deserialize_raft_rpc_frame_counted(
+                &line,
+                &self.telemetry.raft_rpc_malformed_frames_total,
+            ) {
+                Ok(rpc) => rpc,
+                Err(err) => {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        error = %err,
+                        "raft inbound RPC frame rejected by JSON decode",
+                    );
+                    return Err(err);
+                }
+            };
             let response = self.handle_rpc(rpc).await;
             let response_kind = raft_rpc_response_kind(&response);
             let body = match serialize_raft_rpc_response_frame_bounded(
@@ -8218,6 +8242,7 @@ impl BrokerRaft {
                 timeout,
                 &self.telemetry.raft_rpc_inbound_frame_rejections_total,
                 &self.telemetry.raft_rpc_outbound_frame_rejections_total,
+                &self.telemetry.raft_rpc_malformed_frames_total,
                 &self.telemetry.raft_rpc_response_mismatches_total,
             )
             .await;
@@ -8230,6 +8255,15 @@ impl BrokerRaft {
                     request_kind,
                     error = %err,
                     "raft outbound RPC request rejected by frame cap",
+                );
+            } else if matches!(err, BrokerRaftError::Json(_)) {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    peer = %peer.id,
+                    request_kind,
+                    error = %err,
+                    "raft inbound RPC response rejected by JSON decode",
                 );
             }
         }
@@ -8661,6 +8695,28 @@ fn serialize_raft_rpc_response_frame_bounded(
     Ok(body)
 }
 
+fn deserialize_raft_rpc_frame_counted(
+    line: &str,
+    malformed_frame_counter: &AtomicU64,
+) -> Result<RaftRpc, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-deserialize-rpc-frame-counted-1");
+    serde_json::from_str(line.trim()).map_err(|err| {
+        malformed_frame_counter.fetch_add(1, Ordering::Relaxed);
+        BrokerRaftError::Json(err)
+    })
+}
+
+fn deserialize_raft_rpc_response_frame_counted(
+    line: &str,
+    malformed_frame_counter: &AtomicU64,
+) -> Result<RaftRpcResponse, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-deserialize-rpc-response-frame-counted-1");
+    serde_json::from_str(line.trim()).map_err(|err| {
+        malformed_frame_counter.fetch_add(1, Ordering::Relaxed);
+        BrokerRaftError::Json(err)
+    })
+}
+
 fn raft_rpc_response_matches_request(rpc: &RaftRpc, response: &RaftRpcResponse) -> bool {
     crate::routine_id!("ddl-routine-broker-raft-rpc-response-matches-1");
     matches!(response, RaftRpcResponse::Error { .. })
@@ -8780,6 +8836,7 @@ impl<'a> RaftRpcConnectionCall<'a> {
         timeout: Duration,
         inbound_frame_rejection_counter: &AtomicU64,
         outbound_frame_rejection_counter: &AtomicU64,
+        malformed_frame_counter: &AtomicU64,
         response_mismatch_counter: &AtomicU64,
     ) -> Result<RaftRpcResponse, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-rpc-conn-call-guard-call-1");
@@ -8791,6 +8848,7 @@ impl<'a> RaftRpcConnectionCall<'a> {
                 timeout,
                 inbound_frame_rejection_counter,
                 outbound_frame_rejection_counter,
+                malformed_frame_counter,
                 response_mismatch_counter,
             )
             .await;
@@ -8816,6 +8874,7 @@ impl RaftRpcConnection {
         timeout: Duration,
         inbound_frame_rejection_counter: &AtomicU64,
         outbound_frame_rejection_counter: &AtomicU64,
+        malformed_frame_counter: &AtomicU64,
         response_mismatch_counter: &AtomicU64,
     ) -> Result<RaftRpcResponse, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-rpc-conn-call-1");
@@ -8840,7 +8899,11 @@ impl RaftRpcConnection {
 
             let result = tokio::time::timeout(
                 timeout,
-                self.call_connected(&body, inbound_frame_rejection_counter),
+                self.call_connected(
+                    &body,
+                    inbound_frame_rejection_counter,
+                    malformed_frame_counter,
+                ),
             )
             .await;
             match result {
@@ -8882,6 +8945,7 @@ impl RaftRpcConnection {
         &mut self,
         body: &[u8],
         inbound_frame_rejection_counter: &AtomicU64,
+        malformed_frame_counter: &AtomicU64,
     ) -> Result<RaftRpcResponse, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-rpc-conn-connected-1");
         let reader = self
@@ -8899,7 +8963,7 @@ impl RaftRpcConnection {
             inbound_frame_rejection_counter,
         )
         .await?;
-        Ok(serde_json::from_str(line.trim())?)
+        deserialize_raft_rpc_response_frame_counted(&line, malformed_frame_counter)
     }
 
     fn reset(&mut self) {
@@ -23483,6 +23547,35 @@ mod tests {
             metrics.contains("dd_rust_network_mutex_raft_rpc_outbound_frame_rejections_total 2")
         );
         assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_frame_rejections_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn raft_rpc_malformed_frames_are_counted_and_exported() {
+        let dir = temp_dir("raft-rpc-malformed-frame-counters");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let request_err = deserialize_raft_rpc_frame_counted(
+            "{not-json",
+            &raft.telemetry.raft_rpc_malformed_frames_total,
+        )
+        .expect_err("malformed request frame should be counted");
+        assert!(matches!(request_err, BrokerRaftError::Json(_)));
+
+        let response_err = deserialize_raft_rpc_response_frame_counted(
+            r#"{"type":"requestVote","term":1}"#,
+            &raft.telemetry.raft_rpc_malformed_frames_total,
+        )
+        .expect_err("malformed response frame should be counted");
+        assert!(matches!(response_err, BrokerRaftError::Json(_)));
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.raft_rpc_malformed_frames_total, 2);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_rpc_malformed_frames_total 2"));
 
         let _ = fs::remove_dir_all(dir);
     }
