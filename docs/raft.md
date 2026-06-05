@@ -10,6 +10,34 @@ the in-process broker state is changed. Followers can receive HTTP lock
 requests from a round-robin load balancer and proxy them to the current
 leader.
 
+## Implementation Status
+
+BrokerRaft is a real Raft-shaped broker path, but it is not yet an
+etcd/ZooKeeper-grade consensus system.
+
+Implemented:
+
+- leader election with `RequestVote`,
+- leader-ordered lock operations,
+- quorum commit based on peer count, such as 2-of-3 or 3-of-5,
+- durable local hard state and append-only logs,
+- incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
+  `nextIndex`, and `matchIndex`,
+- follower log conflict detection and truncation repair,
+- leader-aware HTTP routing support via `/raft/leaderz`,
+- conservative local snapshot/compaction for disk control.
+
+Still missing:
+
+- `InstallSnapshot` RPC for followers that fall behind the compacted prefix,
+- dynamic membership changes and joint consensus,
+- persistent connection pooling/batching for the hot path,
+- production hardening comparable to etcd or ZooKeeper,
+- recovery from non-idle broker snapshots.
+
+That means BrokerRaft should currently be treated as an experimental
+high-availability broker backend, not as a finished distributed lock service.
+
 ## State Diagram
 
 ```mermaid
@@ -65,9 +93,10 @@ If the load balancer can prefer the leader, it should use
 `GET /raft/leaderz` as the leader-only health check. That removes the proxy
 hop shown above. Correctness does not depend on leader-aware routing, because
 followers proxy writes and the leader still requires quorum before applying.
-The current leader write path is serialized and followers rewrite the full log
-on each append, so this path is intentionally correctness-first rather than
-throughput-optimized.
+The current leader write path is still serialized, and each committed lock
+operation is durably written before applying. Followers now receive incremental
+log suffixes instead of a full-log rewrite on every append, but this path is
+still correctness-first rather than throughput-optimized.
 
 ## Failover Event Trace
 
