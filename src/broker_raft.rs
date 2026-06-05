@@ -3802,6 +3802,54 @@ mod tests {
     }
 
     #[test]
+    fn handle_install_snapshot_rejects_out_of_order_chunk_and_clears_transfer() {
+        let dir = temp_dir("raft-handle-install-snapshot-bad-offset");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = snapshot_payload_bytes_sha256(&bytes);
+        let split = bytes.len() / 2;
+
+        let first = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            0,
+            false,
+            BASE64.encode(&bytes[..split]),
+        );
+        assert!(matches!(
+            first,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+
+        let bad = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            split.saturating_add(1) as u64,
+            true,
+            BASE64.encode(&bytes[split..]),
+        );
+        assert!(
+            matches!(bad, RaftRpcResponse::Error { ref error, .. } if error.contains("offset mismatch"))
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert!(raft.log.latest_snapshot().is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn handle_install_snapshot_rejects_missing_or_bad_checksum() {
         let dir = temp_dir("raft-handle-install-snapshot-checksum");
         let cfg = test_raft_config(dir.clone());
