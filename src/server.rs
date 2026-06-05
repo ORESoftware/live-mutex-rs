@@ -897,7 +897,8 @@ fn http_request_id(
 
 async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-server-raft-metrics-1");
-    let body = state.metrics.render(state.raft.broker());
+    let mut body = state.metrics.render(state.raft.broker());
+    body.push_str(&state.raft.raft_metrics_text());
     (
         StatusCode::OK,
         [(

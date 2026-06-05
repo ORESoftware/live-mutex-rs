@@ -37,11 +37,19 @@ Implemented:
 - durable local term/vote hard state and append-only logs with persisted-log gap
   and term-regression validation on read, including
   latest-snapshot/log-boundary consistency checks,
+- startup validation rejects durable `commitIndex` values ahead of the available
+  latest-snapshot/log boundary instead of silently lowering a committed index
+  after local data loss,
 - leader and follower commit advancement persist `commitIndex` before applying
   committed entries, so restart replay cannot lose a locally committed operation,
 - durable snapshots are treated as committed through `lastIncludedIndex` on
   startup, and live `InstallSnapshot` advances durable hard state before broker
   state observes the snapshot payload,
+- live `InstallSnapshot` applies durable hard-state, membership, learner, and
+  response-cache side effects before installing broker state, so sidecar
+  persistence failures cannot partially replace the state machine,
+- broker snapshot validation checks TTL deadline records against restored
+  holders before install, closing a late-failure path in snapshot apply,
 - synced atomic renames for hard state, snapshot files, sidecar learner state,
   and rewritten log segments; snapshot install fsyncs the new snapshot before
   rewriting the retained log suffix so restart recovery can trust the snapshot
@@ -70,6 +78,9 @@ Implemented:
 - same-term leader conflict rejection for vote, append, and snapshot RPC paths,
 - leader progress updates capped to the AppendEntries batch or snapshot actually
   sent, rather than trusting inflated follower response indexes,
+- stale or delayed conflict responses cannot rewind a peer's `nextIndex` below
+  its known `matchIndex + 1`, preserving the leader progress invariant under
+  overlapping catch-up retries,
 - bounded leader-local client request batching for the HTTP write path,
 - proposal-quorum failure demotion: if a leader appends a client entry but
   cannot commit that target index, it returns unavailable and steps down so load
@@ -104,11 +115,26 @@ Implemented:
 - transient learner catch-up for new peer IDs before joint-consensus promotion,
 - required post-promotion catch-up so every newly promoted voter reaches the
   final membership log index before the membership change returns,
+- learner and new-voter catch-up runs peers concurrently and retries each peer
+  immediately after bounded-batch progress instead of sleeping for the heartbeat
+  interval between every batch,
 - interrupted joint-consensus membership changes can be finished by reposting
   the exact joint config's new peer set, while different peer sets remain
   rejected until the final simple config is committed,
 - operator progress inspection via `GET /raft/progress`, including per-peer
   `nextIndex`, `matchIndex`, lag, and staged-learner visibility,
+- Raft `/metrics` counters for append progress updates, conflict repairs, and
+  conflict clamps:
+  `dd_rust_network_mutex_raft_append_progress_updates_total`,
+  `dd_rust_network_mutex_raft_append_conflict_repairs_total`, and
+  `dd_rust_network_mutex_raft_append_conflict_clamps_total`; invalid
+  `AppendEntries(success=true)` responses that underreport the matched boundary
+  increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`,
+- Raft `/metrics` counters for leader-side `InstallSnapshot` chunk attempts,
+  raw snapshot payload bytes, and snapshot-driven peer progress:
+  `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_bytes_total`, and
+  `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`,
 - consensus-replicated staged-learner management via `GET/POST/DELETE
   /raft/learners`, with a local restart cache and snapshot coverage; promotion
   still goes through log-backed joint consensus,
@@ -126,6 +152,9 @@ Implemented:
   request/response stalls,
 - buffered JSON serialization for append-log, rewritten-log, and snapshot file
   writes before the same fsync/atomic-rename durability steps,
+- cached durable hard state with exact duplicate write elision, so repeated
+  unchanged term/vote/commit persistence requests do not rewrite and fsync
+  `raft-hard-state.json`,
 - explicit `raft.sync_log` / `LMX_RAFT_SYNC_LOG` durability policy: the default
   keeps append-log fsyncs enabled, while `false` is reserved for unsafe
   throughput experiments that accept loss of the latest unsynced log writes
@@ -133,9 +162,24 @@ Implemented:
 - leader-local durable append/fsync work is offloaded from the async runtime's
   core workers before quorum replication begins, preserving durable-before-ack
   ordering without stalling unrelated HTTP and Raft RPC tasks on that worker,
-- follower-side `AppendEntries` append/truncate/repair work is also offloaded
-  to Tokio's blocking pool, so durable follower catch-up does not occupy Raft
-  peer RPC async workers while it waits on filesystem writes,
+- candidate self-vote term/vote persistence is offloaded from the election task,
+  keeping election-time hard-state writes off async workers,
+- leader-side commit finalization is offloaded as well, so persisted
+  `commitIndex` advancement, in-order apply, and snapshot/compaction checks do
+  not occupy the proposal or replication-progress async worker after quorum,
+- leader step-down term/vote persistence is offloaded from live election,
+  replication, request-admission, and quorum-loss async paths,
+- live `RequestVote` handling is offloaded when it can persist term/vote hard
+  state, avoiding election fsyncs on Raft peer RPC async workers,
+- live follower-side `AppendEntries` receive handling is also offloaded to
+  Tokio's blocking pool, so higher-term hard-state writes, durable
+  append/truncate/repair, commit advancement, apply, and compaction checks do
+  not occupy Raft peer RPC async workers while waiting on filesystem writes,
+- `InstallSnapshot` receive handling runs on the blocking pool as well, keeping
+  large chunk writes, checksum verification, JSON parsing, snapshot install, and
+  retained-log rewrite work off core async peer-RPC workers,
+- periodic snapshot/compaction maintenance also runs on the blocking pool, so
+  snapshot serialization and retained-log rewrites do not pin an async worker,
 - leader-local request batching with an early wake when the pending queue reaches
   the configured batch size,
 - bounded leader-local client admission through `client_batch_max_pending`, so a
@@ -278,16 +322,44 @@ additional commits while that worker is running schedule another round instead
 of spawning overlapping background replication tasks.
 Local append-log and snapshot serialization is buffered before fsync, reducing
 small write syscall churn. With the default `raft.sync_log = true`,
-leader-local append/fsync work and follower-side `AppendEntries`
-append/truncate/repair work run on Tokio's blocking pool, so the consensus write
-still waits for required disk durability but ordinary async workers are not
-occupied by blocking filesystem calls. Setting `raft.sync_log = false` skips
-append-log fsyncs and parent-directory syncs on append/rewrite paths; it can be
-useful for isolating disk-sync cost in benchmarks, but it weakens crash
-durability and should not be used for etcd/ZooKeeper-style safety claims.
+leader-local append/fsync work, candidate self-vote persistence, leader-side
+commit finalization, leader step-down persistence, live `RequestVote` handling,
+and live follower-side `AppendEntries` receive handling run on Tokio's blocking
+pool, so the consensus write still waits for required disk durability but
+ordinary async workers are not occupied by blocking filesystem calls.
+`InstallSnapshot` receive handling also runs there, so large snapshot chunk
+writes, checksum verification, JSON parsing, snapshot install, and retained-log
+rewrites do not block core peer-RPC workers. Periodic snapshot/compaction
+maintenance uses the same blocking pool boundary.
+Snapshot apply emits structured `lmx::raft` tracing at the hard-state,
+membership, learner, broker-install, and final runtime-index boundaries so
+operators can see where an install stopped without inferring from files alone.
+Append progress and conflict repair emit debug-level `lmx::raft` events with
+the previous and repaired `nextIndex`/`matchIndex`, the sent batch boundary, and
+whether a stale conflict hint was clamped by known follower progress.
+Impossible `AppendEntries(success=true)` responses that report a `matchIndex`
+below the matched previous entry or sent batch are rejected as non-progress and
+counted in the invalid-success metric.
+Hard state is cached after startup and after successful durable writes; an
+identical term/vote/commit write is elided, while a changed hard state still
+uses the same fsync and atomic rename path before the cache is updated.
+Setting `raft.sync_log = false` skips append-log fsyncs and parent-directory
+syncs on append/rewrite paths; it can be useful for isolating disk-sync cost in
+benchmarks, but it weakens crash durability and should not be used for
+etcd/ZooKeeper-style safety claims.
 When a replication round changes a peer's `nextIndex` or `matchIndex`, the
 leader retries immediately; it sleeps for the heartbeat interval only when the
-round made no progress.
+round made no progress. The retry loop tracks this with a monotonic
+leader-progress generation counter, so it does not clone the whole peer progress
+map on every bounded catch-up round.
+Hot leader checks use a nonblocking role/term cache, and follower proxying uses
+a cached leader peer hint when the runtime mutex is contended, so LB-routed HTTP
+traffic and heartbeat tasks do not pile up behind unrelated Raft state work.
+Follower/candidate election maintenance sleeps until the current election
+deadline instead of polling the runtime mutex every 20 ms; failed election
+attempts still back off briefly before retrying.
+Demotion paths publish non-leader before slow hard-state writes, while write
+admission still verifies leader readiness through the normal quorum/term checks.
 
 ## Profiling
 

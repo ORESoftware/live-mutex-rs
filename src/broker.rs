@@ -2964,6 +2964,12 @@ fn validate_broker_raft_snapshot(snapshot: &BrokerRaftSnapshot) -> Result<(), St
                 deadline.lock_uuid
             ));
         }
+        if !snapshot_deadline_matches_locks(&snapshot.locks, deadline) {
+            return Err(format!(
+                "broker snapshot deadline for `{}` does not match restored holder state",
+                deadline.lock_uuid
+            ));
+        }
     }
     Ok(())
 }
@@ -3056,6 +3062,33 @@ fn snapshot_deadline_matches_state(
             .locks
             .get(key)
             .map(|lock| lock_contains_uuid_for_kind(lock, &deadline.lock_uuid, &deadline.kind))
+            .unwrap_or(false)
+    })
+}
+
+fn snapshot_deadline_matches_locks(
+    locks: &[BrokerRaftLockSnapshot],
+    deadline: &BrokerRaftDeadlineSnapshot,
+) -> bool {
+    crate::routine_id!("ddl-routine-broker-snapshot-deadline-matches-locks-1");
+    deadline.keys.iter().all(|key| {
+        locks
+            .iter()
+            .find(|lock| &lock.key == key)
+            .map(|lock| match deadline.kind {
+                RwHoldKind::Exclusive => lock
+                    .exclusive_holders
+                    .iter()
+                    .any(|holder| holder.lock_uuid == deadline.lock_uuid),
+                RwHoldKind::Read => lock
+                    .readers
+                    .iter()
+                    .any(|holder| holder.lock_uuid == deadline.lock_uuid),
+                RwHoldKind::Write => lock
+                    .writer
+                    .as_ref()
+                    .is_some_and(|holder| holder.lock_uuid == deadline.lock_uuid),
+            })
             .unwrap_or(false)
     })
 }
@@ -3216,6 +3249,50 @@ mod tests {
             [Response::Unlock { unlocked: true, .. }]
         ));
         assert_eq!(restored.metrics().holders, 0);
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_deadline_without_matching_holder() {
+        crate::routine_id!("ddl-routine-broker-test-raft-snapshot-deadline-holder-1");
+        let broker = Broker::new(BrokerConfig::default());
+        let (client, mut rx) = broker.register_client();
+        broker.handle_request(
+            client,
+            Request::Lock {
+                uuid: "snapshot-deadline-request".into(),
+                key: Some("snapshot-deadline-key".into()),
+                keys: None,
+                pid: Some(123),
+                ttl: Some(10_000),
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        let lock_uuid = drain(&mut rx)
+            .into_iter()
+            .find_map(|response| match response {
+                Response::Lock {
+                    acquired: true,
+                    lock_uuid,
+                    ..
+                } => lock_uuid,
+                _ => None,
+            })
+            .expect("lock granted");
+        broker.detach_lock_from_client(client, &lock_uuid);
+        let mut payload = serde_json::json!({
+            "broker": broker.snapshot_for_raft().expect("broker snapshot"),
+        });
+        payload["broker"]["deadlines"][0]["lockUuid"] =
+            serde_json::Value::String("missing-holder".into());
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("deadline without matching holder must be rejected");
+
+        assert!(err.contains("does not match restored holder state"));
     }
 
     #[test]

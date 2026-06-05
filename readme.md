@@ -166,6 +166,14 @@ regular Broker server under the benchmark, and `scripts/profile-raft.sh` for
 the Raft integration-test workload. Both scripts build with the `profiling`
 profile and force frame pointers so `perf`, `sample`, or flamegraph output has
 usable stacks.
+BrokerRaft also keeps small nonblocking leader role/term and leader peer hint
+caches for hot forwarding and heartbeat checks; demotion paths clear the role
+cache before slow hard-state writes, and write admission still uses the normal
+leader-readiness checks. The election loop sleeps until the current election
+deadline while follower/candidate instead of polling the runtime mutex every
+20 ms. Durable hard state is cached after startup and successful writes, so
+exact duplicate term/vote/commit writes are elided instead of rewriting and
+fsyncing `raft-hard-state.json`.
 
 Local loopback measurement on 2026-06-05 with 8 workers, 256 keys, a
 leader-preferred 3-node BrokerRaft cluster, and 3-second runs:
@@ -537,14 +545,22 @@ request. Leader conflict-hint repair
 uses a retained-log term index to move `nextIndex` without rereading the whole
 retained log file; `prevLogTerm`, bounded replication batches, and committed
 apply ranges also use the validated retained-log cache instead of reparsing the
-log file on each hot-path read. Leader-local appends and follower-side
-`AppendEntries` append/truncate/repair work are offloaded to Tokio's blocking
-pool so disk durability does not occupy core async workers. Raft client IDs are
-namespaced with a stable node-derived prefix, so replicated `DropClient` cleanup
-from one leader cannot collide with client IDs created by another leader.
-Committed writes trigger an
+log file on each hot-path read. Leader-local appends, candidate self-vote
+persistence, leader-side commit finalization, leader step-down persistence, live
+`RequestVote` handling, and live follower-side `AppendEntries` receive handling
+are offloaded to Tokio's blocking pool so disk durability, commit advancement,
+apply, and compaction checks do not occupy core async workers. `InstallSnapshot`
+receive handling uses the blocking pool too, keeping large chunk writes,
+checksum verification, JSON parsing, snapshot install, and retained-log rewrites
+off core peer-RPC workers. Periodic snapshot/compaction maintenance uses the
+same blocking boundary. Raft client IDs are namespaced with a stable
+node-derived prefix, so replicated `DropClient` cleanup from one leader cannot
+collide with client IDs created by another leader. Committed writes trigger an
 immediate background `AppendEntries` fan-out so followers learn the updated
-`leaderCommit` without waiting for the next heartbeat tick. The current
+`leaderCommit` without waiting for the next heartbeat tick. Bounded catch-up
+uses a monotonic leader-progress generation counter to retry immediately after
+real `nextIndex`/`matchIndex` movement without cloning the full peer progress map
+each round. The current
 implementation is still slower
 than the regular Broker under concurrent HTTP load, but the leader now drains
 up to `client_batch_max_entries * client_pipeline_max_batches` pending requests
@@ -563,15 +579,25 @@ buffered before the same fsync/atomic-rename durability steps, reducing small
 write syscall churn without changing durable-before-ack ordering. Raft term/vote
 hard state and log entries are persisted; leader-side `commitIndex` advancement
 and follower `leaderCommit` advancement are also persisted before applying
-committed entries. A durable snapshot also normalizes startup `commitIndex` to at
-least its `lastIncludedIndex`, and live `InstallSnapshot` persists that hard
-state before applying the snapshot payload to broker state. Dynamic membership
-is implemented with joint-consensus log entries, and new peer IDs are first
+committed entries. Exact duplicate hard-state writes are skipped from an
+in-memory durable-state cache, while changed hard state still goes through the
+same atomic fsync path before the cache advances. A durable snapshot also
+normalizes startup `commitIndex` to at least its `lastIncludedIndex`; startup
+now rejects a durable `commitIndex` ahead of the available snapshot/log boundary
+instead of silently lowering a committed index after local data loss. Live
+`InstallSnapshot` persists hard state, membership, learner, and response-cache
+side effects before installing broker state, and broker snapshot validation now
+checks TTL deadline records against restored holders before install. The
+snapshot apply boundary emits structured `lmx::raft` tracing for hard-state,
+sidecar, broker-install, and final runtime-index progress. Dynamic membership is
+implemented with joint-consensus log entries, and new peer IDs are first
 caught up as transient learners before they are promoted to voters. The joint
 config entry itself requires the joint old+new quorum, so an old majority alone
 cannot apply a membership transition. After promotion, every newly promoted
 voter must catch up to the final membership log index before the membership
-change returns, and
+change returns; learner/new-voter catch-up now runs peers concurrently and
+retries each peer immediately after bounded-batch progress instead of sleeping
+for the heartbeat interval between batches, and
 `GET /raft/progress` exposes staged learner progress.
 `GET/POST/DELETE /raft/learners` provides consensus-replicated staged-learner
 management for operator add/remove workflows, with a local restart cache and
@@ -579,7 +605,20 @@ snapshot coverage. Promotion remains log-backed through the joint-consensus
 membership endpoint.
 If leader progress for a peer is missing, catch-up starts from the retained
 snapshot/log boundary instead of assuming the peer already has the leader's
-tail.
+tail. Stale conflict responses cannot rewind a peer's `nextIndex` below its
+known `matchIndex + 1`, and debug-level `lmx::raft` append-progress events
+include the sent batch boundary plus conflict-repair/clamp details. Raft
+`/metrics` also exposes
+`dd_rust_network_mutex_raft_append_progress_updates_total`,
+`dd_rust_network_mutex_raft_append_conflict_repairs_total`, and
+`dd_rust_network_mutex_raft_append_conflict_clamps_total`. Impossible
+`AppendEntries(success=true)` replies that report a `matchIndex` below the
+matched previous entry or sent batch are treated as non-progress and increment
+`dd_rust_network_mutex_raft_append_invalid_success_responses_total`.
+Leader-side `InstallSnapshot` catch-up exposes
+`dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
+`dd_rust_network_mutex_raft_install_snapshot_bytes_total`, and
+`dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`.
 Old log entries are compacted only after they are committed, applied, and
 covered by a durable snapshot. Snapshots now carry active holders, queued
 waiters, fencing counters, and TTL deadlines, so `InstallSnapshot` can catch up
