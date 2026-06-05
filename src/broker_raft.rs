@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
@@ -29,6 +31,7 @@ const HARD_STATE_FILE: &str = "raft-hard-state.json";
 const DEFAULT_RAFT_RPC_MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_APPEND_ENTRIES_MAX_ENTRIES: usize = 256;
 const DEFAULT_APPEND_ENTRIES_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct BrokerRaftConfig {
@@ -60,6 +63,9 @@ pub struct BrokerRaftConfig {
     /// batch. The first entry is still sent even if it exceeds this budget so
     /// progress cannot stall on one large command.
     pub append_entries_max_bytes: usize,
+    /// Serialized snapshot payload bytes per `InstallSnapshot` chunk. Base64
+    /// encoding makes the wire frame larger than this raw byte budget.
+    pub install_snapshot_chunk_bytes: usize,
     pub peers: Vec<RaftPeerConfig>,
 }
 
@@ -82,6 +88,7 @@ impl Default for BrokerRaftConfig {
             trailing_log_entries: 10_000,
             append_entries_max_entries: DEFAULT_APPEND_ENTRIES_MAX_ENTRIES,
             append_entries_max_bytes: DEFAULT_APPEND_ENTRIES_MAX_BYTES,
+            install_snapshot_chunk_bytes: DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES,
             peers: Vec::new(),
         }
     }
@@ -139,6 +146,11 @@ impl BrokerRaftConfig {
         if self.append_entries_max_bytes == 0 {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.append_entries_max_bytes must be greater than 0".into(),
+            ));
+        }
+        if self.install_snapshot_chunk_bytes == 0 {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.install_snapshot_chunk_bytes must be greater than 0".into(),
             ));
         }
         Ok(())
@@ -347,6 +359,16 @@ pub enum BrokerRaftError {
         votes: usize,
         quorum: usize,
     },
+    #[error("raft snapshot at index {index} is missing payload checksum")]
+    SnapshotChecksumMissing { index: u64 },
+    #[error(
+        "raft snapshot payload checksum mismatch at index {index}; expected={expected} actual={actual}"
+    )]
+    SnapshotChecksumMismatch {
+        index: u64,
+        expected: String,
+        actual: String,
+    },
     #[error("raft RPC error: {0}")]
     Rpc(String),
 }
@@ -393,7 +415,10 @@ enum RaftRpc {
         leader_id: String,
         last_included_index: u64,
         last_included_term: u64,
-        payload: serde_json::Value,
+        payload_sha256: Option<String>,
+        offset: u64,
+        done: bool,
+        data: String,
     },
     ProxyRequest {
         request: Request,
@@ -505,6 +530,8 @@ pub struct RaftSnapshotMetadata {
     pub last_included_index: u64,
     pub last_included_term: u64,
     pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +558,12 @@ struct RaftLogState {
 #[derive(Debug)]
 struct RaftMaintenanceState {
     last_snapshot_at: Instant,
+}
+
+#[derive(Debug)]
+struct PendingSnapshotTransfer {
+    bytes: Vec<u8>,
+    updated_at_ms: u64,
 }
 
 #[derive(Debug)]
@@ -836,10 +869,12 @@ impl RaftLogStore {
     ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-write-snapshot-1");
         let mut state = self.state.lock();
+        let payload_sha256 = snapshot_payload_sha256(&payload)?;
         let metadata = RaftSnapshotMetadata {
             last_included_index,
             last_included_term,
             created_at_ms: unix_ms(),
+            payload_sha256: Some(payload_sha256),
         };
         let snapshot = RaftSnapshotFile {
             metadata: metadata.clone(),
@@ -863,10 +898,13 @@ impl RaftLogStore {
         &self,
         last_included_index: u64,
         last_included_term: u64,
+        payload_sha256: Option<String>,
         payload: serde_json::Value,
     ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-install-snapshot-log-1");
         let mut state = self.state.lock();
+        let verified_payload_sha256 =
+            verify_snapshot_payload_checksum(last_included_index, &payload, payload_sha256)?;
         if let Some(existing) = state
             .latest_snapshot
             .as_ref()
@@ -890,6 +928,7 @@ impl RaftLogStore {
             last_included_index,
             last_included_term,
             created_at_ms: unix_ms(),
+            payload_sha256: Some(verified_payload_sha256),
         };
         let snapshot = RaftSnapshotFile {
             metadata: metadata.clone(),
@@ -979,6 +1018,7 @@ pub struct BrokerRaft {
     maintenance: Arc<Mutex<RaftMaintenanceState>>,
     commit_lock: Arc<tokio::sync::Mutex<()>>,
     rpc_connections: Arc<Mutex<BTreeMap<String, Arc<AsyncMutex<RaftRpcConnection>>>>>,
+    snapshot_transfers: Arc<Mutex<BTreeMap<String, PendingSnapshotTransfer>>>,
 }
 
 impl BrokerRaft {
@@ -1028,6 +1068,7 @@ impl BrokerRaft {
             })),
             commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             rpc_connections: Arc::new(Mutex::new(BTreeMap::new())),
+            snapshot_transfers: Arc::new(Mutex::new(BTreeMap::new())),
             config,
             log,
         };
@@ -1427,13 +1468,19 @@ impl BrokerRaft {
                 leader_id,
                 last_included_index,
                 last_included_term,
-                payload,
+                payload_sha256,
+                offset,
+                done,
+                data,
             } => self.handle_install_snapshot(
                 term,
                 leader_id,
                 last_included_index,
                 last_included_term,
-                payload,
+                payload_sha256,
+                offset,
+                done,
+                data,
             ),
             RaftRpc::ProxyRequest {
                 request,
@@ -1551,7 +1598,7 @@ impl BrokerRaft {
                 hard_state = Some(runtime.hard_state());
             }
             runtime.role = RaftRole::Follower;
-            runtime.leader_id = Some(leader_id);
+            runtime.leader_id = Some(leader_id.clone());
             runtime.election_deadline = self.next_election_deadline();
         }
 
@@ -1624,7 +1671,10 @@ impl BrokerRaft {
         leader_id: String,
         last_included_index: u64,
         last_included_term: u64,
-        payload: serde_json::Value,
+        payload_sha256: Option<String>,
+        offset: u64,
+        done: bool,
+        data: String,
     ) -> RaftRpcResponse {
         crate::routine_id!("ddl-routine-broker-raft-handle-install-snapshot-1");
         let mut hard_state = None;
@@ -1647,15 +1697,85 @@ impl BrokerRaft {
                 hard_state = Some(runtime.hard_state());
             }
             runtime.role = RaftRole::Follower;
-            runtime.leader_id = Some(leader_id);
+            runtime.leader_id = Some(leader_id.clone());
             runtime.election_deadline = self.next_election_deadline();
         }
 
+        let expected_checksum = match payload_sha256.clone() {
+            Some(checksum) => checksum,
+            None => {
+                return RaftRpcResponse::Error {
+                    term: self.runtime.lock().current_term,
+                    error: BrokerRaftError::SnapshotChecksumMissing {
+                        index: last_included_index,
+                    }
+                    .to_string(),
+                };
+            }
+        };
         let current_snapshot_index = self
             .log
             .latest_snapshot()
             .map(|snapshot| snapshot.last_included_index)
             .unwrap_or(0);
+        let chunk = match decode_snapshot_chunk(&data) {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                self.discard_snapshot_transfer(
+                    &leader_id,
+                    last_included_index,
+                    last_included_term,
+                    &expected_checksum,
+                );
+                return RaftRpcResponse::Error {
+                    term: self.runtime.lock().current_term,
+                    error: err.to_string(),
+                };
+            }
+        };
+        let payload_bytes = match self.stage_snapshot_chunk(
+            &leader_id,
+            last_included_index,
+            last_included_term,
+            &expected_checksum,
+            offset,
+            done,
+            chunk,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return RaftRpcResponse::Error {
+                    term: self.runtime.lock().current_term,
+                    error: err.to_string(),
+                };
+            }
+        };
+        let Some(payload_bytes) = payload_bytes else {
+            return RaftRpcResponse::InstallSnapshot {
+                term: self.runtime.lock().current_term,
+                success: true,
+                last_included_index: current_snapshot_index,
+            };
+        };
+        if let Err(err) = verify_snapshot_payload_bytes_checksum(
+            last_included_index,
+            &payload_bytes,
+            payload_sha256.clone(),
+        ) {
+            return RaftRpcResponse::Error {
+                term: self.runtime.lock().current_term,
+                error: err.to_string(),
+            };
+        }
+        let payload: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+            Ok(payload) => payload,
+            Err(err) => {
+                return RaftRpcResponse::Error {
+                    term: self.runtime.lock().current_term,
+                    error: err.to_string(),
+                };
+            }
+        };
         let snapshot_membership = match membership_from_snapshot_payload(&payload) {
             Ok(membership) => membership,
             Err(err) => {
@@ -1676,6 +1796,7 @@ impl BrokerRaft {
             let installed = match self.log.install_snapshot_from_leader(
                 last_included_index,
                 last_included_term,
+                payload_sha256.clone(),
                 payload.clone(),
             ) {
                 Ok(snapshot) => snapshot,
@@ -2048,71 +2169,98 @@ impl BrokerRaft {
             return Ok(false);
         };
         let last_included_index = snapshot.metadata.last_included_index;
-        let rpc = RaftRpc::InstallSnapshot {
-            term,
-            leader_id: self.config.node_id.clone(),
-            last_included_index,
-            last_included_term: snapshot.metadata.last_included_term,
-            payload: snapshot.payload,
+        let payload_sha256 = match snapshot.metadata.payload_sha256.clone() {
+            Some(checksum) => checksum,
+            None => snapshot_payload_sha256(&snapshot.payload)?,
         };
+        let payload_bytes = serde_json::to_vec(&snapshot.payload)?;
         let timeout = self
             .config
             .election_timeout_min
             .max(self.config.heartbeat_interval.saturating_mul(2))
             .max(Duration::from_millis(250));
-        match self.send_rpc_to_peer(&peer, rpc, timeout).await {
-            Ok(RaftRpcResponse::InstallSnapshot {
-                term: peer_term,
-                success,
-                last_included_index: installed_index,
-            }) => {
-                if peer_term > term {
-                    self.step_down(peer_term, None);
+        let chunk_size = self.config.install_snapshot_chunk_bytes.max(1);
+        let mut offset = 0usize;
+        loop {
+            let end = if payload_bytes.is_empty() {
+                0
+            } else {
+                offset.saturating_add(chunk_size).min(payload_bytes.len())
+            };
+            let done = end >= payload_bytes.len();
+            let data = BASE64.encode(&payload_bytes[offset..end]);
+            let rpc = RaftRpc::InstallSnapshot {
+                term,
+                leader_id: self.config.node_id.clone(),
+                last_included_index,
+                last_included_term: snapshot.metadata.last_included_term,
+                payload_sha256: Some(payload_sha256.clone()),
+                offset: offset as u64,
+                done,
+                data,
+            };
+            match self.send_rpc_to_peer(&peer, rpc, timeout).await {
+                Ok(RaftRpcResponse::InstallSnapshot {
+                    term: peer_term,
+                    success,
+                    last_included_index: installed_index,
+                }) => {
+                    if peer_term > term {
+                        self.step_down(peer_term, None);
+                        return Ok(false);
+                    }
+                    if !success {
+                        return Ok(false);
+                    }
+                    if done {
+                        let mut runtime = self.runtime.lock();
+                        let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
+                            RaftPeerProgress {
+                                next_index: installed_index.saturating_add(1),
+                                match_index: 0,
+                            },
+                        );
+                        progress.match_index = progress.match_index.max(installed_index);
+                        progress.next_index = progress
+                            .next_index
+                            .max(progress.match_index.saturating_add(1));
+                        return Ok(target_index.is_none_or(|target| progress.match_index >= target));
+                    }
+                }
+                Ok(RaftRpcResponse::Error {
+                    term: peer_term,
+                    error,
+                }) => {
+                    if peer_term > term {
+                        self.step_down(peer_term, None);
+                    }
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        error,
+                        "install snapshot rejected",
+                    );
                     return Ok(false);
                 }
-                if success {
-                    let mut runtime = self.runtime.lock();
-                    let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
-                        RaftPeerProgress {
-                            next_index: installed_index.saturating_add(1),
-                            match_index: 0,
-                        },
+                Ok(_) => return Ok(false),
+                Err(err) => {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        error = %err,
+                        "install snapshot failed",
                     );
-                    progress.match_index = progress.match_index.max(installed_index);
-                    progress.next_index = progress
-                        .next_index
-                        .max(progress.match_index.saturating_add(1));
-                    Ok(target_index.is_none_or(|target| progress.match_index >= target))
-                } else {
-                    Ok(false)
+                    return Ok(false);
                 }
             }
-            Ok(RaftRpcResponse::Error {
-                term: peer_term,
-                error,
-            }) => {
-                if peer_term > term {
-                    self.step_down(peer_term, None);
-                }
-                debug!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    peer = %peer.id,
-                    error,
-                    "install snapshot rejected",
-                );
-                Ok(false)
+            if done {
+                return Ok(false);
             }
-            Ok(_) => Ok(false),
-            Err(err) => {
-                debug!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    peer = %peer.id,
-                    error = %err,
-                    "install snapshot failed",
-                );
-                Ok(false)
+            offset = end;
+            if payload_bytes.is_empty() {
+                return Ok(false);
             }
         }
     }
@@ -2276,6 +2424,73 @@ impl BrokerRaft {
             "raft log compacted",
         );
         Ok(())
+    }
+
+    fn stage_snapshot_chunk(
+        &self,
+        leader_id: &str,
+        last_included_index: u64,
+        last_included_term: u64,
+        payload_sha256: &str,
+        offset: u64,
+        done: bool,
+        chunk: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-stage-snapshot-chunk-1");
+        let key = snapshot_transfer_key(
+            leader_id,
+            last_included_index,
+            last_included_term,
+            payload_sha256,
+        );
+        let mut transfers = self.snapshot_transfers.lock();
+        if offset == 0 {
+            transfers.insert(
+                key.clone(),
+                PendingSnapshotTransfer {
+                    bytes: Vec::new(),
+                    updated_at_ms: unix_ms(),
+                },
+            );
+        }
+        let Some(pending) = transfers.get_mut(&key) else {
+            return Err(BrokerRaftError::Rpc(format!(
+                "snapshot chunk for index {last_included_index} started at offset {offset} without offset 0"
+            )));
+        };
+        let expected_offset = pending.bytes.len() as u64;
+        if expected_offset != offset {
+            transfers.remove(&key);
+            return Err(BrokerRaftError::Rpc(format!(
+                "snapshot chunk offset mismatch for index {last_included_index}; expected={} got={offset}",
+                expected_offset
+            )));
+        }
+        pending.bytes.extend_from_slice(&chunk);
+        pending.updated_at_ms = unix_ms();
+        if done {
+            Ok(transfers.remove(&key).map(|pending| pending.bytes))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn discard_snapshot_transfer(
+        &self,
+        leader_id: &str,
+        last_included_index: u64,
+        last_included_term: u64,
+        payload_sha256: &str,
+    ) {
+        crate::routine_id!("ddl-routine-broker-raft-discard-snapshot-transfer-1");
+        self.snapshot_transfers
+            .lock()
+            .remove(&snapshot_transfer_key(
+                leader_id,
+                last_included_index,
+                last_included_term,
+                payload_sha256,
+            ));
     }
 
     async fn send_rpc_to_peer(
@@ -2699,7 +2914,95 @@ fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaf
     }
     let file = File::open(path)?;
     let snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
+    if let Some(expected) = snapshot.metadata.payload_sha256.as_deref() {
+        verify_snapshot_payload_checksum(
+            snapshot.metadata.last_included_index,
+            &snapshot.payload,
+            Some(expected.to_string()),
+        )?;
+    }
     Ok(Some(snapshot))
+}
+
+fn snapshot_payload_sha256(payload: &serde_json::Value) -> Result<String, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-sha256-1");
+    let bytes = serde_json::to_vec(payload)?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn snapshot_payload_bytes_sha256(bytes: &[u8]) -> String {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-bytes-sha256-1");
+    sha256_hex(bytes)
+}
+
+fn verify_snapshot_payload_checksum(
+    index: u64,
+    payload: &serde_json::Value,
+    expected: Option<String>,
+) -> Result<String, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-verify-snapshot-sha256-1");
+    let expected = expected.ok_or(BrokerRaftError::SnapshotChecksumMissing { index })?;
+    let actual = snapshot_payload_sha256(payload)?;
+    if actual != expected {
+        return Err(BrokerRaftError::SnapshotChecksumMismatch {
+            index,
+            expected,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+fn verify_snapshot_payload_bytes_checksum(
+    index: u64,
+    bytes: &[u8],
+    expected: Option<String>,
+) -> Result<String, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-verify-snapshot-bytes-sha256-1");
+    let expected = expected.ok_or(BrokerRaftError::SnapshotChecksumMissing { index })?;
+    let actual = snapshot_payload_bytes_sha256(bytes);
+    if actual != expected {
+        return Err(BrokerRaftError::SnapshotChecksumMismatch {
+            index,
+            expected,
+            actual,
+        });
+    }
+    Ok(actual)
+}
+
+fn decode_snapshot_chunk(data: &str) -> Result<Vec<u8>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-decode-snapshot-chunk-1");
+    BASE64
+        .decode(data.as_bytes())
+        .map_err(|err| BrokerRaftError::Rpc(format!("invalid snapshot chunk encoding: {err}")))
+}
+
+fn snapshot_transfer_key(
+    leader_id: &str,
+    last_included_index: u64,
+    last_included_term: u64,
+    payload_sha256: &str,
+) -> String {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-transfer-key-1");
+    format!("{leader_id}:{last_included_index}:{last_included_term}:{payload_sha256}")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    crate::routine_id!("ddl-routine-broker-raft-sha256-hex-1");
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    crate::routine_id!("ddl-routine-broker-raft-hex-encode-1");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn read_hard_state(path: &Path) -> Result<RaftHardState, BrokerRaftError> {
@@ -2871,6 +3174,15 @@ mod tests {
                 "idleKeysPrunedTotal": 13
             }
         })
+    }
+
+    fn payload_checksum(payload: &serde_json::Value) -> String {
+        snapshot_payload_sha256(payload).expect("snapshot checksum")
+    }
+
+    fn snapshot_rpc_parts(payload: &serde_json::Value) -> (String, String) {
+        let bytes = serde_json::to_vec(payload).expect("snapshot bytes");
+        (snapshot_payload_bytes_sha256(&bytes), BASE64.encode(bytes))
     }
 
     fn test_peer(id: &str, port: u16) -> RaftPeerConfig {
@@ -3303,8 +3615,9 @@ mod tests {
             store.append(term, RaftCommand::Noop).expect("append");
         }
 
+        let payload = idle_snapshot_payload();
         let snapshot = store
-            .install_snapshot_from_leader(2, 1, idle_snapshot_payload())
+            .install_snapshot_from_leader(2, 1, Some(payload_checksum(&payload)), payload)
             .expect("install matching snapshot");
         assert_eq!(snapshot.last_included_index, 2);
         assert_eq!(
@@ -3330,8 +3643,9 @@ mod tests {
             store.append(term, RaftCommand::Noop).expect("append");
         }
 
+        let payload = idle_snapshot_payload();
         store
-            .install_snapshot_from_leader(3, 9, idle_snapshot_payload())
+            .install_snapshot_from_leader(3, 9, Some(payload_checksum(&payload)), payload)
             .expect("install conflicting snapshot");
 
         assert!(store.read_entries().expect("entries").is_empty());
@@ -3349,6 +3663,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_payload_checksum_is_persisted_and_verified_on_read() {
+        let dir = temp_dir("raft-snapshot-checksum");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let payload = idle_snapshot_payload();
+        let expected = payload_checksum(&payload);
+
+        let metadata = store
+            .write_snapshot(4, 2, payload)
+            .expect("write checksummed snapshot");
+
+        assert_eq!(metadata.payload_sha256.as_deref(), Some(expected.as_str()));
+        let snapshot = read_snapshot_file(&store.snapshot_path)
+            .expect("read checksummed snapshot")
+            .expect("snapshot exists");
+        assert_eq!(
+            snapshot.metadata.payload_sha256.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let mut tampered = serde_json::to_value(&snapshot).expect("snapshot json value");
+        tampered["payload"]["note"] = json!("tampered");
+        fs::write(
+            &store.snapshot_path,
+            serde_json::to_vec_pretty(&tampered).expect("tampered snapshot bytes"),
+        )
+        .expect("write tampered snapshot");
+
+        let err = read_snapshot_file(&store.snapshot_path)
+            .expect_err("tampered snapshot must be rejected");
+        assert!(matches!(
+            err,
+            BrokerRaftError::SnapshotChecksumMismatch { index: 4, .. }
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn handle_install_snapshot_advances_runtime_and_resets_idle_broker_state() {
         let dir = temp_dir("raft-handle-install-snapshot");
         let cfg = test_raft_config(dir.clone());
@@ -3360,7 +3712,10 @@ mod tests {
             runtime.last_applied = 1;
         }
 
-        let response = raft.handle_install_snapshot(2, "n2".into(), 7, 2, idle_snapshot_payload());
+        let payload = idle_snapshot_payload();
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+        let response =
+            raft.handle_install_snapshot(2, "n2".into(), 7, 2, Some(checksum), 0, true, data);
 
         assert!(matches!(
             response,
@@ -3382,6 +3737,216 @@ mod tests {
         assert_eq!(raft.log.last_term(), 2);
         assert_eq!(raft.broker.metrics().holders, 0);
         assert_eq!(raft.broker.metrics().waiters, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_install_snapshot_installs_after_final_chunk() {
+        let dir = temp_dir("raft-handle-install-snapshot-chunked");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = snapshot_payload_bytes_sha256(&bytes);
+        let split = bytes.len() / 2;
+
+        let first = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            0,
+            false,
+            BASE64.encode(&bytes[..split]),
+        );
+        assert!(matches!(
+            first,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+        assert!(raft.log.latest_snapshot().is_none());
+
+        let second = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            split as u64,
+            true,
+            BASE64.encode(&bytes[split..]),
+        );
+        assert!(matches!(
+            second,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 7,
+            }
+        ));
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("installed snapshot")
+                .last_included_index,
+            7
+        );
+        assert_eq!(raft.broker.metrics().holders, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_install_snapshot_rejects_missing_or_bad_checksum() {
+        let dir = temp_dir("raft-handle-install-snapshot-checksum");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let missing_payload = idle_snapshot_payload();
+        let (_, missing_data) = snapshot_rpc_parts(&missing_payload);
+        let missing =
+            raft.handle_install_snapshot(2, "n2".into(), 7, 2, None, 0, true, missing_data);
+        assert!(
+            matches!(missing, RaftRpcResponse::Error { ref error, .. } if error.contains("missing payload checksum"))
+        );
+
+        let bad = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some("not-the-right-checksum".into()),
+            0,
+            true,
+            snapshot_rpc_parts(&idle_snapshot_payload()).1,
+        );
+        assert!(
+            matches!(bad, RaftRpcResponse::Error { ref error, .. } if error.contains("checksum mismatch"))
+        );
+        assert!(raft.log.latest_snapshot().is_none());
+        assert_eq!(raft.log.last_index(), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn install_snapshot_to_peer_sends_payload_in_chunks() {
+        let dir = temp_dir("raft-send-install-snapshot-chunked");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake snapshot peer");
+        let peer_addr = listener.local_addr().expect("fake snapshot peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.install_snapshot_chunk_bytes = 64;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let mut payload = idle_snapshot_payload();
+        payload["note"] = json!("x".repeat(512));
+        let expected_bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let expected_checksum = snapshot_payload_bytes_sha256(&expected_bytes);
+        raft.log
+            .write_snapshot(7, 3, payload)
+            .expect("write source snapshot");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 4;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_for_server = Arc::clone(&received);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept snapshot peer");
+            let mut reader = TokioBufReader::new(stream);
+            let mut expected_offset = 0u64;
+            loop {
+                let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                    .await
+                    .expect("read install snapshot chunk");
+                let rpc: RaftRpc =
+                    serde_json::from_str(&line).expect("parse install snapshot chunk");
+                let (term, index, checksum, offset, done, data) = match rpc {
+                    RaftRpc::InstallSnapshot {
+                        term,
+                        last_included_index,
+                        payload_sha256,
+                        offset,
+                        done,
+                        data,
+                        ..
+                    } => (
+                        term,
+                        last_included_index,
+                        payload_sha256.expect("checksum"),
+                        offset,
+                        done,
+                        data,
+                    ),
+                    other => panic!("unexpected rpc: {other:?}"),
+                };
+                assert_eq!(checksum, expected_checksum);
+                assert_eq!(offset, expected_offset);
+                let chunk = decode_snapshot_chunk(&data).expect("decode chunk");
+                expected_offset += chunk.len() as u64;
+                received_for_server.lock().extend_from_slice(&chunk);
+                let response = RaftRpcResponse::InstallSnapshot {
+                    term,
+                    success: true,
+                    last_included_index: if done { index } else { 0 },
+                };
+                let body = serde_json::to_vec(&response).expect("snapshot response");
+                reader
+                    .get_mut()
+                    .write_all(&body)
+                    .await
+                    .expect("write snapshot response");
+                reader
+                    .get_mut()
+                    .write_all(b"\n")
+                    .await
+                    .expect("write snapshot newline");
+                reader
+                    .get_mut()
+                    .flush()
+                    .await
+                    .expect("flush snapshot response");
+                if done {
+                    break;
+                }
+            }
+        });
+
+        let peer = RaftPeerConfig {
+            id: "n2".into(),
+            addr: peer_addr.to_string(),
+        };
+        let caught_up = raft
+            .install_snapshot_to_peer(peer, 4, Some(7))
+            .await
+            .expect("install snapshot to fake peer");
+        assert!(caught_up);
+        server.await.expect("snapshot peer server");
+        assert_eq!(received.lock().as_slice(), expected_bytes.as_slice());
+        assert_eq!(
+            raft.runtime
+                .lock()
+                .leader_progress
+                .get("n2")
+                .expect("progress")
+                .match_index,
+            7
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

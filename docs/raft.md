@@ -24,8 +24,9 @@ Implemented:
 - incremental `AppendEntries` with `prevLogIndex`, `prevLogTerm`,
   `nextIndex`, `matchIndex`, and bounded catch-up batches,
 - follower log conflict detection and truncation repair,
-- `InstallSnapshot` catch-up for followers behind the compacted prefix, limited
-  to the current idle-broker snapshot format,
+- chunked `InstallSnapshot` catch-up for followers behind the compacted prefix,
+  limited to the current idle-broker snapshot format,
+- SHA-256 snapshot payload checksums verified before snapshot install,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
 - persistent Raft peer connection reuse for vote, append, and snapshot RPCs,
@@ -38,8 +39,9 @@ Still missing:
 - learner/staging workflows for adding a cold node before it is promoted to a
   voter,
 - request batching and pipelining for the hot path,
-- production hardening comparable to etcd or ZooKeeper,
-- broader snapshot transfer mechanics such as chunking and checksums.
+- streaming snapshots directly to disk instead of staging one assembled snapshot
+  payload in memory,
+- production hardening comparable to etcd or ZooKeeper.
 
 That means BrokerRaft should currently be treated as an experimental
 high-availability broker backend, not as a finished distributed lock service.

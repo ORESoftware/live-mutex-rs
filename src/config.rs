@@ -97,6 +97,7 @@ struct RaftFileConfig {
     trailing_log_entries: Option<u64>,
     append_entries_max_entries: Option<usize>,
     append_entries_max_bytes: Option<usize>,
+    install_snapshot_chunk_bytes: Option<usize>,
     peers: Vec<RaftPeerConfig>,
 }
 
@@ -306,6 +307,9 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.append_entries_max_bytes = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES")
         .or(file.append_entries_max_bytes)
         .unwrap_or(cfg.append_entries_max_bytes);
+    cfg.install_snapshot_chunk_bytes = env_parse("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES")
+        .or(file.install_snapshot_chunk_bytes)
+        .unwrap_or(cfg.install_snapshot_chunk_bytes);
     cfg.peers = file.peers.clone();
     Ok(cfg)
 }
@@ -382,6 +386,7 @@ mod tests {
             node_id = "node-1"
             append_entries_max_entries = 17
             append_entries_max_bytes = 12345
+            install_snapshot_chunk_bytes = 54321
 
             [[raft.peers]]
             id = "node-1"
@@ -403,5 +408,6 @@ mod tests {
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 17);
         assert_eq!(raft.append_entries_max_bytes, 12345);
+        assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
     }
 }
