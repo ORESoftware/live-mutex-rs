@@ -108,8 +108,10 @@ Implemented:
 - duplicate non-final `InstallSnapshot` chunks, including delayed duplicate
   first chunks, are idempotently acknowledged without appending bytes twice or
   clearing the staged transfer, while real offset gaps still reset the transfer;
-  follower-side staged chunks, staged bytes, duplicate chunks, and offset
-  mismatches are exposed in `/metrics`,
+  follower-side staged chunks, staged bytes, duplicate chunks, offset
+  mismatches, and local staged-file length mismatches are exposed in `/metrics`
+  via counters including
+  `dd_rust_network_mutex_raft_install_snapshot_staged_file_mismatches_total`,
 - inbound `InstallSnapshot` chunks are decoded and checked against
   `raft.install_snapshot_chunk_bytes` before term/leader mutation; oversized
   chunks increment
@@ -131,8 +133,10 @@ Implemented:
   they can alter quorum state,
 - removed local nodes clear leader state, staged learners, progress, and pooled
   peer RPC connections when applying the new membership,
-- same-id peer address changes drop the old pooled RPC connection immediately
-  when applying the new membership,
+- same-id peer address changes reset leader progress and drop the old pooled RPC
+  connection immediately when applying the new membership,
+- same-id staged learner address changes reset learner progress and drop the
+  old pooled RPC connection before the learner can satisfy catch-up,
 - surviving local nodes clear any known leader or persisted vote target that is
   no longer active in the new membership before exposing the config change,
 - startup recovery rechecks persisted votes after applying snapshot and committed
@@ -164,9 +168,14 @@ Implemented:
   conflict clamps:
   `dd_rust_network_mutex_raft_append_progress_updates_total`,
   `dd_rust_network_mutex_raft_append_conflict_repairs_total`, and
-  `dd_rust_network_mutex_raft_append_conflict_clamps_total`; invalid
+  `dd_rust_network_mutex_raft_append_conflict_clamps_total`; raw conflict hints
+  that would move `nextIndex` above the failed probe or local log tail are
+  capped and counted in
+  `dd_rust_network_mutex_raft_append_conflict_high_clamps_total`; invalid
   `AppendEntries(success=true)` responses that underreport the matched boundary
   increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
+  success responses that overreport beyond the sent batch are capped and
+  increment `dd_rust_network_mutex_raft_append_capped_success_responses_total`;
   snapshot fallbacks from the append path increment
   `dd_rust_network_mutex_raft_append_snapshot_fallbacks_total`, split into
   `dd_rust_network_mutex_raft_append_snapshot_prev_term_misses_total` for
@@ -177,13 +186,19 @@ Implemented:
   `dd_rust_network_mutex_raft_append_entries_requests_total`,
   `dd_rust_network_mutex_raft_append_entries_heartbeats_total`,
   `dd_rust_network_mutex_raft_append_entries_sent_total`,
+  `dd_rust_network_mutex_raft_append_entries_frame_clamps_total`,
   `dd_rust_network_mutex_raft_append_entries_successes_total`,
   `dd_rust_network_mutex_raft_append_entries_conflicts_total`, and
-  `dd_rust_network_mutex_raft_append_entries_rpc_errors_total`,
+  `dd_rust_network_mutex_raft_append_entries_rpc_errors_total`; serialized
+  batches that would exceed the Raft RPC frame cap are shortened by exact frame
+  sizing before the socket write and counted in the frame-clamp counter,
 - follower-side malformed leader-RPC counters for frames rejected before
   leader/term mutation:
   `dd_rust_network_mutex_raft_append_entries_malformed_requests_total` and
   `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`;
+  sender rejections for unknown, stale, or conflicting leaders are counted in
+  `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
+  `dd_rust_network_mutex_raft_follower_install_snapshot_sender_rejections_total`;
   oversized snapshot chunks also increment
   `dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total`, while
   staged-transfer byte limit rejections increment
@@ -199,6 +214,7 @@ Implemented:
 - BrokerRaft request-flow counters and gauges for profiling where request time
   goes before, during, and after consensus:
   `dd_rust_network_mutex_raft_client_proposals_total`,
+  `dd_rust_network_mutex_raft_client_proposal_quorum_failures_total`,
   `dd_rust_network_mutex_raft_client_queue_full_total`,
   `dd_rust_network_mutex_raft_client_batches_total`,
   `dd_rust_network_mutex_raft_client_batch_entries_total`,
@@ -228,13 +244,26 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_successes_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
-  `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`; success
+  `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`;
+  configured raw snapshot chunks whose serialized Raft RPC frame would exceed
+  the frame cap after base64/JSON overhead are clamped by exact frame sizing and
+  counted in
+  `dd_rust_network_mutex_raft_install_snapshot_frame_chunk_clamps_total`; success
   responses received before the leader sends the final chunk are ignored for
   peer progress and counted in
-  `dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total`;
+  final success responses that underreport the installed snapshot index are
+  ignored for progress and counted in
+  `dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total`;
+  final success responses that overreport the installed snapshot index are
+  capped to the sent snapshot boundary and counted in
+  `dd_rust_network_mutex_raft_install_snapshot_capped_success_responses_total`,
 - log-retention counters and gauges:
   `dd_rust_network_mutex_raft_log_compactions_total`,
   `dd_rust_network_mutex_raft_log_compacted_entries_total`,
+  `dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total`,
+  `dd_rust_network_mutex_raft_log_compaction_cadence_triggers_total`,
+  `dd_rust_network_mutex_raft_log_compaction_safety_skips_total`,
   `dd_rust_network_mutex_raft_log_write_rollbacks_total`,
   `dd_rust_network_mutex_raft_log_write_rollback_errors_total`,
   `dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total`,
@@ -246,6 +275,10 @@ Implemented:
   `dd_rust_network_mutex_raft_last_log_index`,
   `dd_rust_network_mutex_raft_commit_index`,
   `dd_rust_network_mutex_raft_last_applied`,
+  `dd_rust_network_mutex_raft_latest_snapshot_index`,
+  `dd_rust_network_mutex_raft_latest_snapshot_age_ms`,
+  `dd_rust_network_mutex_raft_snapshot_maintenance_age_ms`,
+  `dd_rust_network_mutex_raft_log_compaction_eligible_index`,
   `dd_rust_network_mutex_raft_peer_max_lag_entries`,
   `dd_rust_network_mutex_raft_leader_quorum_age_ms`, and
   `dd_rust_network_mutex_raft_leader_ready`; log write rollback attempts and
@@ -436,11 +469,13 @@ counters so profiling runs can distinguish normal catch-up from expensive local
 log repair. Follower suffix repair uses lower-bound retained-log slicing to
 keep the retained prefix instead of scanning it entry by entry, then truncates
 the log file at the retained-prefix byte offset and appends the leader suffix
-instead of rewriting the full retained log. If that write path reports an error,
-the retained log/index/byte cache is reloaded from disk before the follower
-returns the failure. Append-only and truncate-and-append log writers roll the
-file length back on write/flush/sync failure so partial suffix bytes are not
-left behind.
+instead of rewriting the full retained log. The in-memory retained entries,
+serialized-byte cache, and term indexes are truncated and extended in place
+after the disk write succeeds, so conflict repair does not clone a large
+retained prefix. If that write path reports an error, the retained
+log/index/byte cache is reloaded from disk before the follower returns the
+failure. Append-only and truncate-and-append log writers roll the file length
+back on write/flush/sync failure so partial suffix bytes are not left behind.
 Follower snapshot install also keeps any matching retained suffix with an
 indexed retained-log slice instead of clone-filtering the full retained cache.
 Follower snapshot staging treats duplicate already-covered non-final chunks as
