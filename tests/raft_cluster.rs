@@ -21,11 +21,8 @@ static RAFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 
 struct RaftCluster {
     http_ports: Vec<u16>,
-    raft_ports: Vec<u16>,
     peers: Vec<RaftPeerConfig>,
-    initial_peers: Vec<RaftPeerConfig>,
     data_dir: PathBuf,
-    tuning: RaftClusterTuning,
     handles: Vec<Option<JoinHandle<()>>>,
 }
 
@@ -36,22 +33,6 @@ impl RaftCluster {
             let _ = handle.await;
         }
         wait_for_http_unavailable(self.http_ports[index], "/raft/status").await;
-    }
-
-    async fn restart_node(&mut self, index: usize) {
-        assert!(
-            self.handles[index].is_none(),
-            "node {index} is already running"
-        );
-        self.handles[index] = Some(spawn_raft_node(
-            index,
-            &self.raft_ports,
-            &self.http_ports,
-            &self.data_dir,
-            &self.initial_peers,
-            &self.tuning,
-        ));
-        wait_for_http_port(self.http_ports[index], "/raft/status").await;
     }
 }
 
@@ -75,6 +56,8 @@ struct RaftClusterTuning {
     snapshot_max_log_entries: u64,
     snapshot_max_log_bytes: u64,
     trailing_log_entries: u64,
+    append_entries_max_entries: usize,
+    append_entries_max_bytes: usize,
     install_snapshot_chunk_bytes: usize,
 }
 
@@ -89,6 +72,8 @@ impl Default for RaftClusterTuning {
             snapshot_max_log_entries: defaults.snapshot_max_log_entries,
             snapshot_max_log_bytes: defaults.snapshot_max_log_bytes,
             trailing_log_entries: defaults.trailing_log_entries,
+            append_entries_max_entries: defaults.append_entries_max_entries,
+            append_entries_max_bytes: defaults.append_entries_max_bytes,
             install_snapshot_chunk_bytes: defaults.install_snapshot_chunk_bytes,
         }
     }
@@ -196,11 +181,8 @@ async fn start_cluster_with_tuning(
 
     let cluster = RaftCluster {
         http_ports,
-        raft_ports,
         peers,
-        initial_peers,
         data_dir,
-        tuning,
         handles,
     };
     wait_for_http(&cluster).await;
@@ -229,6 +211,8 @@ fn spawn_raft_node(
     raft.snapshot_max_log_entries = tuning.snapshot_max_log_entries;
     raft.snapshot_max_log_bytes = tuning.snapshot_max_log_bytes;
     raft.trailing_log_entries = tuning.trailing_log_entries;
+    raft.append_entries_max_entries = tuning.append_entries_max_entries;
+    raft.append_entries_max_bytes = tuning.append_entries_max_bytes;
     raft.install_snapshot_chunk_bytes = tuning.install_snapshot_chunk_bytes;
     raft.peers = initial_peers.to_vec();
     raft.broker = BrokerConfig::default();
@@ -395,6 +379,28 @@ fn simple_membership_peer_ids(membership: &Value) -> Option<BTreeSet<String>> {
     )
 }
 
+fn membership_target_peer_ids(membership: &Value) -> Option<BTreeSet<String>> {
+    match membership["state"].as_str()? {
+        "simple" => Some(
+            membership
+                .get("peers")?
+                .as_array()?
+                .iter()
+                .filter_map(|peer| peer["id"].as_str().map(str::to_string))
+                .collect(),
+        ),
+        "joint" => Some(
+            membership
+                .get("newPeers")?
+                .as_array()?
+                .iter()
+                .filter_map(|peer| peer["id"].as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 async fn wait_for_zero_holders_and_waiters(cluster: &RaftCluster) {
     let nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
     wait_for_zero_holders_and_waiters_among(cluster, &nodes).await;
@@ -471,6 +477,45 @@ async fn wait_for_status_index_at_least(port: u16, field: &str, min: u64) -> Val
     }
 }
 
+async fn wait_for_status_indexes_at_least_among(
+    cluster: &RaftCluster,
+    nodes: &[usize],
+    min_commit_index: u64,
+    min_last_applied: u64,
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut latest = Vec::new();
+    loop {
+        latest.clear();
+        let mut converged = true;
+        let mut statuses = Vec::new();
+        for index in nodes {
+            let port = cluster.http_ports[*index];
+            let Some(status) = http_get_json(port, "/raft/status").await else {
+                converged = false;
+                latest.push(format!("{port}: status unavailable"));
+                continue;
+            };
+            let commit_index = status["commitIndex"].as_u64();
+            let last_applied = status["lastApplied"].as_u64();
+            latest.push(format!(
+                "{port}: commitIndex={commit_index:?} lastApplied={last_applied:?} status={status:?}"
+            ));
+            converged &= commit_index.is_some_and(|value| value >= min_commit_index)
+                && last_applied.is_some_and(|value| value >= min_last_applied);
+            statuses.push(status);
+        }
+        if converged && statuses.len() == nodes.len() {
+            return statuses;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for raft status indexes commitIndex >= {min_commit_index} and lastApplied >= {min_last_applied}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_for_metric_at_least(port: u16, name: &str, min: u64) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut latest = None;
@@ -488,6 +533,13 @@ async fn wait_for_metric_at_least(port: u16, name: &str, min: u64) -> u64 {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn current_metric(port: u16, name: &str) -> u64 {
+    let metrics = http_get_text(port, "/metrics")
+        .await
+        .unwrap_or_else(|| panic!("metrics unavailable on port {port}"));
+    metric_value(&metrics, name).unwrap_or_else(|| panic!("metric {name} missing on port {port}"))
 }
 
 async fn start_round_robin_lb(backends: Vec<u16>) -> TestLb {
@@ -637,6 +689,11 @@ async fn raft_lb_round_robin_survives_leader_failover() {
     assert_eq!(status, 200, "acquire response: {acquire:?}");
     assert_eq!(acquire["acquired"], true, "acquire response: {acquire:?}");
     let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+    let acquired_status =
+        wait_for_status_index_at_least(cluster.http_ports[old_leader], "lastApplied", 1).await;
+    let acquired_index = acquired_status["lastApplied"]
+        .as_u64()
+        .expect("old leader lastApplied after acquire");
 
     cluster.abort_node(old_leader).await;
     let survivors: Vec<usize> = (0..cluster.http_ports.len())
@@ -644,6 +701,8 @@ async fn raft_lb_round_robin_survives_leader_failover() {
         .collect();
     let new_leader = wait_for_leader_among(&cluster, &survivors).await;
     assert_ne!(new_leader, old_leader);
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, acquired_index, acquired_index)
+        .await;
 
     let (status, release) = http_post_json(
         lb.port,
@@ -653,6 +712,17 @@ async fn raft_lb_round_robin_survives_leader_failover() {
     .await;
     assert_eq!(status, 200, "release response: {release:?}");
     assert_eq!(release["unlocked"], true, "release response: {release:?}");
+    let release_status = wait_for_status_index_at_least(
+        cluster.http_ports[new_leader],
+        "lastApplied",
+        acquired_index.saturating_add(1),
+    )
+    .await;
+    let release_index = release_status["lastApplied"]
+        .as_u64()
+        .expect("new leader lastApplied after release");
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, release_index, release_index)
+        .await;
     wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
 
     let (status, reacquire) =
@@ -662,6 +732,17 @@ async fn raft_lb_round_robin_survives_leader_failover() {
         reacquire["acquired"], true,
         "LB should route to the surviving Raft quorum after leader failover: {reacquire:?}"
     );
+    let reacquire_status = wait_for_status_index_at_least(
+        cluster.http_ports[new_leader],
+        "lastApplied",
+        release_index.saturating_add(1),
+    )
+    .await;
+    let reacquire_index = reacquire_status["lastApplied"]
+        .as_u64()
+        .expect("new leader lastApplied after reacquire");
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, reacquire_index, reacquire_index)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -707,8 +788,6 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
         .copied()
         .find(|idx| *idx != old_leader)
         .unwrap();
-    cluster.abort_node(old_leader).await;
-    cluster.abort_node(second_old_voter).await;
     let survivors = (0..cluster.http_ports.len())
         .filter(|idx| *idx != old_leader && *idx != second_old_voter)
         .collect::<Vec<_>>();
@@ -717,6 +796,63 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
         3,
         "test should leave exactly a new 5-node quorum online"
     );
+    let shrink_target = survivors
+        .iter()
+        .map(|idx| cluster.peers[*idx].clone())
+        .collect::<Vec<_>>();
+    let (status, removal) = http_post_json(
+        cluster.http_ports[old_leader],
+        "/raft/membership",
+        json!({"peers": shrink_target}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "membership removal response should commit even when it removes the current leader: {removal:?}"
+    );
+    assert_eq!(removal["clusterSize"].as_u64(), Some(3));
+    assert_eq!(removal["quorumSize"].as_u64(), Some(2));
+    let expected_survivor_ids = survivors
+        .iter()
+        .map(|idx| cluster.peers[*idx].id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_simple_membership(&cluster, &survivors, &expected_survivor_ids, 3, 2).await;
+    for removed in [old_leader, second_old_voter] {
+        let status = http_get_json(cluster.http_ports[removed], "/raft/status")
+            .await
+            .unwrap_or_else(|| panic!("removed node {removed} should still serve status"));
+        assert_eq!(
+            status["isLeader"], false,
+            "removed node must step down: {status:?}"
+        );
+        assert_eq!(
+            membership_target_peer_ids(&status["membership"]),
+            Some(expected_survivor_ids.clone()),
+            "removed node should observe a survivor-only target membership even if it is still in the old side of joint consensus: {status:?}"
+        );
+        let removed_key = format!(
+            "raft-removed-node-write-{}-{}",
+            removed,
+            uuid::Uuid::new_v4()
+        );
+        let (status, rejected) = http_post_json(
+            cluster.http_ports[removed],
+            "/v1/lock",
+            json!({"key": removed_key, "ttlMs": 5000, "waitMs": 0}),
+        )
+        .await;
+        assert_eq!(
+            status, 503,
+            "removed node must not serve direct Raft writes after applying final membership: {rejected:?}"
+        );
+        assert!(
+            rejected["error"].as_str().is_some(),
+            "removed node rejection should include an error body: {rejected:?}"
+        );
+    }
+
+    cluster.abort_node(old_leader).await;
+    cluster.abort_node(second_old_voter).await;
     let _new_leader = wait_for_leader_among(&cluster, &survivors).await;
     let survivor_ports = survivors
         .iter()
@@ -753,7 +889,7 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compaction() {
+async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let tuning = RaftClusterTuning {
         snapshot_max_log_entries: 3,
@@ -762,18 +898,12 @@ async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compacti
         install_snapshot_chunk_bytes: 128,
         ..RaftClusterTuning::default()
     };
-    let mut cluster = start_cluster_with_tuning(3, 3, tuning).await;
-    let leader = wait_for_leader(&cluster).await;
-    let lagging_follower = (0..cluster.http_ports.len())
-        .find(|idx| *idx != leader)
-        .expect("non-leader follower");
-    let other_follower = (0..cluster.http_ports.len())
-        .find(|idx| *idx != leader && *idx != lagging_follower)
-        .expect("second non-leader follower");
-    cluster.abort_node(lagging_follower).await;
+    let cluster = start_cluster_with_tuning(4, 3, tuning).await;
+    let leader = wait_for_leader_among(&cluster, &[0, 1, 2]).await;
+    let learner = cluster.peers[3].clone();
 
     for step in 0..8 {
-        let key = format!("raft-snapshot-catchup-{step}-{}", uuid::Uuid::new_v4());
+        let key = format!("raft-snapshot-learner-{step}-{}", uuid::Uuid::new_v4());
         let (status, acquire) = http_post_json(
             cluster.http_ports[leader],
             "/v1/lock",
@@ -782,11 +912,11 @@ async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compacti
         .await;
         assert_eq!(
             status, 200,
-            "snapshot catch-up acquire response: {acquire:?}"
+            "snapshot learner acquire response: {acquire:?}"
         );
         assert_eq!(
             acquire["acquired"], true,
-            "snapshot catch-up acquire response: {acquire:?}"
+            "snapshot learner acquire response: {acquire:?}"
         );
         let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
         let (status, release) = http_post_json(
@@ -797,18 +927,18 @@ async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compacti
         .await;
         assert_eq!(
             status, 200,
-            "snapshot catch-up release response: {release:?}"
+            "snapshot learner release response: {release:?}"
         );
         assert_eq!(
             release["unlocked"], true,
-            "snapshot catch-up release response: {release:?}"
+            "snapshot learner release response: {release:?}"
         );
     }
 
     let leader_status = http_get_json(cluster.http_ports[leader], "/raft/status")
         .await
         .expect("leader status after compaction writes");
-    let target_commit = leader_status["commitIndex"]
+    let pre_stage_commit = leader_status["commitIndex"]
         .as_u64()
         .expect("leader commit index");
     let leader_snapshot_index = wait_for_metric_at_least(
@@ -824,99 +954,222 @@ async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compacti
     )
     .await;
     assert!(
-        leader_snapshot_index < target_commit,
-        "test should leave a retained suffix after the compacted prefix so restart catch-up exercises InstallSnapshot plus AppendEntries; snapshot={leader_snapshot_index} commit={target_commit}"
+        leader_snapshot_index < pre_stage_commit,
+        "test should leave a retained suffix after the compacted prefix; snapshot={leader_snapshot_index} commit={pre_stage_commit}"
+    );
+    let learner_status = http_get_json(cluster.http_ports[3], "/raft/status")
+        .await
+        .expect("bootstrap learner status before staging");
+    assert_eq!(
+        learner_status["lastLogIndex"].as_u64(),
+        Some(0),
+        "bootstrap learner should start without the leader's compacted log: {learner_status:?}"
     );
 
-    cluster.restart_node(lagging_follower).await;
-    cluster.abort_node(other_follower).await;
-    let survivors = vec![leader, lagging_follower];
-    let active_leader = wait_for_leader_among(&cluster, &survivors).await;
-    let catchup_key = format!("raft-snapshot-forced-catchup-{}", uuid::Uuid::new_v4());
-    let (status, catchup_acquire) = http_post_json(
-        cluster.http_ports[active_leader],
-        "/v1/lock",
-        json!({"key": catchup_key, "ttlMs": 5000}),
+    let (status, staged) = http_post_json(
+        cluster.http_ports[leader],
+        "/raft/learners",
+        json!({"peers": [learner]}),
     )
     .await;
+    assert_eq!(status, 200, "stage learner response: {staged:?}");
     assert_eq!(
-        status, 200,
-        "forced catch-up acquire response: {catchup_acquire:?}"
+        staged["learners"].as_array().map(Vec::len),
+        Some(1),
+        "stage learner response should list the caught-up learner: {staged:?}"
     );
-    assert_eq!(
-        catchup_acquire["acquired"], true,
-        "forced catch-up acquire response: {catchup_acquire:?}"
-    );
-    let catchup_lock_uuid = catchup_acquire["lockUuid"].as_str().unwrap().to_string();
-    let (status, catchup_release) = http_post_json(
-        cluster.http_ports[active_leader],
-        "/v1/unlock",
-        json!({"key": catchup_key, "lockUuid": catchup_lock_uuid}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "forced catch-up release response: {catchup_release:?}"
-    );
-    assert_eq!(
-        catchup_release["unlocked"], true,
-        "forced catch-up release response: {catchup_release:?}"
-    );
-    let target_commit = http_get_json(cluster.http_ports[active_leader], "/raft/status")
-        .await
-        .and_then(|status| status["commitIndex"].as_u64())
-        .expect("leader commit index after forced catch-up write");
+    let stage_target = staged["progress"]["lastLogIndex"]
+        .as_u64()
+        .expect("leader last log index after learner staging");
+
     wait_for_metric_at_least(
-        cluster.http_ports[lagging_follower],
+        cluster.http_ports[3],
         "dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total",
         1,
     )
     .await;
     wait_for_metric_at_least(
-        cluster.http_ports[lagging_follower],
+        cluster.http_ports[3],
         "dd_rust_network_mutex_raft_latest_snapshot_index",
         leader_snapshot_index,
     )
     .await;
-    wait_for_status_index_at_least(
-        cluster.http_ports[lagging_follower],
-        "lastApplied",
-        target_commit,
-    )
-    .await;
-    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+    wait_for_status_index_at_least(cluster.http_ports[3], "lastApplied", stage_target).await;
 
-    let key = format!("raft-snapshot-rejoined-{}", uuid::Uuid::new_v4());
-    let (status, acquire) = http_post_json(
-        cluster.http_ports[lagging_follower],
-        "/v1/lock",
-        json!({"key": key, "ttlMs": 5000}),
+    let progress = http_get_json(cluster.http_ports[leader], "/raft/progress")
+        .await
+        .expect("leader progress after learner catch-up");
+    assert!(
+        progress["peers"].as_array().unwrap().iter().any(|peer| {
+            peer["id"].as_str() == Some("node-4")
+                && peer["stagedLearner"] == true
+                && peer["caughtUp"] == true
+        }),
+        "leader progress should show node-4 as a caught-up staged learner: {progress:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snapshot() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let tuning = RaftClusterTuning {
+        snapshot_max_log_entries: 100_000,
+        snapshot_max_log_bytes: u64::MAX,
+        append_entries_max_entries: 2,
+        append_entries_max_bytes: usize::MAX,
+        ..RaftClusterTuning::default()
+    };
+    let cluster = start_cluster_with_tuning(4, 3, tuning).await;
+    let leader = wait_for_leader_among(&cluster, &[0, 1, 2]).await;
+    let learner = cluster.peers[3].clone();
+
+    for step in 0..5 {
+        let key = format!("raft-append-learner-{step}-{}", uuid::Uuid::new_v4());
+        let (status, acquire) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/lock",
+            json!({"key": key, "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(status, 200, "append learner acquire response: {acquire:?}");
+        assert_eq!(
+            acquire["acquired"], true,
+            "append learner acquire response: {acquire:?}"
+        );
+        let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+        let (status, release) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/unlock",
+            json!({"key": key, "lockUuid": lock_uuid}),
+        )
+        .await;
+        assert_eq!(status, 200, "append learner release response: {release:?}");
+        assert_eq!(
+            release["unlocked"], true,
+            "append learner release response: {release:?}"
+        );
+    }
+
+    let leader_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status before append-only learner staging");
+    let pre_stage_commit = leader_status["commitIndex"]
+        .as_u64()
+        .expect("leader commit index");
+    assert!(
+        pre_stage_commit >= 10,
+        "test should build a multi-batch retained suffix before staging learner: {leader_status:?}"
+    );
+    assert_eq!(
+        current_metric(
+            cluster.http_ports[leader],
+            "dd_rust_network_mutex_raft_latest_snapshot_index"
+        )
+        .await,
+        0,
+        "append-only catch-up test should not compact before staging"
+    );
+    let learner_status = http_get_json(cluster.http_ports[3], "/raft/status")
+        .await
+        .expect("bootstrap learner status before append-only staging");
+    assert_eq!(
+        learner_status["lastLogIndex"].as_u64(),
+        Some(0),
+        "bootstrap learner should start empty before append-only catch-up: {learner_status:?}"
+    );
+
+    let before_batches = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_batches_total",
+    )
+    .await;
+    let before_sent = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    )
+    .await;
+    let before_fallbacks = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_snapshot_fallbacks_total",
+    )
+    .await;
+
+    let (status, staged) = http_post_json(
+        cluster.http_ports[leader],
+        "/raft/learners",
+        json!({"peers": [learner]}),
     )
     .await;
     assert_eq!(
         status, 200,
-        "restarted follower proxy acquire response: {acquire:?}"
+        "append-only stage learner response: {staged:?}"
     );
-    assert_eq!(
-        acquire["acquired"], true,
-        "restarted follower proxy acquire response: {acquire:?}"
-    );
-    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
-    let (status, release) = http_post_json(
-        cluster.http_ports[lagging_follower],
-        "/v1/unlock",
-        json!({"key": key, "lockUuid": lock_uuid}),
+    let stage_target = staged["progress"]["lastLogIndex"]
+        .as_u64()
+        .expect("leader last log index after append-only learner staging");
+    wait_for_status_index_at_least(cluster.http_ports[3], "lastApplied", stage_target).await;
+
+    let after_batches = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_batches_total",
+    )
+    .await;
+    let after_sent = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    )
+    .await;
+    let after_fallbacks = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_snapshot_fallbacks_total",
     )
     .await;
     assert_eq!(
-        status, 200,
-        "restarted follower proxy release response: {release:?}"
+        after_fallbacks, before_fallbacks,
+        "append-only learner catch-up should not fall back to InstallSnapshot"
     );
     assert_eq!(
-        release["unlocked"], true,
-        "restarted follower proxy release response: {release:?}"
+        current_metric(
+            cluster.http_ports[3],
+            "dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total"
+        )
+        .await,
+        0,
+        "append-only learner should not stage snapshot chunks"
     );
-    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+    assert_eq!(
+        current_metric(
+            cluster.http_ports[3],
+            "dd_rust_network_mutex_raft_latest_snapshot_index"
+        )
+        .await,
+        0,
+        "append-only learner should not install a snapshot"
+    );
+    let minimum_catchup_batches = (stage_target + 1) / 2;
+    assert!(
+        after_batches.saturating_sub(before_batches) >= minimum_catchup_batches,
+        "bounded catch-up should require multiple AppendEntries batches; before={before_batches} after={after_batches} target={stage_target}"
+    );
+    assert!(
+        after_sent.saturating_sub(before_sent) >= stage_target,
+        "learner catch-up should send the retained log entries rather than one full-log rewrite; before={before_sent} after={after_sent} target={stage_target}"
+    );
+
+    let progress = http_get_json(cluster.http_ports[leader], "/raft/progress")
+        .await
+        .expect("leader progress after append-only learner catch-up");
+    assert!(
+        progress["peers"].as_array().unwrap().iter().any(|peer| {
+            peer["id"].as_str() == Some("node-4")
+                && peer["stagedLearner"] == true
+                && peer["caughtUp"] == true
+                && peer["matchIndex"]
+                    .as_u64()
+                    .is_some_and(|idx| idx >= stage_target)
+        }),
+        "leader progress should show node-4 caught up through bounded AppendEntries: {progress:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1023,19 +1276,87 @@ async fn assert_http_lock_contract(port: u16, label: &str) {
         "{label} composite response: {composite:?}"
     );
     let composite_uuid = composite["lockUuid"].as_str().unwrap().to_string();
-    for key in composite["keys"].as_array().unwrap() {
+    let composite_keys = composite["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        composite_keys.len(),
+        2,
+        "{label} composite should hold both requested keys: {composite:?}"
+    );
+    for key in &composite_keys {
         assert!(
-            composite["fencingTokens"][key.as_str().unwrap()]
-                .as_u64()
-                .is_some(),
-            "{label} composite should include fencing token for {key:?}: {composite:?}"
+            composite["fencingTokens"][key].as_u64().is_some(),
+            "{label} composite should include fencing token for {key}: {composite:?}"
         );
     }
+
+    let (status, overlapping_single) = http_post_json(
+        port,
+        "/v1/lock",
+        json!({"key": composite_keys[0].clone(), "ttlMs": 5000, "waitMs": 50}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "{label} overlapping single response: {overlapping_single:?}"
+    );
+    assert_eq!(
+        overlapping_single["acquired"], false,
+        "{label} single-key acquire must not grant while composite holds that key: {overlapping_single:?}"
+    );
+
+    let overlap_extra_key = format!("{label}-composite-overlap-{}", uuid::Uuid::new_v4());
+    let (status, overlapping_composite) = http_post_json(
+        port,
+        "/v1/lock",
+        json!({"keys": [composite_keys[1].clone(), overlap_extra_key], "ttlMs": 5000, "waitMs": 50}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "{label} overlapping composite response: {overlapping_composite:?}"
+    );
+    assert_eq!(
+        overlapping_composite["acquired"], false,
+        "{label} composite acquire must use union overlap semantics, not intersection-only semantics: {overlapping_composite:?}"
+    );
+
+    let disjoint_key = format!("{label}-composite-disjoint-{}", uuid::Uuid::new_v4());
+    let (status, disjoint) = http_post_json(
+        port,
+        "/v1/lock",
+        json!({"key": disjoint_key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "{label} disjoint response: {disjoint:?}");
+    assert_eq!(
+        disjoint["acquired"], true,
+        "{label} disjoint key should still grant while composite is held: {disjoint:?}"
+    );
+    let disjoint_uuid = disjoint["lockUuid"].as_str().unwrap().to_string();
+    let (status, disjoint_release) = http_post_json(
+        port,
+        "/v1/unlock",
+        json!({"key": disjoint_key, "lockUuid": disjoint_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "{label} disjoint release response: {disjoint_release:?}"
+    );
+    assert_eq!(
+        disjoint_release["unlocked"], true,
+        "{label} disjoint release response: {disjoint_release:?}"
+    );
 
     let (status, composite_release) = http_post_json(
         port,
         "/v1/unlock",
-        json!({"keys": composite["keys"], "lockUuid": composite_uuid}),
+        json!({"keys": composite_keys, "lockUuid": composite_uuid}),
     )
     .await;
     assert_eq!(

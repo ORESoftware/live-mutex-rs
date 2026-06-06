@@ -477,4 +477,95 @@ mod tests {
         assert!(!raft.sync_log);
         assert_eq!(raft.peer_token.as_deref(), Some("cluster-secret"));
     }
+
+    #[test]
+    fn shipped_regular_config_keeps_raft_disabled_with_three_node_plan() {
+        let cfg: ConfigFile =
+            toml::from_str(include_str!("../lmx.toml")).expect("shipped lmx.toml parses");
+
+        assert_eq!(cfg.raft.enabled, Some(false));
+        assert_eq!(cfg.raft.node_id.as_deref(), Some("node-1"));
+        assert_eq!(cfg.raft.bind_addr.as_deref(), Some("127.0.0.1:7980"));
+        assert_eq!(
+            cfg.raft.data_dir.as_deref(),
+            Some(Path::new("./data/raft/node-1"))
+        );
+        assert_eq!(cfg.raft.snapshot_interval_ms, Some(1_800_000));
+        assert_eq!(cfg.raft.snapshot_max_log_entries, Some(100_000));
+        assert_eq!(cfg.raft.snapshot_max_log_bytes, Some(67_108_864));
+        assert_eq!(cfg.raft.trailing_log_entries, Some(10_000));
+
+        let peer_ids = cfg
+            .raft
+            .peers
+            .iter()
+            .map(|peer| peer.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(peer_ids, vec!["node-1", "node-2", "node-3"]);
+
+        let raft = build_raft_config(&cfg.raft).expect("regular raft config builds");
+        assert!(!raft.enabled);
+        assert_eq!(raft.cluster_size(), 3);
+        assert_eq!(raft.quorum_size(), 2);
+    }
+
+    #[test]
+    fn shipped_raft_config_enables_bounded_two_of_three_cluster() {
+        let cfg: ConfigFile =
+            toml::from_str(include_str!("../lmx-raft.toml")).expect("shipped lmx-raft.toml parses");
+
+        assert_eq!(cfg.server.disable_tcp, Some(true));
+        assert_eq!(cfg.server.disable_http, Some(false));
+        assert_eq!(cfg.raft.enabled, Some(true));
+        assert_eq!(cfg.raft.node_id.as_deref(), Some("node-1"));
+        assert_eq!(cfg.raft.bind_addr.as_deref(), Some("0.0.0.0:7980"));
+        assert_eq!(cfg.raft.advertise_addr.as_deref(), Some("node-1:7980"));
+        assert_eq!(
+            cfg.raft.data_dir.as_deref(),
+            Some(Path::new("/var/lib/dd-rust-network-mutex/raft"))
+        );
+        assert_eq!(cfg.raft.heartbeat_interval_ms, Some(50));
+        assert_eq!(cfg.raft.election_timeout_min_ms, Some(150));
+        assert_eq!(cfg.raft.election_timeout_max_ms, Some(300));
+        assert_eq!(cfg.raft.snapshot_interval_ms, Some(1_800_000));
+        assert_eq!(cfg.raft.snapshot_max_log_entries, Some(100_000));
+        assert_eq!(cfg.raft.snapshot_max_log_bytes, Some(67_108_864));
+        assert_eq!(cfg.raft.trailing_log_entries, Some(10_000));
+        assert_eq!(cfg.raft.append_entries_max_entries, Some(256));
+        assert_eq!(cfg.raft.append_entries_max_bytes, Some(1_048_576));
+        assert_eq!(cfg.raft.install_snapshot_chunk_bytes, Some(1_048_576));
+        assert_eq!(
+            cfg.raft.install_snapshot_max_staged_bytes,
+            Some(134_217_728)
+        );
+        assert_eq!(cfg.raft.install_snapshot_max_staged_transfers, Some(4));
+        assert_eq!(cfg.raft.install_snapshot_stale_transfer_ms, Some(1_800_000));
+        assert_eq!(cfg.raft.client_batch_max_entries, Some(32));
+        assert_eq!(cfg.raft.client_pipeline_max_batches, Some(4));
+        assert_eq!(cfg.raft.client_batch_max_pending, Some(8192));
+        assert_eq!(cfg.raft.client_batch_max_delay_ms, Some(1));
+        assert_eq!(cfg.raft.client_response_cache_max_entries, Some(8192));
+        assert_eq!(cfg.raft.sync_log, Some(true));
+
+        let peer_ids = cfg
+            .raft
+            .peers
+            .iter()
+            .map(|peer| peer.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(peer_ids, vec!["node-1", "node-2", "node-3"]);
+
+        let raft = build_raft_config(&cfg.raft).expect("BrokerRaft config builds");
+        assert!(raft.enabled);
+        assert_eq!(raft.cluster_size(), 3);
+        assert_eq!(raft.quorum_size(), 2);
+        assert_eq!(raft.append_entries_max_entries, 256);
+        assert_eq!(raft.append_entries_max_bytes, 1_048_576);
+        assert_eq!(raft.install_snapshot_chunk_bytes, 1_048_576);
+        assert_eq!(raft.client_batch_max_entries, 32);
+        assert_eq!(raft.client_pipeline_max_batches, 4);
+        assert_eq!(raft.client_batch_max_pending, 8192);
+        assert_eq!(raft.client_batch_max_delay, Duration::from_millis(1));
+        assert!(raft.sync_log);
+    }
 }

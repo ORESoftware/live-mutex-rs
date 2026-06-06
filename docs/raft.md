@@ -90,6 +90,9 @@ Implemented:
 - follower `leaderCommit` advancement capped at the matched leader log index,
 - post-commit `AppendEntries` fan-out so followers learn the updated
   `leaderCommit` promptly after quorum commit,
+- loopback failover coverage now waits for surviving voters' `commitIndex` and
+  `lastApplied` to converge across acquire, release, and reacquire operations
+  after the old leader is killed,
 - non-quorum `AppendEntries` RPCs are detached instead of cancelled once a
   target write reaches quorum, so slow followers can still advance progress
   without delaying the client response,
@@ -128,6 +131,9 @@ Implemented:
   cleanup entries from a new leader cannot collide with client IDs logged by a
   previous leader,
 - chunked `InstallSnapshot` catch-up for followers behind the compacted prefix,
+- loopback cluster coverage for a bootstrapped learner added after leader
+  compaction, proving live `InstallSnapshot` transfer plus retained-suffix
+  catch-up before the learner reports caught up,
 - active broker-state snapshots for holders, queued waiters, fencing counters,
   and TTL deadlines, staged on receiver disk before install,
 - stale staged `InstallSnapshot` part cleanup, including orphaned transfer-file
@@ -180,6 +186,10 @@ Implemented:
   `AppendEntries` and `InstallSnapshot` messages before term, leader, log, or
   snapshot mutation, including after restart; never-promoted transient learners
   can still be caught up before promotion,
+- public client requests are also rejected on removed local voters and on nodes
+  that are present only in the old side of joint consensus, so load balancers do
+  not keep using an endpoint that is being removed even if it can still
+  participate in Raft transition mechanics,
 - same-id peer address changes reset leader progress and drop the old pooled RPC
   connection immediately when applying the new membership,
 - same-id staged learner address changes reset learner progress and drop the
@@ -345,12 +355,15 @@ Implemented:
   `dd_rust_network_mutex_raft_proxy_requests_forwarded_total`,
   `dd_rust_network_mutex_raft_proxy_requests_handled_total`,
   `dd_rust_network_mutex_raft_proxy_request_errors_total`,
+  `dd_rust_network_mutex_raft_client_removed_member_rejections_total`,
   `dd_rust_network_mutex_raft_client_batch_pending`,
   `dd_rust_network_mutex_raft_client_batch_driver_active`, and
   `dd_rust_network_mutex_raft_client_response_cache_entries`; queue-full and
   batch-failure paths log warn-level `lmx::raft` events, commit advancement logs
   debug-level quorum observations, while proxy forwarding and proxy errors log
-  debug-level events with request id and leader hint fields,
+  debug-level events with request id and leader hint fields; removed-member
+  public request rejections log as a separate client counter because they do not
+  attempt follower-to-leader proxying,
 - Raft `/metrics` counters for follower-side `AppendEntries` conflict
   responses and suffix repair work:
   `dd_rust_network_mutex_raft_follower_append_conflicts_total`,
@@ -508,7 +521,10 @@ Implemented:
   snapshots, while mismatched payload reuse is rejected,
 - composite/multi-key lock requests are replicated as normal client commands,
   preserving the single-broker overlap/union semantics through retained-log
-  replay and Raft snapshot restore,
+  replay and Raft snapshot restore; BrokerRaft intentionally does not model
+  multi-key locking as separate per-key consensus transactions, so narrowing
+  BrokerRaft to single-key-only later would be an admission-policy choice rather
+  than a Raft protocol change,
 - coalesced post-commit `AppendEntries` fan-out, so bursty commits wake lagging
   peers promptly without spawning one background replication task per commit,
 - leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
@@ -611,6 +627,9 @@ log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
 reuse open TCP connections, including follower-to-leader proxy requests. The
+loopback cluster tests now include a bootstrapped learner that catches up over
+multiple bounded `AppendEntries` batches without any `InstallSnapshot` fallback,
+covering the retained-suffix performance path end to end. The
 leader serves `prevLogTerm`, bounded entry
 batches, commit-range reads, and retained-term conflict hints from a validated
 in-memory retained-log cache, using index lower-bound lookups for retained

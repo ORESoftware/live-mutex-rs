@@ -404,6 +404,7 @@ pub struct RaftTelemetrySnapshot {
     pub proxy_requests_forwarded_total: u64,
     pub proxy_requests_handled_total: u64,
     pub proxy_request_errors_total: u64,
+    pub client_removed_member_rejections_total: u64,
     pub apply_committed_errors_total: u64,
     pub leader_commit_advancements_total: u64,
     pub leader_commit_advanced_entries_total: u64,
@@ -1545,6 +1546,7 @@ struct BrokerRaftTelemetry {
     proxy_requests_forwarded_total: AtomicU64,
     proxy_requests_handled_total: AtomicU64,
     proxy_request_errors_total: AtomicU64,
+    client_removed_member_rejections_total: AtomicU64,
     apply_committed_errors_total: AtomicU64,
     leader_commit_advancements_total: AtomicU64,
     leader_commit_advanced_entries_total: AtomicU64,
@@ -2632,8 +2634,12 @@ pub struct BrokerRaft {
 }
 
 impl BrokerRaft {
-    pub fn open(config: BrokerRaftConfig) -> Result<Self, BrokerRaftError> {
+    pub fn open(mut config: BrokerRaftConfig) -> Result<Self, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-open-1");
+        config.node_id = config.node_id.trim().to_string();
+        if config.enabled || !config.peers.is_empty() {
+            config.peers = validate_membership_peers(config.peers.clone())?;
+        }
         config.validate()?;
         let telemetry = Arc::new(BrokerRaftTelemetry::default());
         let log_store = RaftLogStore::open_with_sync_log_and_telemetry(
@@ -3556,6 +3562,10 @@ impl BrokerRaft {
                 .telemetry
                 .proxy_request_errors_total
                 .load(Ordering::Relaxed),
+            client_removed_member_rejections_total: self
+                .telemetry
+                .client_removed_member_rejections_total
+                .load(Ordering::Relaxed),
             apply_committed_errors_total: self
                 .telemetry
                 .apply_committed_errors_total
@@ -4341,6 +4351,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_proxy_request_errors_total Proxied client requests that could not be forwarded, were sent to a non-leader, or returned an error.\n",
                 "# TYPE dd_rust_network_mutex_raft_proxy_request_errors_total counter\n",
                 "dd_rust_network_mutex_raft_proxy_request_errors_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_client_removed_member_rejections_total Public client requests rejected locally because this node is a removed voter or only in the old side of joint membership.\n",
+                "# TYPE dd_rust_network_mutex_raft_client_removed_member_rejections_total counter\n",
+                "dd_rust_network_mutex_raft_client_removed_member_rejections_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_apply_committed_errors_total Committed Raft entries that failed while applying to local sidecars or broker state.\n",
                 "# TYPE dd_rust_network_mutex_raft_apply_committed_errors_total counter\n",
                 "dd_rust_network_mutex_raft_apply_committed_errors_total {}\n",
@@ -4378,6 +4391,7 @@ impl BrokerRaft {
             snapshot.proxy_requests_forwarded_total,
             snapshot.proxy_requests_handled_total,
             snapshot.proxy_request_errors_total,
+            snapshot.client_removed_member_rejections_total,
             snapshot.apply_committed_errors_total,
             snapshot.leader_commit_advancements_total,
             snapshot.leader_commit_advanced_entries_total,
@@ -5719,6 +5733,22 @@ impl BrokerRaft {
         let request = request_for_ephemeral_wait(request, wait, is_acquire);
         let request_fingerprint = request_fingerprint(&request)?;
         let fail_fast_acquire = request_is_fail_fast_acquire(&request);
+        if let Some(reason) = self.local_client_request_rejection_reason() {
+            self.telemetry
+                .client_removed_member_rejections_total
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                request_uuid,
+                reason,
+                "raft node rejected public client request because local membership is being removed",
+            );
+            return Err(BrokerRaftError::NotLeader {
+                leader_id: self.leader_id(),
+                leader_addr: self.leader_addr(),
+            });
+        }
         if !self.is_leader() {
             let (leader_id, leader_peer) = self.leader_peer_hint();
             if leader_id.as_deref() == Some(self.config.node_id.as_str()) {
@@ -6119,6 +6149,25 @@ impl BrokerRaft {
         runtime.local_voter_seen && !runtime.membership.contains_id(&self.config.node_id)
     }
 
+    fn local_client_request_rejection_reason(&self) -> Option<&'static str> {
+        crate::routine_id!("ddl-routine-broker-raft-local-client-reject-reason-1");
+        let runtime = self.runtime.lock();
+        if self.local_seen_voter_is_removed(&runtime) {
+            return Some("removed-voter");
+        }
+        let RaftMembership::Joint {
+            old_peers,
+            new_peers,
+        } = &runtime.membership
+        else {
+            return None;
+        };
+        let local_id = self.config.node_id.as_str();
+        let in_old = old_peers.iter().any(|peer| peer.id == local_id);
+        let in_new = new_peers.iter().any(|peer| peer.id == local_id);
+        (in_old && !in_new).then_some("joint-old-only")
+    }
+
     fn with_peer_auth(&self, mut rpc: RaftRpc) -> RaftRpc {
         crate::routine_id!("ddl-routine-broker-raft-with-peer-auth-1");
         let token = self.config.peer_token.clone();
@@ -6273,9 +6322,6 @@ impl BrokerRaft {
             runtime.voted_for.clone()
         };
         if term > runtime.current_term || granted {
-            if term > runtime.current_term {
-                self.publish_role_cache(RaftRole::Follower, term);
-            }
             let state = RaftHardState {
                 current_term: response_term,
                 voted_for: next_voted_for.clone(),
@@ -6297,6 +6343,7 @@ impl BrokerRaft {
             runtime.election_deadline = self.next_election_deadline();
         }
         runtime.voted_for = next_voted_for;
+        self.publish_runtime_role_cache(&runtime);
         self.publish_leader_peer_hint_cache(&runtime);
         RaftRpcResponse::RequestVote {
             term: response_term,
@@ -6583,7 +6630,6 @@ impl BrokerRaft {
             });
         }
         if term > runtime.current_term {
-            self.publish_role_cache(RaftRole::Follower, term);
             let state = RaftHardState {
                 current_term: term,
                 voted_for: None,
@@ -6598,6 +6644,8 @@ impl BrokerRaft {
             runtime.current_term = term;
             runtime.voted_for = None;
             runtime.leader_id = None;
+            self.publish_runtime_role_cache(&runtime);
+            self.publish_leader_peer_hint_cache(&runtime);
         }
         if runtime
             .leader_id
@@ -6627,10 +6675,10 @@ impl BrokerRaft {
                 conflict_term: None,
             });
         }
-        self.publish_role_cache(RaftRole::Follower, runtime.current_term);
         runtime.role = RaftRole::Follower;
         runtime.leader_id = Some(leader_id.to_string());
         runtime.election_deadline = self.next_election_deadline();
+        self.publish_runtime_role_cache(&runtime);
         self.publish_leader_peer_hint_cache(&runtime);
         Ok(runtime.commit_index)
     }
@@ -7866,7 +7914,6 @@ impl BrokerRaft {
             voted_for: Some(self.config.node_id.clone()),
             commit_index: runtime.commit_index,
         };
-        self.publish_role_cache(RaftRole::Candidate, term);
         self.log.write_hard_state(&hard_state)?;
         runtime.role = RaftRole::Candidate;
         runtime.current_term = term;
@@ -7883,6 +7930,7 @@ impl BrokerRaft {
             quorum = runtime.membership.quorum_size(),
             "raft candidate election started",
         );
+        self.publish_runtime_role_cache(&runtime);
         self.publish_leader_peer_hint_cache(&runtime);
         Ok(Some(term))
     }
@@ -10757,13 +10805,6 @@ impl BrokerRaft {
             (hard_state, staged_learners)
         };
         self.persist_staged_learners_for_active_peers(&staged_learners, &active_peers)?;
-        if !self_is_active {
-            let term = hard_state
-                .as_ref()
-                .map(|state| state.current_term)
-                .unwrap_or_else(|| self.current_term());
-            self.publish_role_cache(RaftRole::Follower, term);
-        }
         if let Some(state) = &hard_state {
             self.log.write_hard_state(state)?;
         }
@@ -10947,6 +10988,8 @@ impl BrokerRaft {
                     error = %err,
                     "failed to persist raft hard state after step down",
                 );
+                self.publish_runtime_role_cache(&runtime);
+                self.publish_leader_peer_hint_cache(&runtime);
                 return;
             }
             runtime.current_term = term;
@@ -11064,6 +11107,7 @@ fn next_election_deadline_parts_for_config(
     (deadline, timeout, jitter)
 }
 
+#[cfg(test)]
 fn election_timeout_for_config(config: &BrokerRaftConfig, tick_ms: u64) -> Duration {
     crate::routine_id!("ddl-routine-broker-raft-election-timeout-config-1");
     election_timeout_and_jitter_for_config(config, tick_ms).0
@@ -11712,6 +11756,7 @@ fn append_entries_frame_len(
     Ok(writer.bytes)
 }
 
+#[cfg(test)]
 fn append_entries_frame(
     meta: &AppendEntriesFrameMeta<'_>,
     entries: &[RaftLogEntry],
@@ -11938,6 +11983,7 @@ fn install_snapshot_empty_data_frame_len(
     Ok(writer.bytes)
 }
 
+#[cfg(test)]
 fn install_snapshot_chunk_frame_len(
     meta: &InstallSnapshotFrameMeta<'_>,
     payload_bytes: &[u8],
@@ -11955,6 +12001,7 @@ fn install_snapshot_chunk_frame_len(
     Ok(sizer.frame_len(raw_len))
 }
 
+#[cfg(test)]
 fn install_snapshot_chunk_frame(
     meta: &InstallSnapshotFrameMeta<'_>,
     payload_bytes: &[u8],
@@ -13710,6 +13757,19 @@ mod tests {
         cfg
     }
 
+    fn assert_cached_role_term(raft: &BrokerRaft, role: RaftRole, term: u64) {
+        assert_eq!(
+            raft.cached_role.load(Ordering::Acquire),
+            BrokerRaft::role_cache_value(role),
+            "cached raft role should match runtime after durability boundary"
+        );
+        assert_eq!(
+            raft.cached_term.load(Ordering::Acquire),
+            term,
+            "cached raft term should match runtime after durability boundary"
+        );
+    }
+
     fn colliding_peer_id_for_prefix(target_id: &str) -> String {
         crate::routine_id!("ddl-routine-broker-raft-test-colliding-peer-id-1");
         let target_prefix = raft_client_id_prefix(target_id);
@@ -13950,6 +14010,63 @@ mod tests {
         let raft = BrokerRaft::open(cfg).expect("open raft with async log policy");
 
         assert!(!raft.log.sync_log);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_open_normalizes_configured_peer_identity_strings() {
+        let dir = temp_dir("raft-open-normalizes-configured-peers");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.node_id = " n1 ".into();
+        cfg.peers = vec![
+            RaftPeerConfig {
+                id: " n3 ".into(),
+                addr: " 127.0.0.1:7982 ".into(),
+            },
+            RaftPeerConfig {
+                id: " n1 ".into(),
+                addr: " 127.0.0.1:7980 ".into(),
+            },
+            RaftPeerConfig {
+                id: " n2 ".into(),
+                addr: " 127.0.0.1:7981 ".into(),
+            },
+        ];
+
+        let raft = BrokerRaft::open(cfg).expect("open raft with trim-normalized config");
+
+        assert_eq!(raft.config.node_id, "n1");
+        assert_eq!(
+            raft.config
+                .peers
+                .iter()
+                .map(|peer| (peer.id.as_str(), peer.addr.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("n1", "127.0.0.1:7980"),
+                ("n2", "127.0.0.1:7981"),
+                ("n3", "127.0.0.1:7982"),
+            ]
+        );
+        assert_eq!(
+            raft.membership().active_peers(),
+            vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ]
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert!(runtime.local_voter_seen);
+            assert!(runtime.membership.contains_id("n1"));
+            assert!(!runtime.membership.contains_id(" n1 "));
+        }
+        assert!(
+            dir.join(LOCAL_VOTER_STATE_FILE).exists(),
+            "normalized local voter id should arm the durable removed-voter guard"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -14750,6 +14867,96 @@ mod tests {
     }
 
     #[test]
+    fn local_client_request_guard_rejects_removed_or_joint_old_only_node() {
+        let dir = temp_dir("raft-local-client-removed-guard");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        raft.apply_membership(RaftMembership::from_simple(vec![
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+            test_peer("n4", 7983),
+        ]))
+        .expect("apply membership removing local node");
+        assert_eq!(
+            raft.local_client_request_rejection_reason(),
+            Some("removed-voter")
+        );
+
+        raft.apply_membership(RaftMembership::Joint {
+            old_peers: vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+            new_peers: vec![
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ],
+        })
+        .expect("apply joint membership removing local node from target config");
+        assert_eq!(
+            raft.local_client_request_rejection_reason(),
+            Some("joint-old-only")
+        );
+
+        raft.apply_membership(RaftMembership::Joint {
+            old_peers: vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+            new_peers: vec![
+                test_peer("n1", 7980),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ],
+        })
+        .expect("apply joint membership retaining local node in target config");
+        assert_eq!(raft.local_client_request_rejection_reason(), None);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn local_client_request_guard_rejects_public_request_without_proxy_error() {
+        let dir = temp_dir("raft-local-client-removed-public-reject");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        raft.apply_membership(RaftMembership::from_simple(vec![
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+            test_peer("n4", 7983),
+        ]))
+        .expect("apply membership removing local node");
+
+        let err = raft
+            .run_ephemeral(
+                single_lock_request("removed-public-lock", "removed-public-key"),
+                "removed-public-lock",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect_err("removed local voter must reject public client request");
+
+        assert!(matches!(err, BrokerRaftError::NotLeader { .. }));
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.client_removed_member_rejections_total, 1);
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 0);
+        assert_eq!(telemetry.proxy_requests_handled_total, 0);
+        assert_eq!(telemetry.proxy_request_errors_total, 0);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_client_removed_member_rejections_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn removed_configured_voter_rejects_append_entries_without_term_mutation() {
         let dir = temp_dir("raft-removed-voter-rejects-append");
         let cfg = test_raft_config(dir.clone());
@@ -15186,6 +15393,60 @@ mod tests {
             assert!(runtime.membership.contains_id("n3"));
             assert!(!runtime.membership.contains_id("n4"));
         }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_membership_local_removal_hard_state_failure_preserves_role_cache() {
+        let dir = temp_dir("raft-membership-local-removal-cache-hard-state-fails");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let before = raft.membership();
+        let initial_state = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n1".into()),
+            commit_index: 0,
+        };
+        raft.log
+            .write_hard_state(&initial_state)
+            .expect("write initial hard state");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.voted_for = Some("n1".into());
+        }
+        assert!(raft.is_leader(), "initial leader cache refresh");
+        assert_cached_role_term(&raft, RaftRole::Leader, 7);
+        fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
+            .expect("block hard-state temp path");
+
+        let err = raft
+            .apply_membership(RaftMembership::from_simple(vec![
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ]))
+            .expect_err("local removal should require durable hard-state write");
+
+        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(raft.membership(), before);
+        assert_eq!(
+            raft.log.read_hard_state().expect("read hard state"),
+            initial_state
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.role, RaftRole::Leader);
+            assert_eq!(runtime.current_term, 7);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n1"));
+            assert_eq!(runtime.voted_for.as_deref(), Some("n1"));
+            assert!(runtime.membership.contains_id("n1"));
+            assert!(!runtime.membership.contains_id("n4"));
+        }
+        assert_cached_role_term(&raft, RaftRole::Leader, 7);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -17265,6 +17526,8 @@ mod tests {
         raft.log
             .write_hard_state(&initial_state)
             .expect("persist initial hard state");
+        assert!(raft.is_leader(), "initial leader cache refresh");
+        assert_cached_role_term(&raft, RaftRole::Leader, 2);
         fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
             .expect("block hard-state temp path");
 
@@ -17284,6 +17547,7 @@ mod tests {
             assert_eq!(runtime.leader_id.as_deref(), Some("n1"));
             assert_eq!(runtime.election_deadline, initial_deadline);
         }
+        assert_cached_role_term(&raft, RaftRole::Leader, 2);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -18022,6 +18286,11 @@ mod tests {
         raft.log
             .write_hard_state(&initial_state)
             .expect("persist initial hard state");
+        {
+            let runtime = raft.runtime.lock();
+            raft.publish_runtime_role_cache(&runtime);
+        }
+        assert_cached_role_term(&raft, RaftRole::Follower, 3);
         fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
             .expect("block hard-state temp path");
 
@@ -18040,6 +18309,7 @@ mod tests {
             assert_eq!(runtime.leader_id, None);
             assert_eq!(runtime.election_deadline, initial_deadline);
         }
+        assert_cached_role_term(&raft, RaftRole::Follower, 3);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -28581,6 +28851,7 @@ mod tests {
             runtime.role = RaftRole::Follower;
             runtime.leader_id = None;
         }
+        assert_cached_role_term(&raft, RaftRole::Follower, 0);
         fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
             .expect("block hard-state temp path");
 
@@ -28600,6 +28871,7 @@ mod tests {
             assert_eq!(runtime.commit_index, 0);
             assert_eq!(runtime.last_applied, 0);
         }
+        assert_cached_role_term(&raft, RaftRole::Follower, 0);
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
             RaftHardState::default()
@@ -28941,6 +29213,8 @@ mod tests {
         raft.log
             .write_hard_state(&initial_state)
             .expect("persist initial hard state");
+        assert!(raft.is_leader(), "initial leader cache refresh");
+        assert_cached_role_term(&raft, RaftRole::Leader, 3);
         fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
             .expect("block hard-state temp path");
 
@@ -28958,6 +29232,7 @@ mod tests {
             assert_eq!(runtime.leader_id.as_deref(), Some("n1"));
             assert_eq!(runtime.election_deadline, initial_deadline);
         }
+        assert_cached_role_term(&raft, RaftRole::Leader, 3);
 
         let _ = fs::remove_dir_all(dir);
     }
