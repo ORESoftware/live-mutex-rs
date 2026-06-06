@@ -29,6 +29,8 @@ node_id = "node-1"
 bind_addr = "0.0.0.0:7980"
 advertise_addr = "node-1:7980"
 data_dir = "/var/lib/dd-rust-network-mutex/raft"
+# Keep true so only one live BrokerRaft process can own this durable state.
+data_dir_lock = true
 # Optional shared secret for Raft peer RPC frames. Prefer setting
 # LMX_RAFT_PEER_TOKEN from a Kubernetes Secret instead of committing a value.
 # peer_token = "replace-with-a-secret"
@@ -49,8 +51,8 @@ snapshot_max_log_entries = 100000
 snapshot_max_log_bytes = 67108864
 trailing_log_entries = 10000
 
-# Bound one AppendEntries batch so lagging followers catch up incrementally
-# instead of receiving an unbounded log suffix in one JSON frame.
+# Bound AppendEntries catch-up so lagging followers receive incremental JSON
+# frames, with a capped number of sequential per-peer batches before yielding.
 append_entries_max_entries = 256
 append_entries_max_bytes = 1048576
 append_entries_max_inline_batches = 64
@@ -63,6 +65,7 @@ client_pipeline_max_batches = 4
 client_batch_max_pending = 8192
 client_batch_max_delay_ms = 1
 client_response_cache_max_entries = 8192
+proxy_retry_budget_ms = 2000
 # Keep true for crash-safe Raft durability. Set false only for explicit
 # benchmark/throughput experiments where losing the last unsynced log writes
 # after a process or host crash is acceptable.

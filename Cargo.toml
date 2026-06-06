@@ -52,9 +52,9 @@ base64 = "0.22"
 # `cargo update -p linked-queue`.
 linked-queue = { git = "https://github.com/ORESoftware/linked-queue.rs", rev = "edb6138101bd579d848f0fe58bd4d77e1a1d6094" }
 futures-util = "0.3"
-# `libc` is only used on Linux to call setsockopt(TCP_QUICKACK), but it's
-# small enough on other platforms (the cfg-gated code is just compiled
-# out) that pulling it in unconditionally keeps the Cargo features simple.
+# `libc` is used for Linux TCP_QUICKACK and Unix advisory data-dir flocking.
+# Pulling it in unconditionally keeps the Cargo features simple while those
+# call sites stay cfg-gated.
 libc = "0.2"
 # OTel — gated behind the `otel` cargo feature so a minimal build can
 # strip the gRPC/protobuf dependency tree. All four crates must move in

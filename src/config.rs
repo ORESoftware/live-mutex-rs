@@ -88,6 +88,7 @@ struct RaftFileConfig {
     bind_addr: Option<String>,
     advertise_addr: Option<String>,
     data_dir: Option<PathBuf>,
+    data_dir_lock: Option<bool>,
     heartbeat_interval_ms: Option<u64>,
     election_timeout_min_ms: Option<u64>,
     election_timeout_max_ms: Option<u64>,
@@ -107,6 +108,7 @@ struct RaftFileConfig {
     client_batch_max_pending: Option<usize>,
     client_batch_max_delay_ms: Option<u64>,
     client_response_cache_max_entries: Option<usize>,
+    proxy_retry_budget_ms: Option<u64>,
     sync_log: Option<bool>,
     peer_token: Option<String>,
     peers: Vec<RaftPeerConfig>,
@@ -283,6 +285,9 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.data_dir = env_path("LMX_RAFT_DATA_DIR")
         .or_else(|| file.data_dir.clone())
         .unwrap_or(cfg.data_dir);
+    cfg.data_dir_lock = env_bool("LMX_RAFT_DATA_DIR_LOCK")
+        .or(file.data_dir_lock)
+        .unwrap_or(cfg.data_dir_lock);
     cfg.heartbeat_interval = Duration::from_millis(
         env_parse("LMX_RAFT_HEARTBEAT_INTERVAL_MS")
             .or(file.heartbeat_interval_ms)
@@ -353,6 +358,11 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.client_response_cache_max_entries = env_parse("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES")
         .or(file.client_response_cache_max_entries)
         .unwrap_or(cfg.client_response_cache_max_entries);
+    cfg.proxy_retry_budget = Duration::from_millis(
+        env_parse("LMX_RAFT_PROXY_RETRY_BUDGET_MS")
+            .or(file.proxy_retry_budget_ms)
+            .unwrap_or(cfg.proxy_retry_budget.as_millis() as u64),
+    );
     cfg.sync_log = env_bool("LMX_RAFT_SYNC_LOG")
         .or(file.sync_log)
         .unwrap_or(cfg.sync_log);
@@ -432,6 +442,7 @@ mod tests {
             [raft]
             enabled = false
             node_id = "node-1"
+            data_dir_lock = false
             append_entries_max_entries = 17
             append_entries_max_bytes = 12345
             append_entries_max_inline_batches = 9
@@ -444,6 +455,7 @@ mod tests {
             client_batch_max_pending = 77
             client_batch_max_delay_ms = 7
             client_response_cache_max_entries = 55
+            proxy_retry_budget_ms = 456
             sync_log = false
             peer_token = "cluster-secret"
 
@@ -466,6 +478,7 @@ mod tests {
         assert_eq!(raft.cluster_size(), 3);
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 17);
+        assert!(!raft.data_dir_lock);
         assert_eq!(raft.append_entries_max_bytes, 12345);
         assert_eq!(raft.append_entries_max_inline_batches, 9);
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
@@ -480,6 +493,7 @@ mod tests {
         assert_eq!(raft.client_batch_max_pending, 77);
         assert_eq!(raft.client_batch_max_delay, Duration::from_millis(7));
         assert_eq!(raft.client_response_cache_max_entries, 55);
+        assert_eq!(raft.proxy_retry_budget, Duration::from_millis(456));
         assert!(!raft.sync_log);
         assert_eq!(raft.peer_token.as_deref(), Some("cluster-secret"));
     }
@@ -496,6 +510,7 @@ mod tests {
             cfg.raft.data_dir.as_deref(),
             Some(Path::new("./data/raft/node-1"))
         );
+        assert_eq!(cfg.raft.data_dir_lock, Some(true));
         assert_eq!(cfg.raft.snapshot_interval_ms, Some(1_800_000));
         assert_eq!(cfg.raft.snapshot_max_log_entries, Some(100_000));
         assert_eq!(cfg.raft.snapshot_max_log_bytes, Some(67_108_864));
@@ -530,6 +545,7 @@ mod tests {
             cfg.raft.data_dir.as_deref(),
             Some(Path::new("/var/lib/dd-rust-network-mutex/raft"))
         );
+        assert_eq!(cfg.raft.data_dir_lock, Some(true));
         assert_eq!(cfg.raft.heartbeat_interval_ms, Some(50));
         assert_eq!(cfg.raft.election_timeout_min_ms, Some(150));
         assert_eq!(cfg.raft.election_timeout_max_ms, Some(300));
@@ -552,6 +568,7 @@ mod tests {
         assert_eq!(cfg.raft.client_batch_max_pending, Some(8192));
         assert_eq!(cfg.raft.client_batch_max_delay_ms, Some(1));
         assert_eq!(cfg.raft.client_response_cache_max_entries, Some(8192));
+        assert_eq!(cfg.raft.proxy_retry_budget_ms, Some(2000));
         assert_eq!(cfg.raft.sync_log, Some(true));
 
         let peer_ids = cfg
@@ -567,6 +584,7 @@ mod tests {
         assert_eq!(raft.cluster_size(), 3);
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 256);
+        assert!(raft.data_dir_lock);
         assert_eq!(raft.append_entries_max_bytes, 1_048_576);
         assert_eq!(raft.append_entries_max_inline_batches, 64);
         assert_eq!(raft.install_snapshot_chunk_bytes, 1_048_576);
@@ -574,6 +592,7 @@ mod tests {
         assert_eq!(raft.client_pipeline_max_batches, 4);
         assert_eq!(raft.client_batch_max_pending, 8192);
         assert_eq!(raft.client_batch_max_delay, Duration::from_millis(1));
+        assert_eq!(raft.proxy_retry_budget, Duration::from_millis(2000));
         assert!(raft.sync_log);
     }
 }

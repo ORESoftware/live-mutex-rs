@@ -28,6 +28,7 @@ node_id = "node-1"
 bind_addr = "127.0.0.1:7980"
 advertise_addr = "node-1:7980"
 data_dir = "./data/raft/node-1"
+data_dir_lock = true
 
 # A 3-node cluster commits with 2 votes. Add node-4 and node-5 below to run a
 # 5-node cluster, which commits with 3 votes. Quorum is derived from peer count;

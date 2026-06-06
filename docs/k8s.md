@@ -301,6 +301,7 @@ data:
     enabled = true
     bind_addr = "0.0.0.0:7980"
     data_dir = "/var/lib/dd-rust-network-mutex/raft"
+    data_dir_lock = true
     heartbeat_interval_ms = 50
     election_timeout_min_ms = 150
     election_timeout_max_ms = 300

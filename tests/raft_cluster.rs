@@ -59,6 +59,7 @@ struct RaftClusterTuning {
     append_entries_max_entries: usize,
     append_entries_max_bytes: usize,
     install_snapshot_chunk_bytes: usize,
+    proxy_retry_budget: Duration,
 }
 
 impl Default for RaftClusterTuning {
@@ -75,6 +76,7 @@ impl Default for RaftClusterTuning {
             append_entries_max_entries: defaults.append_entries_max_entries,
             append_entries_max_bytes: defaults.append_entries_max_bytes,
             install_snapshot_chunk_bytes: defaults.install_snapshot_chunk_bytes,
+            proxy_retry_budget: defaults.proxy_retry_budget,
         }
     }
 }
@@ -214,6 +216,7 @@ fn spawn_raft_node(
     raft.append_entries_max_entries = tuning.append_entries_max_entries;
     raft.append_entries_max_bytes = tuning.append_entries_max_bytes;
     raft.install_snapshot_chunk_bytes = tuning.install_snapshot_chunk_bytes;
+    raft.proxy_retry_budget = tuning.proxy_retry_budget;
     raft.peers = initial_peers.to_vec();
     raft.broker = BrokerConfig::default();
 
@@ -746,6 +749,80 @@ async fn raft_lb_round_robin_survives_leader_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_follower_proxy_retries_through_leaderless_failover_window() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let tuning = RaftClusterTuning {
+        election_timeout_min: Duration::from_millis(1_200),
+        election_timeout_max: Duration::from_millis(1_600),
+        proxy_retry_budget: Duration::from_secs(5),
+        ..RaftClusterTuning::default()
+    };
+    let mut cluster = start_cluster_with_tuning(3, 3, tuning).await;
+    let old_leader = wait_for_leader(&cluster).await;
+    let target_follower = (old_leader + 1) % 3;
+    let key = format!("raft-proxy-failover-key-{}", uuid::Uuid::new_v4());
+
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[old_leader],
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "acquire response: {acquire:?}");
+    assert_eq!(acquire["acquired"], true, "acquire response: {acquire:?}");
+    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+    let acquired_status =
+        wait_for_status_index_at_least(cluster.http_ports[old_leader], "lastApplied", 1).await;
+    let acquired_index = acquired_status["lastApplied"]
+        .as_u64()
+        .expect("old leader lastApplied after acquire");
+    let all_nodes = vec![0, 1, 2];
+    wait_for_status_indexes_at_least_among(&cluster, &all_nodes, acquired_index, acquired_index)
+        .await;
+
+    cluster.abort_node(old_leader).await;
+    let target_port = cluster.http_ports[target_follower];
+    let (status, release) = http_post_json(
+        target_port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "follower proxy should retry through leader churn and release: {release:?}"
+    );
+    assert_eq!(
+        release["unlocked"], true,
+        "follower proxy should release after failover: {release:?}"
+    );
+    wait_for_metric_at_least(
+        target_port,
+        "dd_rust_network_mutex_raft_proxy_request_retries_total",
+        1,
+    )
+    .await;
+
+    let survivors: Vec<usize> = (0..cluster.http_ports.len())
+        .filter(|idx| *idx != old_leader)
+        .collect();
+    let new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    assert_ne!(new_leader, old_leader);
+    let release_status = wait_for_status_index_at_least(
+        cluster.http_ports[new_leader],
+        "lastApplied",
+        acquired_index.saturating_add(1),
+    )
+    .await;
+    let release_index = release_status["lastApplied"]
+        .as_u64()
+        .expect("new leader lastApplied after release");
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, release_index, release_index)
+        .await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let mut cluster = start_cluster_with_nodes(5, 3).await;
@@ -886,6 +963,133 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
         reacquire["acquired"], true,
         "reacquire after membership failover response: {reacquire:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_membership_grows_and_shrinks_through_even_size() {
+    // Even-sized clusters are valid (quorum is always a strict majority), so a
+    // cluster can pass through a 4-node intermediate in both directions:
+    //   grow:   3 -> 4 -> 5   (promote staged learners one at a time)
+    //   shrink: 5 -> 4 -> 3   (remove non-leaders one at a time)
+    // A write must commit at every stable config, and clusterSize/quorumSize
+    // must reflect the strict-majority rule (4 -> quorum 3).
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    // 3 initial voters {0,1,2}; nodes 3 and 4 start as staged learners.
+    let cluster = start_cluster_with_nodes(5, 3).await;
+
+    let peers_for = |idxs: &[usize]| {
+        idxs.iter()
+            .map(|i| cluster.peers[*i].clone())
+            .collect::<Vec<_>>()
+    };
+    let ids_for = |idxs: &[usize]| {
+        idxs.iter()
+            .map(|i| cluster.peers[*i].id.clone())
+            .collect::<BTreeSet<_>>()
+    };
+
+    // Post a membership change to whichever node currently leads the given set,
+    // and assert the committed cluster/quorum sizes. A membership change right
+    // after another can transiently race leader readiness (503 NotLeader), so
+    // re-discover the leader and retry for a bounded window, as operator tooling
+    // would.
+    async fn change_to(
+        cluster: &RaftCluster,
+        current_nodes: &[usize],
+        target: &[RaftPeerConfig],
+        expected_size: u64,
+        expected_quorum: u64,
+        label: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let leader = wait_for_leader_among(cluster, current_nodes).await;
+            let (status, membership) = http_post_json(
+                cluster.http_ports[leader],
+                "/raft/membership",
+                json!({ "peers": target }),
+            )
+            .await;
+            if status == 200 {
+                assert_eq!(
+                    membership["clusterSize"].as_u64(),
+                    Some(expected_size),
+                    "{label} clusterSize: {membership:?}"
+                );
+                assert_eq!(
+                    membership["quorumSize"].as_u64(),
+                    Some(expected_quorum),
+                    "{label} quorumSize: {membership:?}"
+                );
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{label} membership change never committed; last response {status}: {membership:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn write_succeeds(cluster: &RaftCluster, nodes: &[usize], key: &str) {
+        let leader = wait_for_leader_among(cluster, nodes).await;
+        let (status, acquire) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/lock",
+            json!({ "key": key, "ttlMs": 5000 }),
+        )
+        .await;
+        assert_eq!(status, 200, "write at {} nodes: {acquire:?}", nodes.len());
+        assert_eq!(
+            acquire["acquired"],
+            true,
+            "write at {} nodes must commit: {acquire:?}",
+            nodes.len()
+        );
+        let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+        let leader = wait_for_leader_among(cluster, nodes).await;
+        let (status, release) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/unlock",
+            json!({ "key": key, "lockUuid": lock_uuid }),
+        )
+        .await;
+        assert_eq!(status, 200, "release at {} nodes: {release:?}", nodes.len());
+        assert_eq!(release["unlocked"], true, "release: {release:?}");
+    }
+
+    let v3: Vec<usize> = vec![0, 1, 2];
+    let v4: Vec<usize> = vec![0, 1, 2, 3];
+    let v5: Vec<usize> = vec![0, 1, 2, 3, 4];
+
+    // Baseline: the 3-voter cluster elects a leader and commits a write.
+    wait_for_leader_among(&cluster, &v3).await;
+    write_succeeds(&cluster, &v3, "even-grow-at3").await;
+
+    // GROW 3 -> 4 -> 5, promoting one staged learner per step.
+    change_to(&cluster, &v3, &peers_for(&v4), 4, 3, "3->4").await;
+    wait_for_simple_membership(&cluster, &v4, &ids_for(&v4), 4, 3).await;
+    write_succeeds(&cluster, &v4, "even-grow-at4").await;
+
+    change_to(&cluster, &v4, &peers_for(&v5), 5, 3, "4->5").await;
+    wait_for_simple_membership(&cluster, &v5, &ids_for(&v5), 5, 3).await;
+    write_succeeds(&cluster, &v5, "even-grow-at5").await;
+
+    // SHRINK 5 -> 4 -> 3, removing non-leaders so leadership stays put.
+    let leader = wait_for_leader_among(&cluster, &v5).await;
+    let non_leaders: Vec<usize> = v5.iter().copied().filter(|i| *i != leader).collect();
+    let victim_a = non_leaders[0];
+    let victim_b = non_leaders[1];
+    let s4: Vec<usize> = v5.iter().copied().filter(|i| *i != victim_a).collect();
+    let s3: Vec<usize> = s4.iter().copied().filter(|i| *i != victim_b).collect();
+
+    change_to(&cluster, &v5, &peers_for(&s4), 4, 3, "5->4").await;
+    wait_for_simple_membership(&cluster, &s4, &ids_for(&s4), 4, 3).await;
+    write_succeeds(&cluster, &s4, "even-shrink-at4").await;
+
+    change_to(&cluster, &s4, &peers_for(&s3), 3, 2, "4->3").await;
+    wait_for_simple_membership(&cluster, &s3, &ids_for(&s3), 3, 2).await;
+    write_succeeds(&cluster, &s3, "even-shrink-at3").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

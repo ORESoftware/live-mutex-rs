@@ -121,6 +121,9 @@ Implemented:
   progress, so already-caught-up peers do not receive redundant append RPCs
   before the leader can commit or return a membership catch-up result; cached
   progress does not refresh the check-quorum freshness timestamp,
+- already-committed target-index waits prefer a real `matchIndex` quorum and
+  only fall back to a minimal durable committed quorum when volatile leader
+  progress is not strong enough after restart or leadership churn,
 - generic leader replication rounds and quorum waits abandon accounting if the
   active membership changes after peer selection, so stale fan-out cannot
   commit, refresh leader freshness, or linger until the normal quorum timeout
@@ -135,10 +138,16 @@ Implemented:
   `nextIndex` without rereading the whole retained log file,
 - follower `leaderCommit` advancement capped at the matched leader log index,
 - post-commit `AppendEntries` fan-out so followers learn the updated
-  `leaderCommit` promptly after quorum commit,
+  `leaderCommit` promptly after quorum commit, with bounded inline
+  `AppendEntries` catch-up for lagging no-target heartbeat/post-commit fanout
+  peers before yielding,
 - loopback failover coverage now waits for surviving voters' `commitIndex` and
   `lastApplied` to converge across acquire, release, and reacquire operations
   after the old leader is killed,
+- loopback failover coverage also sends a client request to a surviving follower
+  during the leaderless window after the old leader is killed, proving the
+  follower proxy retry budget can bridge stale leader hints and real election
+  churn,
 - non-quorum `AppendEntries` RPCs are detached instead of cancelled once a
   target write reaches quorum or a no-target heartbeat/fan-out round observes an
   active quorum, so slow followers can still advance progress without delaying
@@ -282,6 +291,9 @@ Implemented:
   membership state, so stale votes from removed peers are not carried across
   restart,
 - transient learner catch-up for new peer IDs before joint-consensus promotion,
+- empty-log membership changes still stage new peer IDs as transient learners
+  before appending the joint config, so replacing old voters cannot rely on the
+  old quorum alone and then fail to contact the new quorum,
 - required post-promotion catch-up so every newly promoted voter reaches the
   final membership log index before the membership change returns,
 - if the final membership removes the local leader, the API returns the committed
@@ -427,6 +439,7 @@ Implemented:
   `dd_rust_network_mutex_raft_replication_quorum_progress_retries_total`,
   `dd_rust_network_mutex_raft_replication_quorum_progress_wakeups_total`,
   `dd_rust_network_mutex_raft_replication_quorum_sleeps_total`,
+  `dd_rust_network_mutex_raft_replication_quorum_already_committed_short_circuits_total`,
   `dd_rust_network_mutex_raft_replication_quorum_successes_total`,
   `dd_rust_network_mutex_raft_replication_quorum_timeouts_total`,
   `dd_rust_network_mutex_raft_replication_quorum_leadership_losses_total`, and
@@ -439,9 +452,17 @@ Implemented:
   `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`; no-target
   heartbeat/post-commit AppendEntries or snapshot catch-up attempts skipped
   because the peer already has an in-flight pooled RPC are counted in
-  `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; target-index
-  inline catch-up progress rounds, target reaches, and max-inline-batch yields
-  are counted in
+  `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; no-target
+  heartbeat/post-commit inline catch-up progress rounds, local-tail reaches, and
+  max-inline-batch yields are counted in
+  `dd_rust_network_mutex_raft_fanout_replication_inline_progress_rounds_total`,
+  `dd_rust_network_mutex_raft_fanout_replication_inline_successes_total`, and
+  `dd_rust_network_mutex_raft_fanout_replication_inline_yields_total`;
+  when the post-commit fan-out worker hits that no-target inline-batch cap, it
+  coalesces a follow-up round immediately so recovering followers do not wait
+  for the next heartbeat just to receive the next bounded suffix;
+  target-index inline catch-up progress rounds, target reaches, and
+  max-inline-batch yields are counted in
   `dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total`,
   `dd_rust_network_mutex_raft_target_replication_inline_successes_total`, and
   `dd_rust_network_mutex_raft_target_replication_inline_yields_total`;
@@ -485,6 +506,8 @@ Implemented:
   `dd_rust_network_mutex_raft_client_batch_entries_total`,
   `dd_rust_network_mutex_raft_client_batch_queue_wait_us_total`,
   `dd_rust_network_mutex_raft_client_batch_pipeline_batches_total`,
+  `dd_rust_network_mutex_raft_client_batch_refill_rounds_total`,
+  `dd_rust_network_mutex_raft_client_batch_refilled_entries_total`,
   `dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total`,
   `dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total`,
   `dd_rust_network_mutex_raft_serialized_commit_lane_waits_total`,
@@ -638,6 +661,10 @@ Implemented:
   keeps append-log fsyncs enabled, while `false` is reserved for unsafe
   throughput experiments that accept loss of the latest unsynced log writes
   after a crash,
+- explicit `raft.data_dir_lock` / `LMX_RAFT_DATA_DIR_LOCK` ownership guard:
+  the default keeps an advisory `broker-raft.lock` held for the lifetime of a
+  live `BrokerRaft`, rejecting a second process or handle that tries to append,
+  compact, or install snapshots in the same durable state directory,
 - leader-local durable append/fsync work is offloaded from the async runtime's
   core workers before quorum replication begins, preserving durable-before-ack
   ordering without stalling unrelated HTTP and Raft RPC tasks on that worker,
@@ -665,6 +692,10 @@ Implemented:
   different applied indexes,
 - leader-local request batching with an early wake when the pending queue reaches
   the configured batch size,
+- the client batch driver refills a partially drained pipeline after it acquires
+  the serialized commit lane, so requests that arrived during commit-lane
+  contention can share the same append/replicate/commit round up to
+  `client_batch_max_entries * client_pipeline_max_batches`,
 - bounded leader-local client admission through `client_batch_max_pending`, so a
   stalled quorum rejects before appending new log entries instead of growing the
   pending queue without bound,
@@ -685,8 +716,9 @@ Implemented:
   and requests above the distinct-key cap are rejected before batching or log
   append; older committed composite entries (including any with up to 5 keys
   appended before the cap) still replay and restore from snapshots,
-- coalesced post-commit `AppendEntries` fan-out, so bursty commits wake lagging
-  peers promptly without spawning one background replication task per commit,
+- coalesced post-commit `AppendEntries` fan-out with bounded inline catch-up for
+  lagging peers, so bursty commits wake followers promptly without spawning one
+  background replication task or fan-out/join round per log batch,
 - leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
   exposing `currentTerm`, `commitIndex`, `lastApplied`, `isLeaderReady`,
   `leaderQuorumAgeMs`, and `leaderQuorumTimeoutMs` for convergence and stale
@@ -700,7 +732,7 @@ Implemented:
 
 Still missing:
 
-- broader hot-path pipelining beyond bounded per-peer catch-up and the
+- broader hot-path pipelining beyond bounded per-peer fanout/catch-up and the
   serialized commit/apply lane,
 - production hardening comparable to etcd or ZooKeeper.
 
@@ -789,8 +821,9 @@ operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`, and target-index
-replication can send up to `append_entries_max_inline_batches` bounded batches
-sequentially to the same peer before yielding back to the outer quorum loop.
+replication plus no-target heartbeat/post-commit fanout can send up to
+`append_entries_max_inline_batches` bounded batches sequentially to the same
+peer before yielding back to the outer quorum or fanout loop.
 This preserves per-peer AppendEntries ordering while avoiding one fan-out/join
 round per catch-up batch for lagging followers. Raft peer RPCs reuse open TCP
 connections, including follower-to-leader proxy requests. The
@@ -884,10 +917,12 @@ are test-only; production replication uses bounded suffix or exact range reads.
 The leader can coalesce concurrent client requests into
 bounded append/replicate/commit batches. Under load, the serialized write lane
 drains up to `client_batch_max_entries * client_pipeline_max_batches` pending
-requests into one quorum round, and the coalescer wakes early when a batch fills
-instead of always paying the full coalescing delay. The leader-local waiting
-queue is bounded by `client_batch_max_pending`; overflow requests fail before
-log append, so they do not create partially replicated lock operations.
+requests into one quorum round. If the driver waited behind another operation in
+the serialized commit lane, it refills the pipeline from newly arrived pending
+requests before appending, and the coalescer wakes early when a batch fills
+instead of always paying the full coalescing delay. The leader-local waiting queue
+is bounded by `client_batch_max_pending`; overflow requests fail before log
+append, so they do not create partially replicated lock operations.
 Cancelled client waiters are pruned from the pending queue before capacity
 checks and from drained batches before append, releasing any unapplied
 idempotency-key reservation and incrementing
@@ -901,9 +936,10 @@ retained entries, so ordinary commits below snapshot thresholds do not scan the
 whole log.
 After a quorum commits a write, slow non-quorum peers do not block the
 successful client path. No-target heartbeat and post-commit fan-out rounds also
-return after an active quorum instead of waiting for every slow peer task, and
-they skip peers whose pooled RPC connection is already busy with in-flight work
-before preparing AppendEntries or snapshot payloads.
+return after an active quorum instead of waiting for every slow peer task, can
+advance a lagging peer through multiple bounded AppendEntries batches on the
+same pooled connection, and skip peers whose pooled RPC connection is already
+busy with in-flight work before preparing AppendEntries or snapshot payloads.
 Any in-flight replication to those peers is allowed to finish in the background,
 and the heartbeat loop handles anything still lagging. The commit lane still
 applies committed entries in order, but bursty client writes no longer require
@@ -967,12 +1003,21 @@ Setting `raft.sync_log = false` skips append-log fsyncs and parent-directory
 syncs on append/rewrite paths; it can be useful for isolating disk-sync cost in
 benchmarks, but it weakens crash durability and should not be used for
 etcd/ZooKeeper-style safety claims.
+The data directory should be unique per Raft node. With the default
+`raft.data_dir_lock = true`, startup holds `broker-raft.lock` inside that
+directory and fails early if another live `BrokerRaft` already owns it. This is
+an advisory ownership guard around the local disk files; it does not replace
+Raft quorum or let multiple nodes share one state directory.
 When a replication round changes a peer's `nextIndex` or `matchIndex`, the
 leader retries immediately and notifies other quorum/catch-up waiters; those
 waiters wake before the heartbeat delay if the generation changes in another
 task. It sleeps for the heartbeat interval only when no peer made progress. The
 retry loop tracks this with a monotonic leader-progress generation counter, so
 it does not clone the whole peer progress map on every bounded catch-up round.
+If another in-flight round has already advanced the local durable commit index
+past a target, target-index quorum waits short-circuit before peer fan-out and
+increment
+`dd_rust_network_mutex_raft_replication_quorum_already_committed_short_circuits_total`.
 Hot leader checks use a nonblocking role/term cache, and follower proxying uses
 a cached leader peer hint when the runtime mutex is contended, so LB-routed HTTP
 traffic and heartbeat tasks do not pile up behind unrelated Raft state work.
@@ -980,7 +1025,9 @@ Leader-side proxy responses report the current term after the proxied work
 finishes, and follower proxy responses that carry a higher Raft term force the
 forwarding follower to persist a step-down before returning the proxied client
 result, so round-robin LB traffic cannot leave the proxying node with stale term
-state.
+state. Follower proxying retries transient stale-leader, leaderless, and
+transport failures until `proxy_retry_budget_ms` expires; terminal
+request-payload errors such as idempotency conflicts are not retried.
 Follower/candidate election maintenance sleeps until the current election
 deadline instead of polling the runtime mutex every 20 ms; failed election
 attempts still back off briefly before retrying.
