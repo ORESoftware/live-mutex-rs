@@ -213,8 +213,8 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_duplicate_chunk_mismatches_total`,
   `dd_rust_network_mutex_raft_install_snapshot_staged_file_mismatches_total`,
 - inbound `InstallSnapshot` chunks are decoded and checked against
-  `raft.install_snapshot_chunk_bytes` before term/leader mutation; oversized
-  chunks increment
+  `raft.install_snapshot_chunk_bytes` before term/leader mutation; empty chunks
+  are rejected as malformed, and oversized chunks increment
   `dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total`,
 - one staged `InstallSnapshot` transfer is capped by
   `raft.install_snapshot_max_staged_bytes`, with over-limit transfers discarded
@@ -237,7 +237,12 @@ Implemented:
   `dd_rust_network_mutex_raft_snapshot_transfer_superseded_leader_cleanups_total`,
 - SHA-256 snapshot payload checksums verified before snapshot install, and
   same-index/same-term `InstallSnapshot` retries must match the local snapshot
-  checksum before the follower treats the snapshot as already installed,
+  checksum before the follower treats the snapshot as already installed;
+  accepted checksum metadata is canonicalized to lowercase after verification,
+  while uppercase wire/persisted hex is treated as the same checksum; local
+  same-boundary snapshot writes also validate checksumless legacy snapshot
+  payloads before treating them as idempotent and upgrade matching legacy
+  metadata with a checksum,
 - log-backed dynamic membership changes through joint consensus via
   `GET/POST /raft/membership`,
 - simple membership updates that normalize to the already-active peer set return
@@ -332,7 +337,10 @@ Implemented:
   `dd_rust_network_mutex_raft_append_conflict_high_clamps_total`; conflict
   responses for older in-flight probes are ignored when the peer's `nextIndex`
   has already changed and counted in
-  `dd_rust_network_mutex_raft_append_stale_conflict_responses_total`; invalid
+  `dd_rust_network_mutex_raft_append_stale_conflict_responses_total`; conflict
+  responses with impossible `conflictTerm`/`conflictIndex` hints are rejected
+  before repair and counted in
+  `dd_rust_network_mutex_raft_append_invalid_conflict_responses_total`; invalid
   `AppendEntries(success=true)` responses that underreport the matched boundary
   increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
   success responses that overreport beyond the sent batch are capped and
@@ -916,6 +924,9 @@ with a false follower hint.
 Append progress and conflict repair emit debug-level `lmx::raft` events with
 the previous and repaired `nextIndex`/`matchIndex`, the sent batch boundary, and
 whether a stale conflict hint was clamped by known follower progress.
+Impossible conflict hints with zero terms/indexes or a `conflictIndex` beyond
+the rejected `nextIndex` are treated as invalid peer responses before leader
+progress can be mutated.
 Impossible `AppendEntries(success=true)` responses that report a `matchIndex`
 below the matched previous entry or sent batch are rejected as non-progress and
 counted in the invalid-success metric.

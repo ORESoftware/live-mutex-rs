@@ -104,9 +104,10 @@ pub struct BrokerRaftConfig {
     /// Max concurrent staged `InstallSnapshot` transfers retained on follower
     /// disk before new transfer starts are rejected.
     pub install_snapshot_max_staged_transfers: usize,
-    /// Staged `InstallSnapshot` transfers older than this are discarded before
-    /// accepting new chunks. This bounds disk usage from interrupted snapshot
-    /// streams while keeping the default at the old 30-minute behavior.
+    /// Staged `InstallSnapshot` transfers older than this are discarded.
+    /// Cleanup fires proactively in the maintenance loop (at most every
+    /// `install_snapshot_stale_transfer_after / 2`) so abandoned part files
+    /// are removed even when no new snapshot chunks ever arrive on this node.
     pub install_snapshot_stale_transfer_after: Duration,
     /// Max leader-local client requests to append and replicate in one commit
     /// batch. Membership changes and client-drop cleanup stay serialized.
@@ -363,6 +364,7 @@ pub struct RaftTelemetrySnapshot {
     pub append_conflict_clamps_total: u64,
     pub append_conflict_high_clamps_total: u64,
     pub append_stale_conflict_responses_total: u64,
+    pub append_invalid_conflict_responses_total: u64,
     pub append_invalid_success_responses_total: u64,
     pub append_capped_success_responses_total: u64,
     pub append_stale_term_responses_total: u64,
@@ -391,6 +393,7 @@ pub struct RaftTelemetrySnapshot {
     pub install_snapshot_rejections_total: u64,
     pub install_snapshot_rpc_errors_total: u64,
     pub install_snapshot_premature_success_responses_total: u64,
+    pub install_snapshot_invalid_rejection_responses_total: u64,
     pub install_snapshot_invalid_success_responses_total: u64,
     pub install_snapshot_capped_success_responses_total: u64,
     pub install_snapshot_stale_term_responses_total: u64,
@@ -1729,6 +1732,7 @@ struct BrokerRaftTelemetry {
     append_conflict_clamps_total: AtomicU64,
     append_conflict_high_clamps_total: AtomicU64,
     append_stale_conflict_responses_total: AtomicU64,
+    append_invalid_conflict_responses_total: AtomicU64,
     append_invalid_success_responses_total: AtomicU64,
     append_capped_success_responses_total: AtomicU64,
     append_stale_term_responses_total: AtomicU64,
@@ -1757,6 +1761,7 @@ struct BrokerRaftTelemetry {
     install_snapshot_rejections_total: AtomicU64,
     install_snapshot_rpc_errors_total: AtomicU64,
     install_snapshot_premature_success_responses_total: AtomicU64,
+    install_snapshot_invalid_rejection_responses_total: AtomicU64,
     install_snapshot_invalid_success_responses_total: AtomicU64,
     install_snapshot_capped_success_responses_total: AtomicU64,
     install_snapshot_stale_term_responses_total: AtomicU64,
@@ -2926,6 +2931,7 @@ impl RaftLogStore {
                 )));
             }
             if last_included_index == existing.last_included_index {
+                let existing = existing.clone();
                 if last_included_term != existing.last_included_term {
                     return Err(BrokerRaftError::InvalidLog(format!(
                         "refusing to replace latest snapshot term {} at index {} with term {last_included_term}",
@@ -2935,14 +2941,57 @@ impl RaftLogStore {
                 if existing
                     .payload_sha256
                     .as_deref()
-                    .is_some_and(|existing_checksum| existing_checksum != payload_sha256)
+                    .is_some_and(|existing_checksum| {
+                        !existing_checksum.eq_ignore_ascii_case(&payload_sha256)
+                    })
                 {
                     return Err(BrokerRaftError::InvalidLog(format!(
                         "refusing to replace latest snapshot payload at index {} with a different checksum",
                         existing.last_included_index
                     )));
                 }
-                return Ok(existing.clone());
+                if existing.payload_sha256.is_some() {
+                    return Ok(existing.clone());
+                }
+
+                let snapshot = read_snapshot_file(&self.snapshot_path)?.ok_or_else(|| {
+                    BrokerRaftError::InvalidLog(format!(
+                        "latest snapshot metadata at index {} has no checksum and snapshot file is missing",
+                        existing.last_included_index
+                    ))
+                })?;
+                if snapshot.metadata.last_included_index != existing.last_included_index
+                    || snapshot.metadata.last_included_term != existing.last_included_term
+                {
+                    return Err(BrokerRaftError::InvalidLog(format!(
+                        "latest snapshot metadata changed while validating local snapshot write at index {}",
+                        existing.last_included_index
+                    )));
+                }
+                let existing_payload_sha256 = snapshot_payload_sha256(&snapshot.payload)?;
+                if !existing_payload_sha256.eq_ignore_ascii_case(&payload_sha256) {
+                    return Err(BrokerRaftError::InvalidLog(format!(
+                        "refusing to treat checksumless latest snapshot payload at index {} as idempotent with a different checksum",
+                        existing.last_included_index
+                    )));
+                }
+
+                let metadata = RaftSnapshotMetadata {
+                    payload_sha256: Some(payload_sha256),
+                    ..existing.clone()
+                };
+                let snapshot = RaftSnapshotFile {
+                    metadata: metadata.clone(),
+                    payload: snapshot.payload,
+                };
+                write_pretty_json_atomic(
+                    &self.snapshot_path,
+                    &snapshot,
+                    self.telemetry.as_deref(),
+                )?;
+                state.latest_snapshot = Some(metadata.clone());
+                state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
+                return Ok(metadata);
             }
         }
         if let Some(retained_term) = term_at_index(&state, last_included_index) {
@@ -3865,6 +3914,10 @@ impl BrokerRaft {
                 .telemetry
                 .append_stale_conflict_responses_total
                 .load(Ordering::Relaxed),
+            append_invalid_conflict_responses_total: self
+                .telemetry
+                .append_invalid_conflict_responses_total
+                .load(Ordering::Relaxed),
             append_invalid_success_responses_total: self
                 .telemetry
                 .append_invalid_success_responses_total
@@ -3976,6 +4029,10 @@ impl BrokerRaft {
             install_snapshot_premature_success_responses_total: self
                 .telemetry
                 .install_snapshot_premature_success_responses_total
+                .load(Ordering::Relaxed),
+            install_snapshot_invalid_rejection_responses_total: self
+                .telemetry
+                .install_snapshot_invalid_rejection_responses_total
                 .load(Ordering::Relaxed),
             install_snapshot_invalid_success_responses_total: self
                 .telemetry
@@ -4471,6 +4528,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_stale_conflict_responses_total AppendEntries conflict responses ignored because peer nextIndex had already changed since the failed probe was sent.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_stale_conflict_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_stale_conflict_responses_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_append_invalid_conflict_responses_total AppendEntries conflict responses rejected because conflictTerm or conflictIndex was impossible for the failed probe.\n",
+                "# TYPE dd_rust_network_mutex_raft_append_invalid_conflict_responses_total counter\n",
+                "dd_rust_network_mutex_raft_append_invalid_conflict_responses_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_append_invalid_success_responses_total AppendEntries success responses rejected because the reported matchIndex could not cover the matched previous entry or sent batch.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_invalid_success_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_invalid_success_responses_total {}\n",
@@ -4666,6 +4726,7 @@ impl BrokerRaft {
             snapshot.append_conflict_clamps_total,
             snapshot.append_conflict_high_clamps_total,
             snapshot.append_stale_conflict_responses_total,
+            snapshot.append_invalid_conflict_responses_total,
             snapshot.append_invalid_success_responses_total,
             snapshot.append_capped_success_responses_total,
             snapshot.append_stale_term_responses_total,
@@ -8478,7 +8539,10 @@ impl BrokerRaft {
                 error: format!("malformed InstallSnapshot request: {reason}"),
             };
         }
-        let Some(expected_checksum) = payload_sha256.clone() else {
+        let Some(expected_checksum) = payload_sha256
+            .as_deref()
+            .map(|checksum| checksum.to_ascii_lowercase())
+        else {
             let response_term = self.runtime.lock().current_term;
             self.telemetry
                 .install_snapshot_malformed_requests_total
@@ -8549,7 +8613,7 @@ impl BrokerRaft {
                 };
             }
         };
-        if chunk.is_empty() && !done {
+        if chunk.is_empty() {
             let response_term = self.runtime.lock().current_term;
             self.telemetry
                 .install_snapshot_malformed_requests_total
@@ -8570,11 +8634,11 @@ impl BrokerRaft {
                 snapshot_term = last_included_term,
                 offset,
                 done,
-                "raft rejected empty non-final install-snapshot chunk",
+                "raft rejected empty install-snapshot chunk",
             );
             return RaftRpcResponse::Error {
                 term: response_term,
-                error: "malformed InstallSnapshot request: empty non-final snapshot chunk".into(),
+                error: "malformed InstallSnapshot request: empty snapshot chunk".into(),
             };
         }
         if chunk.len() > self.config.install_snapshot_chunk_bytes {
@@ -8776,14 +8840,12 @@ impl BrokerRaft {
                     }
                 }
             }
-            if let Some(checksum) = payload_sha256.as_deref() {
-                self.discard_snapshot_transfer(
-                    &leader_id,
-                    last_included_index,
-                    last_included_term,
-                    checksum,
-                );
-            }
+            self.discard_snapshot_transfer(
+                &leader_id,
+                last_included_index,
+                last_included_term,
+                &expected_checksum,
+            );
             return RaftRpcResponse::InstallSnapshot {
                 term: self.runtime.lock().current_term,
                 success: true,
@@ -8822,7 +8884,7 @@ impl BrokerRaft {
         if let Err(err) = verify_snapshot_payload_file_checksum(
             last_included_index,
             &payload_path,
-            payload_sha256.clone(),
+            Some(expected_checksum.clone()),
         ) {
             self.remove_snapshot_transfer_file(payload_path, "checksum-verification-failed");
             return RaftRpcResponse::Error {
@@ -8883,7 +8945,7 @@ impl BrokerRaft {
             let installed = match self.log.install_snapshot_from_leader(
                 last_included_index,
                 last_included_term,
-                payload_sha256.clone(),
+                Some(expected_checksum.clone()),
                 payload.clone(),
             ) {
                 Ok(snapshot) => snapshot,
@@ -9129,9 +9191,16 @@ impl BrokerRaft {
 
     async fn maintenance_loop(&self) {
         crate::routine_id!("ddl-routine-broker-raft-maintenance-loop-1");
-        let interval = self.config.snapshot_interval.max(Duration::from_secs(1));
+        // Run on a tick that is at most half the stale-transfer window so that
+        // abandoned InstallSnapshot part files are swept even when no new
+        // snapshot chunks ever arrive.  Compaction gates itself internally on
+        // snapshot_interval, so calling it on every tick is safe.
+        let tick = (self.config.install_snapshot_stale_transfer_after / 2)
+            .min(self.config.snapshot_interval)
+            .max(Duration::from_secs(1));
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(tick).await;
+            self.cleanup_stale_snapshot_transfers(unix_ms());
             if let Err(err) = self.snapshot_and_compact_if_needed_blocking(true).await {
                 warn!(
                     target: "lmx::raft",
@@ -10765,6 +10834,36 @@ impl BrokerRaft {
                             target_reached: false,
                         });
                     }
+                    if let Some(reason) = invalid_append_conflict_hint_reason(
+                        conflict_term,
+                        conflict_index,
+                        next_index,
+                    ) {
+                        self.telemetry
+                            .append_entries_rpc_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.telemetry
+                            .append_invalid_conflict_responses_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            peer = %peer.id,
+                            term,
+                            prev_log_index,
+                            sent_match_index,
+                            reported_match_index = match_index,
+                            conflict_index = ?conflict_index,
+                            conflict_term = ?conflict_term,
+                            target_index = ?target_index,
+                            reason,
+                            "raft ignored append rejection with invalid conflict hint",
+                        );
+                        return Ok(RaftPeerReplicationOutcome {
+                            contacted: true,
+                            target_reached: false,
+                        });
+                    }
                     self.telemetry
                         .append_entries_conflicts_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -10928,7 +11027,9 @@ impl BrokerRaft {
         let cached = self.prepared_install_snapshot_cache.lock().clone()?;
         if cached.metadata.last_included_index == metadata.last_included_index
             && cached.metadata.last_included_term == metadata.last_included_term
-            && cached.payload_sha256 == *expected_checksum
+            && cached
+                .payload_sha256
+                .eq_ignore_ascii_case(expected_checksum)
         {
             Some(cached)
         } else {
@@ -12054,6 +12155,7 @@ impl BrokerRaft {
             self.record_compaction_safety_skip(
                 "no-commit",
                 periodic,
+                threshold_reached,
                 commit_index,
                 last_applied,
                 0,
@@ -12066,6 +12168,7 @@ impl BrokerRaft {
             self.record_compaction_safety_skip(
                 "unapplied-commit",
                 periodic,
+                threshold_reached,
                 commit_index,
                 last_applied,
                 0,
@@ -12086,6 +12189,7 @@ impl BrokerRaft {
             self.record_compaction_safety_skip(
                 "trailing-suffix",
                 periodic,
+                threshold_reached,
                 commit_index,
                 last_applied,
                 compact_through,
@@ -12218,6 +12322,7 @@ impl BrokerRaft {
         &self,
         reason: &'static str,
         periodic: bool,
+        threshold_reached: bool,
         commit_index: u64,
         last_applied: u64,
         compact_through: u64,
@@ -12228,19 +12333,41 @@ impl BrokerRaft {
         self.telemetry
             .log_compaction_safety_skips_total
             .fetch_add(1, Ordering::Relaxed);
-        debug!(
-            target: "lmx::raft",
-            node_id = %self.config.node_id,
-            reason,
-            periodic,
-            commit_index,
-            last_applied,
-            compact_through,
-            trailing_log_entries = self.config.trailing_log_entries,
-            retained_entries,
-            log_bytes,
-            "raft log compaction skipped by safety guard",
-        );
+        if threshold_reached {
+            // The log exceeded the configured size/entry threshold but a
+            // safety guard prevents compaction right now.  This will recover
+            // once the guard condition clears, but the operator should know it
+            // is happening.
+            warn!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                reason,
+                periodic,
+                commit_index,
+                last_applied,
+                compact_through,
+                trailing_log_entries = self.config.trailing_log_entries,
+                retained_entries,
+                log_bytes,
+                snapshot_max_log_bytes = self.config.snapshot_max_log_bytes,
+                snapshot_max_log_entries = self.config.snapshot_max_log_entries,
+                "raft log compaction skipped by safety guard while threshold exceeded",
+            );
+        } else {
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                reason,
+                periodic,
+                commit_index,
+                last_applied,
+                compact_through,
+                trailing_log_entries = self.config.trailing_log_entries,
+                retained_entries,
+                log_bytes,
+                "raft log compaction skipped by safety guard",
+            );
+        }
     }
 
     async fn snapshot_and_compact_if_needed_blocking(
@@ -14841,13 +14968,14 @@ fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaf
         return Ok(None);
     }
     let file = File::open(path)?;
-    let snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
+    let mut snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
     if let Some(expected) = snapshot.metadata.payload_sha256.as_deref() {
-        verify_snapshot_payload_checksum(
+        let verified = verify_snapshot_payload_checksum(
             snapshot.metadata.last_included_index,
             &snapshot.payload,
             Some(expected.to_string()),
         )?;
+        snapshot.metadata.payload_sha256 = Some(verified);
     }
     Ok(Some(snapshot))
 }
@@ -14866,7 +14994,7 @@ fn verify_snapshot_payload_checksum(
     crate::routine_id!("ddl-routine-broker-raft-verify-snapshot-sha256-1");
     let expected = expected.ok_or(BrokerRaftError::SnapshotChecksumMissing { index })?;
     let actual = snapshot_payload_sha256(payload)?;
-    if actual != expected {
+    if !actual.eq_ignore_ascii_case(&expected) {
         return Err(BrokerRaftError::SnapshotChecksumMismatch {
             index,
             expected,
@@ -14911,7 +15039,7 @@ fn validate_existing_snapshot_matches_install(
         }
     };
 
-    if existing_payload_sha256 != incoming_payload_sha256 {
+    if !existing_payload_sha256.eq_ignore_ascii_case(incoming_payload_sha256) {
         return Err(BrokerRaftError::InvalidLog(format!(
             "local snapshot payload checksum at index {} conflicts with InstallSnapshot payload checksum",
             existing.last_included_index
@@ -14929,7 +15057,7 @@ fn verify_snapshot_payload_file_checksum(
     crate::routine_id!("ddl-routine-broker-raft-verify-snapshot-file-sha256-1");
     let expected = expected.ok_or(BrokerRaftError::SnapshotChecksumMissing { index })?;
     let actual = snapshot_payload_file_sha256(path)?;
-    if actual != expected {
+    if !actual.eq_ignore_ascii_case(&expected) {
         return Err(BrokerRaftError::SnapshotChecksumMismatch {
             index,
             expected,
@@ -16149,6 +16277,24 @@ fn validate_append_entries_shape(
         }
     }
     Ok(())
+}
+
+fn invalid_append_conflict_hint_reason(
+    conflict_term: Option<u64>,
+    conflict_index: Option<u64>,
+    current_next_index: u64,
+) -> Option<&'static str> {
+    crate::routine_id!("ddl-routine-broker-raft-invalid-append-conflict-hint-1");
+    if conflict_term == Some(0) {
+        return Some("conflictTerm must be >= 1 when present");
+    }
+    if conflict_index == Some(0) {
+        return Some("conflictIndex must be >= 1 when present");
+    }
+    if conflict_index.is_some_and(|index| index > current_next_index) {
+        return Some("conflictIndex cannot exceed rejected nextIndex");
+    }
+    None
 }
 
 fn first_index_for_term(state: &RaftLogState, term: u64) -> Option<u64> {
@@ -26994,6 +27140,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_rejection_with_invalid_conflict_hint_does_not_rewind_next_index() {
+        let dir = temp_dir("raft-invalid-hint-rejection-keeps-next-index");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: false,
+                match_index: 5,
+                conflict_index: Some(1),
+                conflict_term: Some(0),
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate invalid-hint rejection");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        server.await.expect("fake peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_conflicts_total, 0);
+        assert_eq!(telemetry.append_conflict_repairs_total, 0);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 1);
+        assert_eq!(telemetry.append_invalid_conflict_responses_total, 1);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_append_invalid_conflict_responses_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn append_success_underreporting_prev_log_index_does_not_count_target_ack() {
         let dir = temp_dir("raft-append-success-underreports-prev");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -32630,6 +32887,23 @@ mod tests {
             Some(expected.as_str())
         );
 
+        let mut uppercase_metadata = serde_json::to_value(&snapshot).expect("snapshot json value");
+        uppercase_metadata["metadata"]["payloadSha256"] = json!(expected.to_ascii_uppercase());
+        fs::write(
+            &store.snapshot_path,
+            serde_json::to_vec_pretty(&uppercase_metadata)
+                .expect("uppercase metadata snapshot bytes"),
+        )
+        .expect("write uppercase checksum metadata");
+        let uppercase_snapshot = read_snapshot_file(&store.snapshot_path)
+            .expect("read uppercase checksum snapshot")
+            .expect("snapshot exists");
+        assert_eq!(
+            uppercase_snapshot.metadata.payload_sha256.as_deref(),
+            Some(expected.as_str()),
+            "snapshot checksum metadata should be canonicalized after verification"
+        );
+
         let mut tampered = serde_json::to_value(&snapshot).expect("snapshot json value");
         tampered["payload"]["note"] = json!("tampered");
         fs::write(
@@ -32671,6 +32945,74 @@ mod tests {
                 .expect("latest snapshot")
                 .last_included_index,
             7
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_snapshot_validates_and_upgrades_checksumless_same_boundary_snapshot() {
+        let dir = temp_dir("raft-snapshot-checksumless-same-boundary");
+        let payload = idle_snapshot_payload();
+        let expected_checksum = payload_checksum(&payload);
+        write_raw_snapshot(&dir, 7, 3, payload.clone());
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(&snapshot_path).expect("read raw snapshot"))
+                .expect("snapshot json");
+        legacy["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("payloadSha256");
+        fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&legacy).expect("legacy snapshot bytes"),
+        )
+        .expect("write checksumless legacy snapshot");
+
+        let store = RaftLogStore::open(&dir).expect("open checksumless snapshot");
+        assert_eq!(
+            store
+                .latest_snapshot()
+                .expect("legacy snapshot metadata")
+                .payload_sha256,
+            None
+        );
+
+        let mut changed_payload = payload.clone();
+        changed_payload["note"] = json!("different checksumless same-boundary payload");
+        let err = store
+            .write_snapshot(7, 3, changed_payload)
+            .expect_err("checksumless same-boundary snapshot must still reject payload changes");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("checksumless latest snapshot payload")
+                    && message.contains("different checksum")
+        ));
+
+        let upgraded = store
+            .write_snapshot(7, 3, payload)
+            .expect("matching checksumless snapshot should be upgraded");
+        assert_eq!(
+            upgraded.payload_sha256.as_deref(),
+            Some(expected_checksum.as_str())
+        );
+        assert_eq!(upgraded.created_at_ms, 10);
+        assert_eq!(
+            store
+                .latest_snapshot()
+                .expect("upgraded snapshot metadata")
+                .payload_sha256
+                .as_deref(),
+            Some(expected_checksum.as_str())
+        );
+        let durable = read_snapshot_file(&store.snapshot_path)
+            .expect("read upgraded snapshot")
+            .expect("snapshot exists");
+        assert_eq!(
+            durable.metadata.payload_sha256.as_deref(),
+            Some(expected_checksum.as_str())
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -32945,7 +33287,8 @@ mod tests {
                 true,
                 "invalid snapshot chunk",
             ),
-            (BASE64.encode([]), false, "empty non-final snapshot chunk"),
+            (BASE64.encode([]), false, "empty snapshot chunk"),
+            (BASE64.encode([]), true, "empty snapshot chunk"),
             (oversized_data, true, "exceeding configured limit"),
         ] {
             let response = raft.handle_install_snapshot(
@@ -32981,11 +33324,11 @@ mod tests {
         assert!(raft.snapshot_transfers.lock().is_empty());
         assert!(snapshot_part_files(&dir).is_empty());
         let telemetry = raft.telemetry_snapshot();
-        assert_eq!(telemetry.install_snapshot_malformed_requests_total, 3);
+        assert_eq!(telemetry.install_snapshot_malformed_requests_total, 4);
         assert_eq!(telemetry.install_snapshot_oversized_chunks_total, 1);
         let metrics = raft.raft_metrics_text();
         assert!(metrics
-            .contains("dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total 3"));
+            .contains("dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total 4"));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total 1"));
 
@@ -35289,6 +35632,46 @@ mod tests {
     }
 
     #[test]
+    fn handle_install_snapshot_accepts_uppercase_checksum_canonically() {
+        let dir = temp_dir("raft-handle-install-snapshot-uppercase-checksum");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+
+        let response = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.to_ascii_uppercase()),
+            0,
+            true,
+            data,
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 7,
+            }
+        ));
+        let snapshot = read_snapshot_file(&raft.log.snapshot_path)
+            .expect("read snapshot")
+            .expect("snapshot file");
+        assert_eq!(
+            snapshot.metadata.payload_sha256.as_deref(),
+            Some(checksum.as_str())
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert!(snapshot_part_files(&dir).is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn handle_install_snapshot_ignores_stale_payload_membership() {
         let dir = temp_dir("raft-handle-install-snapshot-stale-membership");
         let cfg = test_raft_config(dir.clone());
@@ -36997,6 +37380,27 @@ mod tests {
         assert!(metrics.contains("dd_rust_network_mutex_raft_append_conflict_high_clamps_total 1"));
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_append_conflict_hint_reason_rejects_zero_or_post_probe_values() {
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(0), Some(1), 5),
+            Some("conflictTerm must be >= 1 when present")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(0), 5),
+            Some("conflictIndex must be >= 1 when present")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), Some(6), 5),
+            Some("conflictIndex cannot exceed rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), Some(5), 5),
+            None
+        );
+        assert_eq!(invalid_append_conflict_hint_reason(Some(1), None, 5), None);
     }
 
     #[test]
