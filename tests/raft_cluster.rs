@@ -4,7 +4,7 @@
 //! load-balancer shape: HTTP requests can land on followers and get proxied to
 //! the elected leader, while commits still require a quorum.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,23 +21,76 @@ static RAFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 
 struct RaftCluster {
     http_ports: Vec<u16>,
-    _data_dir: PathBuf,
-    handles: Vec<JoinHandle<()>>,
+    raft_ports: Vec<u16>,
+    peers: Vec<RaftPeerConfig>,
+    initial_peers: Vec<RaftPeerConfig>,
+    data_dir: PathBuf,
+    tuning: RaftClusterTuning,
+    handles: Vec<Option<JoinHandle<()>>>,
 }
 
 impl RaftCluster {
     async fn abort_node(&mut self, index: usize) {
-        self.handles[index].abort();
-        let _ = (&mut self.handles[index]).await;
+        if let Some(handle) = self.handles[index].take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        wait_for_http_unavailable(self.http_ports[index], "/raft/status").await;
+    }
+
+    async fn restart_node(&mut self, index: usize) {
+        assert!(
+            self.handles[index].is_none(),
+            "node {index} is already running"
+        );
+        self.handles[index] = Some(spawn_raft_node(
+            index,
+            &self.raft_ports,
+            &self.http_ports,
+            &self.data_dir,
+            &self.initial_peers,
+            &self.tuning,
+        ));
+        wait_for_http_port(self.http_ports[index], "/raft/status").await;
     }
 }
 
 impl Drop for RaftCluster {
     fn drop(&mut self) {
         for handle in &self.handles {
-            handle.abort();
+            if let Some(handle) = handle {
+                handle.abort();
+            }
         }
-        let _ = fs::remove_dir_all(&self._data_dir);
+        let _ = fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RaftClusterTuning {
+    heartbeat_interval: Duration,
+    election_timeout_min: Duration,
+    election_timeout_max: Duration,
+    snapshot_interval: Duration,
+    snapshot_max_log_entries: u64,
+    snapshot_max_log_bytes: u64,
+    trailing_log_entries: u64,
+    install_snapshot_chunk_bytes: usize,
+}
+
+impl Default for RaftClusterTuning {
+    fn default() -> Self {
+        let defaults = BrokerRaftConfig::default();
+        Self {
+            heartbeat_interval: Duration::from_millis(50),
+            election_timeout_min: Duration::from_millis(600),
+            election_timeout_max: Duration::from_millis(1_200),
+            snapshot_interval: defaults.snapshot_interval,
+            snapshot_max_log_entries: defaults.snapshot_max_log_entries,
+            snapshot_max_log_bytes: defaults.snapshot_max_log_bytes,
+            trailing_log_entries: defaults.trailing_log_entries,
+            install_snapshot_chunk_bytes: defaults.install_snapshot_chunk_bytes,
+        }
     }
 }
 
@@ -92,9 +145,22 @@ async fn start_regular_http_server() -> RegularHttpServer {
 }
 
 async fn start_cluster() -> RaftCluster {
+    start_cluster_with_nodes(3, 3).await
+}
+
+async fn start_cluster_with_nodes(total_nodes: usize, initial_voters: usize) -> RaftCluster {
+    start_cluster_with_tuning(total_nodes, initial_voters, RaftClusterTuning::default()).await
+}
+
+async fn start_cluster_with_tuning(
+    total_nodes: usize,
+    initial_voters: usize,
+    tuning: RaftClusterTuning,
+) -> RaftCluster {
+    assert!(initial_voters <= total_nodes);
     let mut raft_ports = Vec::new();
     let mut http_ports = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..total_nodes {
         raft_ports.push(pick_port().await);
         http_ports.push(pick_port().await);
     }
@@ -107,50 +173,82 @@ async fn start_cluster() -> RaftCluster {
             addr: format!("127.0.0.1:{port}"),
         })
         .collect();
+    let initial_peers = peers
+        .iter()
+        .take(initial_voters)
+        .cloned()
+        .collect::<Vec<_>>();
 
     let data_dir = std::env::temp_dir().join(format!("lmx-raft-cluster-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&data_dir).unwrap();
 
     let mut handles = Vec::new();
-    for idx in 0..3 {
-        let node_id = format!("node-{}", idx + 1);
-        let mut raft = BrokerRaftConfig::default();
-        raft.enabled = true;
-        raft.node_id = node_id.clone();
-        raft.bind_addr = Some(format!("127.0.0.1:{}", raft_ports[idx]).parse().unwrap());
-        raft.advertise_addr = Some(format!("127.0.0.1:{}", raft_ports[idx]));
-        raft.data_dir = data_dir.join(&node_id);
-        raft.heartbeat_interval = Duration::from_millis(50);
-        raft.election_timeout_min = Duration::from_millis(600);
-        raft.election_timeout_max = Duration::from_millis(1_200);
-        raft.peers = peers.clone();
-        raft.broker = BrokerConfig::default();
-
-        let config = ServerConfig {
-            tcp_bind: None,
-            uds_path: None,
-            http_bind: Some(format!("127.0.0.1:{}", http_ports[idx]).parse().unwrap()),
-            auth_token: None,
-            broker: BrokerConfig::default(),
-            tcp_nodelay: true,
-            tcp_quickack: true,
-            status_bind: None,
-            #[cfg(feature = "tls")]
-            tls: None,
-        };
-
-        handles.push(tokio::spawn(async move {
-            let _ = server::run_raft(config, raft).await;
-        }));
+    for idx in 0..total_nodes {
+        handles.push(Some(spawn_raft_node(
+            idx,
+            &raft_ports,
+            &http_ports,
+            &data_dir,
+            &initial_peers,
+            &tuning,
+        )));
     }
 
     let cluster = RaftCluster {
         http_ports,
-        _data_dir: data_dir,
+        raft_ports,
+        peers,
+        initial_peers,
+        data_dir,
+        tuning,
         handles,
     };
     wait_for_http(&cluster).await;
     cluster
+}
+
+fn spawn_raft_node(
+    index: usize,
+    raft_ports: &[u16],
+    http_ports: &[u16],
+    data_dir: &std::path::Path,
+    initial_peers: &[RaftPeerConfig],
+    tuning: &RaftClusterTuning,
+) -> JoinHandle<()> {
+    let node_id = format!("node-{}", index + 1);
+    let mut raft = BrokerRaftConfig::default();
+    raft.enabled = true;
+    raft.node_id = node_id.clone();
+    raft.bind_addr = Some(format!("127.0.0.1:{}", raft_ports[index]).parse().unwrap());
+    raft.advertise_addr = Some(format!("127.0.0.1:{}", raft_ports[index]));
+    raft.data_dir = data_dir.join(&node_id);
+    raft.heartbeat_interval = tuning.heartbeat_interval;
+    raft.election_timeout_min = tuning.election_timeout_min;
+    raft.election_timeout_max = tuning.election_timeout_max;
+    raft.snapshot_interval = tuning.snapshot_interval;
+    raft.snapshot_max_log_entries = tuning.snapshot_max_log_entries;
+    raft.snapshot_max_log_bytes = tuning.snapshot_max_log_bytes;
+    raft.trailing_log_entries = tuning.trailing_log_entries;
+    raft.install_snapshot_chunk_bytes = tuning.install_snapshot_chunk_bytes;
+    raft.peers = initial_peers.to_vec();
+    raft.broker = BrokerConfig::default();
+
+    let config = ServerConfig {
+        tcp_bind: None,
+        uds_path: None,
+        http_bind: Some(format!("127.0.0.1:{}", http_ports[index]).parse().unwrap()),
+        auth_token: None,
+        broker: BrokerConfig::default(),
+        tcp_nodelay: true,
+        tcp_quickack: true,
+        status_bind: None,
+        #[cfg(feature = "tls")]
+        tls: None,
+    };
+
+    tokio::spawn(async move {
+        let _ = server::run_raft(config, raft).await;
+    })
 }
 
 async fn wait_for_http(cluster: &RaftCluster) {
@@ -182,6 +280,20 @@ async fn wait_for_http_port(port: u16, path: &str) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for HTTP listener on port {port}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_http_unavailable(port: u16, path: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if http_get_json(port, path).await.is_none() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for HTTP listener on port {port} to stop serving {path}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -229,6 +341,58 @@ async fn wait_for_leader_among(cluster: &RaftCluster, nodes: &[usize]) -> usize 
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn wait_for_simple_membership(
+    cluster: &RaftCluster,
+    nodes: &[usize],
+    expected_ids: &BTreeSet<String>,
+    expected_cluster_size: u64,
+    expected_quorum_size: u64,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut latest = Vec::new();
+    loop {
+        latest.clear();
+        let mut converged = true;
+        for index in nodes {
+            let port = cluster.http_ports[*index];
+            let Some(status) = http_get_json(port, "/raft/status").await else {
+                converged = false;
+                latest.push(format!("{port}: status unavailable"));
+                continue;
+            };
+            let peer_ids = simple_membership_peer_ids(&status["membership"]);
+            let ok = status["membershipJoint"] == false
+                && status["clusterSize"].as_u64() == Some(expected_cluster_size)
+                && status["quorumSize"].as_u64() == Some(expected_quorum_size)
+                && peer_ids.as_ref() == Some(expected_ids);
+            latest.push(format!("{port}: status={status:?} peers={peer_ids:?}"));
+            converged &= ok;
+        }
+        if converged {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for raft membership convergence; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn simple_membership_peer_ids(membership: &Value) -> Option<BTreeSet<String>> {
+    if membership["state"] != "simple" {
+        return None;
+    }
+    Some(
+        membership
+            .get("peers")?
+            .as_array()?
+            .iter()
+            .filter_map(|peer| peer["id"].as_str().map(str::to_string))
+            .collect(),
+    )
 }
 
 async fn wait_for_zero_holders_and_waiters(cluster: &RaftCluster) {
@@ -283,6 +447,44 @@ async fn wait_for_zero_holders_and_waiters_on_port(port: u16) {
         assert!(
             tokio::time::Instant::now() < deadline,
             "timed out waiting for backend on port {port} to clear holders/waiters; latest={latest}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_status_index_at_least(port: u16, field: &str, min: u64) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut latest = None;
+    loop {
+        if let Some(status) = http_get_json(port, "/raft/status").await {
+            let value = status[field].as_u64();
+            latest = Some(status.clone());
+            if value.is_some_and(|value| value >= min) {
+                return status;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for /raft/status field {field} >= {min} on port {port}; latest={latest:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_metric_at_least(port: u16, name: &str, min: u64) -> u64 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut latest = None;
+    loop {
+        if let Some(metrics) = http_get_text(port, "/metrics").await {
+            let value = metric_value(&metrics, name);
+            latest = value;
+            if value.is_some_and(|value| value >= min) {
+                return value.unwrap();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for metric {name} >= {min} on port {port}; latest={latest:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -460,6 +662,261 @@ async fn raft_lb_round_robin_survives_leader_failover() {
         reacquire["acquired"], true,
         "LB should route to the surviving Raft quorum after leader failover: {reacquire:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster_with_nodes(5, 3).await;
+    let initial_nodes = vec![0, 1, 2];
+    let old_leader = wait_for_leader_among(&cluster, &initial_nodes).await;
+    let key = format!("raft-membership-key-{}", uuid::Uuid::new_v4());
+
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[old_leader],
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "pre-membership acquire response: {acquire:?}");
+    assert_eq!(
+        acquire["acquired"], true,
+        "pre-membership acquire response: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+
+    let (status, membership) = http_post_json(
+        cluster.http_ports[old_leader],
+        "/raft/membership",
+        json!({"peers": cluster.peers.clone()}),
+    )
+    .await;
+    assert_eq!(status, 200, "membership response: {membership:?}");
+    assert_eq!(membership["clusterSize"].as_u64(), Some(5));
+    assert_eq!(membership["quorumSize"].as_u64(), Some(3));
+    let expected_ids = cluster
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    let all_nodes = vec![0, 1, 2, 3, 4];
+    wait_for_simple_membership(&cluster, &all_nodes, &expected_ids, 5, 3).await;
+
+    let second_old_voter = initial_nodes
+        .iter()
+        .copied()
+        .find(|idx| *idx != old_leader)
+        .unwrap();
+    cluster.abort_node(old_leader).await;
+    cluster.abort_node(second_old_voter).await;
+    let survivors = (0..cluster.http_ports.len())
+        .filter(|idx| *idx != old_leader && *idx != second_old_voter)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        survivors.len(),
+        3,
+        "test should leave exactly a new 5-node quorum online"
+    );
+    let _new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    let survivor_ports = survivors
+        .iter()
+        .map(|idx| cluster.http_ports[*idx])
+        .collect::<Vec<_>>();
+    let lb = start_round_robin_lb(survivor_ports).await;
+
+    let (status, release) = http_post_json(
+        lb.port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "release after membership failover response: {release:?}"
+    );
+    assert_eq!(
+        release["unlocked"], true,
+        "release after membership failover response: {release:?}"
+    );
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+
+    let (status, reacquire) =
+        http_post_json(lb.port, "/v1/lock", json!({"key": key, "ttlMs": 5000})).await;
+    assert_eq!(
+        status, 200,
+        "reacquire after membership failover response: {reacquire:?}"
+    );
+    assert_eq!(
+        reacquire["acquired"], true,
+        "reacquire after membership failover response: {reacquire:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_restarted_follower_catches_up_with_install_snapshot_after_compaction() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let tuning = RaftClusterTuning {
+        snapshot_max_log_entries: 3,
+        snapshot_max_log_bytes: u64::MAX,
+        trailing_log_entries: 0,
+        install_snapshot_chunk_bytes: 128,
+        ..RaftClusterTuning::default()
+    };
+    let mut cluster = start_cluster_with_tuning(3, 3, tuning).await;
+    let leader = wait_for_leader(&cluster).await;
+    let lagging_follower = (0..cluster.http_ports.len())
+        .find(|idx| *idx != leader)
+        .expect("non-leader follower");
+    let other_follower = (0..cluster.http_ports.len())
+        .find(|idx| *idx != leader && *idx != lagging_follower)
+        .expect("second non-leader follower");
+    cluster.abort_node(lagging_follower).await;
+
+    for step in 0..8 {
+        let key = format!("raft-snapshot-catchup-{step}-{}", uuid::Uuid::new_v4());
+        let (status, acquire) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/lock",
+            json!({"key": key, "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "snapshot catch-up acquire response: {acquire:?}"
+        );
+        assert_eq!(
+            acquire["acquired"], true,
+            "snapshot catch-up acquire response: {acquire:?}"
+        );
+        let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+        let (status, release) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/unlock",
+            json!({"key": key, "lockUuid": lock_uuid}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "snapshot catch-up release response: {release:?}"
+        );
+        assert_eq!(
+            release["unlocked"], true,
+            "snapshot catch-up release response: {release:?}"
+        );
+    }
+
+    let leader_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status after compaction writes");
+    let target_commit = leader_status["commitIndex"]
+        .as_u64()
+        .expect("leader commit index");
+    let leader_snapshot_index = wait_for_metric_at_least(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_latest_snapshot_index",
+        1,
+    )
+    .await;
+    wait_for_metric_at_least(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_log_compactions_total",
+        1,
+    )
+    .await;
+    assert!(
+        leader_snapshot_index < target_commit,
+        "test should leave a retained suffix after the compacted prefix so restart catch-up exercises InstallSnapshot plus AppendEntries; snapshot={leader_snapshot_index} commit={target_commit}"
+    );
+
+    cluster.restart_node(lagging_follower).await;
+    cluster.abort_node(other_follower).await;
+    let survivors = vec![leader, lagging_follower];
+    let active_leader = wait_for_leader_among(&cluster, &survivors).await;
+    let catchup_key = format!("raft-snapshot-forced-catchup-{}", uuid::Uuid::new_v4());
+    let (status, catchup_acquire) = http_post_json(
+        cluster.http_ports[active_leader],
+        "/v1/lock",
+        json!({"key": catchup_key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "forced catch-up acquire response: {catchup_acquire:?}"
+    );
+    assert_eq!(
+        catchup_acquire["acquired"], true,
+        "forced catch-up acquire response: {catchup_acquire:?}"
+    );
+    let catchup_lock_uuid = catchup_acquire["lockUuid"].as_str().unwrap().to_string();
+    let (status, catchup_release) = http_post_json(
+        cluster.http_ports[active_leader],
+        "/v1/unlock",
+        json!({"key": catchup_key, "lockUuid": catchup_lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "forced catch-up release response: {catchup_release:?}"
+    );
+    assert_eq!(
+        catchup_release["unlocked"], true,
+        "forced catch-up release response: {catchup_release:?}"
+    );
+    let target_commit = http_get_json(cluster.http_ports[active_leader], "/raft/status")
+        .await
+        .and_then(|status| status["commitIndex"].as_u64())
+        .expect("leader commit index after forced catch-up write");
+    wait_for_metric_at_least(
+        cluster.http_ports[lagging_follower],
+        "dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total",
+        1,
+    )
+    .await;
+    wait_for_metric_at_least(
+        cluster.http_ports[lagging_follower],
+        "dd_rust_network_mutex_raft_latest_snapshot_index",
+        leader_snapshot_index,
+    )
+    .await;
+    wait_for_status_index_at_least(
+        cluster.http_ports[lagging_follower],
+        "lastApplied",
+        target_commit,
+    )
+    .await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+
+    let key = format!("raft-snapshot-rejoined-{}", uuid::Uuid::new_v4());
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[lagging_follower],
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "restarted follower proxy acquire response: {acquire:?}"
+    );
+    assert_eq!(
+        acquire["acquired"], true,
+        "restarted follower proxy acquire response: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+    let (status, release) = http_post_json(
+        cluster.http_ports[lagging_follower],
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "restarted follower proxy release response: {release:?}"
+    );
+    assert_eq!(
+        release["unlocked"], true,
+        "restarted follower proxy release response: {release:?}"
+    );
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

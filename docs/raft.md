@@ -204,6 +204,9 @@ Implemented:
 - interrupted joint-consensus membership changes can be finished by reposting
   the exact joint config's new peer set, while different peer sets remain
   rejected until the final simple config is committed,
+- loopback cluster coverage promotes two bootstrapped learners from a live
+  3-node membership into a 5-node membership, then kills two original voters and
+  verifies the surviving quorum can release and reacquire a pre-promotion lock,
 - joint-consensus `quorumSize` reporting uses the minimum unique ack count that
   can satisfy both old and new majorities, while commit checks still require
   `old-majority && new-majority`,
