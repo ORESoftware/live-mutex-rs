@@ -606,10 +606,13 @@ in-memory durable-state cache, while changed hard state still goes through the
 same atomic fsync path before the cache advances. A durable snapshot also
 normalizes startup `commitIndex` to at least its `lastIncludedIndex`; startup
 now rejects a durable `commitIndex` ahead of the available snapshot/log boundary
-instead of silently lowering a committed index after local data loss. Live
-`InstallSnapshot` persists hard state, membership, learner, and response-cache
-side effects before installing broker state, and broker snapshot validation now
-checks TTL deadline records against restored holders before install. The
+instead of silently lowering a committed index after local data loss. Startup
+also validates the retained log's staged-learner context from the recovered
+snapshot/config membership before committed replay, so old retained learner
+entries that conflict with active voters fail reopen instead of poisoning apply.
+Live `InstallSnapshot` persists hard state, membership, learner, and
+response-cache side effects before installing broker state, and broker snapshot
+validation now checks TTL deadline records against restored holders before install. The
 snapshot apply boundary emits structured `lmx::raft` tracing for hard-state,
 sidecar, broker-install, and final runtime-index progress. Dynamic membership is
 implemented with joint-consensus log entries, and new peer IDs are first
@@ -688,6 +691,11 @@ Malformed follower-side leader RPCs rejected before leader/term mutation expose
 `dd_rust_network_mutex_raft_append_entries_malformed_requests_total`,
 `dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total`,
 and `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`.
+Startup retained-log learner context scans expose
+`dd_rust_network_mutex_raft_open_log_context_validations_total`,
+`dd_rust_network_mutex_raft_open_log_context_validation_entries_total`,
+`dd_rust_network_mutex_raft_open_log_context_validation_us_total`, and
+`dd_rust_network_mutex_raft_open_log_context_validation_errors_total`.
 Follower-side sender rejections for unknown, stale, or conflicting leaders are
 counted separately in
 `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and

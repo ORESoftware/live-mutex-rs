@@ -321,6 +321,10 @@ pub struct RaftTelemetrySnapshot {
     pub append_entries_rpc_errors_total: u64,
     pub append_entries_malformed_requests_total: u64,
     pub append_entries_context_invalid_staged_learners_total: u64,
+    pub open_log_context_validations_total: u64,
+    pub open_log_context_validation_entries_total: u64,
+    pub open_log_context_validation_us_total: u64,
+    pub open_log_context_validation_errors_total: u64,
     pub append_progress_updates_total: u64,
     pub append_conflict_repairs_total: u64,
     pub append_conflict_clamps_total: u64,
@@ -820,6 +824,97 @@ fn validate_staged_learner_entries_against_membership(
     Ok(())
 }
 
+fn validate_retained_log_context_on_open(
+    node_id: &str,
+    log: &RaftLogStore,
+    recovered_membership: RaftMembership,
+    snapshot_index: u64,
+    telemetry: &BrokerRaftTelemetry,
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-open-log-context-1");
+    let last_index = log.last_index();
+    let start_index = snapshot_index.saturating_add(1).max(1);
+    if start_index > last_index {
+        debug!(
+            target: "lmx::raft",
+            node_id,
+            snapshot_index,
+            last_log_index = last_index,
+            "raft startup retained-log context validation skipped because no retained suffix is present",
+        );
+        return Ok(());
+    }
+
+    telemetry
+        .open_log_context_validations_total
+        .fetch_add(1, Ordering::Relaxed);
+    let started = Instant::now();
+    let entries = log.entries_range(start_index, last_index)?;
+    let elapsed_us = duration_us_u64(started.elapsed());
+    if entries.first().map(|entry| entry.index) != Some(start_index)
+        || entries.last().map(|entry| entry.index) != Some(last_index)
+    {
+        telemetry
+            .open_log_context_validation_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        error!(
+            target: "lmx::raft",
+            node_id,
+            snapshot_index,
+            first_checked_index = start_index,
+            last_checked_index = last_index,
+            first_retained_index = ?entries.first().map(|entry| entry.index),
+            last_retained_index = ?entries.last().map(|entry| entry.index),
+            elapsed_us,
+            "raft startup rejected retained log range gap before committed replay",
+        );
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "retained raft log is missing startup validation range {}..={}",
+            start_index, last_index
+        )));
+    }
+    telemetry
+        .open_log_context_validation_entries_total
+        .fetch_add(entries.len() as u64, Ordering::Relaxed);
+    telemetry
+        .open_log_context_validation_us_total
+        .fetch_add(elapsed_us, Ordering::Relaxed);
+
+    if let Err(err) =
+        validate_staged_learner_entries_against_membership(recovered_membership, &entries)
+    {
+        telemetry
+            .open_log_context_validation_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        error!(
+            target: "lmx::raft",
+            node_id,
+            snapshot_index,
+            first_checked_index = start_index,
+            last_checked_index = last_index,
+            checked_entries = entries.len(),
+            elapsed_us,
+            error = %err,
+            "raft startup rejected retained log context before committed replay",
+        );
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "retained raft log has invalid staged learner context: {err}"
+        )));
+    }
+
+    debug!(
+        target: "lmx::raft",
+        node_id,
+        snapshot_index,
+        first_checked_index = start_index,
+        last_checked_index = last_index,
+        checked_entries = entries.len(),
+        elapsed_us,
+        "raft startup validated retained log context before committed replay",
+    );
+    Ok(())
+}
+
 fn raft_command_kind(command: &RaftCommand) -> &'static str {
     crate::routine_id!("ddl-routine-broker-raft-command-kind-1");
     match command {
@@ -1158,6 +1253,10 @@ struct BrokerRaftTelemetry {
     append_entries_rpc_errors_total: AtomicU64,
     append_entries_malformed_requests_total: AtomicU64,
     append_entries_context_invalid_staged_learners_total: AtomicU64,
+    open_log_context_validations_total: AtomicU64,
+    open_log_context_validation_entries_total: AtomicU64,
+    open_log_context_validation_us_total: AtomicU64,
+    open_log_context_validation_errors_total: AtomicU64,
     append_progress_updates_total: AtomicU64,
     append_conflict_repairs_total: AtomicU64,
     append_conflict_clamps_total: AtomicU64,
@@ -2298,6 +2397,13 @@ impl BrokerRaft {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let log = Arc::new(log_store);
+        validate_retained_log_context_on_open(
+            &config.node_id,
+            log.as_ref(),
+            recovered_membership.clone(),
+            snapshot_index,
+            telemetry.as_ref(),
+        )?;
         let now = Instant::now();
         let (election_deadline, initial_election_timeout, initial_election_jitter) =
             next_election_deadline_parts_for_config(&config, now);
@@ -2786,6 +2892,22 @@ impl BrokerRaft {
             append_entries_context_invalid_staged_learners_total: self
                 .telemetry
                 .append_entries_context_invalid_staged_learners_total
+                .load(Ordering::Relaxed),
+            open_log_context_validations_total: self
+                .telemetry
+                .open_log_context_validations_total
+                .load(Ordering::Relaxed),
+            open_log_context_validation_entries_total: self
+                .telemetry
+                .open_log_context_validation_entries_total
+                .load(Ordering::Relaxed),
+            open_log_context_validation_us_total: self
+                .telemetry
+                .open_log_context_validation_us_total
+                .load(Ordering::Relaxed),
+            open_log_context_validation_errors_total: self
+                .telemetry
+                .open_log_context_validation_errors_total
                 .load(Ordering::Relaxed),
             append_progress_updates_total: self
                 .telemetry
@@ -3797,6 +3919,28 @@ impl BrokerRaft {
             leader_ready,
         )
         .expect("write raft metrics text");
+        write!(
+            &mut body,
+            concat!(
+                "# HELP dd_rust_network_mutex_raft_open_log_context_validations_total BrokerRaft startup retained-log context validations run before committed replay.\n",
+                "# TYPE dd_rust_network_mutex_raft_open_log_context_validations_total counter\n",
+                "dd_rust_network_mutex_raft_open_log_context_validations_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_open_log_context_validation_entries_total Retained Raft log entries scanned during BrokerRaft startup context validation.\n",
+                "# TYPE dd_rust_network_mutex_raft_open_log_context_validation_entries_total counter\n",
+                "dd_rust_network_mutex_raft_open_log_context_validation_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_open_log_context_validation_us_total Cumulative microseconds spent validating retained Raft log context during BrokerRaft startup.\n",
+                "# TYPE dd_rust_network_mutex_raft_open_log_context_validation_us_total counter\n",
+                "dd_rust_network_mutex_raft_open_log_context_validation_us_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_open_log_context_validation_errors_total BrokerRaft startup retained-log context validation failures before committed replay.\n",
+                "# TYPE dd_rust_network_mutex_raft_open_log_context_validation_errors_total counter\n",
+                "dd_rust_network_mutex_raft_open_log_context_validation_errors_total {}\n",
+            ),
+            snapshot.open_log_context_validations_total,
+            snapshot.open_log_context_validation_entries_total,
+            snapshot.open_log_context_validation_us_total,
+            snapshot.open_log_context_validation_errors_total,
+        )
+        .expect("write raft startup validation metrics text");
         let (client_batch_pending, client_batch_driver_active) = {
             let batch = self.client_request_batch.lock();
             (
@@ -18175,6 +18319,81 @@ mod tests {
 
         let err = RaftLogStore::open(&dir).expect_err("invalid membership must be rejected");
         assert!(matches!(err, BrokerRaftError::InvalidLog(_)));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_open_rejects_persisted_active_voter_as_staged_learner() {
+        let dir = temp_dir("raft-open-active-voter-as-learner");
+        let cfg = test_raft_config(dir.clone());
+        write_raw_log(
+            &dir,
+            &[RaftLogEntry {
+                index: 1,
+                term: 1,
+                created_at_ms: 10,
+                command: RaftCommand::SetStagedLearners {
+                    learners: vec![test_peer("n2", 7981)],
+                },
+            }],
+        );
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("context-invalid retained learner log must fail open"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("invalid staged learner context")
+                    && message.contains("already an active voter")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_open_validates_persisted_learners_after_unapplied_membership_prefix() {
+        let dir = temp_dir("raft-open-learner-after-membership-prefix");
+        let cfg = test_raft_config(dir.clone());
+        write_raw_log(
+            &dir,
+            &[
+                RaftLogEntry {
+                    index: 1,
+                    term: 1,
+                    created_at_ms: 10,
+                    command: RaftCommand::SetMembership {
+                        membership: RaftMembership::from_simple(vec![
+                            test_peer("n1", 7980),
+                            test_peer("n2", 7981),
+                            test_peer("n4", 7983),
+                        ]),
+                    },
+                },
+                RaftLogEntry {
+                    index: 2,
+                    term: 1,
+                    created_at_ms: 11,
+                    command: RaftCommand::SetStagedLearners {
+                        learners: vec![test_peer("n3", 7982)],
+                    },
+                },
+            ],
+        );
+
+        let raft = BrokerRaft::open(cfg).expect("open context-valid retained learner log");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.open_log_context_validations_total, 1);
+        assert_eq!(telemetry.open_log_context_validation_entries_total, 2);
+        assert_eq!(telemetry.open_log_context_validation_errors_total, 0);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_open_log_context_validations_total 1"));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_open_log_context_validation_entries_total 2"));
 
         let _ = fs::remove_dir_all(dir);
     }

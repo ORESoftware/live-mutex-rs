@@ -45,6 +45,9 @@ Implemented:
 - startup validation rejects durable `commitIndex` values ahead of the available
   latest-snapshot/log boundary instead of silently lowering a committed index
   after local data loss,
+- startup retained-log validation replays membership commands from the recovered
+  snapshot/config membership before committed replay, rejecting old
+  context-invalid staged learner entries that would conflict with active voters,
 - leader and follower commit advancement persist `commitIndex` before applying
   committed entries, so restart replay cannot lose a locally committed operation,
 - durable snapshots are treated as committed through `lastIncludedIndex` on
@@ -247,6 +250,11 @@ Implemented:
   `dd_rust_network_mutex_raft_append_entries_malformed_requests_total`,
   `dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total`,
   and `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`;
+  startup retained-log learner context scans are counted by
+  `dd_rust_network_mutex_raft_open_log_context_validations_total`,
+  `dd_rust_network_mutex_raft_open_log_context_validation_entries_total`,
+  `dd_rust_network_mutex_raft_open_log_context_validation_us_total`, and
+  `dd_rust_network_mutex_raft_open_log_context_validation_errors_total`;
   sender rejections for unknown, stale, or conflicting leaders are counted in
   `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
   `dd_rust_network_mutex_raft_follower_install_snapshot_sender_rejections_total`;
