@@ -562,6 +562,9 @@ retained log file; `prevLogTerm`, bounded replication batches, and committed
 apply ranges also use index lower-bound lookups over the validated retained-log
 cache, including exact retained-index lookup for `prevLogTerm`, instead of
 reparsing the log file or scanning from the prefix on each hot-path read.
+Follower-side request-id fingerprint validation uses retained and snapshotted
+idempotency caches, so append-only catch-up does not rescan the retained prefix
+before rejecting conflicting retries.
 Leader-local appends, candidate self-vote
 persistence, leader-side commit finalization, leader step-down persistence, live
 `RequestVote` handling, and live follower-side `AppendEntries` receive handling
@@ -608,11 +611,16 @@ normalizes startup `commitIndex` to at least its `lastIncludedIndex`; startup
 now rejects a durable `commitIndex` ahead of the available snapshot/log boundary
 instead of silently lowering a committed index after local data loss. Startup
 also validates the retained log's staged-learner context from the recovered
-snapshot/config membership before committed replay, so old retained learner
-entries that conflict with active voters fail reopen instead of poisoning apply.
+snapshot/config membership and retained request-id fingerprints against the
+snapshot-cached idempotency entries before committed replay, so old retained
+learner entries or duplicate request identities that would conflict during apply
+fail reopen instead of poisoning replay.
 Live `InstallSnapshot` persists hard state, membership, learner, and
 response-cache side effects before installing broker state, and broker snapshot
-validation now checks TTL deadline records against restored holders before install. The
+validation now checks TTL deadline records against restored holders before install.
+Snapshot-carried idempotency cache entries are also checked against any retained
+log suffix before the new snapshot/rewrite is installed, so a valid-looking
+snapshot cannot create a later request-id conflict during suffix replay. The
 snapshot apply boundary emits structured `lmx::raft` tracing for hard-state,
 sidecar, broker-install, and final runtime-index progress. Dynamic membership is
 implemented with joint-consensus log entries, and new peer IDs are first
@@ -691,11 +699,14 @@ Malformed follower-side leader RPCs rejected before leader/term mutation expose
 `dd_rust_network_mutex_raft_append_entries_malformed_requests_total`,
 `dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total`,
 and `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`.
-Startup retained-log learner context scans expose
+Startup retained-log learner and request-identity context scans expose
 `dd_rust_network_mutex_raft_open_log_context_validations_total`,
 `dd_rust_network_mutex_raft_open_log_context_validation_entries_total`,
 `dd_rust_network_mutex_raft_open_log_context_validation_us_total`, and
 `dd_rust_network_mutex_raft_open_log_context_validation_errors_total`.
+Follower-side AppendEntries payloads whose request-id fingerprints conflict
+with retained or snapshotted idempotency context increment
+`dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total`.
 Follower-side sender rejections for unknown, stale, or conflicting leaders are
 counted separately in
 `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
@@ -811,6 +822,9 @@ Leader-side `InstallSnapshot` catch-up exposes
 `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
 `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
 `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`.
+Follower-side snapshot payloads whose idempotency cache conflicts with a
+retained suffix increment
+`dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total`.
 Configured raw snapshot chunks whose serialized Raft RPC frame would exceed
 `LMX_RAFT_MAX_FRAME_BYTES` after base64/JSON overhead are clamped by exact frame
 sizing and counted in
@@ -938,6 +952,8 @@ A `lock` request can carry **either** a single `key` **or** a `keys` array
 acquires every requested key atomically or none of them. The wire response
 arrives as `compositeLock` (not `lock`) and includes a per-key `fencingTokens`
 map so callers can fence each protected resource independently.
+BrokerRaft replicates these requests as normal client log entries, so the same
+overlap/union semantics survive committed-log replay and Raft snapshot restore.
 
 ### Why a multi-key lock instead of N single-key acquires
 

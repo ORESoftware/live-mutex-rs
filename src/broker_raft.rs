@@ -321,6 +321,7 @@ pub struct RaftTelemetrySnapshot {
     pub append_entries_rpc_errors_total: u64,
     pub append_entries_malformed_requests_total: u64,
     pub append_entries_context_invalid_staged_learners_total: u64,
+    pub append_entries_context_invalid_request_identities_total: u64,
     pub open_log_context_validations_total: u64,
     pub open_log_context_validation_entries_total: u64,
     pub open_log_context_validation_us_total: u64,
@@ -358,6 +359,7 @@ pub struct RaftTelemetrySnapshot {
     pub install_snapshot_stale_term_responses_total: u64,
     pub install_snapshot_frame_chunk_clamps_total: u64,
     pub install_snapshot_malformed_requests_total: u64,
+    pub install_snapshot_context_invalid_request_identities_total: u64,
     pub install_snapshot_oversized_chunks_total: u64,
     pub install_snapshot_staged_byte_limit_rejections_total: u64,
     pub install_snapshot_staged_transfer_limit_rejections_total: u64,
@@ -769,8 +771,9 @@ fn validate_raft_command(command: &RaftCommand) -> Result<(), BrokerRaftError> {
             validate_staged_learner_peers(learners.clone(), &[])?;
         }
         RaftCommand::ClientRequestWithIdentity {
+            request,
             request_id,
-            request_fingerprint,
+            request_fingerprint: fingerprint,
             ..
         } => {
             if request_id.is_empty() {
@@ -778,9 +781,19 @@ fn validate_raft_command(command: &RaftCommand) -> Result<(), BrokerRaftError> {
                     "client request identity has empty request id".into(),
                 ));
             }
-            if request_fingerprint.is_empty() {
+            if fingerprint.is_empty() {
                 return Err(BrokerRaftError::InvalidAppendEntries(
                     "client request identity has empty request fingerprint".into(),
+                ));
+            }
+            let expected = request_fingerprint(request).map_err(|err| {
+                BrokerRaftError::InvalidAppendEntries(format!(
+                    "client request identity fingerprint could not be computed: {err}"
+                ))
+            })?;
+            if fingerprint != &expected {
+                return Err(BrokerRaftError::InvalidAppendEntries(
+                    "client request identity fingerprint does not match request payload".into(),
                 ));
             }
         }
@@ -824,10 +837,185 @@ fn validate_staged_learner_entries_against_membership(
     Ok(())
 }
 
+fn validate_snapshot_client_response_entries(
+    entries: &[ClientResponseSnapshotEntry],
+) -> Result<BTreeMap<String, String>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-snapshot-client-responses-1");
+    let mut fingerprints = BTreeMap::new();
+    for entry in entries {
+        if entry.request_id.is_empty() || entry.request_fingerprint.is_empty() {
+            return Err(BrokerRaftError::InvalidLog(
+                "snapshot client response entry has empty request id or fingerprint".into(),
+            ));
+        }
+        if fingerprints
+            .insert(entry.request_id.clone(), entry.request_fingerprint.clone())
+            .is_some()
+        {
+            return Err(BrokerRaftError::InvalidLog(format!(
+                "snapshot client response entry duplicates request id `{}`",
+                entry.request_id
+            )));
+        }
+    }
+    Ok(fingerprints)
+}
+
+fn validate_client_request_identity_entries(
+    mut fingerprints: BTreeMap<String, String>,
+    entries: &[RaftLogEntry],
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-request-identity-context-1");
+    add_client_request_identity_entries(&mut fingerprints, entries)
+}
+
+fn add_client_request_identity_entries(
+    fingerprints: &mut BTreeMap<String, String>,
+    entries: &[RaftLogEntry],
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-add-request-identity-context-1");
+    for entry in entries {
+        let RaftCommand::ClientRequestWithIdentity {
+            request_id,
+            request_fingerprint,
+            ..
+        } = &entry.command
+        else {
+            continue;
+        };
+        if let Some(previous) = fingerprints.get(request_id) {
+            if previous != request_fingerprint {
+                return Err(BrokerRaftError::InvalidLog(format!(
+                    "entry index {} reuses request id `{}` with a different request fingerprint",
+                    entry.index, request_id
+                )));
+            }
+        } else {
+            fingerprints.insert(request_id.clone(), request_fingerprint.clone());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetainedRequestIdentityFingerprint {
+    request_fingerprint: String,
+    first_index: u64,
+}
+
+fn retained_request_identity_fingerprints(
+    entries: &[RaftLogEntry],
+) -> Result<BTreeMap<String, RetainedRequestIdentityFingerprint>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-retained-request-identity-cache-1");
+    let mut fingerprints = BTreeMap::new();
+    add_retained_request_identity_entries(&mut fingerprints, entries)?;
+    Ok(fingerprints)
+}
+
+fn add_retained_request_identity_entries(
+    fingerprints: &mut BTreeMap<String, RetainedRequestIdentityFingerprint>,
+    entries: &[RaftLogEntry],
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-add-retained-request-identity-cache-1");
+    for entry in entries {
+        let RaftCommand::ClientRequestWithIdentity {
+            request_id,
+            request_fingerprint,
+            ..
+        } = &entry.command
+        else {
+            continue;
+        };
+        if let Some(previous) = fingerprints.get_mut(request_id) {
+            if previous.request_fingerprint != *request_fingerprint {
+                return Err(BrokerRaftError::InvalidLog(format!(
+                    "entry index {} reuses request id `{}` with a different request fingerprint",
+                    entry.index, request_id
+                )));
+            }
+            previous.first_index = previous.first_index.min(entry.index);
+        } else {
+            fingerprints.insert(
+                request_id.clone(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: request_fingerprint.clone(),
+                    first_index: entry.index,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn entries_have_client_request_identities(entries: &[RaftLogEntry]) -> bool {
+    crate::routine_id!("ddl-routine-broker-raft-entries-have-request-identities-1");
+    entries
+        .iter()
+        .any(|entry| matches!(entry.command, RaftCommand::ClientRequestWithIdentity { .. }))
+}
+
+fn validate_repaired_request_identity_context(
+    snapshot_client_response_fingerprints: &BTreeMap<String, String>,
+    retained_request_fingerprints: &BTreeMap<String, RetainedRequestIdentityFingerprint>,
+    retained_prefix_last_index: u64,
+    suffix: &[RaftLogEntry],
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-repaired-request-identity-context-1");
+    if !entries_have_client_request_identities(suffix) {
+        return Ok(());
+    }
+    let mut incoming_fingerprints = BTreeMap::new();
+    for entry in suffix {
+        let RaftCommand::ClientRequestWithIdentity {
+            request_id,
+            request_fingerprint,
+            ..
+        } = &entry.command
+        else {
+            continue;
+        };
+        if let Some(snapshot_fingerprint) = snapshot_client_response_fingerprints.get(request_id) {
+            if snapshot_fingerprint != request_fingerprint {
+                return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                    "entry index {} reuses request id `{}` with a different request fingerprint from snapshotted idempotency context",
+                    entry.index, request_id
+                )));
+            }
+        }
+        if let Some(retained_fingerprint) =
+            retained_request_fingerprints
+                .get(request_id)
+                .filter(|fingerprint| {
+                    retained_prefix_last_index > 0
+                        && fingerprint.first_index <= retained_prefix_last_index
+                })
+        {
+            if retained_fingerprint.request_fingerprint != *request_fingerprint {
+                return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                    "entry index {} reuses request id `{}` with a different request fingerprint from retained log context",
+                    entry.index, request_id
+                )));
+            }
+        }
+        if let Some(previous) =
+            incoming_fingerprints.insert(request_id.clone(), request_fingerprint.clone())
+        {
+            if previous != *request_fingerprint {
+                return Err(BrokerRaftError::InvalidAppendEntries(format!(
+                    "entry index {} reuses request id `{}` with a different request fingerprint inside append entries",
+                    entry.index, request_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_retained_log_context_on_open(
     node_id: &str,
     log: &RaftLogStore,
     recovered_membership: RaftMembership,
+    snapshot_client_response_fingerprints: BTreeMap<String, String>,
     snapshot_index: u64,
     telemetry: &BrokerRaftTelemetry,
 ) -> Result<(), BrokerRaftError> {
@@ -899,6 +1087,27 @@ fn validate_retained_log_context_on_open(
         );
         return Err(BrokerRaftError::InvalidLog(format!(
             "retained raft log has invalid staged learner context: {err}"
+        )));
+    }
+    if let Err(err) =
+        validate_client_request_identity_entries(snapshot_client_response_fingerprints, &entries)
+    {
+        telemetry
+            .open_log_context_validation_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        error!(
+            target: "lmx::raft",
+            node_id,
+            snapshot_index,
+            first_checked_index = start_index,
+            last_checked_index = last_index,
+            checked_entries = entries.len(),
+            elapsed_us,
+            error = %err,
+            "raft startup rejected retained log request identity context before committed replay",
+        );
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "retained raft log has invalid request identity context: {err}"
         )));
     }
 
@@ -1253,6 +1462,7 @@ struct BrokerRaftTelemetry {
     append_entries_rpc_errors_total: AtomicU64,
     append_entries_malformed_requests_total: AtomicU64,
     append_entries_context_invalid_staged_learners_total: AtomicU64,
+    append_entries_context_invalid_request_identities_total: AtomicU64,
     open_log_context_validations_total: AtomicU64,
     open_log_context_validation_entries_total: AtomicU64,
     open_log_context_validation_us_total: AtomicU64,
@@ -1290,6 +1500,7 @@ struct BrokerRaftTelemetry {
     install_snapshot_stale_term_responses_total: AtomicU64,
     install_snapshot_frame_chunk_clamps_total: AtomicU64,
     install_snapshot_malformed_requests_total: AtomicU64,
+    install_snapshot_context_invalid_request_identities_total: AtomicU64,
     install_snapshot_oversized_chunks_total: AtomicU64,
     install_snapshot_staged_byte_limit_rejections_total: AtomicU64,
     install_snapshot_staged_transfer_limit_rejections_total: AtomicU64,
@@ -1382,6 +1593,8 @@ struct RaftLogState {
     last_term: u64,
     hard_state: RaftHardState,
     latest_snapshot: Option<RaftSnapshotMetadata>,
+    snapshot_client_response_fingerprints: BTreeMap<String, String>,
+    retained_request_fingerprints: BTreeMap<String, RetainedRequestIdentityFingerprint>,
     retained_log_entries: Vec<RaftLogEntry>,
     retained_log_entry_bytes: Vec<usize>,
     term_by_index: BTreeMap<u64, u64>,
@@ -1584,7 +1797,18 @@ impl RaftLogStore {
                 }
             }
         }
-        let latest_snapshot = read_snapshot_metadata(&snapshot_path)?;
+        let latest_snapshot_file = read_snapshot_file(&snapshot_path)?;
+        let snapshot_client_response_fingerprints =
+            if let Some(snapshot_file) = latest_snapshot_file.as_ref() {
+                validate_snapshot_client_response_entries(&client_responses_from_snapshot_payload(
+                    &snapshot_file.payload,
+                )?)?
+            } else {
+                BTreeMap::new()
+            };
+        let latest_snapshot = latest_snapshot_file
+            .as_ref()
+            .map(|snapshot| snapshot.metadata.clone());
         let hard_state = read_hard_state(&hard_state_path)?;
         let entries = read_log_entries_with_snapshot(
             &log_path,
@@ -1602,6 +1826,7 @@ impl RaftLogStore {
             .unwrap_or((0, 0));
 
         let retained_log_entry_bytes = serialized_log_entry_lens(&entries)?;
+        let retained_request_fingerprints = retained_request_identity_fingerprints(&entries)?;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(&entries);
 
@@ -1617,6 +1842,8 @@ impl RaftLogStore {
                 last_term,
                 hard_state,
                 latest_snapshot,
+                snapshot_client_response_fingerprints,
+                retained_request_fingerprints,
                 retained_log_entries: entries.clone(),
                 retained_log_entry_bytes,
                 term_by_index,
@@ -1669,6 +1896,12 @@ impl RaftLogStore {
                 command,
             })
             .collect::<Vec<_>>();
+        validate_repaired_request_identity_context(
+            &state.snapshot_client_response_fingerprints,
+            &state.retained_request_fingerprints,
+            state.last_index,
+            &entries,
+        )?;
         let entry_sizes = serialized_log_entry_lens(&entries)?;
         append_log_entries(
             &self.log_path,
@@ -1691,6 +1924,7 @@ impl RaftLogStore {
         }
         state.retained_log_entries.extend(entries.iter().cloned());
         state.retained_log_entry_bytes.extend(entry_sizes);
+        add_retained_request_identity_entries(&mut state.retained_request_fingerprints, &entries)?;
         Ok(entries)
     }
 
@@ -1851,6 +2085,11 @@ impl RaftLogStore {
         crate::routine_id!("ddl-routine-broker-raft-replace-all-1");
         let mut state = self.state.lock();
         validate_log_entries_for_snapshot(entries, state.latest_snapshot.as_ref())?;
+        validate_client_request_identity_entries(
+            state.snapshot_client_response_fingerprints.clone(),
+            entries,
+        )?;
+        let retained_request_fingerprints = retained_request_identity_fingerprints(entries)?;
         let entry_sizes = serialized_log_entry_lens(entries)?;
         rewrite_log(
             &self.log_path,
@@ -1870,6 +2109,7 @@ impl RaftLogStore {
         }
         state.retained_log_entries = entries.to_vec();
         state.retained_log_entry_bytes = entry_sizes;
+        state.retained_request_fingerprints = retained_request_fingerprints;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(entries);
         state.term_by_index = term_by_index;
@@ -1988,6 +2228,34 @@ impl RaftLogStore {
                 &incoming[pos..],
                 state.latest_snapshot.as_ref(),
             )?;
+            let retained_prefix_last_index = retained_prefix_len
+                .checked_sub(1)
+                .and_then(|index| state.retained_log_entries.get(index))
+                .map(|entry| entry.index)
+                .unwrap_or(0);
+            if let Err(err) = validate_repaired_request_identity_context(
+                &state.snapshot_client_response_fingerprints,
+                &state.retained_request_fingerprints,
+                retained_prefix_last_index,
+                &incoming[pos..],
+            ) {
+                if let Some(telemetry) = self.telemetry.as_deref() {
+                    telemetry
+                        .append_entries_context_invalid_request_identities_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                warn!(
+                    target: "lmx::raft",
+                    prev_log_index,
+                    prev_log_term,
+                    leader_term,
+                    retained_prefix_entries = retained_prefix_len,
+                    repaired_suffix_entries = incoming[pos..].len(),
+                    error = %err,
+                    "raft rejected append-entries repair because request identities conflict with retained context",
+                );
+                return Err(err);
+            }
             if let Err(err) = truncate_and_append_log_entries(
                 &self.log_path,
                 prefix_file_len,
@@ -2008,6 +2276,8 @@ impl RaftLogStore {
                 .retained_log_entries
                 .extend(incoming[pos..].iter().cloned());
             state.retained_log_entry_bytes.extend(incoming_sizes);
+            state.retained_request_fingerprints =
+                retained_request_identity_fingerprints(&state.retained_log_entries)?;
             if let Some((last_index, last_term)) = state
                 .retained_log_entries
                 .last()
@@ -2038,6 +2308,29 @@ impl RaftLogStore {
                     "refusing to fill missing committed follower log entry at index {append_index}; local commitIndex is {local_commit_index}"
                 )));
             }
+            if let Err(err) = validate_repaired_request_identity_context(
+                &state.snapshot_client_response_fingerprints,
+                &state.retained_request_fingerprints,
+                state.last_index,
+                append_only,
+            ) {
+                if let Some(telemetry) = self.telemetry.as_deref() {
+                    telemetry
+                        .append_entries_context_invalid_request_identities_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                warn!(
+                    target: "lmx::raft",
+                    prev_log_index,
+                    prev_log_term,
+                    leader_term,
+                    retained_prefix_entries = state.retained_log_entries.len(),
+                    append_entries = append_only.len(),
+                    error = %err,
+                    "raft rejected append-entries append because request identities conflict with retained context",
+                );
+                return Err(err);
+            }
             let append_sizes = serialized_log_entry_lens(append_only)?;
             append_log_entries(
                 &self.log_path,
@@ -2062,6 +2355,10 @@ impl RaftLogStore {
                 .retained_log_entries
                 .extend(append_only.iter().cloned());
             state.retained_log_entry_bytes.extend(append_sizes);
+            add_retained_request_identity_entries(
+                &mut state.retained_request_fingerprints,
+                append_only,
+            )?;
         }
 
         Ok(RaftAppendReport {
@@ -2098,6 +2395,7 @@ impl RaftLogStore {
         }
         state.retained_log_entries = retained.clone();
         state.retained_log_entry_bytes = retained_sizes;
+        state.retained_request_fingerprints = retained_request_identity_fingerprints(&retained)?;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(&retained);
         state.term_by_index = term_by_index;
@@ -2114,6 +2412,13 @@ impl RaftLogStore {
     ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-write-snapshot-1");
         let mut state = self.state.lock();
+        let snapshot_client_response_fingerprints = validate_snapshot_client_response_entries(
+            &client_responses_from_snapshot_payload(&payload)?,
+        )?;
+        validate_client_request_identity_entries(
+            snapshot_client_response_fingerprints.clone(),
+            &state.retained_log_entries,
+        )?;
         let payload_sha256 = snapshot_payload_sha256(&payload)?;
         let metadata = RaftSnapshotMetadata {
             last_included_index,
@@ -2128,6 +2433,7 @@ impl RaftLogStore {
         write_pretty_json_atomic(&self.snapshot_path, &snapshot, self.telemetry.as_deref())?;
 
         state.latest_snapshot = Some(metadata.clone());
+        state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
         if state.last_index <= metadata.last_included_index {
             state.last_index = metadata.last_included_index;
             state.last_term = metadata.last_included_term;
@@ -2169,6 +2475,30 @@ impl RaftLogStore {
         } else {
             Vec::new()
         };
+        let snapshot_client_response_fingerprints = validate_snapshot_client_response_entries(
+            &client_responses_from_snapshot_payload(&payload)?,
+        )?;
+        if let Err(err) = validate_client_request_identity_entries(
+            snapshot_client_response_fingerprints.clone(),
+            &retained,
+        ) {
+            if let Some(telemetry) = self.telemetry.as_deref() {
+                telemetry
+                    .install_snapshot_context_invalid_request_identities_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            warn!(
+                target: "lmx::raft",
+                snapshot_index = last_included_index,
+                snapshot_term = last_included_term,
+                retained_suffix_entries = retained.len(),
+                error = %err,
+                "raft rejected installed snapshot because retained suffix request identities conflict with snapshot cache",
+            );
+            return Err(BrokerRaftError::InvalidLog(format!(
+                "installed snapshot client response cache conflicts with retained log suffix: {err}"
+            )));
+        }
         let metadata = RaftSnapshotMetadata {
             last_included_index,
             last_included_term,
@@ -2189,6 +2519,7 @@ impl RaftLogStore {
         )?;
 
         state.latest_snapshot = Some(metadata.clone());
+        state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
         if let Some(last) = retained.last() {
             state.last_index = last.index;
             state.last_term = last.term;
@@ -2198,6 +2529,7 @@ impl RaftLogStore {
         }
         state.retained_log_entries = retained.clone();
         state.retained_log_entry_bytes = retained_sizes;
+        state.retained_request_fingerprints = retained_request_identity_fingerprints(&retained)?;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(&retained);
         state.term_by_index = term_by_index;
@@ -2258,6 +2590,7 @@ impl RaftLogStore {
         }
         state.retained_log_entries = retained.clone();
         state.retained_log_entry_bytes = retained_sizes;
+        state.retained_request_fingerprints = retained_request_identity_fingerprints(&retained)?;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(&retained);
         state.term_by_index = term_by_index;
@@ -2312,13 +2645,18 @@ impl BrokerRaft {
         let snapshot_file = log_store.latest_snapshot_file()?;
         let mut recovered_membership = RaftMembership::from_simple(config.peers.clone());
         let mut snapshot_staged_learners = None;
+        let mut snapshot_client_responses = Vec::new();
         if let Some(snapshot_file) = &snapshot_file {
             if let Some(membership) = membership_from_snapshot_payload(&snapshot_file.payload)? {
                 recovered_membership = membership;
             }
             snapshot_staged_learners =
                 staged_learners_from_snapshot_payload(&snapshot_file.payload)?;
+            snapshot_client_responses =
+                client_responses_from_snapshot_payload(&snapshot_file.payload)?;
         }
+        let snapshot_client_response_fingerprints =
+            validate_snapshot_client_response_entries(&snapshot_client_responses)?;
         let staged_learners = if let Some(learners) = snapshot_staged_learners.clone() {
             learners
         } else {
@@ -2401,6 +2739,7 @@ impl BrokerRaft {
             &config.node_id,
             log.as_ref(),
             recovered_membership.clone(),
+            snapshot_client_response_fingerprints,
             snapshot_index,
             telemetry.as_ref(),
         )?;
@@ -2470,9 +2809,7 @@ impl BrokerRaft {
             if let Some(learners) = staged_learners_from_snapshot_payload(&snapshot_file.payload)? {
                 raft.apply_staged_learners(learners)?;
             }
-            raft.restore_client_response_cache(client_responses_from_snapshot_payload(
-                &snapshot_file.payload,
-            )?)?;
+            raft.restore_client_response_cache(snapshot_client_responses)?;
         }
         raft.apply_committed()?;
         raft.clear_removed_vote_for_current_membership()?;
@@ -2893,6 +3230,10 @@ impl BrokerRaft {
                 .telemetry
                 .append_entries_context_invalid_staged_learners_total
                 .load(Ordering::Relaxed),
+            append_entries_context_invalid_request_identities_total: self
+                .telemetry
+                .append_entries_context_invalid_request_identities_total
+                .load(Ordering::Relaxed),
             open_log_context_validations_total: self
                 .telemetry
                 .open_log_context_validations_total
@@ -3040,6 +3381,10 @@ impl BrokerRaft {
             install_snapshot_malformed_requests_total: self
                 .telemetry
                 .install_snapshot_malformed_requests_total
+                .load(Ordering::Relaxed),
+            install_snapshot_context_invalid_request_identities_total: self
+                .telemetry
+                .install_snapshot_context_invalid_request_identities_total
                 .load(Ordering::Relaxed),
             install_snapshot_oversized_chunks_total: self
                 .telemetry
@@ -3481,6 +3826,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total Follower-side InstallSnapshot requests rejected before leader or term mutation because the frame shape was malformed.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total Follower-side InstallSnapshot payloads rejected before durable install because snapshot idempotency cache entries conflict with retained log request identities.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total Follower-side InstallSnapshot chunks rejected because decoded bytes exceeded raft.install_snapshot_chunk_bytes.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total {}\n",
@@ -3583,6 +3931,7 @@ impl BrokerRaft {
             snapshot.local_voter_promotions_total,
             snapshot.local_removed_voter_guard_rejections_total,
             snapshot.install_snapshot_malformed_requests_total,
+            snapshot.install_snapshot_context_invalid_request_identities_total,
             snapshot.install_snapshot_oversized_chunks_total,
             snapshot.install_snapshot_staged_byte_limit_rejections_total,
             snapshot.install_snapshot_staged_transfer_limit_rejections_total,
@@ -3682,6 +4031,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total Follower-side AppendEntries requests rejected before log write because staged learner entries conflict with active membership context.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total counter\n",
                 "dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total Follower-side AppendEntries requests rejected before log write because request-id fingerprints conflict with retained or snapshotted idempotency context.\n",
+                "# TYPE dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total counter\n",
+                "dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_successes_total InstallSnapshot transfers accepted by peers through the snapshot boundary.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_successes_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_successes_total {}\n",
@@ -3862,6 +4214,7 @@ impl BrokerRaft {
             snapshot.append_entries_rpc_errors_total,
             snapshot.append_entries_malformed_requests_total,
             snapshot.append_entries_context_invalid_staged_learners_total,
+            snapshot.append_entries_context_invalid_request_identities_total,
             snapshot.install_snapshot_successes_total,
             snapshot.install_snapshot_rejections_total,
             snapshot.install_snapshot_rpc_errors_total,
@@ -5335,22 +5688,12 @@ impl BrokerRaft {
         entries: Vec<ClientResponseSnapshotEntry>,
     ) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-restore-client-response-cache-1");
+        validate_snapshot_client_response_entries(&entries)?;
         let limit = self.config.client_response_cache_max_entries.max(1);
         let mut cache = self.client_response_cache.lock();
         cache.entries.clear();
         cache.order.clear();
         for entry in entries {
-            if entry.request_id.is_empty() || entry.request_fingerprint.is_empty() {
-                return Err(BrokerRaftError::InvalidLog(
-                    "snapshot client response entry has empty request id or fingerprint".into(),
-                ));
-            }
-            if cache.entries.contains_key(&entry.request_id) {
-                return Err(BrokerRaftError::InvalidLog(format!(
-                    "snapshot client response entry duplicates request id `{}`",
-                    entry.request_id
-                )));
-            }
             cache.order.push_back(entry.request_id.clone());
             cache.entries.insert(
                 entry.request_id,
@@ -7046,7 +7389,9 @@ impl BrokerRaft {
                 error: err.to_string(),
             };
         }
-        if let Err(err) = client_responses_from_snapshot_payload(&payload) {
+        if let Err(err) = client_responses_from_snapshot_payload(&payload)
+            .and_then(|entries| validate_snapshot_client_response_entries(&entries).map(|_| ()))
+        {
             self.remove_snapshot_transfer_file(payload_path, "invalid-client-responses-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
@@ -7184,6 +7529,7 @@ impl BrokerRaft {
         let snapshot_membership = membership_from_snapshot_payload(payload)?;
         let snapshot_learners = staged_learners_from_snapshot_payload(payload)?;
         let snapshot_client_responses = client_responses_from_snapshot_payload(payload)?;
+        validate_snapshot_client_response_entries(&snapshot_client_responses)?;
         let (hard_state, should_apply) = {
             let runtime = self.runtime.lock();
             let next_commit = runtime.commit_index.max(installed_index);
@@ -11984,11 +12330,6 @@ fn granted_lock_uuid(resp: &Response) -> Option<String> {
     }
 }
 
-fn read_snapshot_metadata(path: &Path) -> Result<Option<RaftSnapshotMetadata>, BrokerRaftError> {
-    crate::routine_id!("ddl-routine-broker-raft-read-snapshot-meta-1");
-    Ok(read_snapshot_file(path)?.map(|snapshot| snapshot.metadata))
-}
-
 fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-snapshot-file-1");
     if !path.exists() {
@@ -13417,6 +13758,42 @@ mod tests {
             keep_locks_after_death: false,
             wait: Some(false),
         }
+    }
+
+    fn composite_lock_request(uuid: &str, keys: &[&str]) -> Request {
+        Request::Lock {
+            uuid: uuid.into(),
+            key: None,
+            keys: Some(keys.iter().map(|key| (*key).to_string()).collect()),
+            pid: None,
+            ttl: None,
+            max: None,
+            force: false,
+            retry_count: 0,
+            keep_locks_after_death: false,
+            wait: Some(false),
+        }
+    }
+
+    fn composite_unlock_request(uuid: &str, keys: &[&str], lock_uuid: &str) -> Request {
+        Request::Unlock {
+            uuid: uuid.into(),
+            key: None,
+            keys: Some(keys.iter().map(|key| (*key).to_string()).collect()),
+            lock_uuid: Some(lock_uuid.to_string()),
+            force: false,
+        }
+    }
+
+    fn become_single_node_leader(raft: &BrokerRaft, term: u64) {
+        let mut runtime = raft.runtime.lock();
+        runtime.current_term = term;
+        runtime.role = RaftRole::Leader;
+        runtime.leader_id = Some("n1".into());
+        runtime.membership = RaftMembership::from_simple(vec![test_peer("n1", 7980)]);
+        runtime.leader_progress.clear();
+        drop(runtime);
+        raft.note_leader_quorum_observed();
     }
 
     fn snapshot_part_files(dir: &Path) -> Vec<PathBuf> {
@@ -18324,6 +18701,37 @@ mod tests {
     }
 
     #[test]
+    fn persisted_log_rejects_request_identity_fingerprint_mismatch_on_open() {
+        let dir = temp_dir("raft-log-request-identity-fingerprint-mismatch");
+        write_raw_log(
+            &dir,
+            &[RaftLogEntry {
+                index: 1,
+                term: 1,
+                created_at_ms: 10,
+                command: RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: single_lock_request("bad-fingerprint-request", "identity-key"),
+                    grant: None,
+                    request_id: "bad-fingerprint-request".into(),
+                    request_fingerprint: "not-the-request-fingerprint".into(),
+                },
+            }],
+        );
+
+        let err = RaftLogStore::open(&dir)
+            .expect_err("mismatched request identity fingerprint must be rejected");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("fingerprint does not match request payload")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn broker_open_rejects_persisted_active_voter_as_staged_learner() {
         let dir = temp_dir("raft-open-active-voter-as-learner");
         let cfg = test_raft_config(dir.clone());
@@ -18349,6 +18757,112 @@ mod tests {
             BrokerRaftError::InvalidLog(message)
                 if message.contains("invalid staged learner context")
                     && message.contains("already an active voter")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_open_rejects_retained_request_id_conflict_before_replay() {
+        let dir = temp_dir("raft-open-request-id-conflict");
+        let cfg = test_raft_config(dir.clone());
+        let first_request = single_lock_request("retained-conflict-a", "identity-key-a");
+        let second_request = single_lock_request("retained-conflict-b", "identity-key-b");
+        let first_fingerprint = request_fingerprint(&first_request).expect("first fingerprint");
+        let second_fingerprint = request_fingerprint(&second_request).expect("second fingerprint");
+        write_raw_log(
+            &dir,
+            &[
+                RaftLogEntry {
+                    index: 1,
+                    term: 1,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 1,
+                        request: first_request,
+                        grant: None,
+                        request_id: "retained-conflict".into(),
+                        request_fingerprint: first_fingerprint,
+                    },
+                },
+                RaftLogEntry {
+                    index: 2,
+                    term: 1,
+                    created_at_ms: 11,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: second_request,
+                        grant: None,
+                        request_id: "retained-conflict".into(),
+                        request_fingerprint: second_fingerprint,
+                    },
+                },
+            ],
+        );
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("conflicting retained request identity log must fail open"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("different request fingerprint")
+                    && message.contains("retained-conflict")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_open_rejects_retained_request_id_conflict_against_snapshot_cache() {
+        let dir = temp_dir("raft-open-request-id-snapshot-conflict");
+        let cfg = test_raft_config(dir.clone());
+        let snapshot_request = single_lock_request("snapshot-conflict-a", "snapshot-key-a");
+        let retained_request = single_lock_request("snapshot-conflict-b", "snapshot-key-b");
+        let snapshot_fingerprint =
+            request_fingerprint(&snapshot_request).expect("snapshot fingerprint");
+        let retained_fingerprint =
+            request_fingerprint(&retained_request).expect("retained fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "snapshot-conflict".into(),
+            request_fingerprint: snapshot_fingerprint,
+            response: None,
+        }])
+        .expect("client response snapshot payload");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store
+            .write_snapshot(1, 1, payload)
+            .expect("write request cache snapshot");
+        drop(store);
+        write_raw_log(
+            &dir,
+            &[RaftLogEntry {
+                index: 2,
+                term: 1,
+                created_at_ms: 11,
+                command: RaftCommand::ClientRequestWithIdentity {
+                    client_id: 2,
+                    request: retained_request,
+                    grant: None,
+                    request_id: "snapshot-conflict".into(),
+                    request_fingerprint: retained_fingerprint,
+                },
+            }],
+        );
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("snapshot/retained request identity conflict must fail open"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("invalid request identity context")
+                    && message.contains("snapshot-conflict")
         ));
 
         let _ = fs::remove_dir_all(dir);
@@ -18866,6 +19380,107 @@ mod tests {
     }
 
     #[test]
+    fn retained_request_identity_cache_tracks_compaction_boundary() {
+        let dir = temp_dir("raft-retained-request-cache-compact");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let compacted_request = single_lock_request("compact-request-a", "compact-key-a");
+        let compacted_fingerprint =
+            request_fingerprint(&compacted_request).expect("compacted fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: compacted_request,
+                    grant: None,
+                    request_id: "compacted-request".into(),
+                    request_fingerprint: compacted_fingerprint.clone(),
+                },
+            )
+            .expect("append compacted identity");
+        let retained_request = single_lock_request("compact-request-b", "compact-key-b");
+        let retained_fingerprint =
+            request_fingerprint(&retained_request).expect("retained fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 2,
+                    request: retained_request,
+                    grant: None,
+                    request_id: "retained-request".into(),
+                    request_fingerprint: retained_fingerprint.clone(),
+                },
+            )
+            .expect("append retained identity");
+
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "compacted-request".into(),
+            request_fingerprint: compacted_fingerprint,
+            response: None,
+        }])
+        .expect("snapshot client responses");
+        store.write_snapshot(1, 1, payload).expect("write snapshot");
+        store
+            .compact_to_latest_snapshot()
+            .expect("compact through snapshot");
+
+        {
+            let state = store.state.lock();
+            assert_eq!(
+                state
+                    .retained_request_fingerprints
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["retained-request".to_string()]
+            );
+            let cached = state
+                .retained_request_fingerprints
+                .get("retained-request")
+                .expect("retained request cache");
+            assert_eq!(cached.request_fingerprint, retained_fingerprint);
+            assert_eq!(cached.first_index, 2);
+            assert!(state
+                .snapshot_client_response_fingerprints
+                .contains_key("compacted-request"));
+        }
+
+        let conflicting_request = single_lock_request("compact-request-c", "compact-key-c");
+        let conflicting_fingerprint =
+            request_fingerprint(&conflicting_request).expect("conflicting fingerprint");
+        let err = store
+            .append_entries_from_leader(
+                2,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 12,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 3,
+                        request: conflicting_request,
+                        grant: None,
+                        request_id: "compacted-request".into(),
+                        request_fingerprint: conflicting_fingerprint,
+                    },
+                }],
+            )
+            .expect_err("snapshot request cache must still reject compacted id conflicts");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidAppendEntries(message)
+                if message.contains("snapshotted idempotency context")
+                    && message.contains("compacted-request")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn follower_append_entries_repair_metrics_are_exposed() {
         let dir = temp_dir("raft-follower-repair-metrics");
         let cfg = test_raft_config(dir.clone());
@@ -18987,6 +19602,229 @@ mod tests {
             metrics.contains("dd_rust_network_mutex_raft_follower_append_appended_entries_total 2")
         );
         assert!(metrics.contains("dd_rust_network_mutex_raft_follower_append_rewrites_total 0"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_rejects_request_identity_conflict_before_append() {
+        let dir = temp_dir("raft-append-request-id-conflict");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let first_request = single_lock_request("append-request-a", "append-key-a");
+        let first_fingerprint = request_fingerprint(&first_request).expect("first fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: first_request,
+                    grant: None,
+                    request_id: "append-request-conflict".into(),
+                    request_fingerprint: first_fingerprint,
+                },
+            )
+            .expect("append retained request identity");
+
+        let second_request = single_lock_request("append-request-b", "append-key-b");
+        let second_fingerprint = request_fingerprint(&second_request).expect("second fingerprint");
+        let err = store
+            .append_entries_from_leader(
+                1,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 2,
+                    term: 2,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: second_request,
+                        grant: None,
+                        request_id: "append-request-conflict".into(),
+                        request_fingerprint: second_fingerprint,
+                    },
+                }],
+            )
+            .expect_err("request-id conflict must fail before append");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidAppendEntries(message)
+                if message.contains("retained log context")
+                    && message.contains("append-request-conflict")
+        ));
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_append_entries_rejects_request_identity_conflict_against_snapshot_cache() {
+        let dir = temp_dir("raft-append-request-id-snapshot-conflict");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let snapshot_request = single_lock_request("append-snapshot-a", "snapshot-key-a");
+        let snapshot_fingerprint =
+            request_fingerprint(&snapshot_request).expect("snapshot fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "append-snapshot-conflict".into(),
+            request_fingerprint: snapshot_fingerprint,
+            response: None,
+        }])
+        .expect("snapshot client responses");
+        raft.log
+            .write_snapshot(1, 1, payload)
+            .expect("write snapshot cache");
+
+        let retained_request = single_lock_request("append-snapshot-b", "snapshot-key-b");
+        let retained_fingerprint =
+            request_fingerprint(&retained_request).expect("retained fingerprint");
+        let response = raft.handle_append_entries(
+            2,
+            "n2".into(),
+            1,
+            1,
+            vec![RaftLogEntry {
+                index: 2,
+                term: 2,
+                created_at_ms: 10,
+                command: RaftCommand::ClientRequestWithIdentity {
+                    client_id: 2,
+                    request: retained_request,
+                    grant: None,
+                    request_id: "append-snapshot-conflict".into(),
+                    request_fingerprint: retained_fingerprint,
+                },
+            }],
+            0,
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::Error {
+                ref error,
+                term: 2
+            } if error.contains("snapshotted idempotency context")
+                && error.contains("append-snapshot-conflict")
+        ));
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        assert_eq!(
+            raft.telemetry_snapshot()
+                .append_entries_context_invalid_request_identities_total,
+            1
+        );
+        assert!(raft.raft_metrics_text().contains(
+            "dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total 1"
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_repair_replaces_truncated_request_identity_cache() {
+        let dir = temp_dir("raft-append-request-id-repair-cache");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(1, RaftCommand::Noop).expect("append prefix");
+        let original_request = single_lock_request("repair-original", "repair-old-key");
+        let original_fingerprint =
+            request_fingerprint(&original_request).expect("original fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: original_request,
+                    grant: None,
+                    request_id: "repair-reused-request".into(),
+                    request_fingerprint: original_fingerprint,
+                },
+            )
+            .expect("append uncommitted suffix identity");
+
+        let replacement_request = single_lock_request("repair-replacement", "repair-new-key");
+        let replacement_fingerprint =
+            request_fingerprint(&replacement_request).expect("replacement fingerprint");
+        let report = store
+            .append_entries_from_leader(
+                1,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 2,
+                    term: 2,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: replacement_request,
+                        grant: None,
+                        request_id: "repair-reused-request".into(),
+                        request_fingerprint: replacement_fingerprint.clone(),
+                    },
+                }],
+            )
+            .expect("leader repair may replace truncated request identity");
+
+        assert!(report.success);
+        assert_eq!(report.rewritten_entries, 1);
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
+        );
+        {
+            let state = store.state.lock();
+            let cached = state
+                .retained_request_fingerprints
+                .get("repair-reused-request")
+                .expect("repaired request id cache");
+            assert_eq!(cached.request_fingerprint, replacement_fingerprint);
+            assert_eq!(cached.first_index, 2);
+        }
+
+        let conflicting_request = single_lock_request("repair-conflict", "repair-conflict-key");
+        let conflicting_fingerprint =
+            request_fingerprint(&conflicting_request).expect("conflicting fingerprint");
+        let err = store
+            .append_entries_from_leader(
+                2,
+                2,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 11,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 3,
+                        request: conflicting_request,
+                        grant: None,
+                        request_id: "repair-reused-request".into(),
+                        request_fingerprint: conflicting_fingerprint,
+                    },
+                }],
+            )
+            .expect_err("repaired retained identity cache must reject later conflicts");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidAppendEntries(message)
+                if message.contains("retained log context")
+                    && message.contains("repair-reused-request")
+        ));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -22665,6 +23503,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raft_composite_lock_blocks_overlapping_single_and_composite_keys() {
+        let dir = temp_dir("raft-composite-union-overlap");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        let first = raft
+            .run_ephemeral(
+                composite_lock_request("raft-union-a", &["union-b", "union-a"]),
+                "raft-union-a",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("first composite request")
+            .expect("first composite response");
+        let composite_lock_uuid = match first {
+            Response::CompositeLock {
+                acquired: true,
+                keys,
+                lock_uuid: Some(lock_uuid),
+                fencing_tokens: Some(tokens),
+                ..
+            } => {
+                assert_eq!(keys, vec!["union-a".to_string(), "union-b".to_string()]);
+                assert_eq!(
+                    tokens.keys().cloned().collect::<Vec<_>>(),
+                    vec!["union-a".to_string(), "union-b".to_string()]
+                );
+                lock_uuid
+            }
+            other => panic!("expected granted composite lock, got {other:?}"),
+        };
+
+        let overlapping_single = raft
+            .run_ephemeral(
+                single_lock_request("raft-union-single-b", "union-b"),
+                "raft-union-single-b",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("overlapping single request")
+            .expect("overlapping single response");
+        assert!(matches!(
+            overlapping_single,
+            Response::Lock {
+                acquired: false,
+                ..
+            }
+        ));
+
+        let overlapping_composite = raft
+            .run_ephemeral(
+                composite_lock_request("raft-union-bc", &["union-b", "union-c"]),
+                "raft-union-bc",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("overlapping composite request")
+            .expect("overlapping composite response");
+        assert!(matches!(
+            overlapping_composite,
+            Response::CompositeLock {
+                acquired: false,
+                lock_uuid: None,
+                ..
+            }
+        ));
+
+        let disjoint_single = raft
+            .run_ephemeral(
+                single_lock_request("raft-union-single-c", "union-c"),
+                "raft-union-single-c",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("disjoint single request")
+            .expect("disjoint single response");
+        assert!(matches!(
+            disjoint_single,
+            Response::Lock { acquired: true, .. }
+        ));
+
+        let unlock = raft
+            .run_ephemeral(
+                composite_unlock_request(
+                    "raft-union-unlock",
+                    &["union-a", "union-b"],
+                    &composite_lock_uuid,
+                ),
+                "raft-union-unlock",
+                Duration::ZERO,
+                false,
+            )
+            .await
+            .expect("composite unlock request")
+            .expect("composite unlock response");
+        assert!(matches!(unlock, Response::Unlock { unlocked: true, .. }));
+
+        let after_unlock = raft
+            .run_ephemeral(
+                single_lock_request("raft-union-single-b-after", "union-b"),
+                "raft-union-single-b-after",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("single after composite unlock")
+            .expect("single after composite unlock response");
+        assert!(matches!(
+            after_unlock,
+            Response::Lock { acquired: true, .. }
+        ));
+        assert_eq!(raft.broker.metrics().holders, 2);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn duplicate_ephemeral_request_id_returns_cached_response_without_second_append() {
         let dir = temp_dir("raft-duplicate-request-id-cache");
         let mut cfg = test_raft_config(dir.clone());
@@ -22723,6 +23683,49 @@ mod tests {
         assert!(metrics.contains("dd_rust_network_mutex_raft_client_cache_completed_hits_total 1"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_client_cache_conflicts_total 1"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_client_response_cache_entries 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_snapshot_response_cache_restore_preserves_existing_cache() {
+        let dir = temp_dir("raft-invalid-response-cache-restore");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.restore_client_response_cache(vec![ClientResponseSnapshotEntry {
+            request_id: "existing-request".into(),
+            request_fingerprint: "existing-fingerprint".into(),
+            response: None,
+        }])
+        .expect("restore valid cache entry");
+
+        let err = raft
+            .restore_client_response_cache(vec![
+                ClientResponseSnapshotEntry {
+                    request_id: "duplicate-request".into(),
+                    request_fingerprint: "first-fingerprint".into(),
+                    response: None,
+                },
+                ClientResponseSnapshotEntry {
+                    request_id: "duplicate-request".into(),
+                    request_fingerprint: "second-fingerprint".into(),
+                    response: None,
+                },
+            ])
+            .expect_err("duplicate snapshot cache entry should fail restore");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("duplicates request id `duplicate-request`")
+        ));
+        let cache = raft.client_response_cache.lock();
+        assert_eq!(
+            cache.order.iter().cloned().collect::<Vec<_>>(),
+            vec!["existing-request".to_string()]
+        );
+        assert!(cache.entries.contains_key("existing-request"));
+        assert!(!cache.entries.contains_key("duplicate-request"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -22897,6 +23900,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raft_reopen_replays_composite_union_lock_semantics() {
+        let dir = temp_dir("raft-composite-union-reopen");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg.clone()).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        let first = raft
+            .run_ephemeral(
+                composite_lock_request("reopen-union-a", &["reopen-a", "reopen-b"]),
+                "reopen-union-a",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("first composite request")
+            .expect("first composite response");
+        let lock_uuid = granted_lock_uuid(&first).expect("composite lock uuid");
+        assert_eq!(
+            raft.log.read_hard_state().expect("hard state").commit_index,
+            1
+        );
+        drop(raft);
+
+        let reopened = BrokerRaft::open(cfg).expect("reopen raft");
+        become_single_node_leader(&reopened, 3);
+        let overlapping = reopened
+            .run_ephemeral(
+                single_lock_request("reopen-overlap-a", "reopen-a"),
+                "reopen-overlap-a",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("overlapping single after reopen")
+            .expect("overlapping single response");
+        assert!(matches!(
+            overlapping,
+            Response::Lock {
+                acquired: false,
+                ..
+            }
+        ));
+
+        let unlock = reopened
+            .run_ephemeral(
+                composite_unlock_request("reopen-unlock", &["reopen-a", "reopen-b"], &lock_uuid),
+                "reopen-unlock",
+                Duration::ZERO,
+                false,
+            )
+            .await
+            .expect("unlock after reopen")
+            .expect("unlock response");
+        assert!(matches!(unlock, Response::Unlock { unlocked: true, .. }));
+        let after_unlock = reopened
+            .run_ephemeral(
+                single_lock_request("reopen-after-unlock", "reopen-a"),
+                "reopen-after-unlock",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("single after reopen unlock")
+            .expect("single after reopen unlock response");
+        assert!(matches!(
+            after_unlock,
+            Response::Lock { acquired: true, .. }
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn snapshotted_request_id_cache_survives_compacted_log_reopen() {
         let dir = temp_dir("raft-request-id-snapshot-cache");
         let mut cfg = test_raft_config(dir.clone());
@@ -22956,6 +24032,97 @@ mod tests {
 
         assert_eq!(granted_lock_uuid(&first), granted_lock_uuid(&second));
         assert!(reopened.log.read_entries().expect("entries").is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn raft_snapshot_restores_composite_union_lock_semantics() {
+        let dir = temp_dir("raft-composite-union-snapshot");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_max_log_entries = 0;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let mut raft = BrokerRaft::open(cfg.clone()).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        let first = raft
+            .run_ephemeral(
+                composite_lock_request("snapshot-union-a", &["snapshot-a", "snapshot-b"]),
+                "snapshot-union-a",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("first composite request")
+            .expect("first composite response");
+        let lock_uuid = granted_lock_uuid(&first).expect("composite lock uuid");
+        raft.runtime.lock().membership = RaftMembership::from_simple(cfg.peers.clone());
+        raft.config.snapshot_max_log_entries = 1;
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("snapshot composite lock");
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("snapshot")
+                .last_included_index,
+            1
+        );
+        assert!(raft
+            .log
+            .read_entries()
+            .expect("retained entries")
+            .is_empty());
+        drop(raft);
+
+        let reopened = BrokerRaft::open(cfg).expect("reopen raft");
+        become_single_node_leader(&reopened, 3);
+        let overlapping = reopened
+            .run_ephemeral(
+                composite_lock_request("snapshot-overlap", &["snapshot-b", "snapshot-c"]),
+                "snapshot-overlap",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("overlapping composite after snapshot")
+            .expect("overlapping composite response");
+        assert!(matches!(
+            overlapping,
+            Response::CompositeLock {
+                acquired: false,
+                lock_uuid: None,
+                ..
+            }
+        ));
+
+        let disjoint = reopened
+            .run_ephemeral(
+                single_lock_request("snapshot-disjoint", "snapshot-c"),
+                "snapshot-disjoint",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("disjoint single after snapshot")
+            .expect("disjoint single response");
+        assert!(matches!(disjoint, Response::Lock { acquired: true, .. }));
+
+        let unlock = reopened
+            .run_ephemeral(
+                composite_unlock_request(
+                    "snapshot-unlock",
+                    &["snapshot-a", "snapshot-b"],
+                    &lock_uuid,
+                ),
+                "snapshot-unlock",
+                Duration::ZERO,
+                false,
+            )
+            .await
+            .expect("unlock snapshot composite")
+            .expect("unlock snapshot composite response");
+        assert!(matches!(unlock, Response::Unlock { unlocked: true, .. }));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -23507,6 +24674,62 @@ mod tests {
         );
         assert_eq!(store.last_index(), 4);
         assert_eq!(store.last_term(), 2);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_rejects_request_identity_conflict_with_retained_suffix_before_rewrite() {
+        let dir = temp_dir("raft-install-snapshot-request-id-retained-conflict");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(1, RaftCommand::Noop).expect("append boundary");
+        let retained_request = single_lock_request("snapshot-retained-b", "retained-key");
+        let retained_fingerprint =
+            request_fingerprint(&retained_request).expect("retained fingerprint");
+        store
+            .append(
+                2,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 2,
+                    request: retained_request,
+                    grant: None,
+                    request_id: "snapshot-retained-conflict".into(),
+                    request_fingerprint: retained_fingerprint,
+                },
+            )
+            .expect("append retained identity entry");
+
+        let snapshot_request = single_lock_request("snapshot-retained-a", "snapshot-key");
+        let snapshot_fingerprint =
+            request_fingerprint(&snapshot_request).expect("snapshot fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "snapshot-retained-conflict".into(),
+            request_fingerprint: snapshot_fingerprint,
+            response: None,
+        }])
+        .expect("client response snapshot payload");
+
+        let err = store
+            .install_snapshot_from_leader(1, 1, Some(payload_checksum(&payload)), payload)
+            .expect_err("conflicting snapshot request id must fail before retained rewrite");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("conflicts with retained log suffix")
+                    && message.contains("snapshot-retained-conflict")
+        ));
+        assert!(store.latest_snapshot().is_none());
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("retained entries must not be rewritten")
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -24611,6 +25834,73 @@ mod tests {
                 .map(|snapshot| snapshot.key.as_str()),
             Some("incoming-key")
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_install_snapshot_rejects_request_identity_conflict_with_retained_suffix() {
+        let dir = temp_dir("raft-install-snapshot-retained-request-id-conflict");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log
+            .append(1, RaftCommand::Noop)
+            .expect("append snapshot boundary");
+        let retained_request = single_lock_request("live-snapshot-retained-b", "retained-key");
+        let retained_fingerprint =
+            request_fingerprint(&retained_request).expect("retained fingerprint");
+        raft.log
+            .append(
+                2,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 2,
+                    request: retained_request,
+                    grant: None,
+                    request_id: "live-snapshot-conflict".into(),
+                    request_fingerprint: retained_fingerprint,
+                },
+            )
+            .expect("append retained request identity entry");
+
+        let snapshot_request = single_lock_request("live-snapshot-retained-a", "snapshot-key");
+        let snapshot_fingerprint =
+            request_fingerprint(&snapshot_request).expect("snapshot fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "live-snapshot-conflict".into(),
+            request_fingerprint: snapshot_fingerprint,
+            response: None,
+        }])
+        .expect("client response snapshot payload");
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+
+        let response =
+            raft.handle_install_snapshot(2, "n2".into(), 1, 1, Some(checksum), 0, true, data);
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::Error { ref error, .. }
+                if error.contains("conflicts with retained log suffix")
+                    && error.contains("live-snapshot-conflict")
+        ));
+        assert!(raft.log.latest_snapshot().is_none());
+        assert_eq!(
+            raft.log
+                .read_entries()
+                .expect("retained entries must not be rewritten")
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(
+            telemetry.install_snapshot_context_invalid_request_identities_total,
+            1
+        );
+        assert!(raft.raft_metrics_text().contains(
+            "dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total 1"
+        ));
 
         let _ = fs::remove_dir_all(dir);
     }

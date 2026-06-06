@@ -46,8 +46,10 @@ Implemented:
   latest-snapshot/log boundary instead of silently lowering a committed index
   after local data loss,
 - startup retained-log validation replays membership commands from the recovered
-  snapshot/config membership before committed replay, rejecting old
-  context-invalid staged learner entries that would conflict with active voters,
+  snapshot/config membership before committed replay and checks retained
+  request-id fingerprints against snapshot-cached idempotency entries, rejecting
+  old context-invalid staged learner entries or duplicate request identities
+  that would conflict during apply,
 - leader and follower commit advancement persist `commitIndex` before applying
   committed entries, so restart replay cannot lose a locally committed operation,
 - durable snapshots are treated as committed through `lastIncludedIndex` on
@@ -56,6 +58,10 @@ Implemented:
 - live `InstallSnapshot` applies durable hard-state, membership, learner, and
   response-cache side effects before installing broker state, so sidecar
   persistence failures cannot partially replace the state machine,
+- live `InstallSnapshot` validates snapshot-carried idempotency cache entries
+  against any retained log suffix before writing the new snapshot/rewrite, so a
+  snapshot cannot install request-id state that will conflict during later
+  suffix replay,
 - committed-entry apply failures, such as membership or learner sidecar
   persistence errors, increment
   `dd_rust_network_mutex_raft_apply_committed_errors_total` and emit a
@@ -94,6 +100,9 @@ Implemented:
 - context-invalid staged learner entries are rejected before follower log write
   when they conflict with the active membership implied by applied plus
   unapplied local membership entries,
+- context-invalid request-id entries are rejected before follower log write
+  when their fingerprints conflict with retained or snapshotted idempotency
+  context,
 - membership-gated Raft RPC handling so unknown or removed peer IDs cannot
   advance local term, reset election timers, or install snapshots,
 - hot membership-id checks in vote, append, and snapshot RPC paths scan the
@@ -249,8 +258,9 @@ Implemented:
   leader/term mutation:
   `dd_rust_network_mutex_raft_append_entries_malformed_requests_total`,
   `dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total`,
+  `dd_rust_network_mutex_raft_append_entries_context_invalid_request_identities_total`,
   and `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`;
-  startup retained-log learner context scans are counted by
+  startup retained-log learner and request-identity context scans are counted by
   `dd_rust_network_mutex_raft_open_log_context_validations_total`,
   `dd_rust_network_mutex_raft_open_log_context_validation_entries_total`,
   `dd_rust_network_mutex_raft_open_log_context_validation_us_total`, and
@@ -359,6 +369,9 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
   `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`;
+  follower-side snapshot payloads whose idempotency cache conflicts with a
+  retained suffix increment
+  `dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total`;
   frame-build microseconds measure cumulative time spent sizing/building
   leader-side snapshot chunk frames before the peer RPC wait begins, and request
   microseconds measure cumulative time awaiting leader-side snapshot chunk RPC
@@ -490,6 +503,9 @@ Implemented:
   before append, failed pre-append reservations are released, and the applied
   cache is rebuilt from committed identity log entries and carried in Raft
   snapshots, while mismatched payload reuse is rejected,
+- composite/multi-key lock requests are replicated as normal client commands,
+  preserving the single-broker overlap/union semantics through retained-log
+  replay and Raft snapshot restore,
 - coalesced post-commit `AppendEntries` fan-out, so bursty commits wake lagging
   peers promptly without spawning one background replication task per commit,
 - leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
@@ -618,12 +634,13 @@ log repair. Follower suffix repair uses lower-bound retained-log slicing to
 keep the retained prefix instead of scanning it entry by entry, then truncates
 the log file at the retained-prefix byte offset and appends the leader suffix
 instead of rewriting the full retained log. The in-memory retained entries,
-serialized-byte cache, and term indexes are truncated and extended in place
-after the disk write succeeds, so conflict repair does not clone a large
-retained prefix. If that write path reports an error, the retained
-log/index/byte cache is reloaded from disk before the follower returns the
-failure. Append-only and truncate-and-append log writers roll the file length
-back on write/flush/sync failure so partial suffix bytes are not left behind.
+serialized-byte cache, term indexes, and retained request-id fingerprint cache
+are truncated and extended in place after the disk write succeeds, so conflict
+repair does not clone or rescan a large retained prefix. If that write path
+reports an error, the retained log/index/byte/idempotency cache is reloaded
+from disk before the follower returns the failure. Append-only and
+truncate-and-append log writers roll the file length back on write/flush/sync
+failure so partial suffix bytes are not left behind.
 Follower snapshot install also keeps any matching retained suffix with an
 indexed retained-log slice instead of clone-filtering the full retained cache.
 Leader snapshot fan-out prepares the snapshot payload once per replication round
