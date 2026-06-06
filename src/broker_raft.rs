@@ -569,6 +569,7 @@ pub struct RaftTelemetrySnapshot {
     pub log_compaction_threshold_triggers_total: u64,
     pub log_compaction_cadence_triggers_total: u64,
     pub log_compaction_safety_skips_total: u64,
+    pub log_retained_byte_cache_repairs_total: u64,
     pub log_write_rollbacks_total: u64,
     pub log_write_rollback_errors_total: u64,
     pub log_append_file_opens_total: u64,
@@ -2099,6 +2100,7 @@ struct BrokerRaftTelemetry {
     log_compaction_threshold_triggers_total: AtomicU64,
     log_compaction_cadence_triggers_total: AtomicU64,
     log_compaction_safety_skips_total: AtomicU64,
+    log_retained_byte_cache_repairs_total: AtomicU64,
     log_write_rollbacks_total: AtomicU64,
     log_write_rollback_errors_total: AtomicU64,
     log_append_file_opens_total: AtomicU64,
@@ -3316,6 +3318,7 @@ impl RaftLogStore {
             return Ok(existing.clone());
         }
 
+        self.repair_retained_log_entry_byte_cache_if_needed(&mut state, "install-snapshot")?;
         let retain_suffix = term_at_index(&state, last_included_index) == Some(last_included_term);
         let (retained, retained_sizes): (Vec<RaftLogEntry>, Vec<usize>) = if retain_suffix {
             let suffix_start =
@@ -3406,6 +3409,7 @@ impl RaftLogStore {
             });
         }
 
+        self.repair_retained_log_entry_byte_cache_if_needed(&mut state, "compact-through")?;
         let before = state.retained_log_entries.len();
         let suffix_start = retained_entry_upper_bound(&state.retained_log_entries, through_index);
         let compacted_bytes = retained_log_prefix_file_len(
@@ -3439,6 +3443,34 @@ impl RaftLogStore {
             retained_entries: retained_len,
             retained_bytes,
         })
+    }
+
+    fn repair_retained_log_entry_byte_cache_if_needed(
+        &self,
+        state: &mut RaftLogState,
+        reason: &'static str,
+    ) -> Result<(), BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-repair-retained-byte-cache-1");
+        let expected = serialized_log_entry_lens(&state.retained_log_entries)?;
+        if state.retained_log_entry_bytes == expected {
+            return Ok(());
+        }
+        let previous_len = state.retained_log_entry_bytes.len();
+        state.retained_log_entry_bytes = expected;
+        if let Some(telemetry) = self.telemetry.as_deref() {
+            telemetry
+                .log_retained_byte_cache_repairs_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        debug!(
+            target: "lmx::raft",
+            reason,
+            retained_entries = state.retained_log_entries.len(),
+            previous_cache_entries = previous_len,
+            repaired_cache_entries = state.retained_log_entry_bytes.len(),
+            "repaired retained Raft log entry byte-size cache"
+        );
+        Ok(())
     }
 }
 
@@ -4900,6 +4932,10 @@ impl BrokerRaft {
                 .telemetry
                 .log_compaction_safety_skips_total
                 .load(Ordering::Relaxed),
+            log_retained_byte_cache_repairs_total: self
+                .telemetry
+                .log_retained_byte_cache_repairs_total
+                .load(Ordering::Relaxed),
             log_write_rollbacks_total: self
                 .telemetry
                 .log_write_rollbacks_total
@@ -5386,10 +5422,10 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_replication_early_quorum_returns_total Replication rounds returned after quorum before draining every in-flight peer replication task.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_early_quorum_returns_total counter\n",
                 "dd_rust_network_mutex_raft_replication_early_quorum_returns_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total Target-index replication rounds that sent foreground peer RPCs only to the remaining stable-membership quorum need.\n",
+                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total Target-index replication rounds that sent foreground peer RPCs only to the remaining quorum need.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total counter\n",
                 "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total Peer replication tasks skipped from foreground target-index fanout because the stable membership quorum needed fewer peers.\n",
+                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total Peer replication tasks skipped from foreground target-index fanout because quorum needed fewer peers.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total counter\n",
                 "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total Quorum wait iterations that retried immediately to rotate across skipped foreground target-index peers before sleeping for the heartbeat delay.\n",
@@ -5494,6 +5530,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_compaction_safety_skips_total Due log compaction checks skipped because commit/apply/trailing-suffix safety left no removable snapshot-covered prefix.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_compaction_safety_skips_total counter\n",
                 "dd_rust_network_mutex_raft_log_compaction_safety_skips_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total In-memory retained Raft log entry byte-size caches repaired from retained entries before snapshot install or compaction.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total counter\n",
+                "dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_write_rollbacks_total Raft log append or suffix-repair writes that rolled the file length back after write, flush, file sync, or parent-directory sync failure.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_write_rollbacks_total counter\n",
                 "dd_rust_network_mutex_raft_log_write_rollbacks_total {}\n",
@@ -5630,6 +5669,7 @@ impl BrokerRaft {
             snapshot.log_compaction_threshold_triggers_total,
             snapshot.log_compaction_cadence_triggers_total,
             snapshot.log_compaction_safety_skips_total,
+            snapshot.log_retained_byte_cache_repairs_total,
             snapshot.log_write_rollbacks_total,
             snapshot.log_write_rollback_errors_total,
             snapshot.log_append_file_opens_total,
@@ -5975,7 +6015,7 @@ impl BrokerRaft {
         let active_peers = membership.active_peers();
         {
             let runtime = self.runtime.lock();
-            if runtime.role != RaftRole::Leader || runtime.membership != *membership {
+            if runtime.role != RaftRole::Leader {
                 return 0;
             }
             if membership.contains_id(&self.config.node_id) && local_last_index >= target_index {
@@ -8753,7 +8793,7 @@ impl BrokerRaft {
             };
             if let Err(err) = self.log.write_hard_state(&state) {
                 return RaftRpcResponse::Error {
-                    term: response_term,
+                    term: runtime.current_term,
                     error: err.to_string(),
                 };
             }
@@ -9113,7 +9153,7 @@ impl BrokerRaft {
                 };
                 if let Err(err) = self.log.write_hard_state(&state) {
                     return Err(RaftRpcResponse::Error {
-                        term,
+                        term: runtime.current_term,
                         error: err.to_string(),
                     });
                 }
@@ -9557,7 +9597,7 @@ impl BrokerRaft {
                 };
                 if let Err(err) = self.log.write_hard_state(&state) {
                     return Err(RaftRpcResponse::Error {
-                        term,
+                        term: runtime.current_term,
                         error: err.to_string(),
                     });
                 }
@@ -11016,12 +11056,23 @@ impl BrokerRaft {
         Ok(acks)
     }
 
+    #[cfg(test)]
     async fn replicate_log_once_for_membership(
         &self,
         target_index: u64,
         membership: &RaftMembership,
     ) -> Result<BTreeSet<String>, BrokerRaftError> {
-        crate::routine_id!("ddl-routine-broker-raft-replicate-once-membership-1");
+        self.replicate_log_once_for_membership_with_round(target_index, membership, 0)
+            .await
+    }
+
+    async fn replicate_log_once_for_membership_with_round(
+        &self,
+        target_index: u64,
+        membership: &RaftMembership,
+        fanout_round: u64,
+    ) -> Result<BTreeSet<String>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-replicate-once-membership-round-1");
         let mut acks = BTreeSet::new();
         acks.insert(self.config.node_id.clone());
         let (term, leader_commit, active_membership, remote_peers, cached_progress_acks) = {
@@ -11035,16 +11086,17 @@ impl BrokerRaft {
                 if peer.id == self.config.node_id {
                     continue;
                 }
-                if runtime
+                let match_index = runtime
                     .leader_progress
                     .get(&peer.id)
-                    .is_some_and(|progress| progress.match_index >= target_index)
-                {
+                    .map(|progress| progress.match_index)
+                    .unwrap_or(0);
+                if match_index >= target_index {
                     if acks.insert(peer.id) {
                         cached_progress_acks = cached_progress_acks.saturating_add(1);
                     }
                 } else {
-                    remote_peers.push(peer);
+                    remote_peers.push((peer, match_index));
                 }
             }
             (
@@ -11085,6 +11137,35 @@ impl BrokerRaft {
                 "raft membership target replication quorum satisfied from cached progress",
             );
             return Ok(acks);
+        }
+        let original_remote_peers = remote_peers.len();
+        let remote_peers = select_target_replication_peers(
+            membership,
+            Some(target_index),
+            &acks,
+            remote_peers,
+            fanout_round,
+        );
+        if remote_peers.len() < original_remote_peers {
+            let skipped_peer_tasks = original_remote_peers.saturating_sub(remote_peers.len());
+            self.telemetry
+                .replication_quorum_limited_fanout_rounds_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .replication_quorum_limited_fanout_skipped_peers_total
+                .fetch_add(skipped_peer_tasks as u64, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                target_index,
+                fanout_round,
+                selected_peer_tasks = remote_peers.len(),
+                skipped_peer_tasks,
+                ack_count = acks.len(),
+                quorum = membership.quorum_size(),
+                membership_joint = membership.is_joint(),
+                "raft membership target replication limited peer fan-out to quorum need",
+            );
         }
         let snapshot_source = Arc::new(SharedInstallSnapshotSource::default());
         let mut tasks = JoinSet::new();
@@ -12240,8 +12321,17 @@ impl BrokerRaft {
                             });
                         }
                     }
-                    let repaired_next_index =
-                        self.next_index_after_conflict(conflict_term, conflict_index, next_index)?;
+                    let repaired_next_index = if let Some(next_index) = self
+                        .snapshot_fallback_next_index_after_conflict(conflict_term, conflict_index)
+                    {
+                        next_index
+                    } else {
+                        self.next_index_after_conflict(
+                            conflict_term,
+                            conflict_index,
+                            next_index,
+                        )?
+                    };
                     let progress = runtime.leader_progress.entry(peer.id.clone()).or_insert(
                         RaftPeerProgress {
                             next_index: repaired_next_index,
@@ -12364,6 +12454,11 @@ impl BrokerRaft {
 
     fn initial_replication_next_index(&self) -> u64 {
         crate::routine_id!("ddl-routine-broker-raft-initial-replication-next-index-1");
+        self.log.last_index().saturating_add(1).max(1)
+    }
+
+    fn retained_replication_floor_next_index(&self) -> u64 {
+        crate::routine_id!("ddl-routine-broker-raft-retained-replication-floor-next-index-1");
         self.log
             .latest_snapshot()
             .map(|snapshot| snapshot.last_included_index.saturating_add(1))
@@ -13214,7 +13309,7 @@ impl BrokerRaft {
             }
             let before_progress = self.leader_progress_generation();
             let acks = self
-                .replicate_log_once_for_membership(target_index, membership)
+                .replicate_log_once_for_membership_with_round(target_index, membership, attempts)
                 .await?;
             let progress_changed = self.leader_progress_generation() != before_progress;
             if !self.leader_membership_round_is_current(round_term, &round_active_membership) {
@@ -13310,6 +13405,24 @@ impl BrokerRaft {
                 self.telemetry
                     .replication_quorum_progress_retries_total
                     .fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let extra_limited_candidates =
+                self.target_replication_extra_candidate_count(target_index, membership);
+            if attempts <= extra_limited_candidates as u64 {
+                self.telemetry
+                    .replication_quorum_limited_fanout_fast_retries_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    target_index,
+                    attempts,
+                    extra_limited_candidates,
+                    membership_joint = membership.is_joint(),
+                    "raft membership replication quorum wait retrying immediately to rotate limited fan-out peers",
+                );
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -14323,7 +14436,7 @@ impl BrokerRaft {
     fn cleanup_stale_snapshot_transfers(&self, now_ms: u64) -> usize {
         crate::routine_id!("ddl-routine-broker-raft-cleanup-stale-snapshot-transfers-1");
         let stale_after_ms = duration_ms_u64(self.config.install_snapshot_stale_transfer_after);
-        let paths = {
+        let (paths, tracked_paths) = {
             let mut transfers = self.snapshot_transfers.lock();
             let stale_keys = transfers
                 .iter()
@@ -14335,10 +14448,15 @@ impl BrokerRaft {
                     }
                 })
                 .collect::<Vec<_>>();
-            stale_keys
+            let paths = stale_keys
                 .into_iter()
                 .filter_map(|key| transfers.remove(&key).map(|pending| pending.path))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let tracked_paths = transfers
+                .values()
+                .map(|pending| pending.path.clone())
+                .collect::<BTreeSet<_>>();
+            (paths, tracked_paths)
         };
         let mut removed = 0usize;
         for path in paths {
@@ -14346,10 +14464,102 @@ impl BrokerRaft {
                 removed += 1;
             }
         }
+        removed +=
+            self.cleanup_orphaned_stale_snapshot_part_files(now_ms, stale_after_ms, tracked_paths);
         if removed > 0 {
             self.telemetry
                 .snapshot_transfer_stale_cleanups_total
                 .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+        removed
+    }
+
+    fn cleanup_orphaned_stale_snapshot_part_files(
+        &self,
+        now_ms: u64,
+        stale_after_ms: u64,
+        tracked_paths: BTreeSet<PathBuf>,
+    ) -> usize {
+        crate::routine_id!("ddl-routine-broker-raft-cleanup-orphaned-stale-snapshot-parts-1");
+        let entries = match fs::read_dir(&self.log.data_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(err) => {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    data_dir = %self.log.data_dir.display(),
+                    error = %err,
+                    "failed to scan raft data dir for stale orphaned InstallSnapshot part files",
+                );
+                return 0;
+            }
+        };
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        data_dir = %self.log.data_dir.display(),
+                        error = %err,
+                        "failed to read raft data dir entry during stale orphaned InstallSnapshot cleanup",
+                    );
+                    continue;
+                }
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if !is_snapshot_part_file_name(name) {
+                continue;
+            }
+            let path = entry.path();
+            if tracked_paths.contains(&path) {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        path = %path.display(),
+                        error = %err,
+                        "failed to read stale orphaned InstallSnapshot part file type",
+                    );
+                    continue;
+                }
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+            let modified_ms = match entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(system_time_ms)
+            {
+                Some(modified_ms) => modified_ms,
+                None => {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        path = %path.display(),
+                        "failed to read stale orphaned InstallSnapshot part file modified time",
+                    );
+                    continue;
+                }
+            };
+            if now_ms.saturating_sub(modified_ms) < stale_after_ms {
+                continue;
+            }
+            if self.remove_snapshot_transfer_file(path, "stale-orphan-transfer") {
+                removed += 1;
+            }
         }
         removed
     }
@@ -14981,7 +15191,7 @@ impl BrokerRaft {
         current_next_index: u64,
     ) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-next-index-conflict-1");
-        let retained_floor = self.initial_replication_next_index().max(1);
+        let retained_floor = self.retained_replication_floor_next_index().max(1);
         let local_tail_next_index = self.log.last_index().saturating_add(1).max(1);
         let repair_ceiling = current_next_index
             .saturating_sub(1)
@@ -15016,6 +15226,24 @@ impl BrokerRaft {
             );
         }
         Ok(clamped)
+    }
+
+    fn snapshot_fallback_next_index_after_conflict(
+        &self,
+        conflict_term: Option<u64>,
+        conflict_index: Option<u64>,
+    ) -> Option<u64> {
+        crate::routine_id!("ddl-routine-broker-raft-conflict-snapshot-fallback-next-index-1");
+        if conflict_term.is_some() {
+            return None;
+        }
+        let retained_floor = self.retained_replication_floor_next_index().max(1);
+        if retained_floor <= 1
+            || !conflict_index.is_some_and(|index| index < retained_floor)
+        {
+            return None;
+        }
+        Some(retained_floor.saturating_sub(1).max(1))
     }
 
     fn next_election_deadline(&self) -> Instant {
@@ -15102,10 +15330,14 @@ fn matched_ids_for_index(
 
 fn unix_ms() -> u64 {
     crate::routine_id!("ddl-routine-broker-raft-unix-ms-1");
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    system_time_ms(SystemTime::now()).unwrap_or(0)
+}
+
+fn system_time_ms(time: SystemTime) -> Option<u64> {
+    crate::routine_id!("ddl-routine-broker-raft-system-time-ms-1");
+    time.duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
@@ -23577,7 +23809,7 @@ mod tests {
 
         let response = raft.handle_append_entries(5, "n2".into(), 0, 0, Vec::new(), 0);
 
-        assert!(matches!(response, RaftRpcResponse::Error { term: 5, .. }));
+        assert!(matches!(response, RaftRpcResponse::Error { term: 2, .. }));
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
             initial_state
@@ -24826,7 +25058,7 @@ mod tests {
 
         let response = raft.handle_request_vote(4, "n2".into(), 0, 0);
 
-        assert!(matches!(response, RaftRpcResponse::Error { term: 4, .. }));
+        assert!(matches!(response, RaftRpcResponse::Error { term: 3, .. }));
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
             initial_state
@@ -26378,38 +26610,41 @@ mod tests {
     }
 
     #[test]
-    fn install_snapshot_rejects_byte_cache_mismatch_before_rewrite() {
-        let dir = temp_dir("raft-install-snapshot-byte-cache-mismatch");
+    fn install_snapshot_repairs_byte_cache_mismatch_before_rewrite() {
+        let dir = temp_dir("raft-install-snapshot-byte-cache-repair");
         let store = RaftLogStore::open(&dir).expect("open store");
         for _ in 0..3 {
             store.append(1, RaftCommand::Noop).expect("append");
         }
-        let log_path = dir.join(LOG_FILE);
-        let original_log = fs::read(&log_path).expect("original log bytes");
         {
             let mut state = store.state.lock();
             state.retained_log_entry_bytes.pop();
         }
 
         let payload = idle_snapshot_payload();
-        let err = store
+        store
             .install_snapshot_from_leader(1, 1, Some(payload_checksum(&payload)), payload)
-            .expect_err("byte cache mismatch must reject before install rewrite");
+            .expect("byte cache mismatch should be repaired before install rewrite");
 
-        assert!(matches!(
-            err,
-            BrokerRaftError::InvalidLog(message)
-                if message.contains("byte-size cache")
-                    && message.contains("2 entries for 3 retained log entries")
-        ));
+        let retained = store.read_entries().expect("retained log");
         assert_eq!(
-            fs::read(&log_path).expect("log after rejected snapshot install"),
-            original_log,
-            "rejected snapshot install must not rewrite the retained log"
+            retained.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+            vec![2, 3]
         );
-        assert!(
-            store.latest_snapshot().is_none(),
-            "rejected snapshot install must not advance in-memory snapshot metadata"
+        {
+            let state = store.state.lock();
+            assert_eq!(
+                state.retained_log_entry_bytes,
+                serialized_log_entry_lens(&state.retained_log_entries)
+                    .expect("repaired retained entry byte cache")
+            );
+        }
+        assert_eq!(
+            store
+                .latest_snapshot()
+                .expect("installed snapshot")
+                .last_included_index,
+            1
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -26843,8 +27078,8 @@ mod tests {
     }
 
     #[test]
-    fn compaction_rejects_byte_cache_mismatch_before_rewrite() {
-        let dir = temp_dir("raft-compaction-byte-cache-mismatch");
+    fn compaction_repairs_byte_cache_mismatch_before_rewrite() {
+        let dir = temp_dir("raft-compaction-byte-cache-repair");
         let store = RaftLogStore::open(&dir).expect("open store");
         for _ in 0..3 {
             store.append(1, RaftCommand::Noop).expect("append");
@@ -26852,28 +27087,60 @@ mod tests {
         store
             .write_snapshot(2, 1, idle_snapshot_payload())
             .expect("write snapshot");
-        let log_path = dir.join(LOG_FILE);
-        let original_log = fs::read(&log_path).expect("original log bytes");
         {
             let mut state = store.state.lock();
             state.retained_log_entry_bytes.pop();
         }
 
-        let err = store
+        let report = store
             .compact_to_latest_snapshot()
-            .expect_err("byte cache mismatch must reject before compaction rewrite");
+            .expect("byte cache mismatch should be repaired before compaction rewrite");
 
-        assert!(matches!(
-            err,
-            BrokerRaftError::InvalidLog(message)
-                if message.contains("byte-size cache")
-                    && message.contains("2 entries for 3 retained log entries")
-        ));
         assert_eq!(
-            fs::read(&log_path).expect("log after rejected compaction"),
-            original_log,
-            "rejected compaction must not rewrite the retained log"
+            report.compacted_entries, 2,
+            "compaction should trim the snapshot-covered prefix after cache repair"
         );
+        let retained = store.read_entries().expect("retained log");
+        assert_eq!(
+            retained.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+            vec![3]
+        );
+        {
+            let state = store.state.lock();
+            assert_eq!(
+                state.retained_log_entry_bytes,
+                serialized_log_entry_lens(&state.retained_log_entries)
+                    .expect("repaired retained entry byte cache")
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_metrics_count_retained_byte_cache_repairs() {
+        let dir = temp_dir("raft-byte-cache-repair-metric");
+        let raft = BrokerRaft::open(test_raft_config(dir.clone())).expect("open raft");
+        for _ in 0..3 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        raft.log
+            .write_snapshot(2, 1, idle_snapshot_payload())
+            .expect("write snapshot");
+        {
+            let mut state = raft.log.state.lock();
+            state.retained_log_entry_bytes.pop();
+        }
+
+        raft.log
+            .compact_to_latest_snapshot()
+            .expect("cache repair should let compaction finish");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_retained_byte_cache_repairs_total, 1);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total 1"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -29990,6 +30257,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_leader_progress_starts_with_optimistic_tail_probe() {
+        let dir = temp_dir("raft-progress-missing-starts-at-tail");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            assert!(
+                !runtime.leader_progress.contains_key("n2"),
+                "test requires missing peer progress"
+            );
+        }
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(
+                        prev_log_index, 5,
+                        "missing progress should start with a lastLogIndex probe"
+                    );
+                    assert!(
+                        entries.is_empty(),
+                        "leader should not replay retained entries before probing the tail"
+                    );
+                    term
+                }
+                RaftRpc::InstallSnapshot { .. } => {
+                    panic!("missing progress must not immediately force snapshot fallback")
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let body = serde_json::to_vec(&RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index: 5,
+                conflict_index: None,
+                conflict_term: None,
+            })
+            .expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            raft.replicate_to_peer(peer, 1, 0, Some(5)),
+        )
+        .await
+        .expect("replication should not stall")
+        .expect("replicate to peer");
+        assert!(outcome.contacted);
+        assert!(outcome.target_reached);
+        server.await.expect("fake peer server");
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 5);
+        assert_eq!(progress.next_index, 6);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn append_conflict_does_not_rewind_next_index_below_known_match_index() {
         let dir = temp_dir("raft-conflict-does-not-rewind-known-match");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -31315,6 +31691,146 @@ mod tests {
         assert_eq!(
             telemetry.append_entries_requests_total, 2,
             "joint target round should contact only the two peers needed after local old-side ack"
+        );
+        assert_eq!(telemetry.replication_quorum_limited_fanout_rounds_total, 1);
+        assert_eq!(
+            telemetry.replication_quorum_limited_fanout_skipped_peers_total,
+            2
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn membership_replication_limits_joint_fanout_before_joint_is_active() {
+        let dir = temp_dir("raft-membership-joint-quorum-limits-fanout");
+        let listener_n2 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind old-only extra peer");
+        let addr_n2 = listener_n2.local_addr().expect("old-only peer addr");
+        let listener_n3 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind overlap quorum peer");
+        let addr_n3 = listener_n3.local_addr().expect("overlap peer addr");
+        let listener_n4 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind new quorum peer");
+        let addr_n4 = listener_n4.local_addr().expect("new quorum peer addr");
+        let listener_n5 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind new-only extra peer");
+        let addr_n5 = listener_n5.local_addr().expect("new-only peer addr");
+
+        let peer_n2 = RaftPeerConfig {
+            id: "n2".into(),
+            addr: addr_n2.to_string(),
+        };
+        let peer_n3 = RaftPeerConfig {
+            id: "n3".into(),
+            addr: addr_n3.to_string(),
+        };
+        let peer_n4 = RaftPeerConfig {
+            id: "n4".into(),
+            addr: addr_n4.to_string(),
+        };
+        let peer_n5 = RaftPeerConfig {
+            id: "n5".into(),
+            addr: addr_n5.to_string(),
+        };
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(250);
+        cfg.election_timeout_max = Duration::from_millis(500);
+        cfg.append_entries_max_entries = 16;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![test_peer("n1", 7980), peer_n2.clone(), peer_n3.clone()];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log.append(1, RaftCommand::Noop).expect("append");
+        let target_membership = RaftMembership::Joint {
+            old_peers: vec![test_peer("n1", 7980), peer_n2.clone(), peer_n3.clone()],
+            new_peers: vec![peer_n3.clone(), peer_n4.clone(), peer_n5.clone()],
+        };
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.membership = RaftMembership::from_simple(vec![
+                test_peer("n1", 7980),
+                peer_n2.clone(),
+                peer_n3.clone(),
+            ]);
+            runtime
+                .staged_learners
+                .insert(peer_n4.id.clone(), peer_n4.clone());
+            runtime
+                .staged_learners
+                .insert(peer_n5.id.clone(), peer_n5.clone());
+            for peer in [&peer_n2, &peer_n3, &peer_n4, &peer_n5] {
+                runtime.leader_progress.insert(
+                    peer.id.clone(),
+                    RaftPeerProgress {
+                        next_index: 1,
+                        match_index: 0,
+                    },
+                );
+            }
+        }
+
+        let unnecessary_n2 = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), listener_n2.accept()).await
+        });
+        let unnecessary_n5 = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), listener_n5.accept()).await
+        });
+        let (n3_seen, release_n3, server_n3) =
+            spawn_held_append_entries_peer(listener_n3, 0, vec![1]);
+        let (n4_seen, release_n4, server_n4) =
+            spawn_held_append_entries_peer(listener_n4, 0, vec![1]);
+
+        let node = raft.clone();
+        let target_for_task = target_membership.clone();
+        let replicate = tokio::spawn(async move {
+            node.replicate_log_once_for_membership(1, &target_for_task)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            n3_seen.await.expect("overlap peer should receive append");
+            n4_seen
+                .await
+                .expect("staged new peer should receive append");
+        })
+        .await
+        .expect("selected joint membership quorum peers should be contacted");
+        release_n3.send(()).expect("release overlap peer");
+        release_n4.send(()).expect("release new peer");
+
+        let acks = tokio::time::timeout(Duration::from_secs(2), replicate)
+            .await
+            .expect("joint membership replication should finish")
+            .expect("replicate task")
+            .expect("replicate result");
+        assert_eq!(
+            acks,
+            BTreeSet::from(["n1".to_string(), "n3".to_string(), "n4".to_string()])
+        );
+        assert!(target_membership.quorum_met(&acks));
+        unnecessary_n2
+            .await
+            .expect("old-only accept task")
+            .expect_err("old-only extra peer should not receive foreground append");
+        unnecessary_n5
+            .await
+            .expect("new-only accept task")
+            .expect_err("new-only extra peer should not receive foreground append");
+        server_n3.await.expect("overlap peer server");
+        server_n4.await.expect("new peer server");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(
+            telemetry.append_entries_requests_total, 2,
+            "membership-scoped target round should contact only the peers needed for joint quorum"
         );
         assert_eq!(telemetry.replication_quorum_limited_fanout_rounds_total, 1);
         assert_eq!(
@@ -38991,7 +39507,7 @@ mod tests {
         let response =
             raft.handle_install_snapshot(5, "n2".into(), 7, 2, Some(checksum), 0, false, data);
 
-        assert!(matches!(response, RaftRpcResponse::Error { term: 5, .. }));
+        assert!(matches!(response, RaftRpcResponse::Error { term: 2, .. }));
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
             initial_state
@@ -39981,6 +40497,62 @@ mod tests {
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
         assert_eq!(telemetry.snapshot_transfer_stale_cleanups_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn maintenance_sweeps_stale_orphaned_snapshot_part_files_without_restart() {
+        let dir = temp_dir("raft-maintenance-stale-orphaned-transfer-sweep");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let orphan = dir.join(format!(
+            "{}orphan{}",
+            SNAPSHOT_PART_FILE_PREFIX, SNAPSHOT_PART_FILE_SUFFIX
+        ));
+        let decoy = dir.join("raft-install-snapshot-decoy.tmp");
+        fs::write(&orphan, b"orphaned partial snapshot").expect("write orphan part");
+        fs::write(&decoy, b"not a snapshot part").expect("write decoy");
+
+        let far_future_ms = unix_ms() + 90 * 60 * 1_000;
+        let removed = raft.cleanup_stale_snapshot_transfers(far_future_ms);
+
+        assert_eq!(removed, 1);
+        assert!(!orphan.exists(), "stale orphaned part file should be swept");
+        assert!(decoy.exists(), "non-matching files must not be removed");
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
+        assert_eq!(telemetry.snapshot_transfer_stale_cleanups_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_orphaned_snapshot_sweep_preserves_tracked_part_paths() {
+        let dir = temp_dir("raft-maintenance-preserve-tracked-transfer");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let tracked = dir.join(format!(
+            "{}tracked{}",
+            SNAPSHOT_PART_FILE_PREFIX, SNAPSHOT_PART_FILE_SUFFIX
+        ));
+        fs::write(&tracked, b"active partial snapshot").expect("write tracked part");
+
+        let removed = raft.cleanup_orphaned_stale_snapshot_part_files(
+            unix_ms() + 90 * 60 * 1_000,
+            1,
+            BTreeSet::from([tracked.clone()]),
+        );
+
+        assert_eq!(removed, 0);
+        assert!(
+            tracked.exists(),
+            "orphan sweep must not remove paths still tracked as active transfers"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_stale_cleanups_total, 0);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -42425,7 +42997,8 @@ mod tests {
             .compact_to_latest_snapshot()
             .expect("compact snapshot prefix");
 
-        assert_eq!(raft.initial_replication_next_index(), 4);
+        assert_eq!(raft.initial_replication_next_index(), 5);
+        assert_eq!(raft.retained_replication_floor_next_index(), 4);
         assert_eq!(
             raft.next_index_after_conflict(None, None, 2)
                 .expect("no hint fallback"),

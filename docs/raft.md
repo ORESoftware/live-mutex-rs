@@ -233,8 +233,9 @@ Implemented:
   `raft.install_snapshot_max_staged_transfers`, with rejected transfer starts
   counted in
   `dd_rust_network_mutex_raft_install_snapshot_staged_transfer_limit_rejections_total`,
-- incomplete staged `InstallSnapshot` transfers that make no progress for
-  `raft.install_snapshot_stale_transfer_ms` are swept proactively by the
+- incomplete staged `InstallSnapshot` transfers, including matching orphaned
+  part files left on disk but no longer tracked in memory, that make no progress
+  for `raft.install_snapshot_stale_transfer_ms` are swept proactively by the
   maintenance loop and are also removed before later chunks are accepted. Stale
   removals increment
   `dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total` in
@@ -450,7 +451,7 @@ Implemented:
   `dd_rust_network_mutex_raft_replication_cached_quorum_short_circuits_total`,
   and quorum returns before every in-flight peer task drains in
   `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`;
-  stable-membership foreground fanout narrowing is counted in
+  target-index foreground fanout narrowing is counted in
   `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total`
   and
   `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total`,
@@ -599,6 +600,7 @@ Implemented:
   `dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total`,
   `dd_rust_network_mutex_raft_log_compaction_cadence_triggers_total`,
   `dd_rust_network_mutex_raft_log_compaction_safety_skips_total`,
+  `dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total`,
   `dd_rust_network_mutex_raft_log_write_rollbacks_total`,
   `dd_rust_network_mutex_raft_log_write_rollback_errors_total`,
   `dd_rust_network_mutex_raft_log_append_file_opens_total`,
@@ -632,9 +634,10 @@ Implemented:
 - staged learner additions/removals are blocked while joint consensus is active,
   so operator membership-management commands cannot interleave with an unfinished
   voter transition,
-- conservative missing-progress repair: if leader progress for a peer is absent,
-  catch-up starts from the retained snapshot/log boundary instead of assuming
-  the follower already has the leader's tail,
+- optimistic missing-progress repair: if leader progress for a peer is absent,
+  catch-up starts with a `lastLogIndex + 1` heartbeat probe, then conflict
+  hints move `nextIndex` down to the retained snapshot/log floor when the peer
+  is actually behind,
 - persistent Raft peer connection reuse for vote, append, snapshot, and follower
   proxy RPCs,
 - pooled peer RPC response-type validation; a mismatched response resets the
@@ -713,10 +716,10 @@ Implemented:
   the serialized commit lane, so requests that arrived during commit-lane
   contention can share the same append/replicate/commit round up to
   `client_batch_max_entries * client_pipeline_max_batches`,
-- target-index replication under stable membership narrows the first peer
-  fan-out to the remaining votes needed for quorum, including joint-consensus
-  old/new majority needs, and rotates that narrowed candidate set on retries;
-  heartbeat and post-commit fan-out remain broad,
+- target-index replication, including membership-scoped joint commits, narrows
+  foreground peer fan-out to the remaining votes needed for quorum, including
+  joint-consensus old/new majority needs, and rotates that narrowed candidate
+  set on retries; heartbeat and post-commit fan-out remain broad,
 - bounded leader-local client admission through `client_batch_max_pending`, so a
   stalled quorum rejects before appending new log entries instead of growing the
   pending queue without bound,

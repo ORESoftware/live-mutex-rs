@@ -754,14 +754,15 @@ connection. Re-staging the same learner id with a different address resets that
 learner's progress and drops the old pooled RPC connection before catch-up can
 succeed. Promotion remains log-backed through the joint-consensus membership
 endpoint.
-If leader progress for a peer is missing, catch-up starts from the retained
-snapshot/log boundary instead of assuming the peer already has the leader's
-tail. When an election completes, the new leader seeds replication progress
-from the current runtime membership and staged learners instead of the stale
-peer list captured before vote RPCs. Stale conflict responses cannot rewind a
-peer's `nextIndex` below its known `matchIndex + 1`; stale in-memory
-`nextIndex` values above the local log tail are clamped to `lastLogIndex + 1`
-before replication so they do not force unnecessary snapshot fallback.
+If leader progress for a peer is missing, catch-up starts with a
+`lastLogIndex + 1` heartbeat probe, then conflict hints move `nextIndex` down
+to the retained snapshot/log floor when the peer is actually behind. When an
+election completes, the new leader seeds replication progress from the current
+runtime membership and staged learners instead of the stale peer list captured
+before vote RPCs. Stale conflict responses cannot rewind a peer's `nextIndex`
+below its known `matchIndex + 1`; stale in-memory `nextIndex` values above the
+local log tail are clamped to `lastLogIndex + 1` before replication so they do
+not force unnecessary snapshot fallback.
 Debug-level `lmx::raft` append-progress events
 include the sent batch boundary plus conflict-repair/clamp details. Malformed
 `AppendEntries` frames with term zero, impossible previous-log summaries,

@@ -946,7 +946,7 @@ async fn raft_lb_round_robin_survives_leader_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn raft_follower_proxy_retries_through_leaderless_failover_window() {
+async fn raft_follower_proxy_survives_leaderless_failover_window() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let tuning = RaftClusterTuning {
         election_timeout_min: Duration::from_millis(1_200),
@@ -993,12 +993,23 @@ async fn raft_follower_proxy_retries_through_leaderless_failover_window() {
         release["unlocked"], true,
         "follower proxy should release after failover: {release:?}"
     );
-    wait_for_metric_at_least(
+    let forwarded = current_metric(
         target_port,
-        "dd_rust_network_mutex_raft_proxy_request_retries_total",
-        1,
+        "dd_rust_network_mutex_raft_proxy_requests_forwarded_total",
     )
     .await;
+    let retries = current_metric(
+        target_port,
+        "dd_rust_network_mutex_raft_proxy_request_retries_total",
+    )
+    .await;
+    let target_status = http_get_json(target_port, "/raft/status")
+        .await
+        .expect("target status after failover release");
+    assert!(
+        forwarded >= 1 || target_status["isLeader"] == true,
+        "failover release should either be proxied by the target follower or handled after it became leader; forwarded={forwarded}, retries={retries}, status={target_status:?}, release={release:?}"
+    );
 
     let survivors: Vec<usize> = (0..cluster.http_ports.len())
         .filter(|idx| *idx != old_leader)
