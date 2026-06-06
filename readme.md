@@ -205,14 +205,17 @@ fsyncing `raft-hard-state.json`.
 Local loopback measurement on 2026-06-05 with 8 workers, 256 keys, a
 leader-preferred 3-node BrokerRaft cluster, and 3-second runs:
 
-| Target | Raft log sync | Successful cycles/sec | p50 cycle latency |
+| Target | Raft sync policy | Successful cycles/sec | p50 cycle latency |
 | --- | --- | ---: | ---: |
-| BrokerRaft | `sync_log=true` | 319 | 24.031 ms |
-| BrokerRaft | `sync_log=false` | 1,072 | 6.832 ms |
+| BrokerRaft | `sync_log=true`, `sync_commit=true` | 319 | 24.031 ms |
+| BrokerRaft | `sync_log=false`, `sync_commit=true` | 1,072 | 6.832 ms |
 
 `sync_log=false` is intentionally unsafe: it skips append-log fsyncs to expose
 the disk-sync ceiling, but a process or host crash can lose the latest unsynced
-Raft entries. Keep the default `sync_log=true` for crash-safe failover tests.
+Raft entries. `sync_commit=false` is a separate unsafe benchmark switch that
+skips commit-slot fsyncs; acknowledged entries may recover only through the last
+synced commit slot after a crash. Keep the defaults `sync_log=true` and
+`sync_commit=true` for crash-safe failover tests.
 
 ## Wire protocol (TCP / UDS)
 
@@ -286,14 +289,15 @@ remove non-voting learners before promoting them through membership change.
 quorum and 503 otherwise, which lets an HTTP-aware load balancer prefer a
 quorum-fresh leader without making follower proxying part of the hot path.
 `/raft/status`, `/raft/progress`, `/raft/learners`, and `/raft/leaderz` expose
-`isLeaderReady`, `leaderQuorumAgeMs`, and `leaderQuorumTimeoutMs` so operators
-can distinguish the raw Raft leader from a leader still fresh enough to accept
-writes.
-BrokerRaft's public lock API is intentionally single-key-only: `/v1/lock` and
-`/v1/unlock` requests that use a `keys` array are rejected before they enter the
-Raft batcher or log. Multi-key composite locking remains available on the
-regular non-consensus Broker, where union-style multi-resource locks do not
-expand the consensus surface.
+`isLeaderReady`, `leaderQuorumAgeMs`, `leaderQuorumTimeoutMs`, `syncLog`,
+`syncCommit`, and `unsafeDurability` so operators can distinguish the raw Raft
+leader from a leader still fresh enough to accept writes and can spot unsafe
+benchmark durability settings in status output.
+BrokerRaft's public lock API supports single-key requests plus bounded
+multi-key `keys` requests up to 3 distinct keys. The lower replicated cap keeps
+per-log-index fencing-token reservations bounded while preserving union-style
+overlap semantics. Larger composite requests are rejected before they enter the
+Raft batcher or log.
 
 `waitMs` is HTTP long-poll: the broker holds the request open up to that many
 milliseconds while waiting for a queued lock to be granted. The default is no
@@ -308,8 +312,10 @@ and reserves in-flight request IDs before append. A retry with the same request
 id and same payload will not append a second command while the first proposal is
 pending, and can return the original result after the response is known. Reusing
 a request id with a different payload returns `409 Conflict`. The bounded applied
-cache is rebuilt from committed log replay and included in Raft snapshots; it is
-not an unbounded etcd-style client-session ledger.
+cache is rebuilt from committed log replay and included in Raft snapshots.
+Unapplied reservations are not trimmed merely because the completed-response
+cache is full; they remain bounded by the leader-local pending queue. This is not
+an unbounded etcd-style client-session ledger.
 
 If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 `Authorization: Bearer <token>` or `X-LMX-Auth: <token>` header.
@@ -353,6 +359,7 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES` | `8192` | Max recent BrokerRaft HTTP request-id responses retained for bounded idempotent retries.          |
 | `LMX_RAFT_PROXY_RETRY_BUDGET_MS` | `2000` | Follower retry window for re-discovering and re-forwarding a proxied client request during leader churn. |
 | `LMX_RAFT_SYNC_LOG` | `true` | Flush Raft append-log writes to stable storage before acknowledging them. Set `false` only for explicit unsafe throughput/benchmark experiments; crash durability is weakened. |
+| `LMX_RAFT_SYNC_COMMIT` | `true` | Flush commit-only hard-state slot writes before applying committed entries. Set `false` only for explicit unsafe throughput/benchmark experiments; crash recovery may replay only through the last synced commit slot. |
 | `LMX_RAFT_PEER_TOKEN` | unset | Optional shared secret required on Raft peer RPC frames. Use a Kubernetes Secret or equivalent in multi-node deployments; blank values are treated as unset. |
 | `LMX_TTL_SWEEP_INTERVAL_MS` | `10`         | Periodic TTL-eviction sweep cadence (originally `live-mutex#13`). `0` disables auto-eviction.    |
 | `LMX_STATUS_PORT`       | unset            | Bind a dedicated read-only HTML status listener on this port (originally `live-mutex#108`). The same page is also served at `/` on `LMX_HTTP_PORT`. |
@@ -644,7 +651,21 @@ forwarding node with stale term state. Followers retry transient proxy
 failures, stale leader hints, and leaderless intervals for up to
 `proxy_retry_budget_ms`, while terminal request-payload errors still fail
 immediately; the loopback cluster suite covers a request landing on a follower
-during the leaderless failover window. The current
+during the leaderless failover window. Follower proxying uses the direct Raft
+peer addresses from membership; it does not send proxied requests back through
+the load balancer. If a follower lacks a leader hint, it tries active peers
+directly until one handles the request as leader or the retry budget expires. A
+non-leader proxy response can include a structured leader hint; the forwarding
+follower only accepts hints that resolve to configured active peers, and when
+both ID and address are supplied both must match the same peer. It then retries
+that peer immediately instead of walking unrelated peers first. Each outbound
+proxy RPC is capped by the remaining retry budget, so a silent candidate peer
+cannot stretch a follower request beyond that configured window. After a
+successful proxied write in the follower's current term, the forwarding follower
+refreshes its volatile leader hint and election deadline, so later round-robin
+LB traffic prefers the same direct peer until normal Raft observations replace
+that hint.
+The current
 implementation is still slower
 than the regular Broker under concurrent HTTP load, but the leader now drains
 up to `client_batch_max_entries * client_pipeline_max_batches` pending requests
@@ -661,12 +682,19 @@ peer catch-up retries immediately when a bounded batch or conflict repair moves
 quorum/catch-up waiters before the heartbeat delay when progress moves in a
 separate task. Target-index quorum rounds reuse existing `matchIndex` progress
 for already-caught-up peers instead of sending redundant append RPCs before
-commit/catch-up can finish. Already-committed waits prefer a real `matchIndex`
+commit/catch-up can finish; under stable membership they also send the first
+target round only to the remaining peers needed for quorum, including
+joint-consensus old/new majority needs, rotating the candidate set on retries so
+unavailable peers do not monopolize catch-up. If a narrowed attempt makes no
+progress while skipped candidates remain, the quorum wait retries the rotated set
+immediately before sleeping for the heartbeat delay.
+Already-committed waits prefer a real `matchIndex`
 quorum and only fall back to a minimal durable committed quorum when volatile
 leader progress is not strong enough after restart or leadership churn; cached
 progress does not refresh the check-quorum freshness timestamp. `/raft/status`
-exposes `currentTerm`, `commitIndex`, `lastApplied`, and the leader quorum freshness fields to help spot convergence
-lag or a stale partitioned leader. No-target heartbeat and post-commit fan-out
+exposes `currentTerm`, `commitIndex`, `lastApplied`, sync policy fields, and the
+leader quorum freshness fields to help spot convergence lag, unsafe durability
+settings, or a stale partitioned leader. No-target heartbeat and post-commit fan-out
 rounds return after an active quorum instead of waiting for every slow peer task,
 skip peers whose pooled RPC connection is already busy with in-flight work, and
 post-commit follower wakeups are coalesced through one active fan-out worker
@@ -847,7 +875,13 @@ target-index progress is split out as
 `dd_rust_network_mutex_raft_replication_cached_quorum_short_circuits_total`, and
 `dd_rust_network_mutex_raft_replication_early_quorum_returns_total` so profiling
 runs can distinguish zero-RPC commits, already-committed target waits, and
-fanout rounds that returned once a quorum had replied. No-target
+fanout rounds that returned once a quorum had replied. Stable-membership
+foreground fanout narrowing is counted in
+`dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total` and
+`dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total`.
+Immediate retry rotation across skipped foreground candidates is counted in
+`dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total`.
+No-target
 heartbeat/post-commit AppendEntries or snapshot
 catch-up attempts skipped because the peer already has an in-flight pooled RPC
 are counted in
@@ -909,7 +943,13 @@ keys or request ids.
 `dd_rust_network_mutex_raft_apply_committed_us_total`,
 `dd_rust_network_mutex_raft_client_batch_pending`,
 `dd_rust_network_mutex_raft_client_batch_driver_active`, and
-`dd_rust_network_mutex_raft_client_response_cache_entries`. Queue-full,
+`dd_rust_network_mutex_raft_client_response_cache_entries`. That response-cache
+gauge is split further into
+`dd_rust_network_mutex_raft_client_response_cache_pending_entries`,
+`dd_rust_network_mutex_raft_client_response_cache_completed_entries`, and
+`dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries`
+so perf runs can distinguish active idempotency reservations from replayable
+completed responses and unknown completed outcomes. Queue-full,
 cancelled-before-append, batch-failure, and committed-entry apply-failure paths emit warn/error-level
 `lmx::raft` logs; proxy forwarding and proxy errors emit debug-level logs with
 request id and leader hint fields.

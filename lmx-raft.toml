@@ -25,6 +25,9 @@ enabled = true
 # raft.peers is the active voter set. node_id normally appears there, but a
 # new node may start outside the voter set as a learner until /raft/learners and
 # /raft/membership promote it through consensus.
+# Peer addrs must be directly reachable pod-to-pod: Raft replication,
+# InstallSnapshot, and follower-to-leader client proxying dial these addresses
+# instead of going back through the public load balancer.
 node_id = "node-1"
 bind_addr = "0.0.0.0:7980"
 advertise_addr = "node-1:7980"
@@ -70,6 +73,10 @@ proxy_retry_budget_ms = 2000
 # benchmark/throughput experiments where losing the last unsynced log writes
 # after a process or host crash is acceptable.
 sync_log = true
+# Keep true for crash-safe commitIndex durability. Set false only for explicit
+# benchmark/throughput experiments where committed entries may replay only
+# through the last synced commit slot after a process or host crash.
+sync_commit = true
 
 [[raft.peers]]
 id = "node-1"

@@ -42,6 +42,11 @@ contention, so failed attempts cannot leave a deferred waiter behind.
 ## Run every smoke test
 
 ```bash
+# offline protocol discriminator parity (no broker)
+./clients/check-protocol-parity.sh
+```
+
+```bash
 # 1. start the broker (in another terminal)
 cargo run --release --no-default-features --bin dd-rust-network-mutex
 
@@ -67,6 +72,9 @@ constructor:
   construction.
 - Gleam → custom types are real ADTs; non-exhaustive `case` is a compile
   error.
+- Python → `enum.Enum` request/response discriminators plus typed builders.
+- C++ → `enum class` request/response discriminators and switch helpers.
+- Java → `enum RequestType` / `enum ResponseType` with typed request builders.
 
 The upstream `live-mutex` broker switches on bare strings, so a typo
 silently routes to "no handler". This is the structural fix.

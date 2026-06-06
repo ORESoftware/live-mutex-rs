@@ -110,6 +110,7 @@ struct RaftFileConfig {
     client_response_cache_max_entries: Option<usize>,
     proxy_retry_budget_ms: Option<u64>,
     sync_log: Option<bool>,
+    sync_commit: Option<bool>,
     peer_token: Option<String>,
     peers: Vec<RaftPeerConfig>,
 }
@@ -366,6 +367,9 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.sync_log = env_bool("LMX_RAFT_SYNC_LOG")
         .or(file.sync_log)
         .unwrap_or(cfg.sync_log);
+    cfg.sync_commit = env_bool("LMX_RAFT_SYNC_COMMIT")
+        .or(file.sync_commit)
+        .unwrap_or(cfg.sync_commit);
     cfg.peer_token =
         env_string("LMX_RAFT_PEER_TOKEN").or_else(|| non_empty(file.peer_token.clone()));
     cfg.peers = file.peers.clone();
@@ -457,6 +461,7 @@ mod tests {
             client_response_cache_max_entries = 55
             proxy_retry_budget_ms = 456
             sync_log = false
+            sync_commit = false
             peer_token = "cluster-secret"
 
             [[raft.peers]]
@@ -495,6 +500,7 @@ mod tests {
         assert_eq!(raft.client_response_cache_max_entries, 55);
         assert_eq!(raft.proxy_retry_budget, Duration::from_millis(456));
         assert!(!raft.sync_log);
+        assert!(!raft.sync_commit);
         assert_eq!(raft.peer_token.as_deref(), Some("cluster-secret"));
     }
 
@@ -570,6 +576,7 @@ mod tests {
         assert_eq!(cfg.raft.client_response_cache_max_entries, Some(8192));
         assert_eq!(cfg.raft.proxy_retry_budget_ms, Some(2000));
         assert_eq!(cfg.raft.sync_log, Some(true));
+        assert_eq!(cfg.raft.sync_commit, Some(true));
 
         let peer_ids = cfg
             .raft
@@ -594,5 +601,6 @@ mod tests {
         assert_eq!(raft.client_batch_max_delay, Duration::from_millis(1));
         assert_eq!(raft.proxy_retry_budget, Duration::from_millis(2000));
         assert!(raft.sync_log);
+        assert!(raft.sync_commit);
     }
 }

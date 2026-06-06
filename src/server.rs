@@ -971,6 +971,9 @@ async fn raft_status(State(state): State<RaftAppState>) -> AxumResponse {
         "lastApplied": progress.last_applied,
         "lastLogIndex": progress.last_log_index,
         "lastLogTerm": progress.last_log_term,
+        "syncLog": progress.sync_log,
+        "syncCommit": progress.sync_commit,
+        "unsafeDurability": progress.unsafe_durability,
     }))
     .into_response()
 }
@@ -1024,6 +1027,9 @@ async fn raft_learners(State(state): State<RaftAppState>) -> AxumResponse {
         "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
         "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
         "lastLogIndex": progress.last_log_index,
+        "syncLog": progress.sync_log,
+        "syncCommit": progress.sync_commit,
+        "unsafeDurability": progress.unsafe_durability,
         "learners": learners,
     }))
     .into_response()
@@ -1120,6 +1126,9 @@ async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
         "leaderAddr": progress.leader_addr,
         "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
         "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
+        "syncLog": progress.sync_log,
+        "syncCommit": progress.sync_commit,
+        "unsafeDurability": progress.unsafe_durability,
     });
     if progress.is_leader_ready {
         Json(body).into_response()

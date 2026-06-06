@@ -22,6 +22,9 @@ PORT="${LIVE_MUTEX_PORT:-6970}"
 export LIVE_MUTEX_HOST="$HOST"
 export LIVE_MUTEX_PORT="$PORT"
 
+echo "==> client protocol parity"
+"$HERE/clients/check-protocol-parity.sh"
+
 if ! nc -z "$HOST" "$PORT" 2>/dev/null; then
   echo "FATAL: broker not listening on $HOST:$PORT" >&2
   echo "       start it with: cargo run --release --no-default-features --bin dd-rust-network-mutex" >&2

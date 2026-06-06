@@ -168,6 +168,11 @@ pub struct BrokerRaftConfig {
     /// before the node acknowledges it. Disabling this is an explicit
     /// performance/benchmark tradeoff and weakens crash durability.
     pub sync_log: bool,
+    /// When true, commit-only hard-state slot writes are flushed before the
+    /// leader applies committed entries. Disabling this is a separate explicit
+    /// benchmark/throughput tradeoff: acknowledged log entries remain written,
+    /// but crash recovery may replay only through the last synced commit slot.
+    pub sync_commit: bool,
     /// Optional shared secret required on Raft peer RPC frames. When unset,
     /// the peer listener preserves the existing trusted-network behavior.
     pub peer_token: Option<String>,
@@ -206,6 +211,7 @@ impl Default for BrokerRaftConfig {
             client_response_cache_max_entries: DEFAULT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES,
             proxy_retry_budget: DEFAULT_PROXY_RETRY_BUDGET,
             sync_log: true,
+            sync_commit: true,
             peer_token: None,
             peers: Vec::new(),
         }
@@ -368,6 +374,9 @@ pub struct RaftProgressSnapshot {
     pub last_applied: u64,
     pub last_log_index: u64,
     pub last_log_term: u64,
+    pub sync_log: bool,
+    pub sync_commit: bool,
+    pub unsafe_durability: bool,
     pub membership_joint: bool,
     pub membership: RaftMembership,
     pub peers: Vec<RaftPeerProgressSnapshot>,
@@ -524,6 +533,9 @@ pub struct RaftTelemetrySnapshot {
     pub replication_cached_progress_acks_total: u64,
     pub replication_cached_quorum_short_circuits_total: u64,
     pub replication_early_quorum_returns_total: u64,
+    pub replication_quorum_limited_fanout_rounds_total: u64,
+    pub replication_quorum_limited_fanout_skipped_peers_total: u64,
+    pub replication_quorum_limited_fanout_fast_retries_total: u64,
     pub replication_busy_peer_skips_total: u64,
     pub fanout_replication_inline_progress_rounds_total: u64,
     pub fanout_replication_inline_successes_total: u64,
@@ -756,6 +768,103 @@ fn peer_votes(peers: &[RaftPeerConfig], ack_ids: &BTreeSet<String>) -> usize {
         .iter()
         .filter(|peer| ack_ids.contains(&peer.id))
         .count()
+}
+
+fn select_target_replication_peers(
+    membership: &RaftMembership,
+    target_index: Option<u64>,
+    ack_ids: &BTreeSet<String>,
+    mut remote_peers: Vec<(RaftPeerConfig, u64)>,
+    fanout_round: u64,
+) -> Vec<RaftPeerConfig> {
+    crate::routine_id!("ddl-routine-broker-raft-select-target-replication-peers-1");
+    let Some(_) = target_index else {
+        return remote_peers.into_iter().map(|(peer, _)| peer).collect();
+    };
+    if membership.quorum_met(ack_ids) {
+        return Vec::new();
+    }
+    if remote_peers.is_empty() {
+        return Vec::new();
+    }
+
+    let original_remote_peers = remote_peers.clone();
+    remote_peers.sort_by(|(left_peer, left_match), (right_peer, right_match)| {
+        right_match
+            .cmp(left_match)
+            .then_with(|| left_peer.id.cmp(&right_peer.id))
+    });
+    if remote_peers.len() > 1 {
+        let offset = fanout_round.saturating_sub(1) as usize % remote_peers.len();
+        remote_peers.rotate_left(offset);
+    }
+
+    let mut selected = BTreeMap::<String, RaftPeerConfig>::new();
+    let mut selected_acks = ack_ids.clone();
+    while !membership.quorum_met(&selected_acks) {
+        let mut best = None::<(usize, u64, usize)>;
+        for (pos, (peer, match_index)) in remote_peers.iter().enumerate() {
+            if selected.contains_key(&peer.id) {
+                continue;
+            }
+            let mut candidate_acks = selected_acks.clone();
+            candidate_acks.insert(peer.id.clone());
+            let gain = quorum_gain(membership, &selected_acks, &candidate_acks);
+            if gain == 0 {
+                continue;
+            }
+            let candidate = (gain, *match_index, usize::MAX.saturating_sub(pos));
+            if best.is_none_or(|current| candidate > current) {
+                best = Some(candidate);
+            }
+        }
+        let Some((_, _, inverted_pos)) = best else {
+            return original_remote_peers
+                .into_iter()
+                .map(|(peer, _)| peer)
+                .collect();
+        };
+        let pos = usize::MAX.saturating_sub(inverted_pos);
+        let peer = remote_peers[pos].0.clone();
+        selected_acks.insert(peer.id.clone());
+        selected.insert(peer.id.clone(), peer);
+    }
+
+    if selected.len() >= original_remote_peers.len() {
+        return original_remote_peers
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect();
+    }
+    selected.into_values().collect()
+}
+
+fn quorum_gain(
+    membership: &RaftMembership,
+    before: &BTreeSet<String>,
+    after: &BTreeSet<String>,
+) -> usize {
+    crate::routine_id!("ddl-routine-broker-raft-quorum-gain-1");
+    match membership {
+        RaftMembership::Simple { peers } => peer_votes(peers, after)
+            .min(quorum_for(peers.len()))
+            .saturating_sub(peer_votes(peers, before).min(quorum_for(peers.len()))),
+        RaftMembership::Joint {
+            old_peers,
+            new_peers,
+        } => {
+            let old_quorum = quorum_for(old_peers.len());
+            let new_quorum = quorum_for(new_peers.len());
+            peer_votes(old_peers, after)
+                .min(old_quorum)
+                .saturating_sub(peer_votes(old_peers, before).min(old_quorum))
+                .saturating_add(
+                    peer_votes(new_peers, after)
+                        .min(new_quorum)
+                        .saturating_sub(peer_votes(new_peers, before).min(new_quorum)),
+                )
+        }
+    }
 }
 
 fn add_peer_if_present(ack_ids: &mut BTreeSet<String>, peers: &[RaftPeerConfig], peer_id: &str) {
@@ -1569,6 +1678,10 @@ enum RaftRpcResponse {
         term: u64,
         response: Option<Response>,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leader_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        leader_addr: Option<String>,
     },
     Error {
         term: u64,
@@ -1950,6 +2063,9 @@ struct BrokerRaftTelemetry {
     replication_cached_progress_acks_total: AtomicU64,
     replication_cached_quorum_short_circuits_total: AtomicU64,
     replication_early_quorum_returns_total: AtomicU64,
+    replication_quorum_limited_fanout_rounds_total: AtomicU64,
+    replication_quorum_limited_fanout_skipped_peers_total: AtomicU64,
+    replication_quorum_limited_fanout_fast_retries_total: AtomicU64,
     replication_busy_peer_skips_total: AtomicU64,
     fanout_replication_inline_progress_rounds_total: AtomicU64,
     fanout_replication_inline_successes_total: AtomicU64,
@@ -2178,6 +2294,7 @@ pub struct RaftLogStore {
     hard_state_path: PathBuf,
     hard_state_commit_path: PathBuf,
     sync_log: bool,
+    sync_commit: bool,
     telemetry: Option<Arc<BrokerRaftTelemetry>>,
     log_append_file: Mutex<Option<CachedLogAppendFile>>,
     hard_state_commit_file: Mutex<Option<CachedHardStateCommitFile>>,
@@ -2193,12 +2310,30 @@ impl RaftLogStore {
         data_dir: impl Into<PathBuf>,
         sync_log: bool,
     ) -> Result<Self, BrokerRaftError> {
-        Self::open_with_sync_log_and_telemetry(data_dir, sync_log, None)
+        Self::open_with_sync_policy(data_dir, sync_log, true)
     }
 
+    pub fn open_with_sync_policy(
+        data_dir: impl Into<PathBuf>,
+        sync_log: bool,
+        sync_commit: bool,
+    ) -> Result<Self, BrokerRaftError> {
+        Self::open_with_sync_policy_and_telemetry(data_dir, sync_log, sync_commit, None)
+    }
+
+    #[cfg(test)]
     fn open_with_sync_log_and_telemetry(
         data_dir: impl Into<PathBuf>,
         sync_log: bool,
+        telemetry: Option<Arc<BrokerRaftTelemetry>>,
+    ) -> Result<Self, BrokerRaftError> {
+        Self::open_with_sync_policy_and_telemetry(data_dir, sync_log, true, telemetry)
+    }
+
+    fn open_with_sync_policy_and_telemetry(
+        data_dir: impl Into<PathBuf>,
+        sync_log: bool,
+        sync_commit: bool,
         telemetry: Option<Arc<BrokerRaftTelemetry>>,
     ) -> Result<Self, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-log-open-1");
@@ -2273,6 +2408,7 @@ impl RaftLogStore {
             hard_state_path,
             hard_state_commit_path,
             sync_log,
+            sync_commit,
             telemetry,
             log_append_file: Mutex::new(None),
             hard_state_commit_file: Mutex::new(None),
@@ -2627,6 +2763,7 @@ impl RaftLogStore {
             generation,
             current_term,
             commit_index,
+            self.sync_commit,
             self.telemetry.as_deref(),
         )
     }
@@ -3453,9 +3590,10 @@ impl BrokerRaft {
             None
         };
         let telemetry = Arc::new(BrokerRaftTelemetry::default());
-        let log_store = RaftLogStore::open_with_sync_log_and_telemetry(
+        let log_store = RaftLogStore::open_with_sync_policy_and_telemetry(
             &config.data_dir,
             config.sync_log,
+            config.sync_commit,
             Some(Arc::clone(&telemetry)),
         )?;
         let mut hard_state = log_store.read_hard_state()?;
@@ -3865,6 +4003,52 @@ impl BrokerRaft {
         (hint.leader_id, hint.leader_peer)
     }
 
+    fn proxy_candidate_peers(
+        &self,
+        preferred: Option<&RaftPeerConfig>,
+        attempts: u64,
+    ) -> Vec<RaftPeerConfig> {
+        crate::routine_id!("ddl-routine-broker-raft-proxy-candidate-peers-1");
+        let mut peers = self
+            .active_peers()
+            .into_iter()
+            .filter(|peer| peer.id != self.config.node_id)
+            .collect::<Vec<_>>();
+        if peers.len() > 1 {
+            let offset = attempts as usize % peers.len();
+            peers.rotate_left(offset);
+        }
+        if let Some(preferred) = preferred {
+            if preferred.id != self.config.node_id {
+                peers.retain(|peer| peer.id != preferred.id);
+                peers.insert(0, preferred.clone());
+            }
+        }
+        peers
+    }
+
+    fn proxy_redirect_peer(
+        &self,
+        leader_id: Option<&str>,
+        leader_addr: Option<&str>,
+        reject_peer_id: &str,
+    ) -> Option<RaftPeerConfig> {
+        crate::routine_id!("ddl-routine-broker-raft-proxy-redirect-peer-1");
+        let active_peers = self.active_peers();
+        if let Some(leader_id) = leader_id {
+            if leader_id == self.config.node_id || leader_id == reject_peer_id {
+                return None;
+            }
+            return active_peers.into_iter().find(|peer| {
+                peer.id == leader_id && leader_addr.is_none_or(|addr| peer.addr == addr)
+            });
+        }
+        let leader_addr = leader_addr?;
+        active_peers
+            .into_iter()
+            .find(|peer| peer.id != self.config.node_id && peer.addr == leader_addr)
+    }
+
     pub fn leader_addr(&self) -> Option<String> {
         crate::routine_id!("ddl-routine-broker-raft-leader-addr-1");
         self.leader_peer_hint().1.map(|peer| peer.addr)
@@ -4031,6 +4215,9 @@ impl BrokerRaft {
             last_applied,
             last_log_index,
             last_log_term,
+            sync_log: self.config.sync_log,
+            sync_commit: self.config.sync_commit,
+            unsafe_durability: !(self.config.sync_log && self.config.sync_commit),
             membership_joint: membership.is_joint(),
             membership,
             peers,
@@ -4571,6 +4758,18 @@ impl BrokerRaft {
             replication_early_quorum_returns_total: self
                 .telemetry
                 .replication_early_quorum_returns_total
+                .load(Ordering::Relaxed),
+            replication_quorum_limited_fanout_rounds_total: self
+                .telemetry
+                .replication_quorum_limited_fanout_rounds_total
+                .load(Ordering::Relaxed),
+            replication_quorum_limited_fanout_skipped_peers_total: self
+                .telemetry
+                .replication_quorum_limited_fanout_skipped_peers_total
+                .load(Ordering::Relaxed),
+            replication_quorum_limited_fanout_fast_retries_total: self
+                .telemetry
+                .replication_quorum_limited_fanout_fast_retries_total
                 .load(Ordering::Relaxed),
             replication_busy_peer_skips_total: self
                 .telemetry
@@ -5187,6 +5386,15 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_replication_early_quorum_returns_total Replication rounds returned after quorum before draining every in-flight peer replication task.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_early_quorum_returns_total counter\n",
                 "dd_rust_network_mutex_raft_replication_early_quorum_returns_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total Target-index replication rounds that sent foreground peer RPCs only to the remaining stable-membership quorum need.\n",
+                "# TYPE dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total counter\n",
+                "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total Peer replication tasks skipped from foreground target-index fanout because the stable membership quorum needed fewer peers.\n",
+                "# TYPE dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total counter\n",
+                "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total Quorum wait iterations that retried immediately to rotate across skipped foreground target-index peers before sleeping for the heartbeat delay.\n",
+                "# TYPE dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total counter\n",
+                "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_replication_busy_peer_skips_total No-target heartbeat, post-commit, or snapshot replication attempts skipped because that peer already had an in-flight RPC on the pooled connection.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_busy_peer_skips_total counter\n",
                 "dd_rust_network_mutex_raft_replication_busy_peer_skips_total {}\n",
@@ -5386,6 +5594,9 @@ impl BrokerRaft {
             snapshot.replication_cached_progress_acks_total,
             snapshot.replication_cached_quorum_short_circuits_total,
             snapshot.replication_early_quorum_returns_total,
+            snapshot.replication_quorum_limited_fanout_rounds_total,
+            snapshot.replication_quorum_limited_fanout_skipped_peers_total,
+            snapshot.replication_quorum_limited_fanout_fast_retries_total,
             snapshot.replication_busy_peer_skips_total,
             snapshot.fanout_replication_inline_progress_rounds_total,
             snapshot.fanout_replication_inline_successes_total,
@@ -5511,7 +5722,32 @@ impl BrokerRaft {
                 if batch.driver_active { 1 } else { 0 },
             )
         };
-        let client_response_cache_entries = self.client_response_cache.lock().entries.len() as u64;
+        let (
+            client_response_cache_entries,
+            client_response_cache_pending_entries,
+            client_response_cache_completed_entries,
+            client_response_cache_applied_without_response_entries,
+        ) = {
+            let cache = self.client_response_cache.lock();
+            let mut pending = 0_u64;
+            let mut completed = 0_u64;
+            let mut applied_without_response = 0_u64;
+            for cached in cache.entries.values() {
+                if !cached.applied {
+                    pending = pending.saturating_add(1);
+                } else if cached.response.is_some() {
+                    completed = completed.saturating_add(1);
+                } else {
+                    applied_without_response = applied_without_response.saturating_add(1);
+                }
+            }
+            (
+                cache.entries.len() as u64,
+                pending,
+                completed,
+                applied_without_response,
+            )
+        };
         write!(
             &mut body,
             concat!(
@@ -5578,7 +5814,7 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_proxy_request_errors_total Proxied client requests that could not be forwarded, were sent to a non-leader, or returned an error.\n",
                 "# TYPE dd_rust_network_mutex_raft_proxy_request_errors_total counter\n",
                 "dd_rust_network_mutex_raft_proxy_request_errors_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_proxy_request_retries_total Follower proxy attempts retried after a stale leader hint, transport failure, or leaderless interval before forwarding succeeded or the budget expired.\n",
+                "# HELP dd_rust_network_mutex_raft_proxy_request_retries_total Follower proxy attempts retried after a stale leader hint, direct peer-discovery miss, transport failure, or leaderless interval before forwarding succeeded or the budget expired.\n",
                 "# TYPE dd_rust_network_mutex_raft_proxy_request_retries_total counter\n",
                 "dd_rust_network_mutex_raft_proxy_request_retries_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_client_removed_member_rejections_total Public client requests rejected locally because this node is a removed voter or only in the old side of joint membership.\n",
@@ -5614,6 +5850,15 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_client_response_cache_entries Current idempotent response cache entries retained by BrokerRaft.\n",
                 "# TYPE dd_rust_network_mutex_raft_client_response_cache_entries gauge\n",
                 "dd_rust_network_mutex_raft_client_response_cache_entries {}\n",
+                "# HELP dd_rust_network_mutex_raft_client_response_cache_pending_entries Current unapplied idempotency reservations retained while original requests are still queued or uncommitted.\n",
+                "# TYPE dd_rust_network_mutex_raft_client_response_cache_pending_entries gauge\n",
+                "dd_rust_network_mutex_raft_client_response_cache_pending_entries {}\n",
+                "# HELP dd_rust_network_mutex_raft_client_response_cache_completed_entries Current idempotent response cache entries with replayable completed responses.\n",
+                "# TYPE dd_rust_network_mutex_raft_client_response_cache_completed_entries gauge\n",
+                "dd_rust_network_mutex_raft_client_response_cache_completed_entries {}\n",
+                "# HELP dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries Current applied idempotency records whose original response is unavailable, so duplicate callers observe an unknown completed outcome instead of appending again.\n",
+                "# TYPE dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries gauge\n",
+                "dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries {}\n",
             ),
             snapshot.client_proposals_total,
             snapshot.client_proposal_quorum_failures_total,
@@ -5648,6 +5893,9 @@ impl BrokerRaft {
             client_batch_pending,
             client_batch_driver_active,
             client_response_cache_entries,
+            client_response_cache_pending_entries,
+            client_response_cache_completed_entries,
+            client_response_cache_applied_without_response_entries,
         )
         .expect("write raft client metrics text");
         body
@@ -5713,6 +5961,49 @@ impl BrokerRaft {
             "raft committed quorum shortcut used durable fallback because volatile matchIndex did not prove quorum",
         );
         Some(acks)
+    }
+
+    fn target_replication_extra_candidate_count(
+        &self,
+        target_index: u64,
+        membership: &RaftMembership,
+    ) -> usize {
+        crate::routine_id!("ddl-routine-broker-raft-target-extra-candidates-1");
+        let local_last_index = self.log.last_index();
+        let mut ack_ids = BTreeSet::new();
+        let mut remote_peers = Vec::<(RaftPeerConfig, u64)>::new();
+        let active_peers = membership.active_peers();
+        {
+            let runtime = self.runtime.lock();
+            if runtime.role != RaftRole::Leader || runtime.membership != *membership {
+                return 0;
+            }
+            if membership.contains_id(&self.config.node_id) && local_last_index >= target_index {
+                ack_ids.insert(self.config.node_id.clone());
+            }
+            for peer in active_peers {
+                if peer.id == self.config.node_id {
+                    continue;
+                }
+                let progress = runtime.leader_progress.get(&peer.id);
+                if progress.is_some_and(|progress| progress.match_index >= target_index) {
+                    ack_ids.insert(peer.id.clone());
+                } else {
+                    remote_peers.push((
+                        peer,
+                        progress.map(|progress| progress.match_index).unwrap_or(0),
+                    ));
+                }
+            }
+        }
+        let selected = select_target_replication_peers(
+            membership,
+            Some(target_index),
+            &ack_ids,
+            remote_peers.clone(),
+            1,
+        );
+        remote_peers.len().saturating_sub(selected.len())
     }
 
     fn note_quorum_wait_already_committed(
@@ -6320,6 +6611,15 @@ impl BrokerRaft {
                     .iter()
                     .map(|peer| peer.id.clone())
                     .collect::<BTreeSet<_>>();
+                let promoted_voters = joint_new_peers
+                    .iter()
+                    .filter(|peer| peer.id != self.config.node_id && !old_ids.contains(&peer.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.prepare_promoted_voter_catch_up_progress(
+                    &promoted_voters,
+                    self.log.last_index().saturating_add(1),
+                );
                 let final_index = self
                     .append_replicate_commit_apply(RaftCommand::SetMembership {
                         membership: RaftMembership::from_simple(joint_new_peers.clone()),
@@ -6383,6 +6683,15 @@ impl BrokerRaft {
             }
             return Err(err);
         }
+        let promoted_voters = new_peers
+            .iter()
+            .filter(|peer| peer.id != self.config.node_id && !old_ids.contains(&peer.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.prepare_promoted_voter_catch_up_progress(
+            &promoted_voters,
+            self.log.last_index().saturating_add(1),
+        );
         let final_index = self
             .append_replicate_commit_apply(RaftCommand::SetMembership {
                 membership: RaftMembership::from_simple(new_peers),
@@ -6943,6 +7252,7 @@ impl BrokerRaft {
             .into_iter()
             .filter(|peer| peer.id != self.config.node_id && !old_ids.contains(&peer.id))
             .collect::<Vec<_>>();
+        self.prepare_promoted_voter_catch_up_progress(&new_voters, target_index);
         let mut catchup_tasks = JoinSet::new();
         for peer in new_voters {
             let node = self.clone();
@@ -6965,6 +7275,66 @@ impl BrokerRaft {
             }
         }
         Ok(())
+    }
+
+    fn prepare_promoted_voter_catch_up_progress(
+        &self,
+        voters: &[RaftPeerConfig],
+        target_index: u64,
+    ) {
+        crate::routine_id!("ddl-routine-broker-raft-prepare-promoted-voter-progress-1");
+        if voters.is_empty() || target_index == 0 {
+            return;
+        }
+        let initial_next_index = self.initial_replication_next_index();
+        let mut changed = false;
+        {
+            let mut runtime = self.runtime.lock();
+            if runtime.role != RaftRole::Leader {
+                return;
+            }
+            for peer in voters {
+                if !(runtime.membership.contains_id(&peer.id)
+                    || runtime.staged_learners.contains_key(&peer.id))
+                {
+                    continue;
+                }
+                let inserted = !runtime.leader_progress.contains_key(&peer.id);
+                let progress =
+                    runtime
+                        .leader_progress
+                        .entry(peer.id.clone())
+                        .or_insert(RaftPeerProgress {
+                            next_index: initial_next_index,
+                            match_index: 0,
+                        });
+                changed |= inserted;
+                if progress.match_index >= target_index {
+                    continue;
+                }
+                let conservative_next_index = progress
+                    .match_index
+                    .saturating_add(1)
+                    .max(initial_next_index);
+                if progress.next_index > conservative_next_index {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        target_index,
+                        match_index = progress.match_index,
+                        prev_next_index = progress.next_index,
+                        next_index = conservative_next_index,
+                        "raft reset promoted voter progress before final membership catch-up",
+                    );
+                    progress.next_index = conservative_next_index;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.note_leader_progress_changed();
+        }
     }
 
     async fn catch_up_new_voters_if_still_active(
@@ -7445,6 +7815,7 @@ impl BrokerRaft {
         let retry_budget = wait.max(self.config.proxy_retry_budget);
         let deadline = deadline_after(retry_budget);
         let mut attempts = 0u64;
+        let mut redirected_leader_peer = None;
 
         loop {
             if self.is_leader() {
@@ -7462,7 +7833,9 @@ impl BrokerRaft {
                 });
             }
 
-            let Some(leader_peer) = leader_peer else {
+            let preferred_peer = redirected_leader_peer.as_ref().or(leader_peer.as_ref());
+            let candidate_peers = self.proxy_candidate_peers(preferred_peer, attempts);
+            if candidate_peers.is_empty() {
                 if self
                     .sleep_before_proxy_retry(
                         deadline,
@@ -7494,166 +7867,243 @@ impl BrokerRaft {
                 });
             };
 
-            attempts = attempts.saturating_add(1);
-            let rpc = RaftRpc::ProxyRequest {
-                auth_token: None,
-                request: request.clone(),
-                request_uuid: request_uuid.to_string(),
-                wait_ms: wait.as_millis() as u64,
-                is_acquire,
-            };
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let timeout = remaining.max(Duration::from_millis(250));
-            self.telemetry
-                .proxy_requests_forwarded_total
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(
-                target: "lmx::raft",
-                node_id = %self.config.node_id,
-                leader = %leader_peer.id,
-                leader_addr = %leader_peer.addr,
-                request_uuid,
-                wait_ms = wait.as_millis() as u64,
-                retry_budget_ms = duration_ms_u64(retry_budget),
-                attempt = attempts,
-                is_acquire,
-                "raft follower proxying client request to leader",
-            );
+            let mut last_retry_error = None;
+            let mut last_retry_peer = None;
+            let mut fast_redirect_peer = None;
+            for candidate_peer in candidate_peers {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                attempts = attempts.saturating_add(1);
+                let rpc = RaftRpc::ProxyRequest {
+                    auth_token: None,
+                    request: request.clone(),
+                    request_uuid: request_uuid.to_string(),
+                    wait_ms: wait.as_millis() as u64,
+                    is_acquire,
+                };
+                self.telemetry
+                    .proxy_requests_forwarded_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    leader = %candidate_peer.id,
+                    leader_addr = %candidate_peer.addr,
+                    leader_hint = ?leader_id,
+                    request_uuid,
+                    wait_ms = wait.as_millis() as u64,
+                    retry_budget_ms = duration_ms_u64(retry_budget),
+                    attempt = attempts,
+                    is_acquire,
+                    "raft follower proxying client request to candidate leader",
+                );
 
-            let response = match self.send_rpc_to_peer(&leader_peer, rpc, timeout).await {
-                Ok(response) => response,
-                Err(err) => {
-                    self.telemetry
-                        .proxy_request_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    let error = err.to_string();
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        leader = %leader_peer.id,
-                        leader_addr = %leader_peer.addr,
-                        request_uuid,
-                        attempt = attempts,
-                        error = %error,
-                        "raft follower proxy request failed",
-                    );
-                    if self
-                        .sleep_before_proxy_retry(
-                            deadline,
+                let response = match self.send_rpc_to_peer(&candidate_peer, rpc, remaining).await {
+                    Ok(response) => response,
+                    Err(err) => {
+                        self.telemetry
+                            .proxy_request_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        let error = err.to_string();
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            leader = %candidate_peer.id,
+                            leader_addr = %candidate_peer.addr,
                             request_uuid,
-                            attempts,
-                            "transport",
-                            Some(&leader_peer),
-                            Some(error),
-                        )
-                        .await
-                    {
+                            attempt = attempts,
+                            error = %error,
+                            "raft follower proxy request failed",
+                        );
+                        last_retry_peer = Some(candidate_peer);
+                        last_retry_error = Some(error);
                         continue;
                     }
-                    return Err(err);
-                }
-            };
+                };
 
-            match response {
-                RaftRpcResponse::ProxyResponse {
-                    term: peer_term,
-                    response,
-                    error: None,
-                } => {
-                    self.observe_proxy_response_term(&leader_peer, peer_term, true, request_uuid)
+                match response {
+                    RaftRpcResponse::ProxyResponse {
+                        term: peer_term,
+                        response,
+                        error: None,
+                        ..
+                    } => {
+                        self.observe_proxy_response_term(
+                            &candidate_peer,
+                            peer_term,
+                            true,
+                            request_uuid,
+                        )
                         .await;
-                    return Ok(ProxyForwardOutcome::Proxied(response));
-                }
-                RaftRpcResponse::ProxyResponse {
-                    term: peer_term,
-                    error: Some(error),
-                    ..
-                } => {
-                    self.observe_proxy_response_term(&leader_peer, peer_term, false, request_uuid)
-                        .await;
-                    self.telemetry
-                        .proxy_request_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        leader = %leader_peer.id,
-                        leader_addr = %leader_peer.addr,
-                        request_uuid,
-                        attempt = attempts,
-                        error = %error,
-                        "raft leader returned proxy request error",
-                    );
-                    if !proxy_error_is_terminal(&error)
-                        && self
-                            .sleep_before_proxy_retry(
-                                deadline,
-                                request_uuid,
-                                attempts,
-                                "proxy-error",
-                                Some(&leader_peer),
-                                Some(error.clone()),
-                            )
-                            .await
-                    {
-                        continue;
+                        return Ok(ProxyForwardOutcome::Proxied(response));
                     }
-                    return Err(BrokerRaftError::Rpc(error));
-                }
-                RaftRpcResponse::Error {
-                    term: peer_term,
-                    error,
-                } => {
-                    self.observe_proxy_response_term(&leader_peer, peer_term, false, request_uuid)
+                    RaftRpcResponse::ProxyResponse {
+                        term: peer_term,
+                        error: Some(error),
+                        leader_id: proxy_leader_id,
+                        leader_addr: proxy_leader_addr,
+                        ..
+                    } => {
+                        self.observe_proxy_response_term(
+                            &candidate_peer,
+                            peer_term,
+                            false,
+                            request_uuid,
+                        )
                         .await;
-                    self.telemetry
-                        .proxy_request_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        leader = %leader_peer.id,
-                        leader_addr = %leader_peer.addr,
-                        request_uuid,
-                        attempt = attempts,
-                        error = %error,
-                        "raft leader returned proxy request RPC error",
-                    );
-                    if !proxy_error_is_terminal(&error)
-                        && self
-                            .sleep_before_proxy_retry(
-                                deadline,
-                                request_uuid,
-                                attempts,
-                                "proxy-rpc-error",
-                                Some(&leader_peer),
-                                Some(error.clone()),
-                            )
-                            .await
-                    {
-                        continue;
+                        self.telemetry
+                            .proxy_request_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            leader = %candidate_peer.id,
+                            leader_addr = %candidate_peer.addr,
+                            request_uuid,
+                            attempt = attempts,
+                            error = %error,
+                            "raft proxy candidate returned request error",
+                        );
+                        if proxy_error_is_terminal(&error) {
+                            return Err(BrokerRaftError::Rpc(error));
+                        }
+                        let try_next_peer = proxy_error_is_not_leader(&error);
+                        last_retry_peer = Some(candidate_peer);
+                        last_retry_error = Some(error);
+                        if try_next_peer {
+                            if let Some(redirect_peer) = self.proxy_redirect_peer(
+                                proxy_leader_id.as_deref(),
+                                proxy_leader_addr.as_deref(),
+                                last_retry_peer
+                                    .as_ref()
+                                    .map(|peer| peer.id.as_str())
+                                    .unwrap_or(""),
+                            ) {
+                                fast_redirect_peer = Some(redirect_peer);
+                                break;
+                            }
+                            continue;
+                        }
+                        break;
                     }
-                    return Err(BrokerRaftError::Rpc(error));
-                }
-                other => {
-                    self.telemetry
-                        .proxy_request_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        leader = %leader_peer.id,
-                        leader_addr = %leader_peer.addr,
-                        request_uuid,
-                        attempt = attempts,
-                        response = ?other,
-                        "raft follower received unexpected proxy response",
-                    );
-                    return Err(BrokerRaftError::Rpc(format!(
-                        "unexpected proxy response: {other:?}"
-                    )));
+                    RaftRpcResponse::Error {
+                        term: peer_term,
+                        error,
+                    } => {
+                        self.observe_proxy_response_term(
+                            &candidate_peer,
+                            peer_term,
+                            false,
+                            request_uuid,
+                        )
+                        .await;
+                        self.telemetry
+                            .proxy_request_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            leader = %candidate_peer.id,
+                            leader_addr = %candidate_peer.addr,
+                            request_uuid,
+                            attempt = attempts,
+                            error = %error,
+                            "raft proxy candidate returned RPC error",
+                        );
+                        if proxy_error_is_terminal(&error) {
+                            return Err(BrokerRaftError::Rpc(error));
+                        }
+                        let try_next_peer = proxy_error_is_not_leader(&error);
+                        last_retry_peer = Some(candidate_peer);
+                        last_retry_error = Some(error);
+                        if try_next_peer {
+                            continue;
+                        }
+                        break;
+                    }
+                    other => {
+                        self.telemetry
+                            .proxy_request_errors_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            leader = %candidate_peer.id,
+                            leader_addr = %candidate_peer.addr,
+                            request_uuid,
+                            attempt = attempts,
+                            response = ?other,
+                            "raft follower received unexpected proxy response",
+                        );
+                        return Err(BrokerRaftError::Rpc(format!(
+                            "unexpected proxy response: {other:?}"
+                        )));
+                    }
                 }
             }
+
+            if let Some(redirect_peer) = fast_redirect_peer {
+                self.telemetry
+                    .proxy_request_retries_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    redirected_leader = %redirect_peer.id,
+                    redirected_leader_addr = %redirect_peer.addr,
+                    request_uuid,
+                    attempts,
+                    "raft follower proxy retrying immediately with structured leader hint",
+                );
+                redirected_leader_peer = Some(redirect_peer);
+                continue;
+            }
+
+            let retry_reason = if leader_peer.is_some() {
+                "proxy-error"
+            } else {
+                "leader-discovery"
+            };
+            if self
+                .sleep_before_proxy_retry(
+                    deadline,
+                    request_uuid,
+                    attempts,
+                    retry_reason,
+                    last_retry_peer.as_ref(),
+                    last_retry_error.clone(),
+                )
+                .await
+            {
+                continue;
+            }
+            if let Some(error) = last_retry_error {
+                if proxy_error_is_not_leader(&error) {
+                    self.telemetry
+                        .proxy_request_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        leader_id = ?leader_id,
+                        request_uuid,
+                        error = %error,
+                        attempts,
+                        "raft follower could not discover a leader for proxied client request",
+                    );
+                    return Err(BrokerRaftError::NotLeader {
+                        leader_id: self.leader_id().or(leader_id.clone()),
+                        leader_addr: self.leader_addr(),
+                    });
+                }
+                return Err(BrokerRaftError::Rpc(error));
+            }
+            return Err(BrokerRaftError::NotLeader {
+                leader_id: self.leader_id().or(leader_id.clone()),
+                leader_addr: self.leader_addr(),
+            });
         }
     }
 
@@ -7795,10 +8245,42 @@ impl BrokerRaft {
         request_uuid: &str,
     ) {
         crate::routine_id!("ddl-routine-broker-raft-observe-proxy-term-1");
-        let current_term = self.runtime.lock().current_term;
-        if response_term <= current_term {
-            return;
-        }
+        let current_term = {
+            let mut runtime = self.runtime.lock();
+            let current_term = runtime.current_term;
+            if response_term < current_term {
+                return;
+            }
+            if response_term == current_term {
+                if !leader_confirmed
+                    || leader_peer.id == self.config.node_id
+                    || !runtime.membership.contains_id(&leader_peer.id)
+                    || runtime.role == RaftRole::Leader
+                {
+                    return;
+                }
+                let previous_leader = runtime.leader_id.clone();
+                runtime.role = RaftRole::Follower;
+                runtime.leader_id = Some(leader_peer.id.clone());
+                runtime.election_deadline = self.next_election_deadline();
+                self.publish_runtime_role_cache(&runtime);
+                self.publish_leader_peer_hint_cache(&runtime);
+                if previous_leader.as_deref() != Some(leader_peer.id.as_str()) {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        leader = %leader_peer.id,
+                        leader_addr = %leader_peer.addr,
+                        request_uuid,
+                        current_term,
+                        previous_leader = ?previous_leader,
+                        "raft follower refreshed leader hint from successful proxied client response",
+                    );
+                }
+                return;
+            }
+            current_term
+        };
         debug!(
             target: "lmx::raft",
             node_id = %self.config.node_id,
@@ -7994,16 +8476,20 @@ impl BrokerRaft {
                         leader_id = ?self.leader_id(),
                         "raft proxy request reached a non-leader",
                     );
+                    let leader_id = self.leader_id();
+                    let leader_addr = self.leader_addr();
                     return RaftRpcResponse::ProxyResponse {
                         term,
                         response: None,
                         error: Some(
                             BrokerRaftError::NotLeader {
-                                leader_id: self.leader_id(),
-                                leader_addr: self.leader_addr(),
+                                leader_id: leader_id.clone(),
+                                leader_addr: leader_addr.clone(),
                             }
                             .to_string(),
                         ),
+                        leader_id,
+                        leader_addr,
                     };
                 }
                 match self
@@ -8019,6 +8505,8 @@ impl BrokerRaft {
                         term: self.runtime.lock().current_term,
                         response,
                         error: None,
+                        leader_id: None,
+                        leader_addr: None,
                     },
                     Err(err) => {
                         self.telemetry
@@ -8033,10 +8521,19 @@ impl BrokerRaft {
                             error = %err,
                             "raft leader failed proxied client request",
                         );
+                        let (leader_id, leader_addr) = match &err {
+                            BrokerRaftError::NotLeader {
+                                leader_id,
+                                leader_addr,
+                            } => (leader_id.clone(), leader_addr.clone()),
+                            _ => (None, None),
+                        };
                         RaftRpcResponse::ProxyResponse {
                             term: self.runtime.lock().current_term,
                             response: None,
                             error: Some(err.to_string()),
+                            leader_id,
+                            leader_addr,
                         }
                     }
                 }
@@ -10297,6 +10794,14 @@ impl BrokerRaft {
         &self,
         target_index: Option<u64>,
     ) -> Result<BTreeSet<String>, BrokerRaftError> {
+        self.replicate_log_once_with_round(target_index, 0).await
+    }
+
+    async fn replicate_log_once_with_round(
+        &self,
+        target_index: Option<u64>,
+        fanout_round: u64,
+    ) -> Result<BTreeSet<String>, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-once-1");
         let mut acks = BTreeSet::new();
         acks.insert(self.config.node_id.clone());
@@ -10323,7 +10828,12 @@ impl BrokerRaft {
                         cached_progress_acks = cached_progress_acks.saturating_add(1);
                     }
                 } else {
-                    remote_peers.push(peer);
+                    let match_index = runtime
+                        .leader_progress
+                        .get(&peer.id)
+                        .map(|progress| progress.match_index)
+                        .unwrap_or(0);
+                    remote_peers.push((peer, match_index));
                 }
             }
             (
@@ -10363,6 +10873,34 @@ impl BrokerRaft {
             );
             self.advance_leader_commit_from_progress_blocking().await?;
             return Ok(acks);
+        }
+        let original_remote_peers = remote_peers.len();
+        let remote_peers = select_target_replication_peers(
+            &membership,
+            target_index,
+            &acks,
+            remote_peers,
+            fanout_round,
+        );
+        if target_index.is_some() && remote_peers.len() < original_remote_peers {
+            let skipped_peer_tasks = original_remote_peers.saturating_sub(remote_peers.len());
+            self.telemetry
+                .replication_quorum_limited_fanout_rounds_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.telemetry
+                .replication_quorum_limited_fanout_skipped_peers_total
+                .fetch_add(skipped_peer_tasks as u64, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                target_index = ?target_index,
+                fanout_round,
+                selected_peer_tasks = remote_peers.len(),
+                skipped_peer_tasks,
+                ack_count = acks.len(),
+                quorum = membership.quorum_size(),
+                "raft target replication limited peer fan-out to quorum need",
+            );
         }
         let snapshot_source = Arc::new(SharedInstallSnapshotSource::default());
         let mut tasks = JoinSet::new();
@@ -12480,7 +13018,9 @@ impl BrokerRaft {
                 return Ok(acks);
             }
             let before_progress = self.leader_progress_generation();
-            let acks = self.replicate_log_once(Some(target_index)).await?;
+            let acks = self
+                .replicate_log_once_with_round(Some(target_index), attempts)
+                .await?;
             let progress_changed = self.leader_progress_generation() != before_progress;
             let round_still_current =
                 self.leader_membership_round_is_current(round_term, &round_membership);
@@ -12576,6 +13116,23 @@ impl BrokerRaft {
                 self.telemetry
                     .replication_quorum_progress_retries_total
                     .fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                continue;
+            }
+            let extra_limited_candidates =
+                self.target_replication_extra_candidate_count(target_index, &round_membership);
+            if attempts <= extra_limited_candidates as u64 {
+                self.telemetry
+                    .replication_quorum_limited_fanout_fast_retries_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    target_index,
+                    attempts,
+                    extra_limited_candidates,
+                    "raft replication quorum wait retrying immediately to rotate limited fan-out peers",
+                );
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -15817,7 +16374,15 @@ fn observe_client_response_cache(
 fn trim_client_response_cache(cache: &mut ClientResponseCacheState, limit: usize) {
     crate::routine_id!("ddl-routine-broker-raft-trim-client-response-cache-1");
     while cache.entries.len() > limit {
-        let Some(oldest) = cache.order.pop_front() else {
+        let Some(evict_pos) = cache.order.iter().position(|request_id| {
+            cache
+                .entries
+                .get(request_id)
+                .is_none_or(|cached| cached.applied)
+        }) else {
+            break;
+        };
+        let Some(oldest) = cache.order.remove(evict_pos) else {
             break;
         };
         cache.entries.remove(&oldest);
@@ -15847,6 +16412,12 @@ fn proxy_error_is_terminal(error: &str) -> bool {
     error.contains("was reused with a different request payload")
         // BrokerRaftError::UnsupportedClientRequest
         || error.contains("unsupported raft client request")
+}
+
+fn proxy_error_is_not_leader(error: &str) -> bool {
+    crate::routine_id!("ddl-routine-broker-raft-proxy-error-not-leader-1");
+    // BrokerRaftError::NotLeader
+    error.contains("raft node is not leader")
 }
 
 fn deterministic_grant_plan(request: &Request, index: u64) -> Option<RaftGrantPlan> {
@@ -16397,6 +16968,7 @@ fn write_hard_state_commit_slot(
         generation,
         current_term,
         commit_index,
+        true,
         None,
     )
 }
@@ -16407,6 +16979,7 @@ fn write_hard_state_commit_slot_with_cache(
     generation: u64,
     current_term: u64,
     commit_index: u64,
+    sync_commit: bool,
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<u64, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-write-hard-state-commit-slot-1");
@@ -16446,8 +17019,10 @@ fn write_hard_state_commit_slot_with_cache(
         file.seek(SeekFrom::Start(hard_state_commit_slot_offset(generation)))?;
         file.write_all(&body)?;
         file.flush()?;
-        file.sync_data()?;
-        if created {
+        if sync_commit {
+            file.sync_data()?;
+        }
+        if created && sync_commit {
             if let Some(parent) = path.parent() {
                 sync_dir(parent)?;
             }
@@ -18384,10 +18959,12 @@ mod tests {
         let dir = temp_dir("raft-log-sync-policy");
         let mut cfg = test_raft_config(dir.clone());
         cfg.sync_log = false;
+        cfg.sync_commit = false;
 
         let raft = BrokerRaft::open(cfg).expect("open raft with async log policy");
 
         assert!(!raft.log.sync_log);
+        assert!(!raft.log.sync_commit);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -18938,6 +19515,166 @@ mod tests {
             five.quorum_met(&ids(&["n1", "n2", "n3", "n4"])),
             "4 of 5 commits"
         );
+    }
+
+    #[test]
+    fn target_replication_peer_selection_limits_and_rotates_simple_quorum() {
+        let membership = RaftMembership::from_simple(five_test_peers());
+        let ack_ids = BTreeSet::from(["n1".to_string()]);
+        let remote_peers = vec![
+            (test_peer("n2", 7981), 0),
+            (test_peer("n3", 7982), 0),
+            (test_peer("n4", 7983), 0),
+            (test_peer("n5", 7984), 0),
+        ];
+
+        let selected_round_one = select_target_replication_peers(
+            &membership,
+            Some(9),
+            &ack_ids,
+            remote_peers.clone(),
+            1,
+        )
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            selected_round_one,
+            vec!["n2".to_string(), "n3".to_string()],
+            "5-node target writes with only the leader acked need two remote voters"
+        );
+
+        let selected_round_two =
+            select_target_replication_peers(&membership, Some(9), &ack_ids, remote_peers, 2)
+                .into_iter()
+                .map(|peer| peer.id)
+                .collect::<Vec<_>>();
+        assert_eq!(
+            selected_round_two,
+            vec!["n3".to_string(), "n4".to_string()],
+            "later quorum-wait attempts rotate the narrowed peer set"
+        );
+
+        let ack_ids = BTreeSet::from(["n1".to_string(), "n2".to_string()]);
+        let selected_with_cached_ack = select_target_replication_peers(
+            &membership,
+            Some(9),
+            &ack_ids,
+            vec![
+                (test_peer("n3", 7982), 0),
+                (test_peer("n4", 7983), 0),
+                (test_peer("n5", 7984), 0),
+            ],
+            1,
+        )
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            selected_with_cached_ack,
+            vec!["n3".to_string()],
+            "cached follower progress reduces the remote fanout need"
+        );
+
+        let no_target_selected = select_target_replication_peers(
+            &membership,
+            None,
+            &BTreeSet::from(["n1".to_string()]),
+            vec![
+                (test_peer("n2", 7981), 0),
+                (test_peer("n3", 7982), 0),
+                (test_peer("n4", 7983), 0),
+            ],
+            1,
+        )
+        .len();
+        assert_eq!(
+            no_target_selected, 3,
+            "heartbeat/post-commit fanout stays broad"
+        );
+    }
+
+    #[test]
+    fn target_replication_peer_selection_limits_joint_quorum_safely() {
+        let ack_ids = BTreeSet::from(["n1".to_string()]);
+        let overlapping_joint = RaftMembership::Joint {
+            old_peers: vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+            new_peers: vec![
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+                test_peer("n5", 7984),
+            ],
+        };
+        let selected_overlap = select_target_replication_peers(
+            &overlapping_joint,
+            Some(11),
+            &ack_ids,
+            vec![
+                (test_peer("n2", 7981), 0),
+                (test_peer("n3", 7982), 0),
+                (test_peer("n4", 7983), 0),
+                (test_peer("n5", 7984), 0),
+            ],
+            1,
+        )
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            selected_overlap,
+            vec!["n3".to_string(), "n4".to_string()],
+            "overlapping joint quorum should prefer a peer that counts for both old and new"
+        );
+        let overlap_acks = ack_ids
+            .iter()
+            .cloned()
+            .chain(selected_overlap.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert!(overlapping_joint.quorum_met(&overlap_acks));
+
+        let disjoint_joint = RaftMembership::Joint {
+            old_peers: vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+            new_peers: vec![
+                test_peer("n4", 7983),
+                test_peer("n5", 7984),
+                test_peer("n6", 7985),
+            ],
+        };
+        let selected_disjoint = select_target_replication_peers(
+            &disjoint_joint,
+            Some(11),
+            &ack_ids,
+            vec![
+                (test_peer("n2", 7981), 0),
+                (test_peer("n3", 7982), 0),
+                (test_peer("n4", 7983), 0),
+                (test_peer("n5", 7984), 0),
+                (test_peer("n6", 7985), 0),
+            ],
+            1,
+        )
+        .into_iter()
+        .map(|peer| peer.id)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            selected_disjoint,
+            vec!["n2".to_string(), "n4".to_string(), "n5".to_string()],
+            "disjoint joint quorum needs one old-side voter and two new-side voters"
+        );
+        let disjoint_acks = ack_ids
+            .iter()
+            .cloned()
+            .chain(selected_disjoint.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        assert!(disjoint_joint.quorum_met(&disjoint_acks));
     }
 
     #[test]
@@ -20591,6 +21328,9 @@ mod tests {
         assert_eq!(progress.current_term, 1);
         assert_eq!(progress.commit_index, 1);
         assert_eq!(progress.last_applied, 1);
+        assert!(progress.sync_log);
+        assert!(progress.sync_commit);
+        assert!(!progress.unsafe_durability);
         let n1 = progress
             .peers
             .iter()
@@ -20617,6 +21357,23 @@ mod tests {
         assert!(!n4.voter);
         assert_eq!(n4.membership_role, "stagedLearner");
         assert_eq!(n4.lag, Some(2));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn progress_snapshot_exposes_unsafe_durability_policy() {
+        let dir = temp_dir("raft-progress-durability-policy");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.sync_log = false;
+        cfg.sync_commit = false;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let progress = raft.progress_snapshot();
+
+        assert!(!progress.sync_log);
+        assert!(!progress.sync_commit);
+        assert!(progress.unsafe_durability);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -27317,6 +28074,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflicting_peer_repairs_suffix_without_resending_full_log() {
+        let dir = temp_dir("raft-conflict-repair-bounded-suffix");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind conflicting peer");
+        let peer_addr = listener.local_addr().expect("conflicting peer addr");
+        let unused_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused peer addr");
+        let unused_addr = unused_listener.local_addr().expect("unused peer addr");
+        drop(unused_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(500);
+        cfg.election_timeout_max = Duration::from_millis(1_000);
+        cfg.append_entries_max_entries = 8;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: unused_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log.append(7, RaftCommand::Noop).expect("append one");
+        raft.log.append(7, RaftCommand::Noop).expect("append two");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 3,
+                    match_index: 0,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n3".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+            raft.publish_runtime_role_cache(&runtime);
+        }
+        raft.note_leader_quorum_observed();
+
+        let observed = Arc::new(Mutex::new(Vec::<(u64, u64, Vec<u64>, bool)>::new()));
+        let observed_for_server = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept conflicting peer");
+            let mut reader = TokioBufReader::new(stream);
+
+            for _ in 0..2 {
+                let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                    .await
+                    .expect("read append entries");
+                let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+                let (term, prev_log_index, prev_log_term, indexes) = match rpc {
+                    RaftRpc::AppendEntries {
+                        term,
+                        prev_log_index,
+                        prev_log_term,
+                        entries,
+                        ..
+                    } => {
+                        let indexes = entries.iter().map(|entry| entry.index).collect::<Vec<_>>();
+                        (term, prev_log_index, prev_log_term, indexes)
+                    }
+                    other => panic!("unexpected rpc: {other:?}"),
+                };
+
+                if prev_log_index == 2 {
+                    observed_for_server.lock().push((
+                        prev_log_index,
+                        prev_log_term,
+                        indexes,
+                        false,
+                    ));
+                    let response = RaftRpcResponse::AppendEntries {
+                        term,
+                        success: false,
+                        match_index: 1,
+                        conflict_index: Some(2),
+                        conflict_term: Some(6),
+                    };
+                    let body = serde_json::to_vec(&response).expect("serialize conflict response");
+                    reader
+                        .get_mut()
+                        .write_all(&body)
+                        .await
+                        .expect("write conflict response");
+                    reader
+                        .get_mut()
+                        .write_all(b"\n")
+                        .await
+                        .expect("write conflict newline");
+                    reader
+                        .get_mut()
+                        .flush()
+                        .await
+                        .expect("flush conflict response");
+                    continue;
+                }
+
+                observed_for_server.lock().push((
+                    prev_log_index,
+                    prev_log_term,
+                    indexes.clone(),
+                    true,
+                ));
+                assert_eq!(prev_log_index, 1);
+                assert_eq!(prev_log_term, 7);
+                assert_eq!(indexes, vec![2]);
+                let response = RaftRpcResponse::AppendEntries {
+                    term,
+                    success: true,
+                    match_index: 2,
+                    conflict_index: None,
+                    conflict_term: None,
+                };
+                let body = serde_json::to_vec(&response).expect("serialize append response");
+                reader
+                    .get_mut()
+                    .write_all(&body)
+                    .await
+                    .expect("write append response");
+                reader
+                    .get_mut()
+                    .write_all(b"\n")
+                    .await
+                    .expect("write append newline");
+                reader
+                    .get_mut()
+                    .flush()
+                    .await
+                    .expect("flush append response");
+                return;
+            }
+            panic!("conflicting peer never received repaired suffix append");
+        });
+
+        let acks = raft
+            .replicate_until_quorum(2)
+            .await
+            .expect("repair conflicting peer to quorum");
+        assert_eq!(acks, BTreeSet::from(["n1".to_string(), "n2".to_string()]));
+        server.await.expect("conflicting peer server");
+        assert_eq!(
+            observed.lock().clone(),
+            vec![(2, 7, Vec::<u64>::new(), false), (1, 7, vec![2], true)],
+            "leader should probe the conflicting suffix, then send only the repaired suffix entry"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.commit_index, 2);
+            let progress = runtime.leader_progress.get("n2").expect("n2 progress");
+            assert_eq!(progress.match_index, 2);
+            assert_eq!(progress.next_index, 3);
+        }
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_requests_total, 2);
+        assert_eq!(telemetry.append_entries_heartbeats_total, 1);
+        assert_eq!(
+            telemetry.append_entries_sent_total, 1,
+            "conflict repair should send only the missing suffix entry, not the full log"
+        );
+        assert_eq!(telemetry.append_entries_conflicts_total, 1);
+        assert_eq!(telemetry.append_conflict_repairs_total, 1);
+        assert_eq!(telemetry.append_entries_successes_total, 1);
+        assert_eq!(telemetry.append_progress_updates_total, 2);
+        assert_eq!(telemetry.target_replication_inline_progress_rounds_total, 2);
+        assert_eq!(telemetry.target_replication_inline_successes_total, 1);
+        assert_eq!(telemetry.replication_quorum_successes_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn target_replication_yields_after_inline_append_batch_cap() {
         let dir = temp_dir("raft-inline-catchup-cap");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -30104,16 +31048,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicate_log_once_detaches_non_quorum_peer_after_quorum_return() {
-        let dir = temp_dir("raft-quorum-detaches-slow-peer");
+    async fn target_replication_limits_simple_fanout_to_quorum_need() {
+        let dir = temp_dir("raft-target-quorum-limits-fanout");
         let listener_n2 = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind fast peer");
-        let addr_n2 = listener_n2.local_addr().expect("fast peer addr");
+            .expect("bind quorum peer");
+        let addr_n2 = listener_n2.local_addr().expect("quorum peer addr");
         let listener_n3 = TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind slow peer");
-        let addr_n3 = listener_n3.local_addr().expect("slow peer addr");
+            .expect("bind unnecessary peer");
+        let addr_n3 = listener_n3.local_addr().expect("unnecessary peer addr");
 
         let mut cfg = test_raft_config(dir.clone());
         cfg.heartbeat_interval = Duration::from_millis(10);
@@ -30155,15 +31099,13 @@ mod tests {
             );
         }
 
-        let (n3_seen_tx, n3_seen_rx) = oneshot::channel();
-        let (release_n3_tx, release_n3_rx) = oneshot::channel();
         let server_n2 = tokio::spawn(async move {
-            let (stream, _) = listener_n2.accept().await.expect("accept fast peer");
+            let (stream, _) = listener_n2.accept().await.expect("accept quorum peer");
             let mut reader = TokioBufReader::new(stream);
             let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
                 .await
-                .expect("read fast append entries");
-            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse fast append entries");
+                .expect("read quorum append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse quorum append entries");
             let (term, match_index) = match rpc {
                 RaftRpc::AppendEntries {
                     term,
@@ -30180,7 +31122,6 @@ mod tests {
                 }
                 other => panic!("unexpected rpc: {other:?}"),
             };
-            n3_seen_rx.await.expect("slow peer should receive append");
             let response = RaftRpcResponse::AppendEntries {
                 term,
                 success: true,
@@ -30188,27 +31129,266 @@ mod tests {
                 conflict_index: None,
                 conflict_term: None,
             };
-            let body = serde_json::to_vec(&response).expect("serialize fast response");
+            let body = serde_json::to_vec(&response).expect("serialize quorum response");
             reader
                 .get_mut()
                 .write_all(&body)
                 .await
-                .expect("write fast response");
+                .expect("write quorum response");
             reader
                 .get_mut()
                 .write_all(b"\n")
                 .await
-                .expect("write fast newline");
-            reader.get_mut().flush().await.expect("flush fast response");
+                .expect("write quorum newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush quorum response");
         });
+        let unnecessary_accept = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), listener_n3.accept()).await
+        });
+
+        let acks = raft
+            .replicate_log_once(Some(1))
+            .await
+            .expect("replicate to quorum");
+        assert_eq!(acks, BTreeSet::from(["n1".to_string(), "n2".to_string()]));
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.replication_early_quorum_returns_total, 0);
+        assert_eq!(telemetry.replication_cached_progress_acks_total, 0);
+        assert_eq!(telemetry.replication_cached_quorum_short_circuits_total, 0);
+        assert_eq!(
+            telemetry.append_entries_requests_total, 1,
+            "target round should only contact the one peer needed for a 3-node quorum"
+        );
+        assert_eq!(telemetry.replication_quorum_limited_fanout_rounds_total, 1);
+        assert_eq!(
+            telemetry.replication_quorum_limited_fanout_skipped_peers_total,
+            1
+        );
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_replication_early_quorum_returns_total 0")
+        );
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total 1"
+        ));
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total 1"
+        ));
+        assert_eq!(
+            raft.runtime
+                .lock()
+                .leader_progress
+                .get("n3")
+                .map(|progress| progress.match_index),
+            Some(0),
+            "unneeded peer should not be updated by the target quorum round"
+        );
+        unnecessary_accept
+            .await
+            .expect("unnecessary accept task")
+            .expect_err("unneeded target peer should not receive a connection");
+
+        server_n2.await.expect("quorum peer server");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn target_replication_limits_joint_fanout_to_both_quorum_needs() {
+        let dir = temp_dir("raft-target-joint-quorum-limits-fanout");
+        let listener_n2 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind old-only extra peer");
+        let addr_n2 = listener_n2.local_addr().expect("old-only peer addr");
+        let listener_n3 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind overlap quorum peer");
+        let addr_n3 = listener_n3.local_addr().expect("overlap peer addr");
+        let listener_n4 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind new quorum peer");
+        let addr_n4 = listener_n4.local_addr().expect("new quorum peer addr");
+        let listener_n5 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind new-only extra peer");
+        let addr_n5 = listener_n5.local_addr().expect("new-only peer addr");
+
+        let peer_n2 = RaftPeerConfig {
+            id: "n2".into(),
+            addr: addr_n2.to_string(),
+        };
+        let peer_n3 = RaftPeerConfig {
+            id: "n3".into(),
+            addr: addr_n3.to_string(),
+        };
+        let peer_n4 = RaftPeerConfig {
+            id: "n4".into(),
+            addr: addr_n4.to_string(),
+        };
+        let peer_n5 = RaftPeerConfig {
+            id: "n5".into(),
+            addr: addr_n5.to_string(),
+        };
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(250);
+        cfg.election_timeout_max = Duration::from_millis(500);
+        cfg.append_entries_max_entries = 16;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            peer_n2.clone(),
+            peer_n3.clone(),
+            peer_n4.clone(),
+            peer_n5.clone(),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log.append(1, RaftCommand::Noop).expect("append");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.membership = RaftMembership::Joint {
+                old_peers: vec![test_peer("n1", 7980), peer_n2.clone(), peer_n3.clone()],
+                new_peers: vec![peer_n3.clone(), peer_n4.clone(), peer_n5.clone()],
+            };
+            for peer in [&peer_n2, &peer_n3, &peer_n4, &peer_n5] {
+                runtime.leader_progress.insert(
+                    peer.id.clone(),
+                    RaftPeerProgress {
+                        next_index: 1,
+                        match_index: 0,
+                    },
+                );
+            }
+        }
+
+        let unnecessary_n2 = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), listener_n2.accept()).await
+        });
+        let unnecessary_n5 = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), listener_n5.accept()).await
+        });
+        let (n3_seen, release_n3, server_n3) =
+            spawn_held_append_entries_peer(listener_n3, 0, vec![1]);
+        let (n4_seen, release_n4, server_n4) =
+            spawn_held_append_entries_peer(listener_n4, 0, vec![1]);
+
+        let node = raft.clone();
+        let replicate = tokio::spawn(async move { node.replicate_log_once(Some(1)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            n3_seen.await.expect("overlap peer should receive append");
+            n4_seen.await.expect("new peer should receive append");
+        })
+        .await
+        .expect("selected joint quorum peers should be contacted");
+        release_n3.send(()).expect("release overlap peer");
+        release_n4.send(()).expect("release new peer");
+
+        let acks = tokio::time::timeout(Duration::from_secs(2), replicate)
+            .await
+            .expect("joint target replication should finish")
+            .expect("replicate task")
+            .expect("replicate result");
+        assert_eq!(
+            acks,
+            BTreeSet::from(["n1".to_string(), "n3".to_string(), "n4".to_string()])
+        );
+        assert!(raft.runtime.lock().membership.quorum_met(&acks));
+        unnecessary_n2
+            .await
+            .expect("old-only accept task")
+            .expect_err("old-only extra peer should not receive foreground append");
+        unnecessary_n5
+            .await
+            .expect("new-only accept task")
+            .expect_err("new-only extra peer should not receive foreground append");
+        server_n3.await.expect("overlap peer server");
+        server_n4.await.expect("new peer server");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(
+            telemetry.append_entries_requests_total, 2,
+            "joint target round should contact only the two peers needed after local old-side ack"
+        );
+        assert_eq!(telemetry.replication_quorum_limited_fanout_rounds_total, 1);
+        assert_eq!(
+            telemetry.replication_quorum_limited_fanout_skipped_peers_total,
+            2
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn target_replication_limited_fanout_rotates_after_failed_peer() {
+        let dir = temp_dir("raft-target-quorum-limited-fanout-rotates");
+        let closed_n2 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closed first peer");
+        let addr_n2 = closed_n2.local_addr().expect("closed first peer addr");
+        drop(closed_n2);
+        let listener_n3 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rotated quorum peer");
+        let addr_n3 = listener_n3.local_addr().expect("rotated quorum peer addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(250);
+        cfg.election_timeout_max = Duration::from_millis(500);
+        cfg.append_entries_max_entries = 16;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: addr_n2.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: addr_n3.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log.append(1, RaftCommand::Noop).expect("append");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n3".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
         let server_n3 = tokio::spawn(async move {
-            let (stream, _) = listener_n3.accept().await.expect("accept slow peer");
+            let (stream, _) = listener_n3
+                .accept()
+                .await
+                .expect("accept rotated quorum peer");
             let mut reader = TokioBufReader::new(stream);
             let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
                 .await
-                .expect("read slow append entries");
-            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse slow append entries");
-            let term = match rpc {
+                .expect("read rotated append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse rotated append entries");
+            let (term, match_index) = match rpc {
                 RaftRpc::AppendEntries {
                     term,
                     prev_log_index,
@@ -30220,68 +31400,73 @@ mod tests {
                         entries.iter().map(|entry| entry.index).collect::<Vec<_>>(),
                         vec![1]
                     );
-                    term
+                    (term, 1)
                 }
                 other => panic!("unexpected rpc: {other:?}"),
             };
-            let _ = n3_seen_tx.send(());
-            release_n3_rx.await.expect("release slow response");
             let response = RaftRpcResponse::AppendEntries {
                 term,
                 success: true,
-                match_index: 1,
+                match_index,
                 conflict_index: None,
                 conflict_term: None,
             };
-            let body = serde_json::to_vec(&response).expect("serialize slow response");
-            let _ = reader.get_mut().write_all(&body).await;
-            let _ = reader.get_mut().write_all(b"\n").await;
-            let _ = reader.get_mut().flush().await;
+            let body = serde_json::to_vec(&response).expect("serialize rotated response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write rotated response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write rotated newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush rotated response");
         });
 
-        let acks = raft
-            .replicate_log_once(Some(1))
+        let acks = tokio::time::timeout(Duration::from_secs(2), raft.replicate_until_quorum(1))
             .await
-            .expect("replicate to quorum");
-        assert_eq!(acks, BTreeSet::from(["n1".to_string(), "n2".to_string()]));
+            .expect("target quorum should retry rotated follower")
+            .expect("replicate until quorum");
+        assert_eq!(acks, BTreeSet::from(["n1".to_string(), "n3".to_string()]));
+        server_n3.await.expect("rotated quorum peer server");
+
         let telemetry = raft.telemetry_snapshot();
-        assert_eq!(telemetry.replication_early_quorum_returns_total, 1);
-        assert_eq!(telemetry.replication_cached_progress_acks_total, 0);
-        assert_eq!(telemetry.replication_cached_quorum_short_circuits_total, 0);
-        let metrics = raft.raft_metrics_text();
+        assert_eq!(telemetry.replication_quorum_successes_total, 1);
         assert!(
-            metrics.contains("dd_rust_network_mutex_raft_replication_early_quorum_returns_total 1")
+            telemetry.replication_quorum_attempts_total >= 2,
+            "first narrowed attempt should fail on n2 before retrying n3"
         );
+        assert_eq!(telemetry.replication_quorum_limited_fanout_rounds_total, 2);
+        assert_eq!(
+            telemetry.replication_quorum_limited_fanout_skipped_peers_total,
+            2
+        );
+        assert_eq!(
+            telemetry.replication_quorum_limited_fanout_fast_retries_total,
+            1
+        );
+        assert_eq!(
+            telemetry.replication_quorum_sleeps_total, 0,
+            "limited fanout should rotate to the skipped peer before sleeping"
+        );
+        assert!(raft.raft_metrics_text().contains(
+            "dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total 1"
+        ));
         assert_eq!(
             raft.runtime
                 .lock()
                 .leader_progress
                 .get("n3")
                 .map(|progress| progress.match_index),
-            Some(0),
-            "slow peer should not have replied before quorum returned"
+            Some(1)
         );
 
-        release_n3_tx.send(()).expect("release slow peer");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if raft
-                    .runtime
-                    .lock()
-                    .leader_progress
-                    .get("n3")
-                    .is_some_and(|progress| progress.match_index >= 1)
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("detached slow peer replication should still update progress");
-
-        server_n2.await.expect("fast peer server");
-        server_n3.await.expect("slow peer server");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -32005,6 +33190,194 @@ mod tests {
             .expect("progress");
         assert_eq!(progress.match_index, 6);
         assert_eq!(progress.next_index, 7);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_fallback_continues_with_retained_suffix_append_entries() {
+        let dir = temp_dir("raft-snapshot-fallback-retained-suffix");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake snapshot peer");
+        let peer_addr = listener.local_addr().expect("fake snapshot peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.append_entries_max_entries = 2;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.install_snapshot_chunk_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..8 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        raft.log
+            .write_snapshot(6, 1, idle_snapshot_payload())
+            .expect("write snapshot");
+        raft.log
+            .compact_to_latest_snapshot()
+            .expect("compact snapshot prefix");
+        assert_eq!(
+            raft.log
+                .read_entries()
+                .expect("retained entries")
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake snapshot peer");
+            let mut reader = TokioBufReader::new(stream);
+
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read install snapshot");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse install snapshot");
+            let term = match rpc {
+                RaftRpc::InstallSnapshot {
+                    term,
+                    last_included_index,
+                    last_included_term,
+                    offset,
+                    done,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(last_included_index, 6);
+                    assert_eq!(last_included_term, 1);
+                    assert_eq!(offset, 0);
+                    assert!(done);
+                    assert!(!decode_snapshot_chunk(&data)
+                        .expect("decode snapshot")
+                        .is_empty());
+                    term
+                }
+                RaftRpc::AppendEntries { .. } => {
+                    panic!("peer before compacted prefix must receive InstallSnapshot first")
+                }
+                other => panic!("unexpected first catch-up rpc: {other:?}"),
+            };
+            let body = serde_json::to_vec(&RaftRpcResponse::InstallSnapshot {
+                term,
+                success: true,
+                last_included_index: 6,
+            })
+            .expect("serialize snapshot response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write snapshot response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write snapshot newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush snapshot response");
+
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read retained suffix append");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse retained suffix append");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 6);
+                    assert_eq!(prev_log_term, 1);
+                    assert_eq!(
+                        entries.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+                        vec![7, 8]
+                    );
+                    term
+                }
+                RaftRpc::InstallSnapshot { .. } => {
+                    panic!("snapshot fallback should continue with retained suffix AppendEntries")
+                }
+                other => panic!("unexpected second catch-up rpc: {other:?}"),
+            };
+            let body = serde_json::to_vec(&RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index: 8,
+                conflict_index: None,
+                conflict_term: None,
+            })
+            .expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(8))
+            .await
+            .expect("replicate snapshot then retained suffix");
+        assert!(outcome.contacted);
+        assert!(outcome.target_reached);
+        assert!(outcome.progress_changed);
+        server.await.expect("fake snapshot peer server");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_snapshot_fallbacks_total, 1);
+        assert_eq!(telemetry.append_snapshot_suffix_gaps_total, 1);
+        assert_eq!(telemetry.install_snapshot_successes_total, 1);
+        assert_eq!(telemetry.install_snapshot_progress_updates_total, 1);
+        assert_eq!(telemetry.append_entries_batches_total, 1);
+        assert_eq!(telemetry.append_entries_sent_total, 2);
+        assert_eq!(telemetry.append_entries_successes_total, 1);
+        assert_eq!(telemetry.append_progress_updates_total, 1);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 8);
+        assert_eq!(progress.next_index, 9);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -33931,6 +35304,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_request_id_survives_response_cache_trim() {
+        let dir = temp_dir("raft-pending-request-id-survives-cache-trim");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.client_response_cache_max_entries = 1;
+        cfg.client_batch_max_entries = 4;
+        cfg.client_batch_max_delay = Duration::from_secs(60);
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        let first_request = single_lock_request("trim-pending-a", "trim-pending-key-a");
+        let first = {
+            let node = raft.clone();
+            tokio::spawn(async move {
+                node.run_ephemeral(first_request, "trim-pending-a", Duration::ZERO, true)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), raft.client_batch_waiting.notified())
+            .await
+            .expect("batch driver should wait for first coalescing delay");
+
+        let second_request = single_lock_request("trim-pending-b", "trim-pending-key-b");
+        let second = {
+            let node = raft.clone();
+            tokio::spawn(async move {
+                node.run_ephemeral(second_request, "trim-pending-b", Duration::ZERO, true)
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft.client_request_batch.lock().pending.len() >= 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second request should be queued before duplicate retry");
+
+        {
+            let cache = raft.client_response_cache.lock();
+            assert_eq!(
+                cache.entries.len(),
+                2,
+                "unapplied request-id reservations may temporarily exceed the completed-response cache limit"
+            );
+            assert!(cache
+                .entries
+                .get("trim-pending-a")
+                .is_some_and(|cached| !cached.applied));
+            assert!(cache
+                .entries
+                .get("trim-pending-b")
+                .is_some_and(|cached| !cached.applied));
+        }
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_client_response_cache_entries 2"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_client_response_cache_pending_entries 2")
+        );
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_client_response_cache_completed_entries 0"));
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries 0"
+        ));
+
+        let duplicate = raft
+            .run_ephemeral(
+                single_lock_request("trim-pending-a", "trim-pending-key-a"),
+                "trim-pending-a",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("duplicate pending request should not error");
+        assert!(
+            duplicate.is_none(),
+            "duplicate retry should still observe the first request id as pending after cache trim"
+        );
+        assert_eq!(
+            raft.client_request_batch.lock().pending.len(),
+            2,
+            "duplicate pending request must not enqueue a second log command"
+        );
+        assert!(
+            raft.log.read_entries().expect("entries").is_empty(),
+            "no request should append before the delayed batch is released"
+        );
+
+        raft.client_batch_notify.notify_one();
+        let first_response = first
+            .await
+            .expect("first task")
+            .expect("first request")
+            .expect("first response");
+        let second_response = second
+            .await
+            .expect("second task")
+            .expect("second request")
+            .expect("second response");
+        assert!(matches!(
+            first_response,
+            Response::Lock { acquired: true, .. }
+        ));
+        assert!(matches!(
+            second_response,
+            Response::Lock { acquired: true, .. }
+        ));
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 2);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.client_cache_pending_hits_total, 1);
+        assert_eq!(telemetry.client_proposals_total, 2);
+        assert_eq!(telemetry.client_batches_total, 1);
+        assert_eq!(telemetry.client_batch_entries_total, 2);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_client_response_cache_entries 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_client_response_cache_pending_entries 0")
+        );
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_client_response_cache_completed_entries 1"));
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries 0"
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn request_id_reservation_is_released_when_queue_full_before_append() {
         let dir = temp_dir("raft-request-id-queue-full-release");
         let mut cfg = test_raft_config(dir.clone());
@@ -34433,6 +35936,437 @@ mod tests {
         assert_eq!(telemetry.proxy_requests_forwarded_total, 0);
         assert_eq!(telemetry.proxy_requests_handled_total, 0);
         assert_eq!(telemetry.proxy_request_errors_total, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follower_proxy_discovers_leader_by_trying_active_peers_without_hint() {
+        let dir = temp_dir("raft-follower-proxy-peer-discovery");
+        let follower_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake follower peer");
+        let follower_addr = follower_listener
+            .local_addr()
+            .expect("fake follower peer addr");
+        let leader_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake leader peer");
+        let leader_addr = leader_listener.local_addr().expect("fake leader peer addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: follower_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: leader_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 5;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = None;
+        }
+
+        let follower_server = tokio::spawn(async move {
+            let (stream, _) = follower_listener
+                .accept()
+                .await
+                .expect("accept fake follower proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read follower proxy request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse follower proxy request");
+            match rpc {
+                RaftRpc::ProxyRequest { request_uuid, .. } => {
+                    assert_eq!(request_uuid, "discover-proxy");
+                }
+                other => panic!("unexpected proxy-discovery rpc to follower: {other:?}"),
+            }
+            let response = RaftRpcResponse::ProxyResponse {
+                term: 5,
+                response: None,
+                error: Some(
+                    BrokerRaftError::NotLeader {
+                        leader_id: Some("n3".into()),
+                        leader_addr: Some(leader_addr.to_string()),
+                    }
+                    .to_string(),
+                ),
+                leader_id: None,
+                leader_addr: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize follower proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write follower proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write follower proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush follower proxy response");
+        });
+
+        let leader_server = tokio::spawn(async move {
+            let (stream, _) = leader_listener
+                .accept()
+                .await
+                .expect("accept fake leader proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read leader proxy request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse leader proxy request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    request_uuid,
+                    request,
+                    ..
+                } => {
+                    assert_eq!(request_uuid, "discover-proxy");
+                    assert!(
+                        matches!(
+                            request,
+                            Request::Lock {
+                                key: Some(ref key),
+                                ..
+                            } if key == "discover-proxy-key"
+                        ),
+                        "unexpected proxied request: {request:?}"
+                    );
+                }
+                other => panic!("unexpected proxy-discovery rpc to leader: {other:?}"),
+            }
+            let response = RaftRpcResponse::ProxyResponse {
+                term: 5,
+                response: Some(Response::Lock {
+                    uuid: "discover-proxy".into(),
+                    key: "discover-proxy-key".into(),
+                    acquired: true,
+                    lock_request_count: 0,
+                    lock_uuid: Some("discovered-lock".into()),
+                    fencing_token: Some(7),
+                    readers_count: None,
+                    error: None,
+                }),
+                error: None,
+                leader_id: None,
+                leader_addr: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize leader proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write leader proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write leader proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush leader proxy response");
+        });
+
+        let response = raft
+            .run_ephemeral(
+                single_lock_request("discover-proxy", "discover-proxy-key"),
+                "discover-proxy",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("follower proxy discovery should succeed")
+            .expect("proxied response");
+        assert!(matches!(
+            response,
+            Response::Lock {
+                acquired: true,
+                lock_uuid: Some(ref lock_uuid),
+                ..
+            } if lock_uuid == "discovered-lock"
+        ));
+        follower_server.await.expect("fake follower server");
+        leader_server.await.expect("fake leader server");
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 2);
+        assert_eq!(telemetry.proxy_requests_handled_total, 0);
+        assert_eq!(telemetry.proxy_request_errors_total, 1);
+        assert_eq!(telemetry.proxy_request_retries_total, 0);
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 5);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n3"));
+        }
+        assert_eq!(raft.leader_addr(), Some(leader_addr.to_string()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follower_proxy_uses_structured_not_leader_hint_for_fast_redirect() {
+        let dir = temp_dir("raft-follower-proxy-structured-redirect");
+        let stale_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stale follower peer");
+        let stale_addr = stale_listener.local_addr().expect("stale follower addr");
+        let unused_n3 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused n3 addr");
+        let addr_n3 = unused_n3.local_addr().expect("unused n3 addr");
+        drop(unused_n3);
+        let unused_n4 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused n4 addr");
+        let addr_n4 = unused_n4.local_addr().expect("unused n4 addr");
+        drop(unused_n4);
+        let leader_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirected leader peer");
+        let leader_addr = leader_listener
+            .local_addr()
+            .expect("redirected leader addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: stale_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: addr_n3.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n4".into(),
+                addr: addr_n4.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n5".into(),
+                addr: leader_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 5;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+
+        let stale_server = tokio::spawn(async move {
+            let (stream, _) = stale_listener
+                .accept()
+                .await
+                .expect("accept stale follower proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read stale follower proxy request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse stale proxy request");
+            match rpc {
+                RaftRpc::ProxyRequest { request_uuid, .. } => {
+                    assert_eq!(request_uuid, "structured-redirect");
+                }
+                other => panic!("unexpected stale proxy rpc: {other:?}"),
+            }
+            let response = RaftRpcResponse::ProxyResponse {
+                term: 5,
+                response: None,
+                error: Some(
+                    BrokerRaftError::NotLeader {
+                        leader_id: Some("n5".into()),
+                        leader_addr: Some(leader_addr.to_string()),
+                    }
+                    .to_string(),
+                ),
+                leader_id: Some("n5".into()),
+                leader_addr: Some(leader_addr.to_string()),
+            };
+            let body = serde_json::to_vec(&response).expect("serialize stale proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write stale proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write stale proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush stale proxy response");
+        });
+
+        let leader_server = tokio::spawn(async move {
+            let (stream, _) = leader_listener
+                .accept()
+                .await
+                .expect("accept redirected leader proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read redirected leader proxy request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse leader proxy request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    request_uuid,
+                    request,
+                    ..
+                } => {
+                    assert_eq!(request_uuid, "structured-redirect");
+                    assert!(
+                        matches!(
+                            request,
+                            Request::Lock {
+                                key: Some(ref key),
+                                ..
+                            } if key == "structured-redirect-key"
+                        ),
+                        "unexpected redirected request: {request:?}"
+                    );
+                }
+                other => panic!("unexpected redirected leader rpc: {other:?}"),
+            }
+            let response = RaftRpcResponse::ProxyResponse {
+                term: 5,
+                response: Some(Response::Lock {
+                    uuid: "structured-redirect".into(),
+                    key: "structured-redirect-key".into(),
+                    acquired: true,
+                    lock_request_count: 0,
+                    lock_uuid: Some("structured-redirect-lock".into()),
+                    fencing_token: Some(11),
+                    readers_count: None,
+                    error: None,
+                }),
+                error: None,
+                leader_id: None,
+                leader_addr: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize leader proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write leader proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write leader proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush leader proxy response");
+        });
+
+        let response = raft
+            .run_ephemeral(
+                single_lock_request("structured-redirect", "structured-redirect-key"),
+                "structured-redirect",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("structured redirect should proxy to hinted leader")
+            .expect("proxied response");
+        assert!(matches!(
+            response,
+            Response::Lock {
+                acquired: true,
+                lock_uuid: Some(ref lock_uuid),
+                ..
+            } if lock_uuid == "structured-redirect-lock"
+        ));
+        stale_server.await.expect("stale follower server");
+        leader_server.await.expect("redirected leader server");
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        {
+            let connections = raft.rpc_connections.lock();
+            assert!(connections.contains_key("n2"));
+            assert!(connections.contains_key("n5"));
+            assert!(
+                !connections.contains_key("n3") && !connections.contains_key("n4"),
+                "structured redirect should avoid probing intervening peers"
+            );
+        }
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 2);
+        assert_eq!(telemetry.proxy_requests_handled_total, 0);
+        assert_eq!(telemetry.proxy_request_errors_total, 1);
+        assert_eq!(telemetry.proxy_request_retries_total, 1);
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 5);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n5"));
+        }
+        assert_eq!(raft.leader_addr(), Some(leader_addr.to_string()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn proxy_redirect_peer_requires_configured_active_peer_match() {
+        let dir = temp_dir("raft-proxy-redirect-peer-validation");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let matched = raft
+            .proxy_redirect_peer(Some("n2"), Some("127.0.0.1:7981"), "n3")
+            .expect("matching id/address hint should resolve");
+        assert_eq!(matched.id, "n2");
+        assert_eq!(matched.addr, "127.0.0.1:7981");
+
+        assert!(
+            raft.proxy_redirect_peer(Some("n2"), Some("127.0.0.1:7982"), "n3")
+                .is_none(),
+            "mismatched structured id/address hint must not be accepted"
+        );
+        assert!(
+            raft.proxy_redirect_peer(Some("n2"), None, "n2").is_none(),
+            "a peer should not redirect back to the peer that just rejected the proxy request"
+        );
+        assert!(
+            raft.proxy_redirect_peer(Some("n1"), None, "n2").is_none(),
+            "a follower must not redirect a proxy request back to itself"
+        );
+
+        let addr_only = raft
+            .proxy_redirect_peer(None, Some("127.0.0.1:7982"), "n2")
+            .expect("address-only hint should resolve only configured active peers");
+        assert_eq!(addr_only.id, "n3");
+        assert_eq!(addr_only.addr, "127.0.0.1:7982");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -35094,6 +37028,7 @@ mod tests {
                 term: 4,
                 response: None,
                 error: Some(ref error),
+                ..
             } if error.contains("raft node is not leader")
         ));
         assert!(raft.rpc_connections.lock().is_empty());
@@ -35133,6 +37068,7 @@ mod tests {
                 term: 5,
                 response: None,
                 error: Some(ref error),
+                ..
             } if error.contains("at most 3 distinct keys")
         ));
         assert!(raft.log.read_entries().expect("entries").is_empty());
@@ -35194,6 +37130,8 @@ mod tests {
                     term: 7,
                     response: None,
                     error: None,
+                    leader_id: None,
+                    leader_addr: None,
                 })
                 .expect("serialize proxy response");
                 reader
@@ -35299,6 +37237,8 @@ mod tests {
                         term: 7,
                         response: None,
                         error: None,
+                        leader_id: None,
+                        leader_addr: None,
                     }
                 };
                 let body = serde_json::to_vec(&response).expect("serialize proxy response");
@@ -35351,6 +37291,85 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn follower_proxy_rpc_timeout_is_bounded_by_retry_budget() {
+        let dir = temp_dir("raft-follower-proxy-budget-bounds-rpc-timeout");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent leader");
+        let leader_addr = listener.local_addr().expect("silent leader addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.proxy_retry_budget = Duration::from_millis(30);
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: leader_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept silent leader proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read proxied request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse proxied request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    auth_token: None,
+                    request_uuid,
+                    is_acquire: false,
+                    ..
+                } => assert_eq!(request_uuid, "proxy-budget-timeout"),
+                other => panic!("unexpected proxy rpc: {other:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let started = Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_millis(150),
+            raft.run_ephemeral(
+                Request::Unlock {
+                    uuid: "proxy-budget-timeout".into(),
+                    key: Some("proxy-budget-key".into()),
+                    keys: None,
+                    lock_uuid: Some("proxy-budget-lock".into()),
+                    force: false,
+                },
+                "proxy-budget-timeout",
+                Duration::ZERO,
+                false,
+            ),
+        )
+        .await
+        .expect("proxy request should not outlive retry budget")
+        .expect_err("silent leader should make follower proxy fail");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "proxy attempt should be bounded by retry budget, not the old 250ms floor"
+        );
+        assert!(matches!(err, BrokerRaftError::Rpc(_)));
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 1);
+        assert_eq!(telemetry.proxy_request_errors_total, 1);
+        assert_eq!(telemetry.proxy_request_retries_total, 0);
+
+        server.abort();
+        let _ = server.await;
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn proxy_error_terminal_classifier_only_marks_client_payload_errors() {
         assert!(proxy_error_is_terminal(
@@ -35360,6 +37379,12 @@ mod tests {
             "unsupported raft client request: lock wait option is malformed"
         ));
         assert!(!proxy_error_is_terminal("not leader"));
+        assert!(proxy_error_is_not_leader(
+            "raft node is not leader; leader=Some(\"n3\") addr=Some(\"127.0.0.1:7982\")"
+        ));
+        assert!(!proxy_error_is_not_leader(
+            "timed out waiting for pooled Raft RPC connection to peer `n2`"
+        ));
         assert!(!proxy_error_is_terminal(
             "timed out waiting for pooled Raft RPC connection to peer `n2`"
         ));
@@ -35409,6 +37434,8 @@ mod tests {
                 term: 9,
                 response: None,
                 error: None,
+                leader_id: None,
+                leader_addr: None,
             })
             .expect("serialize proxy response");
             reader
@@ -35519,6 +37546,7 @@ mod tests {
                 term: 9,
                 response: None,
                 error: Some(ref error),
+                ..
             } if error.contains("raft node is not leader")
         ));
         {
@@ -41135,6 +43163,66 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "the unused zero-filled commit slot should be treated as empty"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hard_state_commit_slot_sync_policy_is_explicit_and_independent() {
+        let legacy_dir = temp_dir("raft-hard-state-commit-sync-legacy");
+        let legacy_store =
+            RaftLogStore::open_with_sync_log(&legacy_dir, false).expect("open legacy policy store");
+        assert!(!legacy_store.sync_log);
+        assert!(
+            legacy_store.sync_commit,
+            "existing sync_log=false constructor keeps commitIndex durability enabled"
+        );
+        drop(legacy_store);
+        let _ = fs::remove_dir_all(legacy_dir);
+
+        let dir = temp_dir("raft-hard-state-commit-sync-independent");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_policy_and_telemetry(
+            &dir,
+            true,
+            false,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open independent policy store");
+        assert!(store.sync_log);
+        assert!(!store.sync_commit);
+
+        let base = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        let committed = RaftHardState {
+            commit_index: 99,
+            ..base.clone()
+        };
+        store
+            .write_hard_state(&base)
+            .expect("write base hard state");
+        store
+            .write_hard_state(&committed)
+            .expect("write commit-only hard state with async commit policy");
+
+        assert_eq!(
+            telemetry
+                .hard_state_commit_slot_writes_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            store.read_hard_state().expect("read cached hard state"),
+            committed
+        );
+        assert_eq!(
+            read_hard_state(&dir.join(HARD_STATE_FILE)).expect("read sidecar-combined state"),
+            committed,
+            "commit slot is still written and recoverable even when its fsync is disabled"
         );
 
         let _ = fs::remove_dir_all(dir);

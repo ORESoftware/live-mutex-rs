@@ -1,8 +1,9 @@
 # `rust-network-mutex-rs` Wire Protocol
 
 This file is the **single source of truth** for the JSON wire format between
-clients (TypeScript / Rust / Gleam / Dart / Go) and the broker. Every client
-under `clients/<lang>/` MUST mirror these enum variants exactly.
+clients (Rust / TypeScript / Go / Dart / Gleam / Python / C++ / Java) and the
+broker. Every client under `clients/<lang>/` MUST mirror these enum variants
+exactly.
 
 The Rust side is generated from `src/protocol.rs` by serde with:
 
@@ -168,6 +169,9 @@ client below uses the same pattern in its native idiom:
 | Go         | `type RequestType string` + typed const block + switch |
 | Dart       | `sealed class Request` + pattern matching             |
 | Gleam      | `pub type Request { Lock(…) RegisterRead(…) … }`      |
+| Python     | `enum.Enum` discriminators + typed builders           |
+| C++        | `enum class RequestType` + `switch` helpers           |
+| Java       | `enum RequestType` / `enum ResponseType` builders     |
 
 Adding a new variant in Rust is a compile error in every client until the
 client adds the matching constructor — that is the property the upstream

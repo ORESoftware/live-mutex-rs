@@ -60,6 +60,7 @@ struct RaftClusterTuning {
     append_entries_max_bytes: usize,
     install_snapshot_chunk_bytes: usize,
     proxy_retry_budget: Duration,
+    peer_token: Option<String>,
 }
 
 impl Default for RaftClusterTuning {
@@ -77,6 +78,7 @@ impl Default for RaftClusterTuning {
             append_entries_max_bytes: defaults.append_entries_max_bytes,
             install_snapshot_chunk_bytes: defaults.install_snapshot_chunk_bytes,
             proxy_retry_budget: defaults.proxy_retry_budget,
+            peer_token: None,
         }
     }
 }
@@ -217,6 +219,7 @@ fn spawn_raft_node(
     raft.append_entries_max_bytes = tuning.append_entries_max_bytes;
     raft.install_snapshot_chunk_bytes = tuning.install_snapshot_chunk_bytes;
     raft.proxy_retry_budget = tuning.proxy_retry_budget;
+    raft.peer_token = tuning.peer_token.clone();
     raft.peers = initial_peers.to_vec();
     raft.broker = BrokerConfig::default();
 
@@ -545,6 +548,17 @@ async fn current_metric(port: u16, name: &str) -> u64 {
     metric_value(&metrics, name).unwrap_or_else(|| panic!("metric {name} missing on port {port}"))
 }
 
+async fn assert_no_raft_auth_rejections(cluster: &RaftCluster, nodes: &[usize], label: &str) {
+    for index in nodes {
+        let port = cluster.http_ports[*index];
+        assert_eq!(
+            current_metric(port, "dd_rust_network_mutex_raft_rpc_auth_rejections_total").await,
+            0,
+            "{label}: node {index} rejected at least one authenticated Raft peer RPC"
+        );
+    }
+}
+
 async fn start_round_robin_lb(backends: Vec<u16>) -> TestLb {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -574,6 +588,12 @@ async fn raft_http_followers_proxy_acquire_release_after_quorum_commit() {
             .await
             .expect("leaderz request");
         let parsed: Value = serde_json::from_str(&body).expect("leaderz JSON");
+        assert_eq!(parsed["syncLog"], true, "leaderz body: {parsed:?}");
+        assert_eq!(parsed["syncCommit"], true, "leaderz body: {parsed:?}");
+        assert_eq!(
+            parsed["unsafeDurability"], false,
+            "leaderz body: {parsed:?}"
+        );
         if idx == leader {
             assert_eq!(status, 200, "leader leaderz body: {parsed:?}");
             assert_eq!(parsed["isLeader"], true);
@@ -606,6 +626,18 @@ async fn raft_http_followers_proxy_acquire_release_after_quorum_commit() {
         .await
         .expect("leader progress");
     assert_eq!(progress["isLeader"], true, "progress body: {progress:?}");
+    assert_eq!(progress["syncLog"], true, "progress body: {progress:?}");
+    assert_eq!(progress["syncCommit"], true, "progress body: {progress:?}");
+    assert_eq!(
+        progress["unsafeDurability"], false,
+        "progress body: {progress:?}"
+    );
+    let status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status");
+    assert_eq!(status["syncLog"], true, "status body: {status:?}");
+    assert_eq!(status["syncCommit"], true, "status body: {status:?}");
+    assert_eq!(status["unsafeDurability"], false, "status body: {status:?}");
     assert_eq!(
         progress["peers"].as_array().map(Vec::len),
         Some(3),
@@ -676,6 +708,171 @@ async fn raft_http_followers_proxy_acquire_release_after_quorum_commit() {
     assert_eq!(
         reacquire["acquired"], true,
         "lock should be acquirable after quorum release: {reacquire:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_http_follower_proxy_uses_authenticated_direct_peer_rpc() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let tuning = RaftClusterTuning {
+        peer_token: Some(format!("raft-peer-token-{}", uuid::Uuid::new_v4())),
+        ..RaftClusterTuning::default()
+    };
+    let cluster = start_cluster_with_tuning(3, 3, tuning).await;
+    let leader = wait_for_leader(&cluster).await;
+    let follower = (leader + 1) % 3;
+    let follower_status = http_get_json(cluster.http_ports[follower], "/raft/status")
+        .await
+        .expect("follower status");
+    assert_eq!(
+        follower_status["isLeader"], false,
+        "test target should be a follower before public HTTP write: {follower_status:?}"
+    );
+
+    let key = format!("raft-auth-proxy-key-{}", uuid::Uuid::new_v4());
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[follower],
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "follower acquire response: {acquire:?}");
+    assert_eq!(
+        acquire["acquired"], true,
+        "follower acquire response: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+
+    let (status, release) = http_post_json(
+        cluster.http_ports[follower],
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(status, 200, "follower release response: {release:?}");
+    assert_eq!(
+        release["unlocked"], true,
+        "follower release response: {release:?}"
+    );
+    wait_for_zero_holders_and_waiters(&cluster).await;
+
+    wait_for_metric_at_least(
+        cluster.http_ports[follower],
+        "dd_rust_network_mutex_raft_proxy_requests_forwarded_total",
+        2,
+    )
+    .await;
+    wait_for_metric_at_least(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_proxy_requests_handled_total",
+        2,
+    )
+    .await;
+    assert_no_raft_auth_rejections(
+        &cluster,
+        &[leader],
+        "direct peer proxy should carry raft.peer_token",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_membership_change_uses_authenticated_peer_rpc_for_learner_catchup() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let tuning = RaftClusterTuning {
+        append_entries_max_entries: 2,
+        append_entries_max_bytes: usize::MAX,
+        peer_token: Some(format!("raft-peer-token-{}", uuid::Uuid::new_v4())),
+        ..RaftClusterTuning::default()
+    };
+    let cluster = start_cluster_with_tuning(4, 3, tuning).await;
+    let initial_nodes = vec![0, 1, 2];
+    let leader = wait_for_leader_among(&cluster, &initial_nodes).await;
+
+    for step in 0..4 {
+        let key = format!(
+            "raft-auth-membership-catchup-{step}-{}",
+            uuid::Uuid::new_v4()
+        );
+        let (status, acquire) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/lock",
+            json!({"key": key, "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(status, 200, "pre-membership acquire response: {acquire:?}");
+        assert_eq!(
+            acquire["acquired"], true,
+            "pre-membership acquire response: {acquire:?}"
+        );
+        let lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+        let (status, release) = http_post_json(
+            cluster.http_ports[leader],
+            "/v1/unlock",
+            json!({"key": key, "lockUuid": lock_uuid}),
+        )
+        .await;
+        assert_eq!(status, 200, "pre-membership release response: {release:?}");
+        assert_eq!(
+            release["unlocked"], true,
+            "pre-membership release response: {release:?}"
+        );
+    }
+    let before_new_node_appended = current_metric(
+        cluster.http_ports[3],
+        "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
+    )
+    .await;
+
+    let (status, membership) = http_post_json(
+        cluster.http_ports[leader],
+        "/raft/membership",
+        json!({"peers": cluster.peers.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "authenticated membership change response: {membership:?}"
+    );
+    assert_eq!(membership["clusterSize"].as_u64(), Some(4));
+    assert_eq!(membership["quorumSize"].as_u64(), Some(3));
+
+    let all_nodes = vec![0, 1, 2, 3];
+    let expected_ids = cluster
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_simple_membership(&cluster, &all_nodes, &expected_ids, 4, 3).await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &all_nodes).await;
+    assert!(
+        current_metric(
+            cluster.http_ports[3],
+            "dd_rust_network_mutex_raft_follower_append_appended_entries_total"
+        )
+        .await
+            > before_new_node_appended,
+        "new voter should catch up through authenticated AppendEntries RPCs"
+    );
+    assert_no_raft_auth_rejections(
+        &cluster,
+        &all_nodes,
+        "membership change and learner catch-up should use raft.peer_token",
+    )
+    .await;
+
+    let active_leader = wait_for_leader_among(&cluster, &all_nodes).await;
+    let key = format!("raft-auth-membership-post-{}", uuid::Uuid::new_v4());
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[active_leader],
+        "/v1/lock",
+        json!({"key": key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "post-membership acquire response: {acquire:?}");
+    assert_eq!(
+        acquire["acquired"], true,
+        "post-membership acquire response: {acquire:?}"
     );
 }
 
@@ -1099,6 +1296,8 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
         snapshot_max_log_entries: 3,
         snapshot_max_log_bytes: u64::MAX,
         trailing_log_entries: 0,
+        append_entries_max_entries: 2,
+        append_entries_max_bytes: usize::MAX,
         install_snapshot_chunk_bytes: 128,
         ..RaftClusterTuning::default()
     };
@@ -1169,6 +1368,21 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
         Some(0),
         "bootstrap learner should start without the leader's compacted log: {learner_status:?}"
     );
+    let before_leader_batches = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_batches_total",
+    )
+    .await;
+    let before_leader_sent = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    )
+    .await;
+    let before_learner_appended = current_metric(
+        cluster.http_ports[3],
+        "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
+    )
+    .await;
 
     let (status, staged) = http_post_json(
         cluster.http_ports[leader],
@@ -1199,6 +1413,49 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
     )
     .await;
     wait_for_status_index_at_least(cluster.http_ports[3], "lastApplied", stage_target).await;
+    let after_leader_batches = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_batches_total",
+    )
+    .await;
+    let after_leader_sent = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    )
+    .await;
+    let after_learner_appended = current_metric(
+        cluster.http_ports[3],
+        "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
+    )
+    .await;
+    let learner_snapshot_index = current_metric(
+        cluster.http_ports[3],
+        "dd_rust_network_mutex_raft_latest_snapshot_index",
+    )
+    .await;
+    let appended_delta = after_learner_appended.saturating_sub(before_learner_appended);
+    let sent_delta = after_leader_sent.saturating_sub(before_leader_sent);
+    if learner_snapshot_index < stage_target {
+        let retained_suffix_entries = stage_target.saturating_sub(learner_snapshot_index);
+        let expected_suffix_batches = retained_suffix_entries.saturating_add(1) / 2;
+        assert!(
+            appended_delta >= retained_suffix_entries,
+            "learner should append retained suffix entries after installing snapshot; before={before_learner_appended} after={after_learner_appended} suffix={retained_suffix_entries} snapshot={learner_snapshot_index} target={stage_target}"
+        );
+        assert!(
+            after_leader_batches.saturating_sub(before_leader_batches) >= expected_suffix_batches,
+            "snapshot catch-up should continue with bounded AppendEntries batches for the retained suffix; before={before_leader_batches} after={after_leader_batches} expected_at_least={expected_suffix_batches}"
+        );
+        assert!(
+            sent_delta >= retained_suffix_entries,
+            "leader should send retained suffix entries after InstallSnapshot; before={before_leader_sent} after={after_leader_sent} suffix={retained_suffix_entries}"
+        );
+    } else {
+        assert_eq!(
+            appended_delta, 0,
+            "when the installed snapshot already covers the staging target, learner should not need retained suffix appends"
+        );
+    }
 
     let progress = http_get_json(cluster.http_ports[leader], "/raft/progress")
         .await

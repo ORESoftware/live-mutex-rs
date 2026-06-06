@@ -449,7 +449,14 @@ Implemented:
   quorum short-circuits in
   `dd_rust_network_mutex_raft_replication_cached_quorum_short_circuits_total`,
   and quorum returns before every in-flight peer task drains in
-  `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`; no-target
+  `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`;
+  stable-membership foreground fanout narrowing is counted in
+  `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total`
+  and
+  `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total`,
+  while immediate retry rotation across skipped candidates is counted in
+  `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total`;
+  no-target
   heartbeat/post-commit AppendEntries or snapshot catch-up attempts skipped
   because the peer already has an in-flight pooled RPC are counted in
   `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; no-target
@@ -525,7 +532,13 @@ Implemented:
   `dd_rust_network_mutex_raft_apply_committed_us_total`,
   `dd_rust_network_mutex_raft_client_batch_pending`,
   `dd_rust_network_mutex_raft_client_batch_driver_active`, and
-  `dd_rust_network_mutex_raft_client_response_cache_entries`; queue-full and
+  `dd_rust_network_mutex_raft_client_response_cache_entries`
+  split into pending reservations, replayable completed responses, and
+  applied-without-response outcomes through
+  `dd_rust_network_mutex_raft_client_response_cache_pending_entries`,
+  `dd_rust_network_mutex_raft_client_response_cache_completed_entries`, and
+  `dd_rust_network_mutex_raft_client_response_cache_applied_without_response_entries`;
+  queue-full and
   batch-failure paths log warn-level `lmx::raft` events, commit advancement logs
   debug-level quorum observations, while proxy forwarding and proxy errors log
   debug-level events with request id and leader hint fields; removed-member
@@ -661,6 +674,10 @@ Implemented:
   keeps append-log fsyncs enabled, while `false` is reserved for unsafe
   throughput experiments that accept loss of the latest unsynced log writes
   after a crash,
+- explicit `raft.sync_commit` / `LMX_RAFT_SYNC_COMMIT` durability policy: the
+  default keeps commit-only hard-state slot fsyncs enabled before applying
+  committed entries, while `false` is reserved for unsafe throughput experiments
+  that accept recovery only through the last synced commit slot after a crash,
 - explicit `raft.data_dir_lock` / `LMX_RAFT_DATA_DIR_LOCK` ownership guard:
   the default keeps an advisory `broker-raft.lock` held for the lifetime of a
   live `BrokerRaft`, rejecting a second process or handle that tries to append,
@@ -696,6 +713,10 @@ Implemented:
   the serialized commit lane, so requests that arrived during commit-lane
   contention can share the same append/replicate/commit round up to
   `client_batch_max_entries * client_pipeline_max_batches`,
+- target-index replication under stable membership narrows the first peer
+  fan-out to the remaining votes needed for quorum, including joint-consensus
+  old/new majority needs, and rotates that narrowed candidate set on retries;
+  heartbeat and post-commit fan-out remain broad,
 - bounded leader-local client admission through `client_batch_max_pending`, so a
   stalled quorum rejects before appending new log entries instead of growing the
   pending queue without bound,
@@ -721,8 +742,9 @@ Implemented:
   background replication task or fan-out/join round per log batch,
 - leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
   exposing `currentTerm`, `commitIndex`, `lastApplied`, `isLeaderReady`,
-  `leaderQuorumAgeMs`, and `leaderQuorumTimeoutMs` for convergence and stale
-  leader checks,
+  `leaderQuorumAgeMs`, `leaderQuorumTimeoutMs`, `syncLog`, `syncCommit`, and
+  `unsafeDurability` for convergence, stale leader checks, and unsafe durability
+  setting visibility,
 - conservative local snapshot/compaction for disk control,
 - overdue snapshot cadence is honored opportunistically from the commit/apply
   path as well as the maintenance loop, while retained-suffix settings still
@@ -794,6 +816,9 @@ If the load balancer can prefer the leader, it should use
 `GET /raft/leaderz` as the leader-only health check. That removes the proxy
 hop shown above. Correctness does not depend on leader-aware routing, because
 followers proxy writes and the leader still requires quorum before applying.
+The follower proxy hop dials the configured Raft peer address directly
+(`raft.peers[*].addr` / each pod's `advertise_addr`), not the public load
+balancer, so stale LB routing cannot create a proxy loop.
 An old leader that cannot observe quorum for an election-timeout window steps
 down, causing `/raft/leaderz` to return 503 instead of keeping a partitioned
 leader in the preferred LB target set.
@@ -807,9 +832,12 @@ HTTP callers can reduce duplicate retries by supplying `requestId`,
 identity-bearing HTTP write commands in the replicated log and caches a bounded
 set of responses by request id and request fingerprint. While the first request
 is still queued in the leader batch, duplicate retries observe the in-flight
-reservation instead of appending another command. Once applied, the cache is
-rebuilt during committed-log replay and included in Raft snapshots, so recent
-completed retries can survive restart, compaction, and leadership transfer.
+reservation instead of appending another command; cache trimming preserves
+unapplied reservations even when the completed-response cache is full, and those
+reservations remain bounded by the leader-local pending queue. Once applied, the
+cache is rebuilt during committed-log replay and included in Raft snapshots, so
+recent completed retries can survive restart, compaction, and leadership
+transfer.
 This is still a bounded retry hardening layer, not a full etcd-style
 client-session lease or unbounded exactly-once ledger.
 The raw Raft role is still exposed in status as `isLeader`, while
@@ -923,6 +951,14 @@ requests before appending, and the coalescer wakes early when a batch fills
 instead of always paying the full coalescing delay. The leader-local waiting queue
 is bounded by `client_batch_max_pending`; overflow requests fail before log
 append, so they do not create partially replicated lock operations.
+Stable target writes also limit each quorum attempt to the remaining peer votes
+needed for quorum, including both old and new majorities during joint consensus,
+with retry rotation across the active followers. If a narrowed attempt makes no
+progress but skipped candidates still exist, the quorum wait retries immediately
+through the rotated set before sleeping for the heartbeat delay. That keeps
+non-quorum followers out of the foreground commit path while
+heartbeat/post-commit fanout still catches them up outside the direct client
+wait.
 Cancelled client waiters are pruned from the pending queue before capacity
 checks and from drained batches before append, releasing any unapplied
 idempotency-key reservation and incrementing
@@ -1002,7 +1038,10 @@ uses the same fsync and atomic rename path before the cache is updated.
 Setting `raft.sync_log = false` skips append-log fsyncs and parent-directory
 syncs on append/rewrite paths; it can be useful for isolating disk-sync cost in
 benchmarks, but it weakens crash durability and should not be used for
-etcd/ZooKeeper-style safety claims.
+etcd/ZooKeeper-style safety claims. Setting `raft.sync_commit = false` is a
+separate unsafe benchmark policy for commit-only hard-state slot writes; the
+slot is still written, but not flushed before apply, so crash recovery may only
+advance through the last synced commit slot.
 The data directory should be unique per Raft node. With the default
 `raft.data_dir_lock = true`, startup holds `broker-raft.lock` inside that
 directory and fails early if another live `BrokerRaft` already owns it. This is
@@ -1025,9 +1064,23 @@ Leader-side proxy responses report the current term after the proxied work
 finishes, and follower proxy responses that carry a higher Raft term force the
 forwarding follower to persist a step-down before returning the proxied client
 result, so round-robin LB traffic cannot leave the proxying node with stale term
-state. Follower proxying retries transient stale-leader, leaderless, and
-transport failures until `proxy_retry_budget_ms` expires; terminal
-request-payload errors such as idempotency conflicts are not retried.
+state. Follower proxying retries transient stale-leader, leaderless, direct
+peer-discovery, and transport failures until `proxy_retry_budget_ms` expires;
+terminal request-payload errors such as idempotency conflicts are not retried.
+Forwarding uses Raft peer addresses from membership rather than sending proxied
+requests back through the load balancer; if the follower has no usable leader
+hint, it tries active peers directly until one handles the request as leader or
+the budget expires. A non-leader proxy response can include a structured leader
+hint; the forwarding follower only accepts hints that resolve to configured
+active peers (and when both ID and address are supplied, both must match the
+same peer), then retries that peer immediately instead of walking unrelated peers
+first. Each outbound proxy RPC uses the remaining proxy budget as its timeout,
+so a silent candidate peer cannot extend a follower request beyond that
+configured window. When a candidate leader successfully handles a proxied
+request in the follower's current term, the forwarding follower refreshes only
+its volatile leader hint and election deadline, so later round-robin LB writes
+prefer that same direct peer until a heartbeat, term change, or membership
+change says otherwise.
 Follower/candidate election maintenance sleeps until the current election
 deadline instead of polling the runtime mutex every 20 ms; failed election
 attempts still back off briefly before retrying.
@@ -1117,10 +1170,10 @@ Local loopback benchmark evidence from 2026-06-05, using a leader-preferred
 request: the default `raft.sync_log = true` path completed about 319 successful
 acquire/release cycles/sec with p50 cycle latency near 24.031 ms. Re-running the
 same benchmark with unsafe `raft.sync_log = false` completed about 1,072
-cycles/sec with p50 near 6.832 ms. That gap is expected: the safe path waits for
-leader and follower durable log syncs, while the unsafe path is only useful to
-isolate disk-sync cost and does not make etcd/ZooKeeper-style crash-durability
-claims.
+cycles/sec with p50 near 6.832 ms, with `raft.sync_commit = true` still left on.
+That gap is expected: the safe path waits for leader and follower durable log
+syncs, while the unsafe path is only useful to isolate disk-sync cost and does
+not make etcd/ZooKeeper-style crash-durability claims.
 
 Leader-side `commitIndex` advancement and follower `leaderCommit` advancement
 are persisted before applying committed entries, so a restarted node can replay
@@ -1154,9 +1207,10 @@ syncs for the fixed commit slot and append log. During those runs,
 rise with committed writes, while nonzero write-error or invalid-recovery
 counters point at disk or torn-slot recovery behavior. Nonzero truncation
 counters mean recovery found a sidecar larger than the fixed two-slot file and
-trimmed or attempted to trim it back to the bounded size. A future
-throughput-oriented mode would need an explicit durability contract for
-`commitIndex` persistence rather than silently weakening the safe default path.
+trimmed or attempted to trim it back to the bounded size. Throughput experiments
+can set `raft.sync_commit = false` to skip the remaining commit-slot fsync cost,
+but that mode has the explicit crash-recovery tradeoff described above and does
+not support etcd/ZooKeeper-style safety claims.
 
 ## Membership Change Sequence
 
