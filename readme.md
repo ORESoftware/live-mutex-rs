@@ -161,11 +161,13 @@ for the practical “what does the exposed lock service cost?” comparison. Set
 `BENCH_IO_TIMEOUT_MS` to cap each network operation when an endpoint is missing
 or unhealthy.
 
-For CPU profiles, use `scripts/profile-broker.sh` to launch and profile a
-regular Broker server under the benchmark, and `scripts/profile-raft.sh` for
-the Raft integration-test workload. Both scripts build with the `profiling`
-profile and force frame pointers so `perf`, `sample`, or flamegraph output has
-usable stacks.
+For CPU profiles, use `scripts/profile-broker.sh` to launch and profile either
+a regular Broker server or a local three-node BrokerRaft cluster under the same
+benchmark. Set `PROFILE_TARGET=raft` to profile the ready BrokerRaft leader
+process; the default `PROFILE_TARGET=broker` profiles the regular Broker
+baseline. `scripts/profile-raft.sh` still profiles the Raft integration-test
+workload. Both scripts build with the `profiling` profile and force frame
+pointers so `perf`, `sample`, or flamegraph output has usable stacks.
 BrokerRaft also keeps small nonblocking leader role/term and leader peer hint
 caches for hot forwarding and heartbeat checks; demotion paths clear the role
 cache before slow hard-state writes, and write admission still uses the normal
@@ -305,6 +307,7 @@ If `LMX_AUTH_TOKEN` is set, every HTTP call must include either an
 | `LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES` | `1048576` | Serialized snapshot bytes sent per `InstallSnapshot` RPC chunk.                                  |
 | `LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES` | `134217728` | Max decoded snapshot bytes staged on follower disk for one `InstallSnapshot` transfer.            |
 | `LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS` | `4` | Max concurrent staged `InstallSnapshot` transfers retained on follower disk.                      |
+| `LMX_RAFT_INSTALL_SNAPSHOT_STALE_TRANSFER_MS` | `1800000` | Max idle age for an incomplete staged `InstallSnapshot` transfer before follower cleanup.          |
 | `LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES` | `32` | Max leader-local client requests appended and committed in one Raft write batch.                  |
 | `LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES` | `4` | Max configured client batches drained into one append/replicate/commit cycle under leader load.  |
 | `LMX_RAFT_CLIENT_BATCH_MAX_PENDING` | `8192` | Max leader-local client requests allowed to wait for the Raft write lane before new requests are rejected. |
@@ -516,6 +519,9 @@ election path uses PreVote so a stale or partitioned node has to prove a quorum
 would vote before it increments and persists a new term. Malformed PreVote and
 RequestVote frames with term zero or impossible `lastLogIndex` / `lastLogTerm`
 summaries are rejected before term/vote mutation.
+Startup and reset election deadlines are jittered per node inside the configured
+timeout window, and `/metrics` exposes election deadline, PreVote, and candidate
+win/loss counters for spotting timer churn or split-vote loops.
 The leader also tracks check-quorum heartbeats; if it cannot observe quorum for
 an election-timeout window, it steps down so `/raft/leaderz` stops advertising
 a partitioned leader. Write admission uses the same quorum-fresh readiness check
@@ -528,6 +534,11 @@ followers, newly added voters, and transient staged learners during membership
 changes. Use `POST /raft/learners` to commit non-voting peers into the
 replicated staged-learner set and
 `DELETE /raft/learners` to remove staged learner IDs before promotion.
+`raft.peers` is the active voter set; `raft.node_id` normally appears there,
+but a new node can start outside `raft.peers` as a learner/bootstrap node until
+it is staged and promoted through consensus. Once a node has ever been promoted
+to a voter, BrokerRaft records a local durable marker so a later removal keeps
+rejecting AppendEntries and InstallSnapshot after restart.
 
 If a load balancer sits in front, it can round-robin to all nodes and let
 followers proxy to the leader, or it can prefer the current leader by health
@@ -578,7 +589,10 @@ batch size, and the leader-local pending queue is capped by
 `client_batch_max_pending` so a stalled quorum rejects new admissions before
 they are appended to the log instead of growing memory without bound. Lagging
 peer catch-up retries immediately when a bounded batch or conflict repair moves
-`nextIndex`/`matchIndex`. `/raft/status` exposes `currentTerm`, `commitIndex`,
+`nextIndex`/`matchIndex`, and target-index quorum rounds reuse existing
+`matchIndex` progress for already-caught-up peers instead of sending redundant
+append RPCs before commit/catch-up can finish; cached progress does not refresh
+the check-quorum freshness timestamp. `/raft/status` exposes `currentTerm`, `commitIndex`,
 `lastApplied`, and the leader quorum freshness fields to help spot convergence
 lag or a stale partitioned leader. Post-commit follower wakeups are coalesced
 through one active fan-out worker instead of spawning one background replication
@@ -605,10 +619,10 @@ cannot apply a membership transition. Joint `quorumSize` reporting uses the
 minimum unique ack count that can satisfy both majorities, so progress/status
 output does not understate the ack floor during reconfiguration. After
 promotion, every newly promoted voter must catch up to the final membership log
-index before the membership change returns; learner/new-voter catch-up now runs
-peers concurrently and
-retries each peer immediately after bounded-batch progress instead of sleeping
-for the heartbeat interval between batches. Failed transient membership catch-up
+index before the membership change returns; operator-staged learner,
+transient-learner, and promoted-voter catch-up now run peers concurrently and
+retry each peer immediately after bounded-batch progress instead of sleeping for
+the heartbeat interval between batches. Failed transient membership catch-up
 cleanup preserves any operator-staged learner already recorded on disk and
 removes only learners added for that failed attempt, and `GET /raft/progress`
 exposes staged learner progress.
@@ -651,20 +665,29 @@ compacted/missing `prevLogTerm` and
 suffix coverage gaps; debug-level `lmx::raft` logs include peer, `nextIndex`,
 local tail, snapshot boundary, and target index.
 Leader-side AppendEntries attempt/outcome counters now cover request volume,
-heartbeats, sent entries, accepted successes, conflicts, and RPC errors:
+heartbeats, batches, sent entries, log-entry bytes, wire bytes, accepted
+successes, conflicts, and RPC errors:
 `dd_rust_network_mutex_raft_append_entries_requests_total`,
 `dd_rust_network_mutex_raft_append_entries_heartbeats_total`,
+`dd_rust_network_mutex_raft_append_entries_batches_total`,
 `dd_rust_network_mutex_raft_append_entries_sent_total`,
+`dd_rust_network_mutex_raft_append_entries_log_bytes_total`,
+`dd_rust_network_mutex_raft_append_entries_wire_bytes_total`,
+`dd_rust_network_mutex_raft_append_entries_frame_build_us_total`,
+`dd_rust_network_mutex_raft_append_entries_request_us_total`,
 `dd_rust_network_mutex_raft_append_entries_frame_clamps_total`,
 `dd_rust_network_mutex_raft_append_entries_successes_total`,
 `dd_rust_network_mutex_raft_append_entries_conflicts_total`, and
 `dd_rust_network_mutex_raft_append_entries_rpc_errors_total`. Serialized
 AppendEntries batches that would exceed `LMX_RAFT_MAX_FRAME_BYTES` are shortened
 by exact frame sizing before the socket write and counted in the frame-clamp
-counter.
+counter. Frame-build microseconds measure time spent sizing/building the
+leader-side AppendEntries JSON frame before the peer RPC wait begins; the
+selected frame's serialized bytes are reused for the socket write.
 Malformed follower-side leader RPCs rejected before leader/term mutation expose
-`dd_rust_network_mutex_raft_append_entries_malformed_requests_total` and
-`dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`.
+`dd_rust_network_mutex_raft_append_entries_malformed_requests_total`,
+`dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total`,
+and `dd_rust_network_mutex_raft_install_snapshot_malformed_requests_total`.
 Follower-side sender rejections for unknown, stale, or conflicting leaders are
 counted separately in
 `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
@@ -687,12 +710,35 @@ limit rejections increment
 Concurrent staged transfers are capped by
 `raft.install_snapshot_max_staged_transfers`; rejected transfer starts increment
 `dd_rust_network_mutex_raft_install_snapshot_staged_transfer_limit_rejections_total`.
+Incomplete staged transfers that make no progress for
+`raft.install_snapshot_stale_transfer_ms` are removed before later chunks are
+accepted; stale removals increment
+`dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total` in addition
+to the general cleanup counter.
 Leader quorum-wait counters expose the Raft portion of write latency:
 `dd_rust_network_mutex_raft_replication_quorum_waits_total`,
 `dd_rust_network_mutex_raft_replication_quorum_successes_total`,
 `dd_rust_network_mutex_raft_replication_quorum_timeouts_total`,
 `dd_rust_network_mutex_raft_replication_quorum_leadership_losses_total`, and
-`dd_rust_network_mutex_raft_replication_quorum_wait_ms_total`.
+`dd_rust_network_mutex_raft_replication_quorum_wait_ms_total`. Cached
+target-index progress is split out as
+`dd_rust_network_mutex_raft_replication_cached_progress_acks_total`,
+`dd_rust_network_mutex_raft_replication_cached_quorum_short_circuits_total`, and
+`dd_rust_network_mutex_raft_replication_early_quorum_returns_total` so profiling
+runs can distinguish zero-RPC commits from fanout rounds that returned once a
+quorum had replied. Dynamic membership and staged-learner catch-up expose
+`dd_rust_network_mutex_raft_learner_catchup_attempts_total`,
+`dd_rust_network_mutex_raft_learner_catchup_successes_total`,
+`dd_rust_network_mutex_raft_learner_catchup_timeouts_total`,
+`dd_rust_network_mutex_raft_learner_catchup_leadership_losses_total`,
+`dd_rust_network_mutex_raft_learner_catchup_progress_retries_total`,
+`dd_rust_network_mutex_raft_learner_catchup_sleeps_total`, and
+`dd_rust_network_mutex_raft_learner_catchup_wait_ms_total` for learner or
+promoted-voter stalls.
+Learner bootstrap and removed-local-voter paths expose
+`dd_rust_network_mutex_raft_learner_bootstrap_starts_total`,
+`dd_rust_network_mutex_raft_local_voter_promotions_total`, and
+`dd_rust_network_mutex_raft_local_removed_voter_guard_rejections_total`.
 BrokerRaft request-flow metrics help separate broker work from consensus and
 load-balancer proxy work during perf runs:
 `dd_rust_network_mutex_request_duration_seconds` exposes fixed-route latency
@@ -704,6 +750,11 @@ frame payload sizes for CPU/profiling correlation without labelling on lock
 keys or request ids.
 `dd_rust_network_mutex_raft_client_proposals_total`,
 `dd_rust_network_mutex_raft_client_proposal_quorum_failures_total`,
+`dd_rust_network_mutex_raft_apply_committed_errors_total`,
+`dd_rust_network_mutex_raft_leader_commit_advancements_total`,
+`dd_rust_network_mutex_raft_leader_commit_advanced_entries_total`,
+`dd_rust_network_mutex_raft_post_commit_fanout_rounds_total`,
+`dd_rust_network_mutex_raft_post_commit_fanout_errors_total`,
 `dd_rust_network_mutex_raft_client_queue_full_total`,
 `dd_rust_network_mutex_raft_client_batches_total`,
 `dd_rust_network_mutex_raft_client_batch_entries_total`,
@@ -716,9 +767,10 @@ keys or request ids.
 `dd_rust_network_mutex_raft_proxy_request_errors_total`,
 `dd_rust_network_mutex_raft_client_batch_pending`,
 `dd_rust_network_mutex_raft_client_batch_driver_active`, and
-`dd_rust_network_mutex_raft_client_response_cache_entries`. Queue-full and
-batch-failure paths emit warn-level `lmx::raft` logs; proxy forwarding and
-proxy errors emit debug-level logs with request id and leader hint fields.
+`dd_rust_network_mutex_raft_client_response_cache_entries`. Queue-full,
+batch-failure, and committed-entry apply-failure paths emit warn/error-level
+`lmx::raft` logs; proxy forwarding and proxy errors emit debug-level logs with
+request id and leader hint fields.
 Follower-side `AppendEntries` exposes conflict-response and log-repair counters:
 `dd_rust_network_mutex_raft_follower_append_conflicts_total`,
 `dd_rust_network_mutex_raft_follower_append_rewrites_total`,
@@ -744,6 +796,9 @@ catch-up.
 Leader-side `InstallSnapshot` catch-up exposes
 `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
 `dd_rust_network_mutex_raft_install_snapshot_bytes_total`,
+`dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total`,
+`dd_rust_network_mutex_raft_install_snapshot_frame_build_us_total`,
+`dd_rust_network_mutex_raft_install_snapshot_request_us_total`,
 `dd_rust_network_mutex_raft_install_snapshot_successes_total`,
 `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
 `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
@@ -751,9 +806,11 @@ Leader-side `InstallSnapshot` catch-up exposes
 Configured raw snapshot chunks whose serialized Raft RPC frame would exceed
 `LMX_RAFT_MAX_FRAME_BYTES` after base64/JSON overhead are clamped by exact frame
 sizing and counted in
-`dd_rust_network_mutex_raft_install_snapshot_frame_chunk_clamps_total`. Success
-responses that arrive before the final chunk are ignored for peer progress and
-counted in
+`dd_rust_network_mutex_raft_install_snapshot_frame_chunk_clamps_total`.
+Frame-build microseconds measure time spent sizing/building the leader-side
+snapshot chunk frame before the peer RPC wait begins; the selected chunk's
+serialized bytes are reused for the socket write. Success responses that arrive
+before the final chunk are ignored for peer progress and counted in
 `dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total`.
 Final success responses that underreport the installed snapshot index are also
 ignored for progress and counted in
@@ -791,6 +848,9 @@ upper-bound slice and exposes `dd_rust_network_mutex_raft_log_compactions_total`
 `dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total`,
 `dd_rust_network_mutex_raft_log_trailing_partial_recoveries_total`,
 `dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total`,
+`dd_rust_network_mutex_raft_log_compacted_bytes_total`,
+`dd_rust_network_mutex_raft_log_compaction_us_total`,
+`dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total`,
 `dd_rust_network_mutex_raft_log_retained_entries`,
 `dd_rust_network_mutex_raft_log_bytes`,
 `dd_rust_network_mutex_raft_last_log_index`,
@@ -806,12 +866,19 @@ upper-bound slice and exposes `dd_rust_network_mutex_raft_log_compactions_total`
 rollback failures also emit warn-level `lmx::raft` events with path, entry
 count, target byte length, and sync policy fields. Unbounded full-log read/replace
 helpers are test-only; production replication uses bounded suffix or exact range
-reads. Followers verify the snapshot payload SHA-256 checksum before installing
+reads. Successful compaction emits an info-level `lmx::raft` event with
+snapshot index, compacted entries/bytes, retained entries/bytes, and elapsed
+microseconds. Followers verify the snapshot payload SHA-256 checksum before installing
 it, and stale or invalid staged snapshot parts are removed when later snapshot
 traffic resumes, when offsets mismatch, when validation rejects the staged
 payload, or when a node reopens its Raft data directory; removed staged snapshot
 files sync the parent directory and discarded transfers increment
-`dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`.
+`dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`; stale transfer
+cleanup also increments
+`dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total`; when a
+valid higher-term leader clears staged snapshot files from superseded leaders,
+it also increments
+`dd_rust_network_mutex_raft_snapshot_transfer_superseded_leader_cleanups_total`.
 Restored waiters
 keep their original client ids for later replicated cleanup, but old HTTP
 response channels are not resurrected after restart or snapshot install. Lock

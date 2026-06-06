@@ -100,6 +100,7 @@ struct RaftFileConfig {
     install_snapshot_chunk_bytes: Option<usize>,
     install_snapshot_max_staged_bytes: Option<u64>,
     install_snapshot_max_staged_transfers: Option<usize>,
+    install_snapshot_stale_transfer_ms: Option<u64>,
     client_batch_max_entries: Option<usize>,
     client_pipeline_max_batches: Option<usize>,
     client_batch_max_pending: Option<usize>,
@@ -326,6 +327,11 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
         env_parse("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS")
             .or(file.install_snapshot_max_staged_transfers)
             .unwrap_or(cfg.install_snapshot_max_staged_transfers);
+    cfg.install_snapshot_stale_transfer_after = Duration::from_millis(
+        env_parse("LMX_RAFT_INSTALL_SNAPSHOT_STALE_TRANSFER_MS")
+            .or(file.install_snapshot_stale_transfer_ms)
+            .unwrap_or(cfg.install_snapshot_stale_transfer_after.as_millis() as u64),
+    );
     cfg.client_batch_max_entries = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES")
         .or(file.client_batch_max_entries)
         .unwrap_or(cfg.client_batch_max_entries);
@@ -427,6 +433,7 @@ mod tests {
             install_snapshot_chunk_bytes = 54321
             install_snapshot_max_staged_bytes = 654321
             install_snapshot_max_staged_transfers = 5
+            install_snapshot_stale_transfer_ms = 1234
             client_batch_max_entries = 19
             client_pipeline_max_batches = 3
             client_batch_max_pending = 77
@@ -458,6 +465,10 @@ mod tests {
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
         assert_eq!(raft.install_snapshot_max_staged_bytes, 654321);
         assert_eq!(raft.install_snapshot_max_staged_transfers, 5);
+        assert_eq!(
+            raft.install_snapshot_stale_transfer_after,
+            Duration::from_millis(1234)
+        );
         assert_eq!(raft.client_batch_max_entries, 19);
         assert_eq!(raft.client_pipeline_max_batches, 3);
         assert_eq!(raft.client_batch_max_pending, 77);
