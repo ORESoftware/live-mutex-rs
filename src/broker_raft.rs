@@ -294,6 +294,7 @@ pub struct RaftTelemetrySnapshot {
     pub append_entries_heartbeats_total: u64,
     pub append_entries_sent_total: u64,
     pub append_entries_wire_bytes_total: u64,
+    pub append_entries_request_us_total: u64,
     pub append_entries_frame_clamps_total: u64,
     pub append_entries_successes_total: u64,
     pub append_entries_conflicts_total: u64,
@@ -318,6 +319,7 @@ pub struct RaftTelemetrySnapshot {
     pub install_snapshot_chunks_total: u64,
     pub install_snapshot_bytes_total: u64,
     pub install_snapshot_wire_bytes_total: u64,
+    pub install_snapshot_request_us_total: u64,
     pub install_snapshot_payload_prepares_total: u64,
     pub install_snapshot_payload_prepare_us_total: u64,
     pub install_snapshot_payload_prepare_bytes_total: u64,
@@ -1012,6 +1014,7 @@ struct BrokerRaftTelemetry {
     append_entries_heartbeats_total: AtomicU64,
     append_entries_sent_total: AtomicU64,
     append_entries_wire_bytes_total: AtomicU64,
+    append_entries_request_us_total: AtomicU64,
     append_entries_frame_clamps_total: AtomicU64,
     append_entries_successes_total: AtomicU64,
     append_entries_conflicts_total: AtomicU64,
@@ -1036,6 +1039,7 @@ struct BrokerRaftTelemetry {
     install_snapshot_chunks_total: AtomicU64,
     install_snapshot_bytes_total: AtomicU64,
     install_snapshot_wire_bytes_total: AtomicU64,
+    install_snapshot_request_us_total: AtomicU64,
     install_snapshot_payload_prepares_total: AtomicU64,
     install_snapshot_payload_prepare_us_total: AtomicU64,
     install_snapshot_payload_prepare_bytes_total: AtomicU64,
@@ -2497,6 +2501,10 @@ impl BrokerRaft {
                 .telemetry
                 .append_entries_wire_bytes_total
                 .load(Ordering::Relaxed),
+            append_entries_request_us_total: self
+                .telemetry
+                .append_entries_request_us_total
+                .load(Ordering::Relaxed),
             append_entries_frame_clamps_total: self
                 .telemetry
                 .append_entries_frame_clamps_total
@@ -2592,6 +2600,10 @@ impl BrokerRaft {
             install_snapshot_wire_bytes_total: self
                 .telemetry
                 .install_snapshot_wire_bytes_total
+                .load(Ordering::Relaxed),
+            install_snapshot_request_us_total: self
+                .telemetry
+                .install_snapshot_request_us_total
                 .load(Ordering::Relaxed),
             install_snapshot_payload_prepares_total: self
                 .telemetry
@@ -2908,6 +2920,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total Serialized InstallSnapshot request frame bytes attempted by the leader, excluding the trailing newline delimiter.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_request_us_total Cumulative microseconds spent awaiting leader-side InstallSnapshot chunk RPC attempts.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_request_us_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_request_us_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total Leader-side snapshot payload preparations for InstallSnapshot fan-out rounds.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total {}\n",
@@ -2997,6 +3012,7 @@ impl BrokerRaft {
             snapshot.install_snapshot_chunks_total,
             snapshot.install_snapshot_bytes_total,
             snapshot.install_snapshot_wire_bytes_total,
+            snapshot.install_snapshot_request_us_total,
             snapshot.install_snapshot_payload_prepares_total,
             snapshot.install_snapshot_payload_prepare_us_total,
             snapshot.install_snapshot_payload_prepare_bytes_total,
@@ -3067,6 +3083,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_entries_wire_bytes_total Serialized AppendEntries request frame bytes attempted by the leader, excluding the trailing newline delimiter.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_entries_wire_bytes_total counter\n",
                 "dd_rust_network_mutex_raft_append_entries_wire_bytes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_append_entries_request_us_total Cumulative microseconds spent awaiting leader-side AppendEntries RPC attempts.\n",
+                "# TYPE dd_rust_network_mutex_raft_append_entries_request_us_total counter\n",
+                "dd_rust_network_mutex_raft_append_entries_request_us_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_append_entries_frame_clamps_total Leader-side AppendEntries batches shortened because the serialized RPC frame would exceed the Raft RPC frame cap.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_entries_frame_clamps_total counter\n",
                 "dd_rust_network_mutex_raft_append_entries_frame_clamps_total {}\n",
@@ -3210,6 +3229,7 @@ impl BrokerRaft {
             snapshot.append_entries_heartbeats_total,
             snapshot.append_entries_sent_total,
             snapshot.append_entries_wire_bytes_total,
+            snapshot.append_entries_request_us_total,
             snapshot.append_entries_frame_clamps_total,
             snapshot.append_entries_successes_total,
             snapshot.append_entries_conflicts_total,
@@ -7163,7 +7183,13 @@ impl BrokerRaft {
             .election_timeout_min
             .max(self.config.heartbeat_interval.saturating_mul(2))
             .max(Duration::from_millis(250));
-        match self.send_rpc_to_peer(&peer, frame.rpc, timeout).await {
+        let request_started = Instant::now();
+        let response = self.send_rpc_to_peer(&peer, frame.rpc, timeout).await;
+        self.telemetry.append_entries_request_us_total.fetch_add(
+            duration_us_u64(request_started.elapsed()),
+            Ordering::Relaxed,
+        );
+        match response {
             Ok(RaftRpcResponse::AppendEntries {
                 term: peer_term,
                 success,
@@ -7617,7 +7643,13 @@ impl BrokerRaft {
             self.telemetry
                 .install_snapshot_wire_bytes_total
                 .fetch_add(chunk.frame_len as u64, Ordering::Relaxed);
-            match self.send_rpc_to_peer(&peer, chunk.rpc, timeout).await {
+            let request_started = Instant::now();
+            let response = self.send_rpc_to_peer(&peer, chunk.rpc, timeout).await;
+            self.telemetry.install_snapshot_request_us_total.fetch_add(
+                duration_us_u64(request_started.elapsed()),
+                Ordering::Relaxed,
+            );
+            match response {
                 Ok(RaftRpcResponse::InstallSnapshot {
                     term: peer_term,
                     success,
@@ -9170,6 +9202,11 @@ fn unix_ms() -> u64 {
 fn duration_ms_u64(duration: Duration) -> u64 {
     crate::routine_id!("ddl-routine-broker-raft-duration-ms-u64-1");
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_us_u64(duration: Duration) -> u64 {
+    crate::routine_id!("ddl-routine-broker-raft-duration-us-u64-1");
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
 fn peer_rpc_auth_token(rpc: &RaftRpc) -> Option<&str> {
@@ -16895,6 +16932,7 @@ mod tests {
         assert_eq!(telemetry.append_entries_requests_total, 1);
         assert_eq!(telemetry.append_entries_sent_total, 2);
         assert!(telemetry.append_entries_wire_bytes_total > 0);
+        assert!(telemetry.append_entries_request_us_total > 0);
         assert_eq!(telemetry.append_entries_heartbeats_total, 0);
         assert_eq!(telemetry.append_entries_successes_total, 1);
         assert_eq!(telemetry.append_progress_updates_total, 1);
@@ -16904,6 +16942,10 @@ mod tests {
         assert!(metrics.contains(&format!(
             "dd_rust_network_mutex_raft_append_entries_wire_bytes_total {}",
             telemetry.append_entries_wire_bytes_total
+        )));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_append_entries_request_us_total {}",
+            telemetry.append_entries_request_us_total
         )));
         assert!(metrics.contains("dd_rust_network_mutex_raft_append_entries_successes_total 1"));
         server.await.expect("fake peer server");
@@ -22197,6 +22239,7 @@ mod tests {
             expected_bytes.len() as u64
         );
         assert!(telemetry.install_snapshot_wire_bytes_total > expected_bytes.len() as u64);
+        assert!(telemetry.install_snapshot_request_us_total > 0);
         assert_eq!(telemetry.install_snapshot_progress_updates_total, 1);
         assert_eq!(telemetry.install_snapshot_frame_chunk_clamps_total, 0);
         let metrics = raft.raft_metrics_text();
@@ -22210,6 +22253,10 @@ mod tests {
         assert!(metrics.contains(&format!(
             "dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total {}",
             telemetry.install_snapshot_wire_bytes_total
+        )));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_install_snapshot_request_us_total {}",
+            telemetry.install_snapshot_request_us_total
         )));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_install_snapshot_progress_updates_total 1"));

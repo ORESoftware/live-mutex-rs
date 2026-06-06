@@ -192,12 +192,15 @@ Implemented:
   `dd_rust_network_mutex_raft_append_entries_heartbeats_total`,
   `dd_rust_network_mutex_raft_append_entries_sent_total`,
   `dd_rust_network_mutex_raft_append_entries_wire_bytes_total`,
+  `dd_rust_network_mutex_raft_append_entries_request_us_total`,
   `dd_rust_network_mutex_raft_append_entries_frame_clamps_total`,
   `dd_rust_network_mutex_raft_append_entries_successes_total`,
   `dd_rust_network_mutex_raft_append_entries_conflicts_total`, and
-  `dd_rust_network_mutex_raft_append_entries_rpc_errors_total`; serialized
-  batches that would exceed the Raft RPC frame cap are shortened by exact frame
-  sizing before the socket write and counted in the frame-clamp counter,
+  `dd_rust_network_mutex_raft_append_entries_rpc_errors_total`;
+  request microseconds measure cumulative time awaiting leader-side append RPC
+  attempts, while serialized batches that would exceed the Raft RPC frame cap
+  are shortened by exact frame sizing before the socket write and counted in the
+  frame-clamp counter,
 - follower-side malformed leader-RPC counters for frames rejected before
   leader/term mutation:
   `dd_rust_network_mutex_raft_append_entries_malformed_requests_total` and
@@ -271,6 +274,7 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_chunks_total`,
   `dd_rust_network_mutex_raft_install_snapshot_bytes_total`,
   `dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_request_us_total`,
   `dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total`,
   `dd_rust_network_mutex_raft_install_snapshot_payload_prepare_us_total`,
   `dd_rust_network_mutex_raft_install_snapshot_payload_prepare_bytes_total`,
@@ -278,6 +282,8 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
   `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`;
+  request microseconds measure cumulative time awaiting leader-side snapshot
+  chunk RPC attempts;
   configured raw snapshot chunks whose serialized Raft RPC frame would exceed
   the frame cap after base64/JSON overhead are clamped by exact frame sizing and
   counted in
