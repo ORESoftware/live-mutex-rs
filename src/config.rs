@@ -97,6 +97,7 @@ struct RaftFileConfig {
     trailing_log_entries: Option<u64>,
     append_entries_max_entries: Option<usize>,
     append_entries_max_bytes: Option<usize>,
+    append_entries_max_inline_batches: Option<usize>,
     install_snapshot_chunk_bytes: Option<usize>,
     install_snapshot_max_staged_bytes: Option<u64>,
     install_snapshot_max_staged_transfers: Option<usize>,
@@ -317,6 +318,9 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.append_entries_max_bytes = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES")
         .or(file.append_entries_max_bytes)
         .unwrap_or(cfg.append_entries_max_bytes);
+    cfg.append_entries_max_inline_batches = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_INLINE_BATCHES")
+        .or(file.append_entries_max_inline_batches)
+        .unwrap_or(cfg.append_entries_max_inline_batches);
     cfg.install_snapshot_chunk_bytes = env_parse("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES")
         .or(file.install_snapshot_chunk_bytes)
         .unwrap_or(cfg.install_snapshot_chunk_bytes);
@@ -430,6 +434,7 @@ mod tests {
             node_id = "node-1"
             append_entries_max_entries = 17
             append_entries_max_bytes = 12345
+            append_entries_max_inline_batches = 9
             install_snapshot_chunk_bytes = 54321
             install_snapshot_max_staged_bytes = 654321
             install_snapshot_max_staged_transfers = 5
@@ -462,6 +467,7 @@ mod tests {
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 17);
         assert_eq!(raft.append_entries_max_bytes, 12345);
+        assert_eq!(raft.append_entries_max_inline_batches, 9);
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
         assert_eq!(raft.install_snapshot_max_staged_bytes, 654321);
         assert_eq!(raft.install_snapshot_max_staged_transfers, 5);
@@ -533,6 +539,7 @@ mod tests {
         assert_eq!(cfg.raft.trailing_log_entries, Some(10_000));
         assert_eq!(cfg.raft.append_entries_max_entries, Some(256));
         assert_eq!(cfg.raft.append_entries_max_bytes, Some(1_048_576));
+        assert_eq!(cfg.raft.append_entries_max_inline_batches, Some(64));
         assert_eq!(cfg.raft.install_snapshot_chunk_bytes, Some(1_048_576));
         assert_eq!(
             cfg.raft.install_snapshot_max_staged_bytes,
@@ -561,6 +568,7 @@ mod tests {
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 256);
         assert_eq!(raft.append_entries_max_bytes, 1_048_576);
+        assert_eq!(raft.append_entries_max_inline_batches, 64);
         assert_eq!(raft.install_snapshot_chunk_bytes, 1_048_576);
         assert_eq!(raft.client_batch_max_entries, 32);
         assert_eq!(raft.client_pipeline_max_batches, 4);

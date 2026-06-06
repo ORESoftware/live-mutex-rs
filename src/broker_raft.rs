@@ -44,6 +44,7 @@ const SNAPSHOT_PART_FILE_SUFFIX: &str = ".json.part";
 const DEFAULT_RAFT_RPC_MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_APPEND_ENTRIES_MAX_ENTRIES: usize = 256;
 const DEFAULT_APPEND_ENTRIES_MAX_BYTES: usize = 1024 * 1024;
+const DEFAULT_APPEND_ENTRIES_MAX_INLINE_BATCHES: usize = 64;
 const DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES: u64 = 128 * 1024 * 1024;
 const DEFAULT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS: usize = 4;
@@ -58,6 +59,17 @@ const APPEND_ENTRIES_BLOCKING_FRAME_BUILD_ENTRIES: usize = 64;
 const INSTALL_SNAPSHOT_BLOCKING_FRAME_BUILD_BYTES: usize = 256 * 1024;
 const APPLY_COMMITTED_CHUNK_ENTRIES: u64 = 1024;
 const RAFT_CONTEXT_VALIDATION_CHUNK_ENTRIES: u64 = 1024;
+/// Maximum number of *distinct* keys allowed in a public BrokerRaft composite
+/// (multi-key) lock/unlock request. Deliberately capped below the protocol-wide
+/// [`MAX_COMPOSITE_KEYS`] so the per-log-index fencing-token reservation in
+/// [`deterministic_fencing_seed`] (`index * (MAX_COMPOSITE_KEYS + 1)`) always
+/// covers every member key without colliding with the next index's seed. The
+/// inner [`Broker`] still permits up to `MAX_COMPOSITE_KEYS`; this bound only
+/// governs what the replicated front door admits.
+const RAFT_MAX_COMPOSITE_KEYS: usize = 3;
+// Compile-time guarantee that the Raft admission cap never exceeds the token
+// reservation width the inner broker / fencing seed formula are sized for.
+const _: () = assert!(RAFT_MAX_COMPOSITE_KEYS <= MAX_COMPOSITE_KEYS);
 const RAFT_FENCING_TOKEN_BASE: u64 = 4_000_000_000_000_000;
 const RAFT_CLIENT_ID_PREFIX_SHIFT: u64 = 48;
 const RAFT_CLIENT_ID_SEQUENCE_MASK: u64 = (1_u64 << RAFT_CLIENT_ID_PREFIX_SHIFT) - 1;
@@ -95,6 +107,11 @@ pub struct BrokerRaftConfig {
     /// batch. The first entry is still sent even if it exceeds this budget so
     /// progress cannot stall on one large command.
     pub append_entries_max_bytes: usize,
+    /// Max bounded `AppendEntries` batches a target-index replication task can
+    /// send sequentially to one peer before yielding back to the outer quorum
+    /// loop. This preserves per-peer ordering while avoiding one fan-out/join
+    /// round per batch for lagging followers.
+    pub append_entries_max_inline_batches: usize,
     /// Serialized snapshot payload bytes per `InstallSnapshot` chunk. Base64
     /// encoding makes the wire frame larger than this raw byte budget.
     pub install_snapshot_chunk_bytes: usize,
@@ -154,6 +171,7 @@ impl Default for BrokerRaftConfig {
             trailing_log_entries: 10_000,
             append_entries_max_entries: DEFAULT_APPEND_ENTRIES_MAX_ENTRIES,
             append_entries_max_bytes: DEFAULT_APPEND_ENTRIES_MAX_BYTES,
+            append_entries_max_inline_batches: DEFAULT_APPEND_ENTRIES_MAX_INLINE_BATCHES,
             install_snapshot_chunk_bytes: DEFAULT_INSTALL_SNAPSHOT_CHUNK_BYTES,
             install_snapshot_max_staged_bytes: DEFAULT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES,
             install_snapshot_max_staged_transfers: DEFAULT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS,
@@ -247,6 +265,11 @@ impl BrokerRaftConfig {
         if self.append_entries_max_bytes == 0 {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.append_entries_max_bytes must be greater than 0".into(),
+            ));
+        }
+        if self.append_entries_max_inline_batches == 0 {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.append_entries_max_inline_batches must be greater than 0".into(),
             ));
         }
         if self.install_snapshot_chunk_bytes == 0 {
@@ -470,6 +493,9 @@ pub struct RaftTelemetrySnapshot {
     pub replication_cached_quorum_short_circuits_total: u64,
     pub replication_early_quorum_returns_total: u64,
     pub replication_busy_peer_skips_total: u64,
+    pub target_replication_inline_progress_rounds_total: u64,
+    pub target_replication_inline_successes_total: u64,
+    pub target_replication_inline_yields_total: u64,
     pub replication_quorum_waits_total: u64,
     pub replication_quorum_attempts_total: u64,
     pub replication_quorum_progress_retries_total: u64,
@@ -1590,6 +1616,7 @@ struct RaftPeerProgress {
 struct RaftPeerReplicationOutcome {
     contacted: bool,
     target_reached: bool,
+    progress_changed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1838,6 +1865,9 @@ struct BrokerRaftTelemetry {
     replication_cached_quorum_short_circuits_total: AtomicU64,
     replication_early_quorum_returns_total: AtomicU64,
     replication_busy_peer_skips_total: AtomicU64,
+    target_replication_inline_progress_rounds_total: AtomicU64,
+    target_replication_inline_successes_total: AtomicU64,
+    target_replication_inline_yields_total: AtomicU64,
     replication_quorum_waits_total: AtomicU64,
     replication_quorum_attempts_total: AtomicU64,
     replication_quorum_progress_retries_total: AtomicU64,
@@ -4332,6 +4362,18 @@ impl BrokerRaft {
                 .telemetry
                 .replication_busy_peer_skips_total
                 .load(Ordering::Relaxed),
+            target_replication_inline_progress_rounds_total: self
+                .telemetry
+                .target_replication_inline_progress_rounds_total
+                .load(Ordering::Relaxed),
+            target_replication_inline_successes_total: self
+                .telemetry
+                .target_replication_inline_successes_total
+                .load(Ordering::Relaxed),
+            target_replication_inline_yields_total: self
+                .telemetry
+                .target_replication_inline_yields_total
+                .load(Ordering::Relaxed),
             replication_quorum_waits_total: self
                 .telemetry
                 .replication_quorum_waits_total
@@ -4885,6 +4927,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total InstallSnapshot success responses ignored because they arrived before the leader sent the final snapshot chunk.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_invalid_rejection_responses_total InstallSnapshot rejection responses whose reported installed index contradicted the sent snapshot boundary.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_invalid_rejection_responses_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_invalid_rejection_responses_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total InstallSnapshot success responses rejected because the final ack reported an installed index below the sent snapshot boundary.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total {}\n",
@@ -4915,6 +4960,15 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_replication_busy_peer_skips_total No-target heartbeat, post-commit, or snapshot replication attempts skipped because that peer already had an in-flight RPC on the pooled connection.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_busy_peer_skips_total counter\n",
                 "dd_rust_network_mutex_raft_replication_busy_peer_skips_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total Target-index peer replication rounds that advanced or repaired peer progress inside the bounded inline catch-up loop.\n",
+                "# TYPE dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total counter\n",
+                "dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_target_replication_inline_successes_total Target-index peer replication loops that reached the requested log index inside the bounded inline catch-up loop.\n",
+                "# TYPE dd_rust_network_mutex_raft_target_replication_inline_successes_total counter\n",
+                "dd_rust_network_mutex_raft_target_replication_inline_successes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_target_replication_inline_yields_total Target-index peer replication loops that made progress but yielded after reaching raft.append_entries_max_inline_batches before the requested log index.\n",
+                "# TYPE dd_rust_network_mutex_raft_target_replication_inline_yields_total counter\n",
+                "dd_rust_network_mutex_raft_target_replication_inline_yields_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_replication_quorum_waits_total Leader write replication quorum wait loops entered.\n",
                 "# TYPE dd_rust_network_mutex_raft_replication_quorum_waits_total counter\n",
                 "dd_rust_network_mutex_raft_replication_quorum_waits_total {}\n",
@@ -5080,6 +5134,7 @@ impl BrokerRaft {
             snapshot.install_snapshot_rejections_total,
             snapshot.install_snapshot_rpc_errors_total,
             snapshot.install_snapshot_premature_success_responses_total,
+            snapshot.install_snapshot_invalid_rejection_responses_total,
             snapshot.install_snapshot_invalid_success_responses_total,
             snapshot.install_snapshot_capped_success_responses_total,
             snapshot.install_snapshot_stale_term_responses_total,
@@ -5090,6 +5145,9 @@ impl BrokerRaft {
             snapshot.replication_cached_quorum_short_circuits_total,
             snapshot.replication_early_quorum_returns_total,
             snapshot.replication_busy_peer_skips_total,
+            snapshot.target_replication_inline_progress_rounds_total,
+            snapshot.target_replication_inline_successes_total,
+            snapshot.target_replication_inline_yields_total,
             snapshot.replication_quorum_waits_total,
             snapshot.replication_quorum_attempts_total,
             snapshot.replication_quorum_progress_retries_total,
@@ -5525,6 +5583,7 @@ impl BrokerRaft {
         let (result_tx, result_rx) = oneshot::channel();
         let (start_driver, notify_full_batch) = {
             let mut state = self.client_request_batch.lock();
+            self.prune_cancelled_client_request_queue_locked(&mut state.pending);
             let max_pending = self.config.client_batch_max_pending.max(1);
             if state.pending.len() >= max_pending {
                 self.telemetry
@@ -5584,7 +5643,11 @@ impl BrokerRaft {
     async fn drive_client_request_batches(&self) {
         crate::routine_id!("ddl-routine-broker-raft-drive-client-batches-1");
         loop {
-            let pending_len = self.client_request_batch.lock().pending.len();
+            let pending_len = {
+                let mut state = self.client_request_batch.lock();
+                self.prune_cancelled_client_request_queue_locked(&mut state.pending);
+                state.pending.len()
+            };
             let max_entries = self.config.client_batch_max_entries.max(1);
             if pending_len > 0
                 && pending_len < max_entries
@@ -5593,7 +5656,11 @@ impl BrokerRaft {
             {
                 let notified = self.client_batch_notify.notified();
                 tokio::pin!(notified);
-                let pending_len = self.client_request_batch.lock().pending.len();
+                let pending_len = {
+                    let mut state = self.client_request_batch.lock();
+                    self.prune_cancelled_client_request_queue_locked(&mut state.pending);
+                    state.pending.len()
+                };
                 if pending_len > 0 && pending_len < max_entries {
                     #[cfg(test)]
                     self.client_batch_waiting.notify_waiters();
@@ -5726,6 +5793,7 @@ impl BrokerRaft {
     fn take_client_request_pipeline(&self) -> Vec<PendingClientRequest> {
         crate::routine_id!("ddl-routine-broker-raft-take-client-pipeline-1");
         let mut state = self.client_request_batch.lock();
+        self.prune_cancelled_client_request_queue_locked(&mut state.pending);
         let max_entries = self.config.client_batch_max_entries.max(1);
         let max_batches = self.config.client_pipeline_max_batches.max(1);
         let take = state
@@ -5739,6 +5807,40 @@ impl BrokerRaft {
             }
         }
         batch
+    }
+
+    fn prune_cancelled_client_request_queue_locked(
+        &self,
+        pending_queue: &mut VecDeque<PendingClientRequest>,
+    ) -> usize {
+        crate::routine_id!("ddl-routine-broker-raft-prune-cancelled-client-queue-1");
+        let mut pruned = 0usize;
+        pending_queue.retain(|pending| {
+            if pending.result_tx.is_closed() {
+                if let (Some(request_id), Some(request_fingerprint)) = (
+                    pending.request_id.as_deref(),
+                    pending.request_fingerprint.as_deref(),
+                ) {
+                    self.release_unapplied_client_request_id(request_id, request_fingerprint);
+                }
+                pruned = pruned.saturating_add(1);
+                false
+            } else {
+                true
+            }
+        });
+        if pruned > 0 {
+            self.telemetry
+                .client_batch_cancelled_requests_total
+                .fetch_add(pruned as u64, Ordering::Relaxed);
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                pruned_requests = pruned,
+                "raft pruned cancelled client requests from leader-local queue",
+            );
+        }
+        pruned
     }
 
     fn prune_cancelled_client_request_pipeline(
@@ -9191,13 +9293,7 @@ impl BrokerRaft {
 
     async fn maintenance_loop(&self) {
         crate::routine_id!("ddl-routine-broker-raft-maintenance-loop-1");
-        // Run on a tick that is at most half the stale-transfer window so that
-        // abandoned InstallSnapshot part files are swept even when no new
-        // snapshot chunks ever arrive.  Compaction gates itself internally on
-        // snapshot_interval, so calling it on every tick is safe.
-        let tick = (self.config.install_snapshot_stale_transfer_after / 2)
-            .min(self.config.snapshot_interval)
-            .max(Duration::from_secs(1));
+        let tick = Self::maintenance_tick_interval(&self.config);
         loop {
             tokio::time::sleep(tick).await;
             self.cleanup_stale_snapshot_transfers(unix_ms());
@@ -9210,6 +9306,16 @@ impl BrokerRaft {
                 );
             }
         }
+    }
+
+    fn maintenance_tick_interval(config: &BrokerRaftConfig) -> Duration {
+        // Run on a tick that is at most half the stale-transfer window so that
+        // abandoned InstallSnapshot part files are swept even when no new
+        // snapshot chunks ever arrive. Compaction gates itself internally on
+        // snapshot_interval, so calling it on every tick is safe.
+        (config.install_snapshot_stale_transfer_after / 2)
+            .min(config.snapshot_interval)
+            .max(Duration::from_secs(1))
     }
 
     async fn start_election(&self) -> Result<(), BrokerRaftError> {
@@ -10340,6 +10446,85 @@ impl BrokerRaft {
         target_index: Option<u64>,
         snapshot_source: Arc<SharedInstallSnapshotSource>,
     ) -> Result<RaftPeerReplicationOutcome, BrokerRaftError> {
+        let Some(target) = target_index else {
+            return self
+                .replicate_one_batch_to_peer_with_snapshot_source(
+                    peer,
+                    term,
+                    leader_commit,
+                    target_index,
+                    snapshot_source,
+                )
+                .await;
+        };
+
+        let max_inline_batches = self.config.append_entries_max_inline_batches.max(1);
+        let mut contacted = false;
+        for inline_round in 0..max_inline_batches {
+            let outcome = self
+                .replicate_one_batch_to_peer_with_snapshot_source(
+                    peer.clone(),
+                    term,
+                    leader_commit,
+                    Some(target),
+                    Arc::clone(&snapshot_source),
+                )
+                .await?;
+            contacted |= outcome.contacted;
+            if outcome.progress_changed {
+                self.telemetry
+                    .target_replication_inline_progress_rounds_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if outcome.target_reached {
+                self.telemetry
+                    .target_replication_inline_successes_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(RaftPeerReplicationOutcome {
+                    contacted,
+                    target_reached: true,
+                    progress_changed: outcome.progress_changed,
+                });
+            }
+            if !outcome.contacted || !outcome.progress_changed || !self.is_leader_in_term(term) {
+                return Ok(RaftPeerReplicationOutcome {
+                    contacted,
+                    target_reached: false,
+                    progress_changed: outcome.progress_changed,
+                });
+            }
+            if inline_round + 1 < max_inline_batches {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        debug!(
+            target: "lmx::raft",
+            node_id = %self.config.node_id,
+            peer = %peer.id,
+            term,
+            target_index = target,
+            max_inline_batches,
+            "raft target replication yielded after bounded inline AppendEntries catch-up",
+        );
+        self.telemetry
+            .target_replication_inline_yields_total
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(RaftPeerReplicationOutcome {
+            contacted,
+            target_reached: false,
+            progress_changed: true,
+        })
+    }
+
+    async fn replicate_one_batch_to_peer_with_snapshot_source(
+        &self,
+        peer: RaftPeerConfig,
+        term: u64,
+        leader_commit: u64,
+        target_index: Option<u64>,
+        snapshot_source: Arc<SharedInstallSnapshotSource>,
+    ) -> Result<RaftPeerReplicationOutcome, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-peer-1");
         let local_last_index = self.log.last_index();
         let max_next_index = local_last_index.saturating_add(1).max(1);
@@ -10711,6 +10896,7 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     let acknowledged_match_index = match_index.min(sent_match_index);
@@ -10735,6 +10921,7 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     self.telemetry
@@ -10767,7 +10954,8 @@ impl BrokerRaft {
                     progress.next_index = progress
                         .next_index
                         .max(progress.match_index.saturating_add(1));
-                    if *progress != before {
+                    let progress_changed = *progress != before;
+                    if progress_changed {
                         self.note_leader_progress_changed();
                         self.telemetry
                             .append_progress_updates_total
@@ -10790,6 +10978,7 @@ impl BrokerRaft {
                         contacted: true,
                         target_reached: target_index
                             .is_none_or(|target| progress.match_index >= target),
+                        progress_changed,
                     })
                 } else {
                     let mut runtime = self.runtime.lock();
@@ -10812,6 +11001,7 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     if conflict_index.is_none() && conflict_term.is_none() {
@@ -10832,12 +11022,14 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     if let Some(reason) = invalid_append_conflict_hint_reason(
                         conflict_term,
                         conflict_index,
                         next_index,
+                        peer_term,
                     ) {
                         self.telemetry
                             .append_entries_rpc_errors_total
@@ -10862,6 +11054,7 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     self.telemetry
@@ -10887,6 +11080,7 @@ impl BrokerRaft {
                             return Ok(RaftPeerReplicationOutcome {
                                 contacted: true,
                                 target_reached: false,
+                                progress_changed: false,
                             });
                         }
                     }
@@ -10911,7 +11105,8 @@ impl BrokerRaft {
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     progress.next_index = clamped_next_index;
-                    if *progress != before {
+                    let progress_changed = *progress != before;
+                    if progress_changed {
                         self.note_leader_progress_changed();
                         self.telemetry
                             .append_progress_updates_total
@@ -10946,6 +11141,7 @@ impl BrokerRaft {
                     Ok(RaftPeerReplicationOutcome {
                         contacted: true,
                         target_reached: false,
+                        progress_changed,
                     })
                 }
             }
@@ -11372,16 +11568,48 @@ impl BrokerRaft {
                             return Ok(RaftPeerReplicationOutcome {
                                 contacted: true,
                                 target_reached: false,
+                                progress_changed: false,
                             });
                         }
                     }
                     if !success {
+                        if let Some(reason) = invalid_install_snapshot_rejection_reason(
+                            installed_index,
+                            last_included_index,
+                        ) {
+                            self.telemetry
+                                .install_snapshot_rpc_errors_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            self.telemetry
+                                .install_snapshot_invalid_rejection_responses_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                target: "lmx::raft",
+                                node_id = %self.config.node_id,
+                                peer = %peer.id,
+                                term,
+                                snapshot_index = last_included_index,
+                                reported_installed_index = installed_index,
+                                offset,
+                                chunk_len = chunk.raw_len,
+                                done = chunk.done,
+                                target_index = ?target_index,
+                                reason,
+                                "raft ignored install-snapshot rejection with invalid installed index",
+                            );
+                            return Ok(RaftPeerReplicationOutcome {
+                                contacted: true,
+                                target_reached: false,
+                                progress_changed: false,
+                            });
+                        }
                         self.telemetry
                             .install_snapshot_rejections_total
                             .fetch_add(1, Ordering::Relaxed);
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                     if !chunk.done && installed_index >= last_included_index {
@@ -11422,6 +11650,7 @@ impl BrokerRaft {
                             return Ok(RaftPeerReplicationOutcome {
                                 contacted: true,
                                 target_reached: false,
+                                progress_changed: false,
                             });
                         }
                         self.telemetry
@@ -11453,7 +11682,8 @@ impl BrokerRaft {
                         progress.next_index = progress
                             .next_index
                             .max(progress.match_index.saturating_add(1));
-                        if *progress != before {
+                        let progress_changed = *progress != before;
+                        if progress_changed {
                             self.note_leader_progress_changed();
                             self.telemetry
                                 .install_snapshot_progress_updates_total
@@ -11475,6 +11705,7 @@ impl BrokerRaft {
                             contacted: true,
                             target_reached: target_index
                                 .is_none_or(|target| progress.match_index >= target),
+                            progress_changed,
                         });
                     }
                     if chunk.done {
@@ -11495,6 +11726,7 @@ impl BrokerRaft {
                         return Ok(RaftPeerReplicationOutcome {
                             contacted: true,
                             target_reached: false,
+                            progress_changed: false,
                         });
                     }
                 }
@@ -14848,18 +15080,41 @@ fn request_for_ephemeral_wait(mut request: Request, wait: Duration, is_acquire: 
 fn ensure_supported_raft_client_request(request: &Request) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-supported-client-request-1");
     match request {
-        Request::Lock { keys: Some(_), .. } => {
-            Err(BrokerRaftError::UnsupportedClientRequest(
-                "BrokerRaft supports single-key lock requests only; use `key` or the regular Broker for multi-key/composite locking".into(),
-            ))
-        }
-        Request::Unlock { keys: Some(_), .. } => {
-            Err(BrokerRaftError::UnsupportedClientRequest(
-                "BrokerRaft supports single-key unlock requests only; use `key` or the regular Broker for multi-key/composite locking".into(),
-            ))
-        }
+        Request::Lock {
+            keys: Some(keys), ..
+        } => ensure_supported_raft_composite_keys(keys, "lock"),
+        Request::Unlock {
+            keys: Some(keys), ..
+        } => ensure_supported_raft_composite_keys(keys, "unlock"),
         _ => Ok(()),
     }
+}
+
+/// Validate a public composite (`keys`) lock/unlock request before it is allowed
+/// to reach batching or the replicated log. Composite locking is replicated
+/// deterministically (every replica applies the same sorted member order, the
+/// same [`deterministic_lock_uuid`], and the same per-key fencing tokens derived
+/// from [`deterministic_fencing_seed`]), but admission is bounded to
+/// [`RAFT_MAX_COMPOSITE_KEYS`] distinct keys so the token reservation per log
+/// index can never overlap the next index's seed. Distinct count mirrors the
+/// inner broker, which sorts and dedups member keys before granting.
+fn ensure_supported_raft_composite_keys(
+    keys: &[String],
+    op: &'static str,
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-supported-composite-keys-1");
+    if keys.is_empty() {
+        return Err(BrokerRaftError::UnsupportedClientRequest(format!(
+            "composite {op} requires at least one key"
+        )));
+    }
+    let distinct = keys.iter().collect::<BTreeSet<_>>().len();
+    if distinct > RAFT_MAX_COMPOSITE_KEYS {
+        return Err(BrokerRaftError::UnsupportedClientRequest(format!(
+            "BrokerRaft composite {op} supports at most {RAFT_MAX_COMPOSITE_KEYS} distinct keys; got {distinct}"
+        )));
+    }
+    Ok(())
 }
 
 fn request_fingerprint(request: &Request) -> Result<String, BrokerRaftError> {
@@ -16283,16 +16538,34 @@ fn invalid_append_conflict_hint_reason(
     conflict_term: Option<u64>,
     conflict_index: Option<u64>,
     current_next_index: u64,
+    response_term: u64,
 ) -> Option<&'static str> {
     crate::routine_id!("ddl-routine-broker-raft-invalid-append-conflict-hint-1");
     if conflict_term == Some(0) {
         return Some("conflictTerm must be >= 1 when present");
     }
+    if conflict_term.is_some_and(|term| term > response_term) {
+        return Some("conflictTerm cannot exceed response term");
+    }
+    if conflict_term.is_some() && conflict_index.is_none() {
+        return Some("conflictIndex is required when conflictTerm is present");
+    }
     if conflict_index == Some(0) {
         return Some("conflictIndex must be >= 1 when present");
     }
-    if conflict_index.is_some_and(|index| index > current_next_index) {
-        return Some("conflictIndex cannot exceed rejected nextIndex");
+    if conflict_index.is_some_and(|index| index >= current_next_index) {
+        return Some("conflictIndex must be below rejected nextIndex");
+    }
+    None
+}
+
+fn invalid_install_snapshot_rejection_reason(
+    reported_installed_index: u64,
+    sent_snapshot_index: u64,
+) -> Option<&'static str> {
+    crate::routine_id!("ddl-routine-broker-raft-invalid-install-snapshot-rejection-1");
+    if reported_installed_index >= sent_snapshot_index {
+        return Some("rejection cannot report the sent snapshot as installed");
     }
     None
 }
@@ -18200,6 +18473,33 @@ mod tests {
             BrokerRaftError::InvalidConfig(message)
                 if message.contains("install_snapshot_stale_transfer_ms")
         ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn maintenance_tick_interval_follows_stale_transfer_window() {
+        let dir = temp_dir("raft-maintenance-tick-interval");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_interval = Duration::from_secs(30 * 60);
+        cfg.install_snapshot_stale_transfer_after = Duration::from_secs(10);
+        assert_eq!(
+            BrokerRaft::maintenance_tick_interval(&cfg),
+            Duration::from_secs(5)
+        );
+
+        cfg.install_snapshot_stale_transfer_after = Duration::from_millis(500);
+        assert_eq!(
+            BrokerRaft::maintenance_tick_interval(&cfg),
+            Duration::from_secs(1)
+        );
+
+        cfg.snapshot_interval = Duration::from_secs(3);
+        cfg.install_snapshot_stale_transfer_after = Duration::from_secs(30);
+        assert_eq!(
+            BrokerRaft::maintenance_tick_interval(&cfg),
+            Duration::from_secs(3)
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -25743,18 +26043,153 @@ mod tests {
         );
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.replication_quorum_waits_total, 1);
-        assert_eq!(telemetry.replication_quorum_attempts_total, 3);
-        assert_eq!(telemetry.replication_quorum_progress_retries_total, 2);
+        assert_eq!(telemetry.replication_quorum_attempts_total, 1);
+        assert_eq!(telemetry.replication_quorum_progress_retries_total, 0);
         assert_eq!(telemetry.replication_quorum_progress_wakeups_total, 0);
         assert_eq!(telemetry.replication_quorum_sleeps_total, 0);
         assert_eq!(telemetry.replication_quorum_successes_total, 1);
+        assert_eq!(telemetry.target_replication_inline_progress_rounds_total, 3);
+        assert_eq!(telemetry.target_replication_inline_successes_total, 1);
+        assert_eq!(telemetry.target_replication_inline_yields_total, 0);
         let metrics = raft.raft_metrics_text();
-        assert!(metrics.contains("dd_rust_network_mutex_raft_replication_quorum_attempts_total 3"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_replication_quorum_attempts_total 1"));
         assert!(metrics
-            .contains("dd_rust_network_mutex_raft_replication_quorum_progress_retries_total 2"));
+            .contains("dd_rust_network_mutex_raft_replication_quorum_progress_retries_total 0"));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_replication_quorum_progress_wakeups_total 0"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_replication_quorum_sleeps_total 0"));
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total 3"
+        ));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_target_replication_inline_successes_total 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_target_replication_inline_yields_total 0")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn target_replication_yields_after_inline_append_batch_cap() {
+        let dir = temp_dir("raft-inline-catchup-cap");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.append_entries_max_entries = 2;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.append_entries_max_inline_batches = 2;
+        let peer = RaftPeerConfig {
+            id: "n2".into(),
+            addr: peer_addr.to_string(),
+        };
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                peer.id.clone(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let batches = Arc::new(Mutex::new(Vec::<Vec<u64>>::new()));
+        let batches_for_server = Arc::clone(&batches);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            for _ in 0..2 {
+                let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                    .await
+                    .expect("read append entries");
+                let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+                let (term, match_index, batch_indexes) = match rpc {
+                    RaftRpc::AppendEntries {
+                        term,
+                        prev_log_index,
+                        entries,
+                        ..
+                    } => {
+                        let batch_indexes =
+                            entries.iter().map(|entry| entry.index).collect::<Vec<_>>();
+                        let match_index = entries
+                            .last()
+                            .map(|entry| entry.index)
+                            .unwrap_or(prev_log_index);
+                        (term, match_index, batch_indexes)
+                    }
+                    other => panic!("unexpected rpc: {other:?}"),
+                };
+                batches_for_server.lock().push(batch_indexes);
+                let response = RaftRpcResponse::AppendEntries {
+                    term,
+                    success: true,
+                    match_index,
+                    conflict_index: None,
+                    conflict_term: None,
+                };
+                let body = serde_json::to_vec(&response).expect("serialize append response");
+                reader
+                    .get_mut()
+                    .write_all(&body)
+                    .await
+                    .expect("write append response");
+                reader
+                    .get_mut()
+                    .write_all(b"\n")
+                    .await
+                    .expect("write append newline");
+                reader
+                    .get_mut()
+                    .flush()
+                    .await
+                    .expect("flush append response");
+            }
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate to inline cap");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        assert!(outcome.progress_changed);
+        server.await.expect("fake peer server");
+        assert_eq!(batches.lock().clone(), vec![vec![1, 2], vec![3, 4]]);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 4);
+        assert_eq!(progress.next_index, 5);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_requests_total, 2);
+        assert_eq!(telemetry.append_entries_successes_total, 2);
+        assert_eq!(telemetry.append_progress_updates_total, 2);
+        assert_eq!(telemetry.target_replication_inline_progress_rounds_total, 2);
+        assert_eq!(telemetry.target_replication_inline_successes_total, 0);
+        assert_eq!(telemetry.target_replication_inline_yields_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total 2"
+        ));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_target_replication_inline_yields_total 1")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -25899,7 +26334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicate_until_quorum_retries_immediately_after_progress_change() {
+    async fn replicate_until_quorum_catches_up_inline_before_heartbeat_delay() {
         let dir = temp_dir("raft-progress-retry-catchup");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -26019,7 +26454,12 @@ mod tests {
             vec![vec![1, 2], vec![3, 4], vec![5]]
         );
         let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.replication_quorum_attempts_total, 1);
+        assert_eq!(telemetry.replication_quorum_progress_retries_total, 0);
         assert_eq!(telemetry.replication_quorum_progress_wakeups_total, 0);
+        assert_eq!(telemetry.target_replication_inline_progress_rounds_total, 3);
+        assert_eq!(telemetry.target_replication_inline_successes_total, 1);
+        assert_eq!(telemetry.target_replication_inline_yields_total, 0);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -26334,7 +26774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn learner_catchup_retries_immediately_after_progress_change() {
+    async fn learner_catchup_catches_up_inline_before_heartbeat_delay() {
         let dir = temp_dir("raft-learner-progress-retry-catchup");
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -26442,19 +26882,27 @@ mod tests {
         assert_eq!(telemetry.learner_catchup_successes_total, 1);
         assert_eq!(telemetry.learner_catchup_timeouts_total, 0);
         assert_eq!(telemetry.learner_catchup_leadership_losses_total, 0);
-        assert_eq!(telemetry.learner_catchup_progress_retries_total, 2);
+        assert_eq!(telemetry.learner_catchup_progress_retries_total, 0);
         assert_eq!(telemetry.learner_catchup_progress_wakeups_total, 0);
         assert_eq!(telemetry.learner_catchup_sleeps_total, 0);
+        assert_eq!(telemetry.target_replication_inline_progress_rounds_total, 3);
+        assert_eq!(telemetry.target_replication_inline_successes_total, 1);
+        assert_eq!(telemetry.target_replication_inline_yields_total, 0);
         let metrics = raft.raft_metrics_text();
         assert!(metrics.contains("dd_rust_network_mutex_raft_learner_catchup_attempts_total 1"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_learner_catchup_successes_total 1"));
         assert!(
-            metrics.contains("dd_rust_network_mutex_raft_learner_catchup_progress_retries_total 2")
+            metrics.contains("dd_rust_network_mutex_raft_learner_catchup_progress_retries_total 0")
         );
         assert!(
             metrics.contains("dd_rust_network_mutex_raft_learner_catchup_progress_wakeups_total 0")
         );
         assert!(metrics.contains("dd_rust_network_mutex_raft_learner_catchup_sleeps_total 0"));
+        assert!(metrics.contains(
+            "dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total 3"
+        ));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_target_replication_inline_successes_total 1"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -26960,7 +27408,7 @@ mod tests {
                 term,
                 success: false,
                 match_index: 0,
-                conflict_index: Some(6),
+                conflict_index: Some(5),
                 conflict_term: None,
             };
             let body = serde_json::to_vec(&response).expect("serialize append response");
@@ -27200,7 +27648,7 @@ mod tests {
                 success: false,
                 match_index: 5,
                 conflict_index: Some(1),
-                conflict_term: Some(0),
+                conflict_term: Some(term.saturating_add(1)),
             };
             let body = serde_json::to_vec(&response).expect("serialize append response");
             reader
@@ -27224,6 +27672,117 @@ mod tests {
             .replicate_to_peer(peer, 1, 0, Some(5))
             .await
             .expect("replicate invalid-hint rejection");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        server.await.expect("fake peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_conflicts_total, 0);
+        assert_eq!(telemetry.append_conflict_repairs_total, 0);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 1);
+        assert_eq!(telemetry.append_invalid_conflict_responses_total, 1);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_append_invalid_conflict_responses_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn append_rejection_with_term_only_conflict_hint_does_not_rewind_next_index() {
+        let dir = temp_dir("raft-term-only-hint-rejection-keeps-next-index");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: false,
+                match_index: 5,
+                conflict_index: None,
+                conflict_term: Some(1),
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate term-only invalid-hint rejection");
         assert!(outcome.contacted);
         assert!(!outcome.target_reached);
         server.await.expect("fake peer server");
@@ -29039,6 +29598,7 @@ mod tests {
         let mut cfg = test_raft_config(dir.clone());
         cfg.append_entries_max_entries = 2;
         cfg.append_entries_max_bytes = usize::MAX;
+        cfg.append_entries_max_inline_batches = 1;
         let raft = BrokerRaft::open(cfg).expect("open raft");
         for _ in 0..5 {
             raft.log.append(1, RaftCommand::Noop).expect("append");
@@ -29999,6 +30559,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_request_queue_limit_prunes_cancelled_pending_before_rejecting() {
+        let dir = temp_dir("raft-client-request-queue-limit-prunes-cancelled");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.client_response_cache_max_entries = 8;
+        cfg.client_batch_max_pending = 1;
+        cfg.client_batch_max_entries = 1;
+        cfg.client_pipeline_max_batches = 1;
+        cfg.client_batch_max_delay = Duration::ZERO;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        let cancelled_id = "cancelled-pending-before-capacity";
+        let cancelled_request =
+            single_lock_request(cancelled_id, "cancelled-pending-before-capacity-key");
+        let cancelled_fingerprint =
+            request_fingerprint(&cancelled_request).expect("cancelled request fingerprint");
+        assert!(raft
+            .reserve_client_request_id(cancelled_id, &cancelled_fingerprint)
+            .expect("reserve cancelled idempotency key"));
+        let (cancelled_client, _) = raft.register_client();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        drop(cancelled_rx);
+        {
+            let mut state = raft.client_request_batch.lock();
+            state.pending.push_back(PendingClientRequest {
+                client_id: cancelled_client,
+                request: cancelled_request,
+                request_id: Some(cancelled_id.to_string()),
+                request_fingerprint: Some(cancelled_fingerprint.clone()),
+                enqueued_at: Instant::now(),
+                result_tx: cancelled_tx,
+            });
+        }
+
+        let live_uuid = "live-after-cancelled-capacity-prune";
+        let (live_client, mut live_response_rx) = raft.register_client();
+        let index = tokio::time::timeout(
+            Duration::from_secs(1),
+            raft.enqueue_client_request(
+                live_client,
+                single_lock_request(live_uuid, "live-after-cancelled-capacity-key"),
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("live request should not wait behind cancelled capacity")
+        .expect("live request should be accepted after pruning cancelled pending work");
+        assert_eq!(index, 1);
+        let response = wait_for_response(
+            &mut live_response_rx,
+            live_uuid,
+            Duration::from_secs(1),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Some(Response::Lock {
+                acquired: true,
+                lock_uuid: Some(_),
+                ..
+            })
+        ));
+
+        {
+            let state = raft.client_request_batch.lock();
+            assert!(state.pending.is_empty());
+            assert!(!state.driver_active);
+        }
+        assert!(
+            !raft
+                .client_response_cache
+                .lock()
+                .entries
+                .contains_key(cancelled_id),
+            "cancelled request id reservation should be released while pruning queue capacity"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.client_queue_full_total, 0);
+        assert_eq!(telemetry.client_batch_cancelled_requests_total, 1);
+        assert_eq!(telemetry.client_proposals_total, 1);
+        assert_eq!(telemetry.client_batches_total, 1);
+        assert_eq!(telemetry.client_batch_entries_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_client_queue_full_total 0"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_client_batch_cancelled_requests_total 1")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn concurrent_client_requests_share_one_replicated_batch() {
         let dir = temp_dir("raft-client-request-batch");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -30946,58 +31600,186 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_raft_requests_reject_composite_keys_before_append() {
-        let dir = temp_dir("raft-composite-public-rejected");
+    async fn no_wait_composite_acquire_grants_atomically_or_fails_fast_without_waiter() {
+        let dir = temp_dir("raft-no-wait-composite");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
         become_single_node_leader(&raft, 3);
 
-        let acquire_err = raft
+        // All members free -> atomic grant of the whole composite, one entry.
+        let granted = raft
             .run_ephemeral(
-                composite_lock_request("raft-union-a", &["union-b", "union-a"]),
+                composite_lock_request("nw-holder", &["nw-x", "nw-y"]),
+                "nw-holder",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("holder composite")
+            .expect("holder composite response");
+        assert!(matches!(
+            granted,
+            Response::CompositeLock { acquired: true, .. }
+        ));
+        assert_eq!(raft.broker.metrics().holders, 2);
+        assert_eq!(raft.broker.metrics().waiters, 0);
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 1);
+
+        // Overlapping no-wait composite fails fast on the contended member and
+        // never enqueues a waiter or appends a DropClient cleanup entry.
+        let denied = raft
+            .run_ephemeral(
+                composite_lock_request("nw-contended", &["nw-y", "nw-z"]),
+                "nw-contended",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("contended composite")
+            .expect("contended composite response");
+        assert!(matches!(
+            denied,
+            Response::CompositeLock {
+                acquired: false,
+                ..
+            }
+        ));
+        assert_eq!(raft.broker.metrics().holders, 2);
+        assert_eq!(raft.broker.metrics().waiters, 0);
+
+        let entries = raft.log.read_entries().expect("entries");
+        assert_eq!(
+            entries.len(),
+            2,
+            "contended no-wait composite must not append a DropClient cleanup entry"
+        );
+        assert!(matches!(
+            &entries[1].command,
+            RaftCommand::ClientRequestWithIdentity {
+                request: Request::Lock {
+                    keys: Some(_),
+                    wait: Some(false),
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn public_raft_requests_admit_bounded_composite_and_reject_oversized() {
+        let dir = temp_dir("raft-composite-public-bounded");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        become_single_node_leader(&raft, 3);
+
+        // A 3-key composite (the cap) is admitted, replicated, and granted
+        // atomically through the normal deterministic-grant path.
+        let acquired = raft
+            .run_ephemeral(
+                composite_lock_request("raft-union-a", &["union-c", "union-a", "union-b"]),
                 "raft-union-a",
                 Duration::ZERO,
                 true,
             )
             .await
-            .expect_err("BrokerRaft should reject public composite acquire requests");
-        assert!(matches!(
-            acquire_err,
-            BrokerRaftError::UnsupportedClientRequest(message)
-                if message.contains("single-key lock requests only")
-        ));
+            .expect("bounded composite acquire should be admitted")
+            .expect("composite acquire response");
+        let (lock_uuid, fencing_tokens) = match acquired {
+            Response::CompositeLock {
+                acquired: true,
+                keys,
+                lock_uuid: Some(lock_uuid),
+                fencing_tokens: Some(tokens),
+                ..
+            } => {
+                // Broker sorts + dedups member keys; the response reflects that.
+                assert_eq!(keys, vec!["union-a", "union-b", "union-c"]);
+                (lock_uuid, tokens)
+            }
+            other => panic!("expected granted composite lock, got {other:?}"),
+        };
+        assert!(lock_uuid.starts_with("raft-"), "deterministic lock uuid");
+        assert_eq!(fencing_tokens.len(), 3, "one fencing token per member key");
+        assert_eq!(raft.broker.metrics().holders, 3);
+        assert_eq!(raft.broker.metrics().waiters, 0);
+        // Exactly one replicated log entry for the whole composite acquire.
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 1);
 
-        let (client, _) = raft.register_client();
-        let direct_err = raft
-            .handle_request(
-                client,
-                composite_lock_request("raft-direct-union", &["a", "b"]),
-            )
-            .await
-            .expect_err("direct BrokerRaft API should reject composite requests");
-        assert!(matches!(
-            direct_err,
-            BrokerRaftError::UnsupportedClientRequest(message)
-                if message.contains("single-key lock requests only")
-        ));
-
-        let release_err = raft
+        // The matching composite unlock is also admitted and releases all keys.
+        let released = raft
             .run_ephemeral(
-                composite_unlock_request("raft-union-unlock", &["union-a", "union-b"], "lock-id"),
+                composite_unlock_request(
+                    "raft-union-unlock",
+                    &["union-a", "union-b", "union-c"],
+                    &lock_uuid,
+                ),
                 "raft-union-unlock",
                 Duration::ZERO,
                 false,
             )
             .await
-            .expect_err("BrokerRaft should reject public composite unlock requests");
-        assert!(matches!(
-            release_err,
-            BrokerRaftError::UnsupportedClientRequest(message)
-                if message.contains("single-key unlock requests only")
-        ));
-        assert!(raft.log.read_entries().expect("entries").is_empty());
+            .expect("bounded composite unlock should be admitted")
+            .expect("composite unlock response");
+        assert!(matches!(released, Response::Unlock { unlocked: true, .. }));
         assert_eq!(raft.broker.metrics().holders, 0);
-        assert_eq!(raft.broker.metrics().waiters, 0);
+
+        // A composite above the distinct-key cap is rejected before any append.
+        let entries_before = raft.log.read_entries().expect("entries").len();
+        let oversized = raft
+            .run_ephemeral(
+                composite_lock_request("raft-union-big", &["a", "b", "c", "d"]),
+                "raft-union-big",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect_err("oversized composite acquire must be rejected");
+        assert!(matches!(
+            oversized,
+            BrokerRaftError::UnsupportedClientRequest(message)
+                if message.contains("at most 3 distinct keys")
+        ));
+
+        // An empty `keys` composite is rejected before any append.
+        let empty = raft
+            .run_ephemeral(
+                composite_lock_request("raft-union-empty", &[]),
+                "raft-union-empty",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect_err("empty composite acquire must be rejected");
+        assert!(matches!(
+            empty,
+            BrokerRaftError::UnsupportedClientRequest(message)
+                if message.contains("at least one key")
+        ));
+
+        // Oversized composite unlock is likewise rejected before append.
+        let oversized_unlock = raft
+            .run_ephemeral(
+                composite_unlock_request("raft-union-big-unlock", &["a", "b", "c", "d"], "lock-id"),
+                "raft-union-big-unlock",
+                Duration::ZERO,
+                false,
+            )
+            .await
+            .expect_err("oversized composite unlock must be rejected");
+        assert!(matches!(
+            oversized_unlock,
+            BrokerRaftError::UnsupportedClientRequest(message)
+                if message.contains("at most 3 distinct keys")
+        ));
+
+        // None of the rejected requests appended anything.
+        assert_eq!(
+            raft.log.read_entries().expect("entries").len(),
+            entries_before
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -31405,7 +32187,10 @@ mod tests {
             }
         ));
 
-        let unsupported = reopened
+        // A new bounded composite that overlaps the replayed legacy composite
+        // on `reopen-a` is now admitted, but no-wait acquisition fails fast on
+        // the contended member without leaving partial state.
+        let contended = reopened
             .run_ephemeral(
                 composite_lock_request("reopen-new-composite", &["reopen-a", "reopen-c"]),
                 "reopen-new-composite",
@@ -31413,11 +32198,16 @@ mod tests {
                 true,
             )
             .await
-            .expect_err("new public composite requests stay rejected after replay");
+            .expect("new bounded composite is admitted after replay")
+            .expect("contended composite response");
         assert!(matches!(
-            unsupported,
-            BrokerRaftError::UnsupportedClientRequest(_)
+            contended,
+            Response::CompositeLock {
+                acquired: false,
+                ..
+            }
         ));
+        assert_eq!(reopened.broker.metrics().waiters, 0);
 
         let disjoint = reopened
             .run_ephemeral(
@@ -31556,7 +32346,10 @@ mod tests {
             }
         ));
 
-        let unsupported = reopened
+        // A new bounded composite overlapping the snapshot-restored legacy
+        // composite on `snapshot-b` is admitted but fails fast (no-wait) on the
+        // contended member, preserving overlap semantics across snapshot restore.
+        let contended = reopened
             .run_ephemeral(
                 composite_lock_request("snapshot-new-composite", &["snapshot-b", "snapshot-c"]),
                 "snapshot-new-composite",
@@ -31564,11 +32357,16 @@ mod tests {
                 true,
             )
             .await
-            .expect_err("new public composite requests stay rejected after snapshot restore");
+            .expect("new bounded composite is admitted after snapshot restore")
+            .expect("contended composite response");
         assert!(matches!(
-            unsupported,
-            BrokerRaftError::UnsupportedClientRequest(_)
+            contended,
+            Response::CompositeLock {
+                acquired: false,
+                ..
+            }
         ));
+        assert_eq!(reopened.broker.metrics().waiters, 0);
 
         let disjoint = reopened
             .run_ephemeral(
@@ -31624,7 +32422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follower_rejects_composite_request_before_proxying_to_leader() {
+    async fn follower_rejects_oversized_composite_request_before_proxying_to_leader() {
         let dir = temp_dir("raft-follower-composite-no-proxy");
         let mut cfg = test_raft_config(dir.clone());
         cfg.peers = vec![
@@ -31640,20 +32438,22 @@ mod tests {
             runtime.leader_id = Some("n2".into());
         }
 
+        // An oversized composite (above the distinct-key cap) is rejected on the
+        // follower before any proxy connection to the leader is opened.
         let err = raft
             .run_ephemeral(
-                composite_lock_request("follower-composite", &["a", "b"]),
+                composite_lock_request("follower-composite", &["a", "b", "c", "d"]),
                 "follower-composite",
                 Duration::ZERO,
                 true,
             )
             .await
-            .expect_err("follower must reject composite before proxying");
+            .expect_err("follower must reject oversized composite before proxying");
 
         assert!(matches!(
             err,
             BrokerRaftError::UnsupportedClientRequest(message)
-                if message.contains("single-key lock requests only")
+                if message.contains("at most 3 distinct keys")
         ));
         assert!(raft.rpc_connections.lock().is_empty());
         assert!(raft.log.read_entries().expect("entries").is_empty());
@@ -32338,16 +33138,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leader_proxy_request_rejects_composite_before_append() {
+    async fn leader_proxy_request_rejects_oversized_composite_before_append() {
         let dir = temp_dir("raft-peer-proxy-composite-rejected");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
         become_single_node_leader(&raft, 5);
 
+        // A proxied oversized composite is rejected on the leader before append.
         let response = raft
             .handle_rpc(RaftRpc::ProxyRequest {
                 auth_token: None,
-                request: composite_lock_request("peer-proxy-composite", &["a", "b"]),
+                request: composite_lock_request("peer-proxy-composite", &["a", "b", "c", "d"]),
                 request_uuid: "peer-proxy-composite".into(),
                 wait_ms: 0,
                 is_acquire: true,
@@ -32360,7 +33161,7 @@ mod tests {
                 term: 5,
                 response: None,
                 error: Some(ref error),
-            } if error.contains("single-key lock requests only")
+            } if error.contains("at most 3 distinct keys")
         ));
         assert!(raft.log.read_entries().expect("entries").is_empty());
         assert_eq!(raft.broker.metrics().holders, 0);
@@ -34984,6 +35785,89 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_sweeps_stale_snapshot_transfers_without_new_chunks() {
+        // Regression: cleanup_stale_snapshot_transfers was only called from
+        // stage_snapshot_chunk.  Verify that calling it with a future now_ms
+        // (exactly what maintenance_loop does every tick) removes the stale
+        // part file and increments the right telemetry counter, even when no
+        // new snapshot chunks arrive.
+        let dir = temp_dir("raft-maintenance-stale-transfer-sweep");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.install_snapshot_stale_transfer_after = Duration::from_secs(30 * 60);
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 0,
+            })
+            .expect("write initial hard state");
+
+        let payload = idle_snapshot_payload();
+        let checksum = payload_checksum(&payload);
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let split = bytes.len() / 2;
+
+        let response = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            0,
+            false,
+            BASE64.encode(&bytes[..split]),
+        );
+        assert!(
+            matches!(
+                response,
+                RaftRpcResponse::InstallSnapshot { success: true, .. }
+            ),
+            "chunk should be accepted"
+        );
+
+        let staged_path = {
+            let transfers = raft.snapshot_transfers.lock();
+            assert_eq!(transfers.len(), 1, "one staged transfer");
+            transfers
+                .values()
+                .next()
+                .expect("staged transfer")
+                .path
+                .clone()
+        };
+        assert!(staged_path.exists(), "part file must exist before sweep");
+
+        // Simulate the maintenance tick firing after the stale window by
+        // passing now_ms that is far in the future relative to the transfer.
+        let far_future_ms = unix_ms() + 90 * 60 * 1_000;
+        let removed = raft.cleanup_stale_snapshot_transfers(far_future_ms);
+        assert_eq!(
+            removed, 1,
+            "maintenance tick must remove the stale transfer"
+        );
+        assert!(
+            !staged_path.exists(),
+            "part file must be removed by maintenance sweep"
+        );
+        assert!(
+            raft.snapshot_transfers.lock().is_empty(),
+            "in-memory transfer map must be cleared"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
+        assert_eq!(telemetry.snapshot_transfer_stale_cleanups_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn handle_install_snapshot_rejects_out_of_order_chunk_and_clears_transfer() {
         let dir = temp_dir("raft-handle-install-snapshot-bad-offset");
         let cfg = test_raft_config(dir.clone());
@@ -37058,6 +37942,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_snapshot_invalid_rejection_index_does_not_count_rejection() {
+        let dir = temp_dir("raft-send-install-snapshot-invalid-reject-index");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake snapshot peer");
+        let peer_addr = listener.local_addr().expect("fake snapshot peer addr");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log
+            .write_snapshot(7, 3, idle_snapshot_payload())
+            .expect("write source snapshot");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 4;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept snapshot peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read install snapshot");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse install snapshot");
+            let term = match rpc {
+                RaftRpc::InstallSnapshot {
+                    term,
+                    last_included_index,
+                    done,
+                    ..
+                } => {
+                    assert_eq!(last_included_index, 7);
+                    assert!(done);
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::InstallSnapshot {
+                term,
+                success: false,
+                last_included_index: 7,
+            };
+            let body = serde_json::to_vec(&response).expect("snapshot response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write snapshot response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write snapshot newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush snapshot response");
+        });
+
+        let peer = RaftPeerConfig {
+            id: "n2".into(),
+            addr: peer_addr.to_string(),
+        };
+        let outcome = raft
+            .install_snapshot_to_peer(peer, 4, Some(7))
+            .await
+            .expect("install snapshot to fake peer");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        server.await.expect("fake snapshot peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 1);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_rejections_total, 0);
+        assert_eq!(telemetry.install_snapshot_successes_total, 0);
+        assert_eq!(telemetry.install_snapshot_progress_updates_total, 0);
+        assert_eq!(telemetry.install_snapshot_rpc_errors_total, 1);
+        assert_eq!(
+            telemetry.install_snapshot_invalid_rejection_responses_total,
+            1
+        );
+        assert!(raft.raft_metrics_text().contains(
+            "dd_rust_network_mutex_raft_install_snapshot_invalid_rejection_responses_total 1"
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn install_snapshot_response_index_is_capped_to_sent_snapshot() {
         let dir = temp_dir("raft-send-install-snapshot-inflated-index");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -37383,24 +38374,53 @@ mod tests {
     }
 
     #[test]
-    fn invalid_append_conflict_hint_reason_rejects_zero_or_post_probe_values() {
+    fn invalid_append_conflict_hint_reason_rejects_impossible_values() {
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(0), Some(1), 5),
+            invalid_append_conflict_hint_reason(Some(0), Some(1), 5, 1),
             Some("conflictTerm must be >= 1 when present")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(None, Some(0), 5),
+            invalid_append_conflict_hint_reason(Some(2), Some(1), 5, 1),
+            Some("conflictTerm cannot exceed response term")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), None, 5, 1),
+            Some("conflictIndex is required when conflictTerm is present")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(0), 5, 1),
             Some("conflictIndex must be >= 1 when present")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), Some(6), 5),
-            Some("conflictIndex cannot exceed rejected nextIndex")
+            invalid_append_conflict_hint_reason(Some(1), Some(6), 5, 1),
+            Some("conflictIndex must be below rejected nextIndex")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), Some(5), 5),
+            invalid_append_conflict_hint_reason(Some(1), Some(5), 5, 1),
+            Some("conflictIndex must be below rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), Some(4), 5, 1),
             None
         );
-        assert_eq!(invalid_append_conflict_hint_reason(Some(1), None, 5), None);
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(1), 5, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_install_snapshot_rejection_reason_rejects_installed_sent_boundary() {
+        assert_eq!(invalid_install_snapshot_rejection_reason(0, 7), None);
+        assert_eq!(invalid_install_snapshot_rejection_reason(6, 7), None);
+        assert_eq!(
+            invalid_install_snapshot_rejection_reason(7, 7),
+            Some("rejection cannot report the sent snapshot as installed")
+        );
+        assert_eq!(
+            invalid_install_snapshot_rejection_reason(8, 7),
+            Some("rejection cannot report the sent snapshot as installed")
+        );
     }
 
     #[test]
@@ -39794,7 +40814,10 @@ mod tests {
         assert!(telemetry.replication_quorum_attempts_total > 0);
         assert_eq!(telemetry.replication_quorum_progress_retries_total, 0);
         assert!(telemetry.replication_quorum_sleeps_total > 0);
-        assert!(telemetry.append_entries_conflicts_total > 0);
+        assert!(
+            telemetry.append_invalid_conflict_responses_total > 0,
+            "always-rejecting peer starts at nextIndex=1, so its synthetic conflict hint is invalid"
+        );
         let metrics = raft.raft_metrics_text();
         assert!(metrics.contains("dd_rust_network_mutex_raft_replication_quorum_waits_total 1"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_replication_quorum_attempts_total"));
@@ -40147,6 +41170,73 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_composite_grant_replays_same_uuid_and_per_key_tokens_on_independent_nodes() {
+        // A composite is presented with keys out of order; the inner broker
+        // sorts + dedups to [comp-a, comp-b, comp-c]. Each member key's
+        // fencing token is seed + its position in that sorted order, and the
+        // shared composite lock uuid is the deterministic uuid for the entry
+        // index. Two independent nodes replaying the same committed entry must
+        // mint identical uuids and identical per-key tokens.
+        let request =
+            composite_lock_request("deterministic-composite", &["comp-c", "comp-a", "comp-b"]);
+        let command = command_with_deterministic_grant(
+            RaftCommand::ClientRequest {
+                client_id: 42,
+                request,
+                grant: None,
+            },
+            11,
+        );
+        let seed = deterministic_fencing_seed(11);
+        let expected_lock_uuid = deterministic_lock_uuid(11);
+        let expected_tokens: BTreeMap<String, u64> = [
+            ("comp-a".to_string(), seed),
+            ("comp-b".to_string(), seed + 1),
+            ("comp-c".to_string(), seed + 2),
+        ]
+        .into_iter()
+        .collect();
+        // Three distinct member tokens fit strictly below the next index's
+        // seed, proving the reservation width is sufficient for the cap.
+        assert!(seed + 2 < deterministic_fencing_seed(12));
+
+        for suffix in ["a", "b"] {
+            let dir = temp_dir(&format!("raft-deterministic-composite-{suffix}"));
+            let cfg = test_raft_config(dir.clone());
+            let raft = BrokerRaft::open(cfg).expect("open raft");
+            let entry = raft.log.append(4, command.clone()).expect("append command");
+            {
+                let mut runtime = raft.runtime.lock();
+                runtime.commit_index = entry.index;
+            }
+            raft.apply_committed()
+                .expect("apply deterministic composite");
+
+            let tokens_by_key: BTreeMap<String, u64> = raft
+                .broker
+                .top_keys(16)
+                .into_iter()
+                .map(|snapshot| (snapshot.key, snapshot.fencing_counter))
+                .collect();
+            assert_eq!(tokens_by_key, expected_tokens);
+            assert_eq!(raft.broker.metrics().holders, 3);
+            assert_eq!(raft.broker.metrics().waiters, 0);
+
+            assert!(matches!(
+                &command,
+                RaftCommand::ClientRequest {
+                    grant: Some(RaftGrantPlan {
+                        lock_uuid: Some(lock_uuid),
+                        fencing_seed: Some(grant_seed),
+                    }),
+                    ..
+                } if lock_uuid == &expected_lock_uuid && *grant_seed == seed
+            ));
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
     fn threshold_maintenance_snapshots_and_retains_trailing_entries() {
         let dir = temp_dir("raft-threshold-maintenance");
         let mut cfg = test_raft_config(dir.clone());
@@ -40391,6 +41481,47 @@ mod tests {
         );
         assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_safety_skips_total 1"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_eligible_index 0"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_compaction_skip_remains_observable_when_apply_lags_commit() {
+        let dir = temp_dir("raft-threshold-unapplied-safety-skip");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_interval = Duration::from_secs(60);
+        cfg.snapshot_max_log_entries = 2;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..3 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        let last_snapshot_at = Instant::now() - Duration::from_secs(1);
+        raft.maintenance.lock().last_snapshot_at = last_snapshot_at;
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.commit_index = 3;
+            runtime.last_applied = 1;
+            runtime.current_term = 1;
+        }
+
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("threshold maintenance should skip safely");
+
+        assert!(raft.log.latest_snapshot().is_none());
+        assert_eq!(raft.log.read_entries().expect("entries").len(), 3);
+        assert_eq!(raft.maintenance.lock().last_snapshot_at, last_snapshot_at);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_compactions_total, 0);
+        assert_eq!(telemetry.log_compaction_threshold_triggers_total, 1);
+        assert_eq!(telemetry.log_compaction_cadence_triggers_total, 0);
+        assert_eq!(telemetry.log_compaction_safety_skips_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_safety_skips_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compactions_total 0"));
 
         let _ = fs::remove_dir_all(dir);
     }

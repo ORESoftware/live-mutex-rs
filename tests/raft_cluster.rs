@@ -1268,40 +1268,10 @@ async fn assert_http_lock_contract(port: u16, label: &str) {
         format!("{label}-composite-a-{}", uuid::Uuid::new_v4()),
         format!("{label}-composite-b-{}", uuid::Uuid::new_v4()),
     ];
-    if label == "raft" {
-        let (status, composite) = http_post_json(
-            port,
-            "/v1/lock",
-            json!({"keys": keys.clone(), "ttlMs": 5000}),
-        )
-        .await;
-        assert_eq!(status, 400, "{label} composite response: {composite:?}");
-        assert_eq!(composite["acquired"], false);
-        assert!(
-            composite["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("single-key lock requests only")),
-            "{label} BrokerRaft should reject multi-key acquire requests: {composite:?}"
-        );
-
-        let (status, composite_release) = http_post_json(
-            port,
-            "/v1/unlock",
-            json!({"keys": keys, "lockUuid": "not-used"}),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "{label} composite release response: {composite_release:?}"
-        );
-        assert_eq!(composite_release["unlocked"], false);
-        assert!(
-            composite_release["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("single-key unlock requests only")),
-            "{label} BrokerRaft should reject multi-key release requests: {composite_release:?}"
-        );
-    } else {
+    // Bounded composite (<= RAFT_MAX_COMPOSITE_KEYS distinct keys) is supported
+    // identically by the single-node broker and the replicated BrokerRaft front
+    // door, so both labels exercise the same union-overlap semantics here.
+    {
         let (status, composite) =
             http_post_json(port, "/v1/lock", json!({"keys": keys, "ttlMs": 5000})).await;
         assert_eq!(status, 200, "{label} composite response: {composite:?}");
@@ -1400,6 +1370,29 @@ async fn assert_http_lock_contract(port: u16, label: &str) {
         assert_eq!(
             composite_release["unlocked"], true,
             "{label} composite release response: {composite_release:?}"
+        );
+    }
+
+    // The replicated front door caps composite admission at 3 distinct keys; a
+    // 4-key acquire is rejected before append. (The single-node broker accepts
+    // up to MAX_COMPOSITE_KEYS, so this bound is BrokerRaft-specific.)
+    if label == "raft" {
+        let oversized_keys = (0..4)
+            .map(|i| format!("{label}-oversized-{i}-{}", uuid::Uuid::new_v4()))
+            .collect::<Vec<_>>();
+        let (status, oversized) = http_post_json(
+            port,
+            "/v1/lock",
+            json!({"keys": oversized_keys, "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(status, 400, "{label} oversized composite: {oversized:?}");
+        assert_eq!(oversized["acquired"], false);
+        assert!(
+            oversized["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("at most 3 distinct keys")),
+            "{label} BrokerRaft should reject composite above the key cap: {oversized:?}"
         );
     }
 

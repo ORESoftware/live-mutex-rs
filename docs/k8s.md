@@ -308,6 +308,7 @@ data:
     trailing_log_entries = 10000
     append_entries_max_entries = 256
     append_entries_max_bytes = 1048576
+    append_entries_max_inline_batches = 64
     install_snapshot_chunk_bytes = 1048576
     sync_log = true
 

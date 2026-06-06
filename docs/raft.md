@@ -225,8 +225,9 @@ Implemented:
   counted in
   `dd_rust_network_mutex_raft_install_snapshot_staged_transfer_limit_rejections_total`,
 - incomplete staged `InstallSnapshot` transfers that make no progress for
-  `raft.install_snapshot_stale_transfer_ms` are removed before later chunks are
-  accepted. Stale removals increment
+  `raft.install_snapshot_stale_transfer_ms` are swept proactively by the
+  maintenance loop and are also removed before later chunks are accepted. Stale
+  removals increment
   `dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total` in
   addition to the general cleanup counter,
 - after a valid higher-term `InstallSnapshot` chunk is decoded and size-checked,
@@ -438,7 +439,13 @@ Implemented:
   `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`; no-target
   heartbeat/post-commit AppendEntries or snapshot catch-up attempts skipped
   because the peer already has an in-flight pooled RPC are counted in
-  `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; replication
+  `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; target-index
+  inline catch-up progress rounds, target reaches, and max-inline-batch yields
+  are counted in
+  `dd_rust_network_mutex_raft_target_replication_inline_progress_rounds_total`,
+  `dd_rust_network_mutex_raft_target_replication_inline_successes_total`, and
+  `dd_rust_network_mutex_raft_target_replication_inline_yields_total`;
+  replication
   attempts skipped before building/sending catch-up work because the peer has
   already left the active membership and staged learner set are counted in
   `dd_rust_network_mutex_raft_replication_removed_peer_skips_total`; attempts
@@ -539,6 +546,9 @@ Implemented:
   responses received before the leader sends the final chunk are ignored for
   peer progress and counted in
   `dd_rust_network_mutex_raft_install_snapshot_premature_success_responses_total`;
+  `success=false` responses that also claim the sent snapshot boundary was
+  installed are rejected as contradictory peer responses and counted in
+  `dd_rust_network_mutex_raft_install_snapshot_invalid_rejection_responses_total`;
   final success responses that underreport the installed snapshot index are
   ignored for progress and counted in
   `dd_rust_network_mutex_raft_install_snapshot_invalid_success_responses_total`;
@@ -665,12 +675,16 @@ Implemented:
   before append, failed pre-append reservations are released, and the applied
   cache is rebuilt from committed identity log entries and carried in Raft
   snapshots, while mismatched payload reuse is rejected,
-- public BrokerRaft client admission is intentionally single-key-only: requests
-  using `keys` are rejected before batching or log append so union-style
-  multi-resource locking stays out of the consensus surface; older committed
-  composite entries still replay and restore from snapshots so existing local
-  test data can boot, but new multi-key/composite locking remains a regular
-  Broker feature,
+- public BrokerRaft client admission supports composite (multi-key) `keys`
+  locking bounded to at most 3 distinct keys per request (`RAFT_MAX_COMPOSITE_KEYS`,
+  below the protocol-wide `MAX_COMPOSITE_KEYS` of 5). Composite grants replicate
+  deterministically: every replica applies the same sorted member order, the
+  same `deterministic_lock_uuid`, and the same per-key fencing tokens seeded from
+  `deterministic_fencing_seed` (`index * (MAX_COMPOSITE_KEYS + 1)`), so the token
+  reservation per log index never overlaps the next index's seed. Empty `keys`
+  and requests above the distinct-key cap are rejected before batching or log
+  append; older committed composite entries (including any with up to 5 keys
+  appended before the cap) still replay and restore from snapshots,
 - coalesced post-commit `AppendEntries` fan-out, so bursty commits wake lagging
   peers promptly without spawning one background replication task per commit,
 - leader-aware HTTP routing support via `/raft/leaderz`, with `/raft/status`
@@ -686,7 +700,8 @@ Implemented:
 
 Still missing:
 
-- deeper hot-path pipelining beyond the serialized commit/apply lane,
+- broader hot-path pipelining beyond bounded per-peer catch-up and the
+  serialized commit/apply lane,
 - production hardening comparable to etcd or ZooKeeper.
 
 That means BrokerRaft should currently be treated as an experimental
@@ -773,8 +788,12 @@ The current leader write path is still serialized, and each committed lock
 operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
-`append_entries_max_entries` and `append_entries_max_bytes`, and Raft peer RPCs
-reuse open TCP connections, including follower-to-leader proxy requests. The
+`append_entries_max_entries` and `append_entries_max_bytes`, and target-index
+replication can send up to `append_entries_max_inline_batches` bounded batches
+sequentially to the same peer before yielding back to the outer quorum loop.
+This preserves per-peer AppendEntries ordering while avoiding one fan-out/join
+round per catch-up batch for lagging followers. Raft peer RPCs reuse open TCP
+connections, including follower-to-leader proxy requests. The
 leader rechecks that a peer is still an active voter or staged learner before
 building and again before counting/sending each `AppendEntries` batch, so
 membership churn does not waste outbound replication work on removed peers. The
@@ -869,6 +888,11 @@ requests into one quorum round, and the coalescer wakes early when a batch fills
 instead of always paying the full coalescing delay. The leader-local waiting
 queue is bounded by `client_batch_max_pending`; overflow requests fail before
 log append, so they do not create partially replicated lock operations.
+Cancelled client waiters are pruned from the pending queue before capacity
+checks and from drained batches before append, releasing any unapplied
+idempotency-key reservation and incrementing
+`dd_rust_network_mutex_raft_client_batch_cancelled_requests_total` instead of
+counting abandoned work against `client_batch_max_pending`.
 Committed entries are applied from `lastApplied + 1` through `commitIndex` in
 bounded retained-log windows, so large catch-up applies do not clone one giant
 range and uncommitted tail entries are not materialized during apply. Compaction
@@ -911,6 +935,9 @@ membership, learner, broker-install, and final runtime-index boundaries so
 operators can see where an install stopped without inferring from files alone.
 Same-boundary `InstallSnapshot` checksum conflicts are rejected and logged before
 the follower acknowledges the snapshot as already installed.
+Contradictory leader-side `InstallSnapshot(success=false)` responses that report
+the sent snapshot index as installed are treated as invalid peer responses, not
+normal follower rejections.
 Hard-state writes preserve monotonic durable `currentTerm` and `commitIndex`:
 stale term/vote updates that race with a snapshot apply failure cannot lower a
 term or commit boundary that already reached disk. Same-term writes cannot
@@ -924,9 +951,12 @@ with a false follower hint.
 Append progress and conflict repair emit debug-level `lmx::raft` events with
 the previous and repaired `nextIndex`/`matchIndex`, the sent batch boundary, and
 whether a stale conflict hint was clamped by known follower progress.
-Impossible conflict hints with zero terms/indexes or a `conflictIndex` beyond
-the rejected `nextIndex` are treated as invalid peer responses before leader
-progress can be mutated.
+Impossible conflict hints with zero terms/indexes, a `conflictIndex` at or
+beyond the rejected `nextIndex`, or a `conflictTerm` newer than the peer's
+response term are treated as invalid peer responses before leader progress can
+be mutated. Conflict-term hints must include the matching `conflictIndex`;
+term-only hints are rejected because the leader cannot make a precise Raft
+repair from them.
 Impossible `AppendEntries(success=true)` responses that report a `matchIndex`
 below the matched previous entry or sent batch are rejected as non-progress and
 counted in the invalid-success metric.
