@@ -16,6 +16,8 @@ bench_keys="${BENCH_KEYS:-256}"
 bench_duration_ms="${BENCH_DURATION_MS:-10000}"
 bench_ttl_ms="${BENCH_TTL_MS:-5000}"
 bench_io_timeout_ms="${BENCH_IO_TIMEOUT_MS:-5000}"
+capture_metrics="${CAPTURE_METRICS:-true}"
+metrics_timeout_s="${METRICS_TIMEOUT_SECONDS:-2}"
 sample_seconds="${SAMPLE_SECONDS:-8}"
 sample_interval_ms="${SAMPLE_INTERVAL_MS:-1}"
 perf_freq="${PERF_FREQ:-997}"
@@ -47,6 +49,7 @@ usage() {
   echo "env: PROFILE_TARGET=$profile_target PROFILE=$profile OUT_DIR=$out_dir BROKER_HOST=$broker_host BROKER_HTTP_PORT=$broker_http_port" >&2
   echo "env: RAFT_HTTP_BASE_PORT=$raft_http_base_port RAFT_RPC_BASE_PORT=$raft_rpc_base_port RAFT_SYNC_LOG=$raft_sync_log" >&2
   echo "env: BENCH_WORKERS=$bench_workers BENCH_KEYS=$bench_keys BENCH_DURATION_MS=$bench_duration_ms" >&2
+  echo "env: CAPTURE_METRICS=$capture_metrics METRICS_TIMEOUT_SECONDS=$metrics_timeout_s" >&2
 }
 
 case "$profile_target" in
@@ -64,6 +67,16 @@ case "$raft_sync_log" in
   0) raft_sync_log=false ;;
   *)
     echo "RAFT_SYNC_LOG must be true or false; got $raft_sync_log" >&2
+    exit 2
+    ;;
+esac
+
+case "$capture_metrics" in
+  true | false) ;;
+  1) capture_metrics=true ;;
+  0) capture_metrics=false ;;
+  *)
+    echo "CAPTURE_METRICS must be true or false; got $capture_metrics" >&2
     exit 2
     ;;
 esac
@@ -101,6 +114,76 @@ port_open() {
   local host="${1:-$broker_host}"
   local port="${2:-$broker_http_port}"
   (exec 3<>"/dev/tcp/$host/$port") >/dev/null 2>&1
+}
+
+http_capture_body() {
+  local host="$1"
+  local port="$2"
+  local path="$3"
+  local out="$4"
+  if command -v curl >/dev/null 2>&1; then
+    curl -sS --max-time "$metrics_timeout_s" "http://$host:$port$path" >"$out"
+    return
+  fi
+
+  local in_body=false
+  exec 3<>"/dev/tcp/$host/$port"
+  printf 'GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$path" "$host" >&3
+  while IFS= read -r line <&3; do
+    line="${line%$'\r'}"
+    if [ "$in_body" = true ]; then
+      printf '%s\n' "$line"
+    elif [ -z "$line" ]; then
+      in_body=true
+    fi
+  done >"$out"
+  exec 3<&-
+  exec 3>&-
+}
+
+capture_endpoint_artifacts() {
+  local label="$1"
+  local port="$2"
+  local phase="$3"
+  local prefix="$out_dir/$label-$phase"
+  if ! http_capture_body "$broker_host" "$port" "/metrics" "$prefix.metrics.prom"; then
+    echo "warning: failed to capture $label $phase /metrics" >&2
+    rm -f "$prefix.metrics.prom"
+  fi
+  if [ "$profile_target" = "raft" ]; then
+    if ! http_capture_body "$broker_host" "$port" "/raft/status" "$prefix.status.json"; then
+      echo "warning: failed to capture $label $phase /raft/status" >&2
+      rm -f "$prefix.status.json"
+    fi
+    if ! http_capture_body "$broker_host" "$port" "/raft/progress" "$prefix.progress.json"; then
+      echo "warning: failed to capture $label $phase /raft/progress" >&2
+      rm -f "$prefix.progress.json"
+    fi
+    if ! http_capture_body "$broker_host" "$port" "/raft/leaderz" "$prefix.leaderz.json"; then
+      rm -f "$prefix.leaderz.json"
+    fi
+  else
+    if ! http_capture_body "$broker_host" "$port" "/status" "$prefix.status.html"; then
+      echo "warning: failed to capture $label $phase /status" >&2
+      rm -f "$prefix.status.html"
+    fi
+  fi
+}
+
+capture_profile_artifacts() {
+  local phase="$1"
+  if [ "$capture_metrics" != true ]; then
+    return 0
+  fi
+  if [ "$profile_target" = "raft" ]; then
+    local idx=0
+    for port in "${raft_http_ports[@]}"; do
+      capture_endpoint_artifacts "raft-node-$((idx + 1))" "$port" "$phase"
+      idx=$((idx + 1))
+    done
+  else
+    capture_endpoint_artifacts "broker" "$broker_http_port" "$phase"
+  fi
 }
 
 wait_for_port() {
@@ -294,6 +377,7 @@ start_raft_cluster() {
 start_benchmark() {
   bench_log="$out_dir/$profile_target-bench.out"
   rm -f "$bench_log"
+  capture_profile_artifacts before
   if [ "$profile_target" = "raft" ]; then
     BENCH_TARGET=raft \
       BENCH_RAFT="$broker_host:$raft_leader_http_port" \
@@ -316,6 +400,12 @@ start_benchmark() {
   bench_pid=$!
 }
 
+finish_benchmark() {
+  wait "$bench_pid" || true
+  bench_pid=""
+  capture_profile_artifacts after
+}
+
 build_binaries
 case "$profile_target" in
   broker)
@@ -333,8 +423,7 @@ case "$mode" in
     start_benchmark
     sample_status=0
     sample "$profile_pid" "$sample_seconds" "$sample_interval_ms" -mayDie -file "$out" || sample_status=$?
-    wait "$bench_pid" || true
-    bench_pid=""
+    finish_benchmark
     if [ "$sample_status" -ne 0 ]; then
       echo "sample failed with status $sample_status; macOS may require sudo or full Xcode/Instruments permissions" >&2
       exit "$sample_status"
@@ -345,8 +434,7 @@ case "$mode" in
     out="$out_dir/$profile_target-server.perf.data"
     start_benchmark
     perf record -F "$perf_freq" -g -p "$profile_pid" -o "$out" -- sleep "$sample_seconds"
-    wait "$bench_pid" || true
-    bench_pid=""
+    finish_benchmark
     perf report -i "$out" --stdio | tee "$out.report.txt"
     echo "$out"
     ;;
@@ -354,8 +442,7 @@ case "$mode" in
     out="$out_dir/$profile_target-server.svg"
     start_benchmark
     timeout "$sample_seconds" flamegraph --pid "$profile_pid" --output "$out" || status=$?
-    wait "$bench_pid" || true
-    bench_pid=""
+    finish_benchmark
     if [ "${status:-0}" -ne 0 ] && [ "${status:-0}" -ne 124 ]; then
       exit "$status"
     fi

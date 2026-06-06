@@ -946,9 +946,14 @@ async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoRe
     )
 }
 
-async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
+async fn raft_status(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-status-1");
-    let progress = state.raft.progress_snapshot();
+    let progress = match state.raft.progress_snapshot_fresh().await {
+        Ok(progress) => progress,
+        Err(err) => return raft_unavailable(err),
+    };
+    let cluster_size = progress.membership.cluster_size();
+    let quorum_size = progress.membership.quorum_size();
     Json(serde_json::json!({
         "nodeId": progress.node_id,
         "isLeader": progress.is_leader,
@@ -957,8 +962,8 @@ async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
         "leaderAddr": progress.leader_addr,
         "leaderQuorumAgeMs": progress.leader_quorum_age_ms,
         "leaderQuorumTimeoutMs": progress.leader_quorum_timeout_ms,
-        "clusterSize": state.raft.active_cluster_size(),
-        "quorumSize": state.raft.active_quorum_size(),
+        "clusterSize": cluster_size,
+        "quorumSize": quorum_size,
         "membershipJoint": progress.membership_joint,
         "membership": progress.membership,
         "currentTerm": progress.current_term,
@@ -967,30 +972,44 @@ async fn raft_status(State(state): State<RaftAppState>) -> impl IntoResponse {
         "lastLogIndex": progress.last_log_index,
         "lastLogTerm": progress.last_log_term,
     }))
+    .into_response()
 }
 
-async fn raft_membership(State(state): State<RaftAppState>) -> impl IntoResponse {
+async fn raft_membership(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-membership-1");
+    let progress = match state.raft.progress_snapshot_fresh().await {
+        Ok(progress) => progress,
+        Err(err) => return raft_unavailable(err),
+    };
+    let cluster_size = progress.membership.cluster_size();
+    let quorum_size = progress.membership.quorum_size();
     Json(serde_json::json!({
-        "nodeId": state.raft.config().node_id,
-        "isLeader": state.raft.is_leader(),
-        "leaderId": state.raft.leader_id(),
-        "leaderAddr": state.raft.leader_addr(),
-        "clusterSize": state.raft.active_cluster_size(),
-        "quorumSize": state.raft.active_quorum_size(),
-        "membershipJoint": state.raft.membership_is_joint(),
-        "membership": state.raft.membership(),
+        "nodeId": progress.node_id,
+        "isLeader": progress.is_leader,
+        "leaderId": progress.leader_id,
+        "leaderAddr": progress.leader_addr,
+        "clusterSize": cluster_size,
+        "quorumSize": quorum_size,
+        "membershipJoint": progress.membership_joint,
+        "membership": progress.membership,
     }))
+    .into_response()
 }
 
-async fn raft_progress(State(state): State<RaftAppState>) -> impl IntoResponse {
+async fn raft_progress(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-progress-1");
-    Json(state.raft.progress_snapshot())
+    match state.raft.progress_snapshot_fresh().await {
+        Ok(progress) => Json(progress).into_response(),
+        Err(err) => raft_unavailable(err),
+    }
 }
 
-async fn raft_learners(State(state): State<RaftAppState>) -> impl IntoResponse {
+async fn raft_learners(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-learners-1");
-    let progress = state.raft.progress_snapshot();
+    let progress = match state.raft.progress_snapshot_fresh().await {
+        Ok(progress) => progress,
+        Err(err) => return raft_unavailable(err),
+    };
     let learners = progress
         .peers
         .into_iter()
@@ -1007,6 +1026,7 @@ async fn raft_learners(State(state): State<RaftAppState>) -> impl IntoResponse {
         "lastLogIndex": progress.last_log_index,
         "learners": learners,
     }))
+    .into_response()
 }
 
 async fn raft_stage_learners(
@@ -1088,7 +1108,10 @@ async fn raft_change_membership(
 
 async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-leaderz-1");
-    let progress = state.raft.progress_snapshot();
+    let progress = match state.raft.progress_snapshot_fresh().await {
+        Ok(progress) => progress,
+        Err(err) => return raft_unavailable(err),
+    };
     let body = serde_json::json!({
         "nodeId": progress.node_id,
         "isLeader": progress.is_leader,
@@ -1208,6 +1231,11 @@ async fn raft_http_acquire(
             error: None,
         })
         .into_response(),
+        Err(BrokerRaftError::UnsupportedClientRequest(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"acquired": false, "error": error})),
+        )
+            .into_response(),
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
     };
@@ -1265,6 +1293,11 @@ async fn raft_http_release(
             Json(serde_json::json!({"unlocked": false, "error": "broker timed out"})),
         )
             .into_response(),
+        Err(BrokerRaftError::UnsupportedClientRequest(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"unlocked": false, "error": error})),
+        )
+            .into_response(),
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
     };
@@ -1291,6 +1324,13 @@ fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
             Json(serde_json::json!({
                 "error": "request id reused with different payload",
                 "requestId": request_id,
+            })),
+        )
+            .into_response(),
+        BrokerRaftError::UnsupportedClientRequest(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": error,
             })),
         )
             .into_response(),

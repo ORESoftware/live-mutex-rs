@@ -1,12 +1,12 @@
 # Running `live-mutex-rs` on Kubernetes
 
-This doc walks through deploying the Rust broker
-(`oresoftware/live-mutex-rs`) as a cluster-internal locking service.
-The recipe below is what we run in production: one replica, a
-ClusterIP `Service` exposing both the TCP wire protocol and the
-HTTP/Prometheus front-end, an `LMX_AUTH_TOKEN` sourced from a
-Kubernetes `Secret`, and a `Recreate` strategy because all lock state
-lives in the broker's process memory.
+This doc walks through deploying the regular Rust broker
+(`oresoftware/live-mutex-rs`) as a cluster-internal locking service,
+then shows the separate BrokerRaft HA shape. The regular Broker recipe
+below is what we run in production: one replica, a ClusterIP `Service`
+exposing both the TCP wire protocol and the HTTP/Prometheus front-end,
+an `LMX_AUTH_TOKEN` sourced from a Kubernetes `Secret`, and a `Recreate`
+strategy because all regular Broker lock state lives in process memory.
 
 If you've never run a networked mutex broker before, please read
 [the readme](../readme.md) first — especially the
@@ -40,9 +40,11 @@ replica service by design.
    [your service A]   [your service B]   [Lambda → /v1/lock]
 ```
 
-Single replica is the supported posture. See
-[Why single-replica](#why-single-replica) below for the rationale and
-the failover design sketch.
+Single replica is the supported posture for the regular Broker. See
+[Regular Broker: why single-replica](#regular-broker-why-single-replica)
+below for the rationale. For replicated quorum locking, deploy
+BrokerRaft as a separate workload rather than adding replicas to
+`live-mutex-rs`.
 
 ## Container image
 
@@ -222,6 +224,245 @@ Cluster-internal callers reach the broker at:
 - `http://live-mutex-rs.default.svc.cluster.local:6971/v1/*` for
   serverless-style callers (Lambda, Workers) that can't hold a
   long-lived TCP connection.
+
+## BrokerRaft HA deployment
+
+BrokerRaft should be deployed as its own StatefulSet and Services, with
+names that do not overwrite the regular `live-mutex-rs` Deployment. A
+3-node cluster commits with 2 votes; a 5-node cluster commits with 3
+votes. Keep public BrokerRaft admission single-key-only; multi-key
+`keys` requests remain a regular Broker feature.
+
+Use one headless peer Service for stable Raft RPC DNS and one client
+Service for HTTP traffic. The peer Service publishes not-ready
+addresses so the Raft cluster can form even while no leader has passed
+`/raft/leaderz` yet:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-mutex-rs-raft-peers
+  namespace: default
+  labels:
+    app: live-mutex-rs-raft
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: live-mutex-rs-raft
+  ports:
+    - name: raft
+      port: 7980
+      targetPort: raft
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-mutex-rs-raft
+  namespace: default
+  labels:
+    app: live-mutex-rs-raft
+  annotations:
+    prometheus.io/scrape: 'true'
+    prometheus.io/port: '6971'
+    prometheus.io/path: /metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: live-mutex-rs-raft
+  ports:
+    - name: http
+      port: 6971
+      targetPort: http
+```
+
+Mount a Raft config whose peer IDs match the StatefulSet pod names.
+This example is for the `default` namespace:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-mutex-rs-raft-config
+  namespace: default
+data:
+  lmx.toml: |
+    [server]
+    bind_host = "0.0.0.0"
+    http_port = 6971
+    disable_tcp = true
+    disable_http = false
+
+    [broker]
+    default_ttl_ms = 4000
+
+    [raft]
+    enabled = true
+    bind_addr = "0.0.0.0:7980"
+    data_dir = "/var/lib/dd-rust-network-mutex/raft"
+    heartbeat_interval_ms = 50
+    election_timeout_min_ms = 150
+    election_timeout_max_ms = 300
+    snapshot_interval_ms = 1800000
+    trailing_log_entries = 10000
+    append_entries_max_entries = 256
+    append_entries_max_bytes = 1048576
+    install_snapshot_chunk_bytes = 1048576
+    sync_log = true
+
+    [[raft.peers]]
+    id = "live-mutex-rs-raft-0"
+    addr = "live-mutex-rs-raft-0.live-mutex-rs-raft-peers.default.svc.cluster.local:7980"
+
+    [[raft.peers]]
+    id = "live-mutex-rs-raft-1"
+    addr = "live-mutex-rs-raft-1.live-mutex-rs-raft-peers.default.svc.cluster.local:7980"
+
+    [[raft.peers]]
+    id = "live-mutex-rs-raft-2"
+    addr = "live-mutex-rs-raft-2.live-mutex-rs-raft-peers.default.svc.cluster.local:7980"
+```
+
+Then run the Raft image as a StatefulSet. `podManagementPolicy: Parallel`
+matters when the client Service uses leader-only readiness: with the
+default ordered policy, pod 0 can wait for peers that Kubernetes has not
+created yet.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: live-mutex-rs-raft
+  namespace: default
+  labels:
+    app: live-mutex-rs-raft
+spec:
+  serviceName: live-mutex-rs-raft-peers
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: live-mutex-rs-raft
+  template:
+    metadata:
+      labels:
+        app: live-mutex-rs-raft
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: live-mutex-rs-raft
+          image: docker.io/oresoftware/live-mutex-rs-raft:0.1.127
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LMX_CONFIG
+              value: /etc/dd-rust-network-mutex/lmx.toml
+            - name: LMX_RAFT_NODE_ID
+              value: "$(POD_NAME)"
+            - name: LMX_RAFT_ADVERTISE_ADDR
+              value: "$(POD_NAME).live-mutex-rs-raft-peers.$(POD_NAMESPACE).svc.cluster.local:7980"
+            - name: LMX_RAFT_DATA_DIR
+              value: /var/lib/dd-rust-network-mutex/raft
+            - name: LMX_RAFT_PEER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: live-mutex-rs-raft-secrets
+                  key: LMX_RAFT_PEER_TOKEN
+                  optional: true
+            - name: LMX_LOG_FORMAT
+              value: text
+            - name: RUST_LOG
+              value: info,lmx=info
+          ports:
+            - name: http
+              containerPort: 6971
+            - name: raft
+              containerPort: 7980
+          volumeMounts:
+            - name: config
+              mountPath: /etc/dd-rust-network-mutex
+              readOnly: true
+            - name: raft-data
+              mountPath: /var/lib/dd-rust-network-mutex/raft
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /raft/leaderz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: '2'
+              memory: 1Gi
+      volumes:
+        - name: config
+          configMap:
+            name: live-mutex-rs-raft-config
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi
+```
+
+With this layout:
+
+- Peer RPC uses `live-mutex-rs-raft-peers` and does not depend on
+  leader readiness.
+- Client HTTP uses `live-mutex-rs-raft`; because readiness checks
+  `/raft/leaderz`, the Service normally routes to the quorum-fresh
+  leader. If you prefer round-robin plus follower proxying, use
+  `/healthz` for readiness instead.
+- The regular `deployment/live-mutex-rs` remains untouched.
+- Live smoke tests can target the client Service:
+
+```bash
+LMX_LIVE_RAFT_HTTP=live-mutex-rs-raft.default.svc.cluster.local:6971 \
+  cargo test --test k8s_raft_live_smoke -- --ignored --nocapture
+```
 
 ## Authentication
 

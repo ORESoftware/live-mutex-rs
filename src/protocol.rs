@@ -44,7 +44,7 @@ pub const DEFAULT_MAX_CONCURRENCY_CAP: u32 = 1_000;
 /// camelCase. Cross-runtime clients (TypeScript / Go / Dart / Gleam) MUST
 /// mirror this exactly. The Rust source uses snake_case identifiers; serde
 /// does the rename automatically.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",

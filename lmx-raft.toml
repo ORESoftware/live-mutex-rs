@@ -39,9 +39,11 @@ heartbeat_interval_ms = 50
 election_timeout_min_ms = 150
 election_timeout_max_ms = 300
 
-# Snapshot every 30 minutes by default. Old log entries are compacted only
-# after a durable snapshot includes their log index. Retained trailing entries
-# let near-lagging followers catch up with AppendEntries before InstallSnapshot.
+# Snapshot every 30 minutes by default; the interval must be greater than 0.
+# Old log entries are compacted only after a durable snapshot includes their
+# log index. Entry/byte thresholds can be set to 0 to disable that trigger.
+# Retained trailing entries let near-lagging followers catch up with
+# AppendEntries before InstallSnapshot.
 snapshot_interval_ms = 1800000
 snapshot_max_log_entries = 100000
 snapshot_max_log_bytes = 67108864

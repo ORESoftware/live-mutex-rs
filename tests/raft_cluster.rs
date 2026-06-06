@@ -1268,105 +1268,140 @@ async fn assert_http_lock_contract(port: u16, label: &str) {
         format!("{label}-composite-a-{}", uuid::Uuid::new_v4()),
         format!("{label}-composite-b-{}", uuid::Uuid::new_v4()),
     ];
-    let (status, composite) =
-        http_post_json(port, "/v1/lock", json!({"keys": keys, "ttlMs": 5000})).await;
-    assert_eq!(status, 200, "{label} composite response: {composite:?}");
-    assert_eq!(
-        composite["acquired"], true,
-        "{label} composite response: {composite:?}"
-    );
-    let composite_uuid = composite["lockUuid"].as_str().unwrap().to_string();
-    let composite_keys = composite["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|key| key.as_str().unwrap().to_string())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        composite_keys.len(),
-        2,
-        "{label} composite should hold both requested keys: {composite:?}"
-    );
-    for key in &composite_keys {
+    if label == "raft" {
+        let (status, composite) = http_post_json(
+            port,
+            "/v1/lock",
+            json!({"keys": keys.clone(), "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(status, 400, "{label} composite response: {composite:?}");
+        assert_eq!(composite["acquired"], false);
         assert!(
-            composite["fencingTokens"][key].as_u64().is_some(),
-            "{label} composite should include fencing token for {key}: {composite:?}"
+            composite["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("single-key lock requests only")),
+            "{label} BrokerRaft should reject multi-key acquire requests: {composite:?}"
+        );
+
+        let (status, composite_release) = http_post_json(
+            port,
+            "/v1/unlock",
+            json!({"keys": keys, "lockUuid": "not-used"}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "{label} composite release response: {composite_release:?}"
+        );
+        assert_eq!(composite_release["unlocked"], false);
+        assert!(
+            composite_release["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("single-key unlock requests only")),
+            "{label} BrokerRaft should reject multi-key release requests: {composite_release:?}"
+        );
+    } else {
+        let (status, composite) =
+            http_post_json(port, "/v1/lock", json!({"keys": keys, "ttlMs": 5000})).await;
+        assert_eq!(status, 200, "{label} composite response: {composite:?}");
+        assert_eq!(
+            composite["acquired"], true,
+            "{label} composite response: {composite:?}"
+        );
+        let composite_uuid = composite["lockUuid"].as_str().unwrap().to_string();
+        let composite_keys = composite["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            composite_keys.len(),
+            2,
+            "{label} composite should hold both requested keys: {composite:?}"
+        );
+        for key in &composite_keys {
+            assert!(
+                composite["fencingTokens"][key].as_u64().is_some(),
+                "{label} composite should include fencing token for {key}: {composite:?}"
+            );
+        }
+
+        let (status, overlapping_single) = http_post_json(
+            port,
+            "/v1/lock",
+            json!({"key": composite_keys[0].clone(), "ttlMs": 5000, "waitMs": 50}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "{label} overlapping single response: {overlapping_single:?}"
+        );
+        assert_eq!(
+            overlapping_single["acquired"], false,
+            "{label} single-key acquire must not grant while composite holds that key: {overlapping_single:?}"
+        );
+
+        let overlap_extra_key = format!("{label}-composite-overlap-{}", uuid::Uuid::new_v4());
+        let (status, overlapping_composite) = http_post_json(
+            port,
+            "/v1/lock",
+            json!({"keys": [composite_keys[1].clone(), overlap_extra_key], "ttlMs": 5000, "waitMs": 50}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "{label} overlapping composite response: {overlapping_composite:?}"
+        );
+        assert_eq!(
+            overlapping_composite["acquired"], false,
+            "{label} composite acquire must use union overlap semantics, not intersection-only semantics: {overlapping_composite:?}"
+        );
+
+        let disjoint_key = format!("{label}-composite-disjoint-{}", uuid::Uuid::new_v4());
+        let (status, disjoint) = http_post_json(
+            port,
+            "/v1/lock",
+            json!({"key": disjoint_key, "ttlMs": 5000}),
+        )
+        .await;
+        assert_eq!(status, 200, "{label} disjoint response: {disjoint:?}");
+        assert_eq!(
+            disjoint["acquired"], true,
+            "{label} disjoint key should still grant while composite is held: {disjoint:?}"
+        );
+        let disjoint_uuid = disjoint["lockUuid"].as_str().unwrap().to_string();
+        let (status, disjoint_release) = http_post_json(
+            port,
+            "/v1/unlock",
+            json!({"key": disjoint_key, "lockUuid": disjoint_uuid}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "{label} disjoint release response: {disjoint_release:?}"
+        );
+        assert_eq!(
+            disjoint_release["unlocked"], true,
+            "{label} disjoint release response: {disjoint_release:?}"
+        );
+
+        let (status, composite_release) = http_post_json(
+            port,
+            "/v1/unlock",
+            json!({"keys": composite_keys, "lockUuid": composite_uuid}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "{label} composite release response: {composite_release:?}"
+        );
+        assert_eq!(
+            composite_release["unlocked"], true,
+            "{label} composite release response: {composite_release:?}"
         );
     }
-
-    let (status, overlapping_single) = http_post_json(
-        port,
-        "/v1/lock",
-        json!({"key": composite_keys[0].clone(), "ttlMs": 5000, "waitMs": 50}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "{label} overlapping single response: {overlapping_single:?}"
-    );
-    assert_eq!(
-        overlapping_single["acquired"], false,
-        "{label} single-key acquire must not grant while composite holds that key: {overlapping_single:?}"
-    );
-
-    let overlap_extra_key = format!("{label}-composite-overlap-{}", uuid::Uuid::new_v4());
-    let (status, overlapping_composite) = http_post_json(
-        port,
-        "/v1/lock",
-        json!({"keys": [composite_keys[1].clone(), overlap_extra_key], "ttlMs": 5000, "waitMs": 50}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "{label} overlapping composite response: {overlapping_composite:?}"
-    );
-    assert_eq!(
-        overlapping_composite["acquired"], false,
-        "{label} composite acquire must use union overlap semantics, not intersection-only semantics: {overlapping_composite:?}"
-    );
-
-    let disjoint_key = format!("{label}-composite-disjoint-{}", uuid::Uuid::new_v4());
-    let (status, disjoint) = http_post_json(
-        port,
-        "/v1/lock",
-        json!({"key": disjoint_key, "ttlMs": 5000}),
-    )
-    .await;
-    assert_eq!(status, 200, "{label} disjoint response: {disjoint:?}");
-    assert_eq!(
-        disjoint["acquired"], true,
-        "{label} disjoint key should still grant while composite is held: {disjoint:?}"
-    );
-    let disjoint_uuid = disjoint["lockUuid"].as_str().unwrap().to_string();
-    let (status, disjoint_release) = http_post_json(
-        port,
-        "/v1/unlock",
-        json!({"key": disjoint_key, "lockUuid": disjoint_uuid}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "{label} disjoint release response: {disjoint_release:?}"
-    );
-    assert_eq!(
-        disjoint_release["unlocked"], true,
-        "{label} disjoint release response: {disjoint_release:?}"
-    );
-
-    let (status, composite_release) = http_post_json(
-        port,
-        "/v1/unlock",
-        json!({"keys": composite_keys, "lockUuid": composite_uuid}),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "{label} composite release response: {composite_release:?}"
-    );
-    assert_eq!(
-        composite_release["unlocked"], true,
-        "{label} composite release response: {composite_release:?}"
-    );
 
     let force_key = format!("{label}-force-{}", uuid::Uuid::new_v4());
     let (status, force_acquire) =

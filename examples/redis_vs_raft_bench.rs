@@ -22,6 +22,10 @@ use tokio::time::timeout;
 const REDIS_UNLOCK_LUA: &str =
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 const DEFAULT_IO_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_REDIS_ADDR: &str = "127.0.0.1:6379";
+const DEFAULT_BROKER_ADDR: &str = "127.0.0.1:6971";
+const DEFAULT_RAFT_ADDR: &str = "127.0.0.1:6972";
+const DEFAULT_TARGET: &str = "redis-raft";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -29,15 +33,22 @@ enum Target {
     Broker,
     Raft,
     BrokerRaft,
-    Both,
+    RedisRaft,
     All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RaftRoute {
+    RoundRobin,
+    Leader,
 }
 
 #[derive(Debug, Clone)]
 struct Config {
     redis_addr: String,
     broker_addr: String,
-    raft_addr: String,
+    raft_addrs: Vec<String>,
+    raft_route: RaftRoute,
     workers: usize,
     keys: usize,
     duration: Duration,
@@ -93,7 +104,7 @@ async fn main() {
 
     let config = Config::from_env();
     println!(
-        "workers={} keys={} duration_ms={} ttl_ms={} io_timeout_ms={} redis={} broker={} raft={}",
+        "workers={} keys={} duration_ms={} ttl_ms={} io_timeout_ms={} redis={} broker={} raft={} raft_route={}",
         config.workers,
         config.keys,
         config.duration.as_millis(),
@@ -101,14 +112,15 @@ async fn main() {
         config.io_timeout.as_millis(),
         config.redis_addr,
         config.broker_addr,
-        config.raft_addr
+        config.raft_addrs.join(","),
+        config.raft_route.label()
     );
 
     let mut redis_summary = None;
     let mut broker_summary = None;
     let mut raft_summary = None;
 
-    if matches!(config.target, Target::Redis | Target::Both) {
+    if matches!(config.target, Target::Redis | Target::RedisRaft) {
         let summary = run_redis(config.clone()).await;
         print_summary("redis", &summary, config.duration);
         redis_summary = Some(summary);
@@ -123,7 +135,7 @@ async fn main() {
     }
     if matches!(
         config.target,
-        Target::Raft | Target::Both | Target::BrokerRaft | Target::All
+        Target::Raft | Target::RedisRaft | Target::BrokerRaft | Target::All
     ) {
         let summary = run_raft(config.clone()).await;
         print_summary("raft", &summary, config.duration);
@@ -145,25 +157,27 @@ async fn main() {
 
 impl Config {
     fn from_env() -> Self {
-        let target = match env_string("BENCH_TARGET")
-            .unwrap_or_else(|| "both".into())
-            .as_str()
-        {
-            "redis" => Target::Redis,
-            "broker" => Target::Broker,
-            "raft" => Target::Raft,
-            "broker-raft" | "brokervsraft" | "broker_vs_raft" => Target::BrokerRaft,
-            "both" => Target::Both,
-            "all" => Target::All,
-            other => panic!(
-                "BENCH_TARGET must be redis, broker, raft, broker-raft, both, or all; got {other:?}"
+        let target_value = env_string("BENCH_TARGET").unwrap_or_else(|| DEFAULT_TARGET.into());
+        let target = match parse_target(&target_value) {
+            Ok(target) => target,
+            Err(other) => panic!(
+                "BENCH_TARGET must be redis, broker, raft, broker-raft, redis-raft, or all; got {other:?}"
             ),
+        };
+        let raft_route_value =
+            env_string("BENCH_RAFT_ROUTE").unwrap_or_else(|| "round-robin".into());
+        let raft_route = match parse_raft_route(&raft_route_value) {
+            Ok(route) => route,
+            Err(other) => panic!("BENCH_RAFT_ROUTE must be round-robin or leader; got {other:?}"),
         };
         let workers = env_parse("BENCH_WORKERS", 8).max(1);
         Self {
-            redis_addr: env_string("BENCH_REDIS").unwrap_or_else(|| "127.0.0.1:6379".into()),
-            broker_addr: env_string("BENCH_BROKER").unwrap_or_else(|| "127.0.0.1:6971".into()),
-            raft_addr: env_string("BENCH_RAFT").unwrap_or_else(|| "127.0.0.1:6971".into()),
+            redis_addr: env_string("BENCH_REDIS").unwrap_or_else(|| DEFAULT_REDIS_ADDR.into()),
+            broker_addr: env_string("BENCH_BROKER").unwrap_or_else(|| DEFAULT_BROKER_ADDR.into()),
+            raft_addrs: parse_endpoint_list(
+                &env_string("BENCH_RAFT").unwrap_or_else(|| DEFAULT_RAFT_ADDR.into()),
+            ),
+            raft_route,
             workers,
             keys: env_parse("BENCH_KEYS", workers * 16).max(1),
             duration: Duration::from_millis(env_parse("BENCH_DURATION_MS", 10_000)),
@@ -176,6 +190,35 @@ impl Config {
             auth_token: env_string("BENCH_HTTP_AUTH_TOKEN")
                 .or_else(|| env_string("BENCH_RAFT_AUTH_TOKEN"))
                 .or_else(|| env_string("LMX_LIVE_RAFT_AUTH_TOKEN")),
+        }
+    }
+}
+
+fn parse_target(value: &str) -> Result<Target, String> {
+    match value.trim() {
+        "redis" => Ok(Target::Redis),
+        "broker" => Ok(Target::Broker),
+        "raft" => Ok(Target::Raft),
+        "broker-raft" | "brokervsraft" | "broker_vs_raft" => Ok(Target::BrokerRaft),
+        "redis-raft" | "redis_vs_raft" | "both" => Ok(Target::RedisRaft),
+        "all" => Ok(Target::All),
+        other => Err(other.to_string()),
+    }
+}
+
+fn parse_raft_route(value: &str) -> Result<RaftRoute, String> {
+    match value.trim() {
+        "round-robin" | "round_robin" | "rr" | "lb" => Ok(RaftRoute::RoundRobin),
+        "leader" | "leader-preferred" | "leader_preferred" => Ok(RaftRoute::Leader),
+        other => Err(other.to_string()),
+    }
+}
+
+impl RaftRoute {
+    fn label(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round-robin",
+            Self::Leader => "leader",
         }
     }
 }
@@ -263,25 +306,65 @@ async fn redis_lock_cycle(
 
 async fn run_broker(config: Config) -> Summary {
     let endpoint = config.broker_addr.clone();
-    run_http_target(config, "broker", endpoint).await
+    run_http_target(config, "broker", vec![endpoint]).await
 }
 
 async fn run_raft(config: Config) -> Summary {
-    let endpoint = config.raft_addr.clone();
-    run_http_target(config, "raft", endpoint).await
+    let endpoints = raft_benchmark_endpoints(&config).await;
+    run_http_target(config, "raft", endpoints).await
 }
 
-async fn run_http_target(config: Config, name: &'static str, endpoint: String) -> Summary {
+async fn raft_benchmark_endpoints(config: &Config) -> Vec<String> {
+    match config.raft_route {
+        RaftRoute::RoundRobin => config.raft_addrs.clone(),
+        RaftRoute::Leader => match find_ready_raft_leader(config).await {
+            Some(endpoint) => {
+                println!("raft leader route selected {endpoint}");
+                vec![endpoint]
+            }
+            None => {
+                eprintln!(
+                    "BENCH_RAFT_ROUTE=leader could not find a /raft/leaderz endpoint; falling back to round-robin configured endpoints"
+                );
+                config.raft_addrs.clone()
+            }
+        },
+    }
+}
+
+async fn find_ready_raft_leader(config: &Config) -> Option<String> {
+    for endpoint in &config.raft_addrs {
+        match http_status(
+            endpoint,
+            "GET",
+            "/raft/leaderz",
+            config.auth_token.as_deref(),
+            config.io_timeout,
+        )
+        .await
+        {
+            Ok(200) => return Some(endpoint.clone()),
+            Ok(_) => continue,
+            Err(err) => {
+                eprintln!("leader probe {endpoint}/raft/leaderz failed: {err}");
+            }
+        }
+    }
+    None
+}
+
+async fn run_http_target(config: Config, name: &'static str, endpoints: Vec<String>) -> Summary {
     let barrier = Arc::new(Barrier::new(config.workers));
     let deadline = Instant::now() + config.duration;
+    let endpoints = Arc::new(endpoints);
     let mut handles = Vec::new();
     for worker_id in 0..config.workers {
         let cfg = config.clone();
         let barrier = barrier.clone();
-        let endpoint = endpoint.clone();
+        let endpoints = endpoints.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            http_worker(cfg, name, endpoint, worker_id, deadline).await
+            http_worker(cfg, name, endpoints, worker_id, deadline).await
         }));
     }
     collect(handles).await
@@ -290,7 +373,7 @@ async fn run_http_target(config: Config, name: &'static str, endpoint: String) -
 async fn http_worker(
     config: Config,
     name: &str,
-    endpoint: String,
+    endpoints: Arc<Vec<String>>,
     worker_id: usize,
     deadline: Instant,
 ) -> WorkerStats {
@@ -300,8 +383,9 @@ async fn http_worker(
     while Instant::now() < deadline {
         seq += 1;
         let key = bench_key(name, next_key(&mut rng, config.keys));
+        let (acquire_endpoint, release_endpoint) = endpoints_for_cycle(&endpoints, worker_id, seq);
         let start = Instant::now();
-        match http_lock_cycle(&config, &endpoint, &key).await {
+        match http_lock_cycle(&config, acquire_endpoint, release_endpoint, &key).await {
             Ok(true) => {
                 stats.ok += 1;
                 stats.latencies_us.push(start.elapsed().as_micros() as u64);
@@ -316,9 +400,47 @@ async fn http_worker(
     stats
 }
 
-async fn http_lock_cycle(config: &Config, endpoint: &str, key: &str) -> Result<bool, String> {
+fn parse_endpoint_list(value: &str) -> Vec<String> {
+    let endpoints = value
+        .split(',')
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if endpoints.is_empty() {
+        vec![DEFAULT_RAFT_ADDR.into()]
+    } else {
+        endpoints
+    }
+}
+
+fn endpoint_for(endpoints: &[String], worker_id: usize, seq: u64) -> &str {
+    let index = worker_id.wrapping_add(seq as usize).wrapping_sub(1) % endpoints.len().max(1);
+    endpoints
+        .get(index)
+        .map(String::as_str)
+        .unwrap_or(DEFAULT_RAFT_ADDR)
+}
+
+fn endpoints_for_cycle(endpoints: &[String], worker_id: usize, cycle_seq: u64) -> (&str, &str) {
+    (
+        endpoint_for(
+            endpoints,
+            worker_id,
+            cycle_seq.saturating_mul(2).saturating_sub(1),
+        ),
+        endpoint_for(endpoints, worker_id, cycle_seq.saturating_mul(2)),
+    )
+}
+
+async fn http_lock_cycle(
+    config: &Config,
+    acquire_endpoint: &str,
+    release_endpoint: &str,
+    key: &str,
+) -> Result<bool, String> {
     let (_, acquire) = http_json(
-        endpoint,
+        acquire_endpoint,
         "POST",
         "/v1/lock",
         Some(json!({"key": key, "ttlMs": config.ttl_ms})),
@@ -333,7 +455,7 @@ async fn http_lock_cycle(config: &Config, endpoint: &str, key: &str) -> Result<b
         .as_str()
         .ok_or_else(|| format!("missing lockUuid in acquire response: {acquire:?}"))?;
     let (_, release) = http_json(
-        endpoint,
+        release_endpoint,
         "POST",
         "/v1/unlock",
         Some(json!({"key": key, "lockUuid": lock_uuid})),
@@ -438,10 +560,11 @@ fn print_usage() {
         "Rough Redis / Broker / BrokerRaft acquire+release benchmark.\n\
 \n\
 Configuration is environment driven:\n\
-  BENCH_TARGET=redis|broker|raft|broker-raft|both|all\n\
+  BENCH_TARGET=redis|broker|raft|broker-raft|redis-raft|all\n\
   BENCH_REDIS=127.0.0.1:6379\n\
   BENCH_BROKER=127.0.0.1:6971\n\
-  BENCH_RAFT=127.0.0.1:6972\n\
+  BENCH_RAFT=127.0.0.1:6972[,127.0.0.1:6973,...]\n\
+  BENCH_RAFT_ROUTE=round-robin|leader\n\
   BENCH_WORKERS=8\n\
   BENCH_KEYS=128\n\
   BENCH_DURATION_MS=10000\n\
@@ -453,6 +576,22 @@ Example:\n\
   BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
     cargo run --release --no-default-features --example redis_vs_raft_bench"
     );
+}
+
+async fn http_status(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    auth_token: Option<&str>,
+    io_timeout: Duration,
+) -> Result<u16, String> {
+    let (status, _) = timeout(
+        io_timeout,
+        http_request(endpoint, method, path, None, auth_token),
+    )
+    .await
+    .map_err(|_| format!("HTTP {method} {path} to {endpoint} timed out after {io_timeout:?}"))??;
+    Ok(status)
 }
 
 async fn http_json(
@@ -645,4 +784,112 @@ async fn read_line(reader: &mut BufReader<TcpStream>) -> Result<String, String> 
         .await
         .map_err(|err| err.to_string())?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_broker_and_raft_endpoints_are_distinct() {
+        assert_eq!(DEFAULT_BROKER_ADDR, "127.0.0.1:6971");
+        assert_eq!(DEFAULT_RAFT_ADDR, "127.0.0.1:6972");
+        assert_ne!(
+            DEFAULT_BROKER_ADDR, DEFAULT_RAFT_ADDR,
+            "default broker-vs-raft runs must not point both targets at the same HTTP service"
+        );
+    }
+
+    #[test]
+    fn parse_target_accepts_documented_aliases() {
+        assert_eq!(parse_target("redis").unwrap(), Target::Redis);
+        assert_eq!(parse_target("broker").unwrap(), Target::Broker);
+        assert_eq!(parse_target("raft").unwrap(), Target::Raft);
+        assert_eq!(parse_target("broker-raft").unwrap(), Target::BrokerRaft);
+        assert_eq!(parse_target("brokervsraft").unwrap(), Target::BrokerRaft);
+        assert_eq!(parse_target("broker_vs_raft").unwrap(), Target::BrokerRaft);
+        assert_eq!(parse_target("redis-raft").unwrap(), Target::RedisRaft);
+        assert_eq!(parse_target("redis_vs_raft").unwrap(), Target::RedisRaft);
+        assert_eq!(parse_target("both").unwrap(), Target::RedisRaft);
+        assert_eq!(parse_target(DEFAULT_TARGET).unwrap(), Target::RedisRaft);
+        assert_eq!(parse_target("all").unwrap(), Target::All);
+        assert!(parse_target("brokerraft").is_err());
+    }
+
+    #[test]
+    fn parse_raft_route_accepts_lb_and_leader_modes() {
+        assert_eq!(
+            parse_raft_route("round-robin").unwrap(),
+            RaftRoute::RoundRobin
+        );
+        assert_eq!(
+            parse_raft_route("round_robin").unwrap(),
+            RaftRoute::RoundRobin
+        );
+        assert_eq!(parse_raft_route("rr").unwrap(), RaftRoute::RoundRobin);
+        assert_eq!(parse_raft_route("lb").unwrap(), RaftRoute::RoundRobin);
+        assert_eq!(parse_raft_route("leader").unwrap(), RaftRoute::Leader);
+        assert_eq!(
+            parse_raft_route("leader-preferred").unwrap(),
+            RaftRoute::Leader
+        );
+        assert_eq!(
+            parse_raft_route("leader_preferred").unwrap(),
+            RaftRoute::Leader
+        );
+        assert!(parse_raft_route("primary").is_err());
+    }
+
+    #[test]
+    fn parse_host_port_accepts_plain_or_http_endpoint() {
+        assert_eq!(
+            parse_host_port("127.0.0.1:6972").unwrap(),
+            ("127.0.0.1".to_string(), 6972)
+        );
+        assert_eq!(
+            parse_host_port("http://localhost:6972/").unwrap(),
+            ("localhost".to_string(), 6972)
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_list_trims_commas_and_defaults_when_empty() {
+        assert_eq!(
+            parse_endpoint_list("127.0.0.1:6972, 127.0.0.1:6973,,127.0.0.1:6974"),
+            vec![
+                "127.0.0.1:6972".to_string(),
+                "127.0.0.1:6973".to_string(),
+                "127.0.0.1:6974".to_string(),
+            ]
+        );
+        assert_eq!(
+            parse_endpoint_list(" , "),
+            vec![DEFAULT_RAFT_ADDR.to_string()]
+        );
+    }
+
+    #[test]
+    fn endpoint_for_round_robins_by_worker_and_http_request() {
+        let endpoints = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(endpoint_for(&endpoints, 0, 1), "a");
+        assert_eq!(endpoint_for(&endpoints, 0, 2), "b");
+        assert_eq!(endpoint_for(&endpoints, 0, 3), "c");
+        assert_eq!(endpoint_for(&endpoints, 1, 1), "b");
+        assert_eq!(endpoint_for(&endpoints, 2, 1), "c");
+    }
+
+    #[test]
+    fn endpoints_for_cycle_can_split_acquire_and_release() {
+        let endpoints = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(endpoints_for_cycle(&endpoints, 0, 1), ("a", "b"));
+        assert_eq!(endpoints_for_cycle(&endpoints, 0, 2), ("c", "a"));
+        assert_eq!(endpoints_for_cycle(&endpoints, 1, 1), ("b", "c"));
+
+        let single = vec!["leader".to_string()];
+        assert_eq!(
+            endpoints_for_cycle(&single, 4, 99),
+            ("leader", "leader"),
+            "single endpoint mode remains leader-preferred"
+        );
+    }
 }
