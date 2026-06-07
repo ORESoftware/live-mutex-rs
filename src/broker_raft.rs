@@ -3760,10 +3760,17 @@ impl RaftLogStore {
                 .retained_log_entries
                 .extend(append_only.iter().cloned());
             state.retained_log_entry_bytes.extend(append_sizes);
-            add_retained_request_identity_entries(
+            if let Err(err) = add_retained_request_identity_entries(
                 &mut state.retained_request_fingerprints,
                 append_only,
-            )?;
+            ) {
+                if let Err(reload_err) = self.reload_retained_log_from_disk_locked(&mut state) {
+                    return Err(BrokerRaftError::Rpc(format!(
+                        "raft append-only cache update failed: {err}; failed to reload retained log from disk: {reload_err}"
+                    )));
+                }
+                return Err(err);
+            }
         }
 
         Ok(RaftAppendReport {
@@ -18757,8 +18764,14 @@ impl BrokerRaft {
                 .latest_snapshot()
                 .map_or(0, |snapshot| snapshot.last_included_index),
         );
-        let (hard_state, staged_learners) = {
+        let (hard_state, staged_learners, previous_staged_learners, previous_active_peers) = {
             let runtime = self.runtime.lock();
+            let previous_staged_learners = runtime
+                .staged_learners
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let previous_active_peers = runtime.membership.validation_peers();
             let staged_learners = if self_is_active {
                 runtime
                     .staged_learners
@@ -18783,21 +18796,44 @@ impl BrokerRaft {
             } else {
                 None
             };
-            (hard_state, staged_learners)
+            (
+                hard_state,
+                staged_learners,
+                previous_staged_learners,
+                previous_active_peers,
+            )
         };
         self.persist_staged_learners_for_active_peers(&staged_learners, &active_peers)?;
         if let Some(state) = &hard_state {
-            self.log.write_hard_state_clearing_vote(state)?;
+            if let Err(err) = self.log.write_hard_state_clearing_vote(state) {
+                return Err(
+                    self.restore_staged_learners_after_membership_preflight_failure(
+                        &previous_staged_learners,
+                        &previous_active_peers,
+                        "hard-state",
+                        err,
+                    ),
+                );
+            }
         }
         let persist_local_voter_seen = {
             let runtime = self.runtime.lock();
             self_is_active && !runtime.local_voter_seen
         };
         if persist_local_voter_seen {
-            write_local_voter_seen(
+            if let Err(err) = write_local_voter_seen(
                 &self.log.data_dir.join(LOCAL_VOTER_STATE_FILE),
                 Some(&self.telemetry),
-            )?;
+            ) {
+                return Err(
+                    self.restore_staged_learners_after_membership_preflight_failure(
+                        &previous_staged_learners,
+                        &previous_active_peers,
+                        "local-voter-marker",
+                        err,
+                    ),
+                );
+            }
         }
         let mut clear_prepared_snapshot_cache = None;
         {
@@ -18899,6 +18935,25 @@ impl BrokerRaft {
         }
         self.retain_rpc_connections_for_active_peers(self_is_active, &active_peers);
         Ok(())
+    }
+
+    fn restore_staged_learners_after_membership_preflight_failure(
+        &self,
+        previous_staged_learners: &[RaftPeerConfig],
+        previous_active_peers: &[RaftPeerConfig],
+        reason: &'static str,
+        original_error: BrokerRaftError,
+    ) -> BrokerRaftError {
+        crate::routine_id!("ddl-routine-broker-raft-restore-learners-after-membership-fail-1");
+        match self.persist_staged_learners_for_active_peers(
+            previous_staged_learners,
+            previous_active_peers,
+        ) {
+            Ok(()) => original_error,
+            Err(restore_err) => BrokerRaftError::Rpc(format!(
+                "raft membership apply failed during {reason}: {original_error}; failed to restore staged learners sidecar: {restore_err}"
+            )),
+        }
     }
 
     fn retain_rpc_connections_for_active_peers(
@@ -26880,6 +26935,62 @@ mod tests {
     }
 
     #[test]
+    fn apply_membership_restores_learner_sidecar_when_hard_state_write_fails() {
+        let dir = temp_dir("raft-membership-hard-state-fails-restores-learners");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let retained_learner = test_peer("n4", 7983);
+        raft.apply_staged_learners(vec![retained_learner.clone()])
+            .expect("seed staged learner sidecar");
+        let before_membership = raft.membership();
+        let initial_state = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n1".into()),
+            commit_index: 0,
+        };
+        raft.log
+            .write_hard_state(&initial_state)
+            .expect("write initial hard state");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.voted_for = Some("n1".into());
+        }
+        fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
+            .expect("block hard-state temp path");
+
+        let err = raft
+            .apply_membership(RaftMembership::from_simple(vec![
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n5", 7984),
+            ]))
+            .expect_err("local removal should fail after learner sidecar prewrite");
+
+        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(raft.membership(), before_membership);
+        assert_eq!(raft.staged_learners(), vec![retained_learner.clone()]);
+        assert_eq!(
+            read_staged_learners(
+                &dir.join(LEARNERS_FILE),
+                &before_membership.validation_peers(),
+                false,
+            )
+            .expect("read restored learners sidecar"),
+            vec![retained_learner],
+            "failed membership apply must restore the learner sidecar to match unchanged runtime"
+        );
+        assert_eq!(
+            raft.log.read_hard_state().expect("read hard state"),
+            initial_state
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn apply_membership_local_removal_hard_state_failure_preserves_role_cache() {
         let dir = temp_dir("raft-membership-local-removal-cache-hard-state-fails");
         let cfg = test_raft_config(dir.clone());
@@ -26957,6 +27068,51 @@ mod tests {
         assert!(!raft.runtime.lock().local_voter_seen);
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.local_voter_promotions_total, 0);
+        assert!(!dir.join(LOCAL_VOTER_STATE_FILE).exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_membership_restores_learner_sidecar_when_local_voter_marker_write_fails() {
+        let dir = temp_dir("raft-membership-marker-fails-restores-learners");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.node_id = "n4".into();
+        cfg.advertise_addr = Some("127.0.0.1:7983".into());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let local_learner = test_peer("n4", 7983);
+        let retained_learner = test_peer("n5", 7984);
+        raft.apply_staged_learners(vec![local_learner.clone(), retained_learner.clone()])
+            .expect("seed staged learner sidecar");
+        let before_membership = raft.membership();
+        let blocked_tmp = dir.join(LOCAL_VOTER_STATE_FILE).with_extension("json.tmp");
+        fs::create_dir_all(&blocked_tmp).expect("block local-voter temp file");
+
+        let err = raft
+            .apply_membership(RaftMembership::from_simple(vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                local_learner.clone(),
+            ]))
+            .expect_err("promotion should fail after learner sidecar prewrite");
+
+        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(raft.membership(), before_membership);
+        assert!(!raft.runtime.lock().local_voter_seen);
+        assert_eq!(
+            raft.staged_learners(),
+            vec![local_learner.clone(), retained_learner.clone()]
+        );
+        assert_eq!(
+            read_staged_learners(
+                &dir.join(LEARNERS_FILE),
+                &before_membership.validation_peers(),
+                false,
+            )
+            .expect("read restored learners sidecar"),
+            vec![local_learner, retained_learner],
+            "failed local promotion must restore the learner sidecar to match unchanged runtime"
+        );
         assert!(!dir.join(LOCAL_VOTER_STATE_FILE).exists());
 
         let _ = fs::remove_dir_all(dir);
@@ -35136,6 +35292,90 @@ mod tests {
 
         truncate_retained_request_identity_fingerprints(&mut fingerprints, 0);
         assert!(fingerprints.is_empty());
+    }
+
+    #[test]
+    fn append_entries_append_only_cache_failure_reloads_retained_log_state() {
+        let dir = temp_dir("raft-append-cache-failure-reloads");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(1, RaftCommand::Noop).expect("append prefix");
+        let stale_request = single_lock_request("append-cache-stale", "stale-cache-key");
+        let stale_fingerprint =
+            request_fingerprint(&stale_request).expect("stale cache fingerprint");
+        let appended_request = single_lock_request("append-cache-new", "new-cache-key");
+        let appended_fingerprint =
+            request_fingerprint(&appended_request).expect("appended fingerprint");
+        {
+            let mut state = store.state.lock();
+            state.retained_request_fingerprints.insert(
+                "append-cache-reused-request".into(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: stale_fingerprint,
+                    first_index: 99,
+                },
+            );
+        }
+
+        let err = store
+            .append_entries_from_leader(
+                1,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 2,
+                    term: 2,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: appended_request,
+                        grant: None,
+                        request_id: "append-cache-reused-request".into(),
+                        request_fingerprint: appended_fingerprint.clone(),
+                    },
+                }],
+            )
+            .expect_err("stale retained request-id cache should fail after append");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidLog(message)
+                if message.contains("append-cache-reused-request")
+        ));
+        let entries = store.read_entries().expect("entries after reload");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 2)]
+        );
+        {
+            let state = store.state.lock();
+            assert_eq!(state.last_index, 2);
+            assert_eq!(state.last_term, 2);
+            assert_eq!(
+                state.term_by_index.get(&2).copied(),
+                Some(2),
+                "term index should be rebuilt from disk after cache failure"
+            );
+            let cached = state
+                .retained_request_fingerprints
+                .get("append-cache-reused-request")
+                .expect("request-id cache should be reloaded from disk");
+            assert_eq!(cached.request_fingerprint, appended_fingerprint);
+            assert_eq!(cached.first_index, 2);
+        }
+
+        let retry = store
+            .append_entries_from_leader(1, 1, 2, 0, vec![entries[1].clone()])
+            .expect("retry with matching durable entry should converge");
+        assert!(retry.success);
+        assert_eq!(retry.match_index, 2);
+        assert_eq!(retry.appended_entries, 0);
+        assert_eq!(retry.rewritten_entries, 0);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

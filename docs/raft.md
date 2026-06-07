@@ -142,6 +142,9 @@ Implemented:
   `dd_rust_network_mutex_raft_apply_committed_errors_total` and emit a
   structured `lmx::raft` error with entry index, term, command kind, and the
   current apply boundary,
+- membership apply preflight restores the previous staged-learner sidecar if a
+  later hard-state or local-voter marker write fails before runtime mutation, so
+  restart state stays aligned with the unchanged in-memory membership,
 - broker snapshot validation checks TTL deadline records against restored
   holders before install, closing a late-failure path in snapshot apply,
 - synced atomic renames for hard state, snapshot files, sidecar learner state,
@@ -1077,7 +1080,10 @@ repair does not clone or rescan a large retained prefix. Unit coverage also
 asserts the leader-side AppendEntries log-byte counter equals only the repaired
 suffix entry bytes during conflict repair, not the full local log. If that write
 path reports an error, the retained log/index/byte/idempotency cache is reloaded
-from disk before the follower returns the failure. Same-term command conflicts
+from disk before the follower returns the failure. Append-only cache update
+failures after a successful disk append use the same reload path, so injected or
+stale retained request-id cache state cannot leave memory out of sync with the
+durable log before the follower returns the failure. Same-term command conflicts
 at an already-retained index are treated as malformed AppendEntries rather than
 as a matching prefix, so a corrupted leader frame cannot hide divergent command
 state behind the log-matching property. Command-equivalent metadata mismatches
