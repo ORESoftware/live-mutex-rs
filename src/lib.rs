@@ -36,6 +36,7 @@ pub mod protocol;
 pub mod queue;
 pub mod routine;
 pub mod server;
+pub mod sim;
 pub mod sockopt;
 pub mod status;
 
@@ -52,6 +53,7 @@ pub use routine::{
     shutdown_tracing,
 };
 pub use server::{run as run_server, ServerConfig};
+pub use sim::{RaftSim, RaftSimConfig, RaftSimError, RaftSimLock};
 
 #[cfg(feature = "tls")]
 pub use server::TlsConfig;

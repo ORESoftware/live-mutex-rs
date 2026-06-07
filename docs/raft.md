@@ -65,6 +65,9 @@ Implemented:
 - accepted follower `AppendEntries` requests also sync the effective durable
   `commitIndex` into runtime before conflict repair, so stale in-memory state
   cannot permit a rewrite of an entry that disk already records as committed;
+  follower log repair also rechecks the durable hard-state commit index while
+  holding the log-state lock, so a concurrent commit advancement cannot be
+  missed by a stale prepared runtime argument;
   after applying that durable commit, the follower rechecks term, leader, and
   membership before accepting any new entries from the sender,
 - pre-vote round startup and candidate election startup apply any newly visible
@@ -84,6 +87,9 @@ Implemented:
 - durable snapshots are treated as committed through `lastIncludedIndex` on
   startup, and live `InstallSnapshot` advances durable hard state before broker
   state observes the snapshot payload,
+- startup validates the broker-state portion of a recovered snapshot before it
+  normalizes durable `commitIndex` to that snapshot boundary, so an invalid
+  broker snapshot cannot fail reopen after advancing hard state on disk,
 - local snapshot writes are monotonic: exact duplicate snapshot metadata and
   payload are idempotent, while older snapshot indexes or same-index term/payload
   changes are rejected before replacing durable snapshot state; if the retained
@@ -136,6 +142,10 @@ Implemented:
   optimistic `nextIndex` through conflict hints and bounded batches,
 - retained-log term indexing so leader conflict-hint repair can backtrack
   `nextIndex` without rereading the whole retained log file,
+- compacted-prefix conflict hints below the leader's retained snapshot/log floor
+  force the next repair round through `InstallSnapshot` when they have no
+  conflict term, or a conflict term the leader no longer has, instead of looping
+  on an unavailable `prevLogIndex`,
 - follower `leaderCommit` advancement capped at the matched leader log index,
 - post-commit `AppendEntries` fan-out so followers learn the updated
   `leaderCommit` promptly after quorum commit, with bounded inline
@@ -317,7 +327,9 @@ Implemented:
   can satisfy both old and new majorities, while commit checks still require
   `old-majority && new-majority`,
 - operator progress inspection via `GET /raft/progress`, including per-peer
-  `nextIndex`, `matchIndex`, lag, and staged-learner visibility,
+  `nextIndex`, `matchIndex`, lag, and staged-learner visibility; impossible
+  progress above the leader's local log tail remains visible for debugging but
+  reports conservative lag and not-caught-up status,
 - shared Broker/BrokerRaft latency histograms for perf runs:
   `dd_rust_network_mutex_request_duration_seconds` uses fixed route labels such
   as `http_acquire`, `raft_http_acquire`, and `stream_frame`, while
@@ -345,13 +357,19 @@ Implemented:
   conflict clamps:
   `dd_rust_network_mutex_raft_append_progress_updates_total`,
   `dd_rust_network_mutex_raft_append_conflict_repairs_total`, and
-  `dd_rust_network_mutex_raft_append_conflict_clamps_total`; conflict repairs
-  that would move `nextIndex` above the failed probe or local log tail are
-  capped so a rejection cannot advance progress, and counted in
+  `dd_rust_network_mutex_raft_append_conflict_clamps_total`; term-bearing
+  conflict repairs that would move `nextIndex` above the failed probe are
+  rejected, while no-term compacted-prefix hints may raise a stale-low probe up
+  to the follower's reported floor without advancing `matchIndex`; conflict
+  hints above the local log tail are capped and counted in
   `dd_rust_network_mutex_raft_append_conflict_high_clamps_total`; conflict
   responses for older in-flight probes are ignored when the peer's `nextIndex`
   has already changed and counted in
   `dd_rust_network_mutex_raft_append_stale_conflict_responses_total`; conflict
+  hints that prove the follower is below the retained snapshot/log floor
+  increment
+  `dd_rust_network_mutex_raft_append_conflict_snapshot_fallbacks_total` before
+  the next repair round uses `InstallSnapshot`; conflict
   responses with impossible `conflictTerm`/`conflictIndex` hints are rejected
   before repair and counted in
   `dd_rust_network_mutex_raft_append_invalid_conflict_responses_total`; invalid
@@ -368,7 +386,11 @@ Implemented:
   `dd_rust_network_mutex_raft_append_snapshot_suffix_gaps_total` for retained
   suffix coverage gaps, and
   `dd_rust_network_mutex_raft_append_snapshot_frame_overflows_total` when a
-  single retained log entry cannot fit in one `AppendEntries` frame,
+  single retained log entry cannot fit in one `AppendEntries` frame; no-term or
+  unknown-term conflict hints below the retained snapshot/log floor move
+  `nextIndex` under that floor so the next repair round uses the existing
+  prev-term-miss snapshot fallback, and are counted in
+  `dd_rust_network_mutex_raft_append_conflict_snapshot_fallbacks_total`,
 - leader-side AppendEntries attempt/outcome counters for perf comparisons:
   `dd_rust_network_mutex_raft_append_entries_requests_total`,
   `dd_rust_network_mutex_raft_append_entries_heartbeats_total`,
@@ -450,7 +472,10 @@ Implemented:
   quorum short-circuits in
   `dd_rust_network_mutex_raft_replication_cached_quorum_short_circuits_total`,
   and quorum returns before every in-flight peer task drains in
-  `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`;
+  `dd_rust_network_mutex_raft_replication_early_quorum_returns_total`; cached
+  peer `matchIndex` values above the leader's local log tail are ignored for
+  target-index and commit quorum accounting, and already-committed fallback
+  quorum shortcuts require the local log/snapshot to cover the target index,
   target-index foreground fanout narrowing is counted in
   `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total`
   and
@@ -647,8 +672,9 @@ Implemented:
   `dd_rust_network_mutex_raft_pre_vote_malformed_requests_total` or
   `dd_rust_network_mutex_raft_request_vote_malformed_requests_total` and emit
   debug-level `lmx::raft` rejection logs,
-- lower-term `RequestVote` responses are ignored for election quorum and
-  counted in
+- lower-term `PreVote` and `RequestVote` responses are ignored for election
+  quorum and counted in
+  `dd_rust_network_mutex_raft_pre_vote_stale_term_responses_total` and
   `dd_rust_network_mutex_raft_request_vote_stale_term_responses_total`,
 - election timer and candidate churn metrics expose
   `dd_rust_network_mutex_raft_election_deadline_resets_total`,
@@ -720,6 +746,14 @@ Implemented:
   foreground peer fan-out to the remaining votes needed for quorum, including
   joint-consensus old/new majority needs, and rotates that narrowed candidate
   set on retries; heartbeat and post-commit fan-out remain broad,
+- targeted peer catch-up rechecks cached `matchIndex` before building an
+  `AppendEntries` frame, before preparing an `InstallSnapshot` payload, and
+  between snapshot chunks, so concurrent progress cannot force redundant
+  snapshot serialization or streaming,
+- promoted-voter catch-up after the final simple membership entry reuses a
+  nonzero `matchIndex` by lowering `nextIndex` to `matchIndex + 1`, while peers
+  with no known match progress keep the optimistic tail probe to avoid
+  restart-time whole-log sends,
 - bounded leader-local client admission through `client_batch_max_pending`, so a
   stalled quorum rejects before appending new log entries instead of growing the
   pending queue without bound,
