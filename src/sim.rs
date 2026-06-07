@@ -358,11 +358,11 @@ impl RaftSim {
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-leader-1");
         let deadline = deadline_after(DEFAULT_SIM_REQUEST_TIMEOUT);
-        let mut last_not_leader: Option<BrokerRaftError> = None;
+        let mut last_transient_leader_error: Option<BrokerRaftError> = None;
         loop {
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                if let Some(err) = last_not_leader {
+                if let Some(err) = last_transient_leader_error {
                     return Err(err.into());
                 }
                 return Err(RaftSimError::Timeout {
@@ -379,7 +379,11 @@ impl RaftSim {
             {
                 Ok(response) => return Ok(response),
                 Err(err @ BrokerRaftError::NotLeader { .. }) => {
-                    last_not_leader = Some(err);
+                    last_transient_leader_error = Some(err);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err @ BrokerRaftError::QuorumUnavailable { .. }) => {
+                    last_transient_leader_error = Some(err);
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(err) => return Err(err.into()),
@@ -876,6 +880,113 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_five_node_cluster_tolerates_two_failures_then_recovers() {
+        // Mirrors the production 5-node Raft topology (quorum = 3): the cluster
+        // keeps committing with 3 nodes connected (tolerating 2 failures), a
+        // 2-node minority cannot commit, and a heal restores full service.
+        let sim = RaftSim::new(5)
+            .await
+            .expect("start 5-node in-memory raft sim");
+        let leader = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("initial leader elected");
+        let leader_id = leader.config().node_id.clone();
+        assert_eq!(sim.node_ids().len(), 5, "sim should run five voters");
+
+        // Baseline commit with all five connected.
+        let baseline = sim
+            .acquire(format!("five-baseline-{}", Uuid::new_v4()))
+            .await
+            .expect("baseline acquire with five nodes");
+        sim.release(&baseline)
+            .await
+            .expect("release baseline with five nodes");
+
+        // Fail two non-leader nodes; the leader plus two others (3 of 5) keep
+        // quorum.
+        let failed_two = sim
+            .node_ids()
+            .into_iter()
+            .filter(|node_id| node_id != &leader_id)
+            .take(2)
+            .collect::<Vec<_>>();
+        let survivors_three = sim
+            .node_ids()
+            .into_iter()
+            .filter(|node_id| !failed_two.contains(node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(survivors_three.len(), 3);
+        assert!(survivors_three.contains(&leader_id));
+
+        sim.partition(
+            &survivors_three
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            &failed_two.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+
+        // 3 of 5 is still a quorum, so the majority side keeps committing.
+        wait_for_ready_leader_in(&sim, &survivors_three, Duration::from_secs(5))
+            .await
+            .expect("three-node majority keeps a ready leader");
+        let held = sim
+            .acquire(format!("five-quorum3-{}", Uuid::new_v4()))
+            .await
+            .expect("majority of three commits while two nodes are down");
+        sim.release(&held)
+            .await
+            .expect("release on the three-node majority");
+
+        // The two-node minority side must not be able to commit a write.
+        let minority_uuid = format!("five-minority-{}", Uuid::new_v4());
+        let minority_result = sim
+            .run_on_node(
+                &failed_two[0],
+                Request::Lock {
+                    uuid: minority_uuid.clone(),
+                    key: Some(format!("five-minority-key-{}", Uuid::new_v4())),
+                    keys: None,
+                    pid: None,
+                    ttl: None,
+                    max: None,
+                    force: false,
+                    retry_count: 0,
+                    keep_locks_after_death: false,
+                    wait: None,
+                },
+                &minority_uuid,
+                Duration::ZERO,
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                minority_result,
+                Err(RaftSimError::Raft(
+                    BrokerRaftError::QuorumUnavailable { .. }
+                )) | Err(RaftSimError::Raft(BrokerRaftError::NotLeader { .. }))
+                    | Err(RaftSimError::Timeout { .. })
+            ),
+            "a 2-of-5 minority must not commit a write: {minority_result:?}"
+        );
+
+        // Heal the partition: full connectivity restores a single cluster.
+        sim.heal();
+        sim.wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("a leader is re-established after heal");
+        let recovered = sim
+            .acquire(format!("five-healed-{}", Uuid::new_v4()))
+            .await
+            .expect("the healed five-node cluster commits again");
+        sim.release(&recovered)
+            .await
+            .expect("release on the healed cluster");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_memory_majority_partition_elects_new_leader_and_heals_old_leader() {
         let sim = RaftSim::new(3).await.expect("start in-memory raft sim");
         let old_leader = sim
@@ -1181,6 +1292,13 @@ mod tests {
             .into_iter()
             .find(|node_id| node_id != &leader_id)
             .expect("lagging follower id");
+        let seed = sim
+            .acquire(format!("sim-append-lag-seed-{}", Uuid::new_v4()))
+            .await
+            .expect("seed acquire before disconnecting lagging follower");
+        sim.release(&seed)
+            .await
+            .expect("seed release before disconnecting lagging follower");
 
         sim.disconnect_node(&lagging_id);
         for idx in 0..6 {
@@ -1273,6 +1391,13 @@ mod tests {
             .into_iter()
             .find(|node_id| node_id != &leader_id)
             .expect("lagging follower id");
+        let seed = sim
+            .acquire(format!("sim-snapshot-lag-seed-{}", Uuid::new_v4()))
+            .await
+            .expect("seed acquire before disconnecting snapshot lagging follower");
+        sim.release(&seed)
+            .await
+            .expect("seed release before disconnecting snapshot lagging follower");
         let leader_compactions_before = leader.telemetry_snapshot().log_compactions_total;
         let snapshot_fallbacks_before = append_snapshot_fallbacks_total(&sim);
         let snapshot_installs_before = install_snapshot_successes_total(&sim);

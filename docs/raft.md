@@ -213,6 +213,17 @@ Implemented:
   operator visibility,
 - membership-gated Raft RPC handling so unknown or removed peer IDs cannot
   advance local term, reset election timers, or install snapshots,
+- active-peer address-gated Raft RPC handling: `PreVote`, `RequestVote`,
+  `AppendEntries`, and `InstallSnapshot` frames carry the sender's configured
+  Raft peer address, and receivers require the `(peer id, peer addr)` pair to
+  match the active membership before term, vote, log, or snapshot mutation. This
+  closes the stale-pod case where a replaced node keeps its old address but
+  reuses the same peer id,
+- local voter identity is also address-bound: a node advertises its configured
+  `raft.advertise_addr` (or `raft.bind_addr` fallback) on outbound Raft RPCs,
+  startup rejects an initial local voter whose advertised address does not match
+  `raft.peers`, and a process whose local address is later replaced is treated
+  as removed for self-votes, self-quorum, and public client admission,
 - startup validation requires a Raft peer bind address when BrokerRaft is
   enabled, so nodes fail before recovery/election work if they cannot expose
   the peer RPC listener,
@@ -463,6 +474,9 @@ Implemented:
   sender rejections for unknown, stale, or conflicting leaders are counted in
   `dd_rust_network_mutex_raft_follower_append_sender_rejections_total` and
   `dd_rust_network_mutex_raft_follower_install_snapshot_sender_rejections_total`;
+  sender rejections for inactive or replaced vote candidates are counted in
+  `dd_rust_network_mutex_raft_pre_vote_sender_rejections_total` and
+  `dd_rust_network_mutex_raft_request_vote_sender_rejections_total`;
   generic inbound request/response frames rejected before JSON parsing because
   they exceed the frame cap increment
   `dd_rust_network_mutex_raft_rpc_inbound_frame_rejections_total`, and generic
@@ -705,7 +719,9 @@ Implemented:
   retained entries/bytes, and elapsed microseconds,
 - consensus-replicated staged-learner management via `GET/POST/DELETE
   /raft/learners`, with a local restart cache and snapshot coverage; promotion
-  still goes through log-backed joint consensus,
+  still goes through log-backed joint consensus, and `POST /raft/learners`
+  reports a learner catch-up error unless each staged learner reaches the
+  committed staging entry before the call returns,
 - staged learner additions/removals are blocked while joint consensus is active,
   so operator membership-management commands cannot interleave with an unfinished
   voter transition,
@@ -893,7 +909,8 @@ sequenceDiagram
   LB->>F: round-robin request
   F->>L: ProxyRequest(request, wait_ms)
   L->>Disk: append ClientRequest
-  L->>P: AppendEntries(entries, leader_commit)
+  L->>P: AppendEntries(prevLogIndex, prevLogTerm, entries, leaderCommit, leaderId, leaderAddr)
+  P->>P: verify leader id+addr is active
   P-->>L: success from quorum
   L->>B: advance leader commitIndex
   L->>B: apply committed request
@@ -910,6 +927,13 @@ followers proxy writes and the leader still requires quorum before applying.
 The follower proxy hop dials the configured Raft peer address directly
 (`raft.peers[*].addr` / each pod's `advertise_addr`), not the public load
 balancer, so stale LB routing cannot create a proxy loop.
+For peer RPC identity, each pod sends its own configured `advertise_addr` (or
+`bind_addr` fallback), not the address currently listed for its node id in
+membership. If membership replaces that address, the old pod cannot self-label
+as the replacement and is rejected by the active `(node id, addr)` gate.
+The leader accepts a proxied client request only when the proxy sender's
+`(node id, addr)` still matches active membership, so an old pod at a replaced
+address is rejected before appending client work.
 An old leader that cannot observe quorum for an election-timeout window steps
 down, causing `/raft/leaderz` to return 503 instead of keeping a partitioned
 leader in the preferred LB target set.
@@ -1269,7 +1293,14 @@ Use the same benchmark knobs for both scripts, for example:
 BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
 PROFILE_TARGET=raft BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
 PROFILE_TARGET=raft RAFT_BENCH_ROUTE=round-robin BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
+PROFILE_TARGET=raft BENCH_HTTP_KEEPALIVE=true BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
 ```
+
+By default, the Broker/BrokerRaft HTTP benchmark path uses short-lived HTTP
+connections so the reported cycle cost includes the exposed LB-facing transport
+shape. Set `BENCH_HTTP_KEEPALIVE=true` to reuse one HTTP connection per worker
+per endpoint and reduce client-side TCP setup noise when comparing regular
+Broker CPU cost with BrokerRaft quorum, proxy, and durable-log cost.
 
 For manual benchmark runs, `BENCH_RAFT` accepts either one endpoint, such as a
 real LB service or leader-preferred HTTP port, or a comma-separated list of node
