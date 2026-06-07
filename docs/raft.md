@@ -89,6 +89,9 @@ Implemented:
 - step-down reads back the effective monotonic hard state and applies any newly
   visible durable `commitIndex`, so a term change cannot leave live runtime
   state behind a commit that was already persisted,
+- leader commit finalization also applies the visible durable `commitIndex` if a
+  post-persistence leadership/quorum recheck fails, so a safely persisted commit
+  does not wait for a later request path before reaching live runtime,
 - accepted follower `AppendEntries` requests also sync the effective durable
   `commitIndex` into runtime before conflict repair, so stale in-memory state
   cannot permit a rewrite of an entry that disk already records as committed;

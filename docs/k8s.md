@@ -230,8 +230,10 @@ Cluster-internal callers reach the broker at:
 BrokerRaft should be deployed as its own StatefulSet and Services, with
 names that do not overwrite the regular `live-mutex-rs` Deployment. A
 3-node cluster commits with 2 votes; a 5-node cluster commits with 3
-votes. Keep public BrokerRaft admission single-key-only; multi-key
-`keys` requests remain a regular Broker feature.
+votes. Public BrokerRaft admission supports single-key requests and bounded
+multi-key `keys` requests up to 3 distinct keys, preserving the regular
+Broker's union-overlap composite semantics while keeping replicated
+per-log-index fencing-token reservation bounded.
 
 Use one headless peer Service for stable Raft RPC DNS and one client
 Service for HTTP traffic. The peer Service publishes not-ready

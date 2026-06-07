@@ -2078,6 +2078,9 @@ enum EphemeralProxyMode {
     LocalLeaderOnly,
 }
 
+#[cfg(test)]
+type LeaderCommitAfterHardStateWriteHook = Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RaftPreVoteRound {
     current_term: u64,
@@ -4129,6 +4132,8 @@ pub struct BrokerRaft {
     client_batch_notify: Arc<Notify>,
     #[cfg(test)]
     client_batch_waiting: Arc<Notify>,
+    #[cfg(test)]
+    leader_commit_after_hard_state_write: LeaderCommitAfterHardStateWriteHook,
 }
 
 impl BrokerRaft {
@@ -4341,6 +4346,8 @@ impl BrokerRaft {
             client_batch_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             client_batch_waiting: Arc::new(Notify::new()),
+            #[cfg(test)]
+            leader_commit_after_hard_state_write: Arc::new(Mutex::new(None)),
             config,
             log,
         };
@@ -4395,6 +4402,23 @@ impl BrokerRaft {
     pub fn broker(&self) -> &Broker {
         crate::routine_id!("ddl-routine-broker-raft-inner-broker-1");
         &self.broker
+    }
+
+    #[cfg(test)]
+    fn set_leader_commit_after_hard_state_write_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        crate::routine_id!("ddl-routine-broker-raft-set-leader-commit-hook-1");
+        *self.leader_commit_after_hard_state_write.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn run_leader_commit_after_hard_state_write_hook(&self) {
+        crate::routine_id!("ddl-routine-broker-raft-run-leader-commit-hook-1");
+        if let Some(hook) = self.leader_commit_after_hard_state_write.lock().as_ref() {
+            hook();
+        }
     }
 
     pub fn log(&self) -> &RaftLogStore {
@@ -12428,34 +12452,72 @@ impl BrokerRaft {
         };
         if let Some(hard_state) = hard_state {
             self.log.write_hard_state(&hard_state)?;
+            #[cfg(test)]
+            self.run_leader_commit_after_hard_state_write_hook();
+            let mut recheck_failure = None;
             {
                 let mut runtime = self.runtime.lock();
                 if runtime.role != RaftRole::Leader || runtime.current_term != term {
-                    return Ok(false);
-                }
-                let membership = commit_membership
-                    .cloned()
-                    .unwrap_or_else(|| runtime.membership.clone());
-                let ack_ids = matched_ids_for_index(
-                    &self.config.node_id,
-                    self.log.last_index(),
-                    &runtime.leader_progress,
-                    index,
-                );
-                if !membership.quorum_met(&ack_ids) {
-                    return Ok(false);
-                }
-                let previous_commit = runtime.commit_index;
-                runtime.commit_index = runtime.commit_index.max(index);
-                if runtime.commit_index > previous_commit {
-                    committed_from = Some((
-                        previous_commit,
-                        runtime.commit_index,
-                        ack_ids.len(),
-                        membership.quorum_size(),
-                        membership.is_joint(),
+                    recheck_failure = Some((
+                        "role-term",
+                        runtime.current_term,
+                        runtime.role,
+                        0,
+                        runtime.membership.quorum_size(),
+                        runtime.membership.is_joint(),
                     ));
+                } else {
+                    let membership = commit_membership
+                        .cloned()
+                        .unwrap_or_else(|| runtime.membership.clone());
+                    let ack_ids = matched_ids_for_index(
+                        &self.config.node_id,
+                        self.log.last_index(),
+                        &runtime.leader_progress,
+                        index,
+                    );
+                    if !membership.quorum_met(&ack_ids) {
+                        recheck_failure = Some((
+                            "quorum",
+                            runtime.current_term,
+                            runtime.role,
+                            ack_ids.len(),
+                            membership.quorum_size(),
+                            membership.is_joint(),
+                        ));
+                    } else {
+                        let previous_commit = runtime.commit_index;
+                        runtime.commit_index = runtime.commit_index.max(index);
+                        if runtime.commit_index > previous_commit {
+                            committed_from = Some((
+                                previous_commit,
+                                runtime.commit_index,
+                                ack_ids.len(),
+                                membership.quorum_size(),
+                                membership.is_joint(),
+                            ));
+                        }
+                    }
                 }
+            }
+            if let Some((reason, runtime_term, runtime_role, ack_count, quorum, membership_joint)) =
+                recheck_failure
+            {
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    term,
+                    runtime_term,
+                    ?runtime_role,
+                    commit_index = index,
+                    ack_count,
+                    quorum,
+                    membership_joint,
+                    reason,
+                    "raft leader commit recheck failed after durable commit write; applying visible durable commit",
+                );
+                self.apply_visible_durable_commit_index()?;
+                return Ok(false);
             }
         }
         if let Some((previous_commit, commit_index, ack_count, quorum, membership_joint)) =
@@ -14718,19 +14780,20 @@ impl BrokerRaft {
         Ok(())
     }
 
-    fn visible_durable_commit_index_needs_apply(&self) -> Result<bool, BrokerRaftError> {
-        crate::routine_id!("ddl-routine-broker-raft-visible-durable-commit-needs-apply-1");
+    fn visible_durable_commit_index_needs_sync(&self) -> Result<bool, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-visible-durable-commit-needs-sync-1");
         let durable_commit_index = self.log.read_hard_state()?.commit_index;
         if durable_commit_index == 0 {
             return Ok(false);
         }
-        let last_applied = self.runtime.lock().last_applied;
-        Ok(durable_commit_index > last_applied)
+        let runtime = self.runtime.lock();
+        Ok(durable_commit_index > runtime.commit_index
+            || durable_commit_index > runtime.last_applied)
     }
 
     async fn apply_visible_durable_commit_index_blocking(&self) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-apply-visible-durable-commit-blocking-1");
-        if !self.visible_durable_commit_index_needs_apply()? {
+        if !self.visible_durable_commit_index_needs_sync()? {
             return Ok(());
         }
         let node = self.clone();
@@ -41099,13 +41162,13 @@ mod tests {
     }
 
     #[test]
-    fn visible_durable_commit_fast_path_only_requires_unapplied_commit() {
+    fn visible_durable_commit_fast_path_checks_runtime_commit_and_apply_state() {
         let dir = temp_dir("raft-visible-durable-commit-fast-path");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
         assert!(
             !raft
-                .visible_durable_commit_index_needs_apply()
+                .visible_durable_commit_index_needs_sync()
                 .expect("zero commit is already applied"),
             "zero durable commitIndex should skip blocking apply"
         );
@@ -41119,7 +41182,7 @@ mod tests {
             })
             .expect("persist durable commit");
         assert!(
-            raft.visible_durable_commit_index_needs_apply()
+            raft.visible_durable_commit_index_needs_sync()
                 .expect("unapplied durable commit needs apply"),
             "durable commit ahead of lastApplied must use the blocking apply path"
         );
@@ -41131,10 +41194,28 @@ mod tests {
         }
         assert!(
             !raft
-                .visible_durable_commit_index_needs_apply()
+                .visible_durable_commit_index_needs_sync()
                 .expect("applied durable commit can use fast path"),
             "already-applied durable commitIndex should skip the blocking apply path"
         );
+
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.commit_index = 0;
+            runtime.last_applied = entry.index;
+        }
+        assert!(
+            raft.visible_durable_commit_index_needs_sync()
+                .expect("stale runtime commit index needs sync"),
+            "durable commit ahead of runtime commitIndex must use the blocking sync path even when already applied"
+        );
+        raft.apply_visible_durable_commit_index()
+            .expect("sync visible durable commit");
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.commit_index, entry.index);
+            assert_eq!(runtime.last_applied, entry.index);
+        }
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -48418,6 +48499,62 @@ mod tests {
             let runtime = raft.runtime.lock();
             assert_eq!(runtime.commit_index, 1);
             assert_eq!(runtime.last_applied, 1);
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn leader_commit_recheck_failure_after_persist_applies_visible_durable_commit() {
+        let dir = temp_dir("raft-leader-commit-recheck-applies-durable");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let entry = raft
+            .log
+            .append(2, RaftCommand::Noop)
+            .expect("append current");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.commit_index = 0;
+            runtime.last_applied = 0;
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: entry.index.saturating_add(1),
+                    match_index: entry.index,
+                },
+            );
+        }
+        let runtime_for_hook = Arc::clone(&raft.runtime);
+        raft.set_leader_commit_after_hard_state_write_hook(move || {
+            let mut runtime = runtime_for_hook.lock();
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        });
+
+        let committed = raft
+            .commit_leader_index_in_term(entry.index, 2, true)
+            .expect("commit recheck should apply durable commit before returning");
+
+        assert!(
+            !committed,
+            "leader finalization should report that the post-write leader recheck failed"
+        );
+        assert_eq!(
+            raft.log.read_hard_state().expect("hard state").commit_index,
+            entry.index
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.commit_index, entry.index);
+            assert_eq!(
+                runtime.last_applied, entry.index,
+                "durable commit must be visible and applied even when the leader recheck fails"
+            );
         }
 
         let _ = fs::remove_dir_all(dir);
