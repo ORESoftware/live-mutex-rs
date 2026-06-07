@@ -1,21 +1,26 @@
 # `rust-network-mutex-rs` clients
 
-Eight language clients that all speak the same JSON wire protocol (see
+Thirteen language clients/seeds that all speak the same JSON wire protocol (see
 `../PROTOCOL.md`) to the Rust broker. Each client mirrors the Rust
 `Request` / `Response` enum in its native idiom — **no magic strings**,
 unlike the upstream Node `live-mutex` library which uses `if (data.type
 === '…')` chains in `broker.js`.
 
-| Runtime    | Path                | Discriminator construct                      | Smoke command                                                |
-|------------|---------------------|----------------------------------------------|--------------------------------------------------------------|
-| Rust       | `../src/client.rs`  | serde tagged enum (`#[serde(tag="type")]`)   | `cargo test --no-default-features` (in deployment root)      |
+| Runtime    | Path                | Discriminator construct                       | Check / smoke command                                        |
+|------------|---------------------|-----------------------------------------------|--------------------------------------------------------------|
+| Rust       | `../src/client.rs`  | serde tagged enum (`#[serde(tag="type")]`)    | `cargo test --no-default-features` (in deployment root)      |
 | TypeScript | `ts/`               | discriminated union (`type Request = … \| …`) | `pnpm --dir clients/ts smoke`                                |
-| Go         | `go/`               | typed `RequestType` const block + switch     | `go run ./clients/go/cmd/smoke`                              |
-| Dart       | `dart/`             | `sealed class Request` + pattern matching   | `dart run clients/dart/bin/smoke.dart`                       |
-| Gleam      | `gleam/`            | `pub type Request { … }` (true ADT)          | `LIVE_MUTEX_SMOKE=1 gleam test` (in `clients/gleam/`)        |
-| Python     | `python/`           | `enum.Enum` `RequestType` + typed builders   | `python3 clients/python/smoke.py`                            |
-| C++        | `cpp/`              | `enum class RequestType` + `switch`          | `make -C clients/cpp run`                                    |
-| Java       | `java/`             | `enum RequestType` + `switch` (records)      | `clients/java/build.sh && java -cp clients/java/out com.oresoftware.networkmutex.Smoke` |
+| Go         | `go/`               | typed `RequestType` const block + switch      | `go run ./clients/go/cmd/smoke`                              |
+| Dart       | `dart/`             | `sealed class Request` + pattern matching     | `dart run clients/dart/bin/smoke.dart`                       |
+| Gleam      | `gleam/`            | `pub type Request { … }` (true ADT)           | `LIVE_MUTEX_SMOKE=1 gleam test` (in `clients/gleam/`)        |
+| Python     | `python/`           | `enum.Enum` `RequestType` + typed builders    | `python3 clients/python/smoke.py`                            |
+| C++        | `cpp/`              | `enum class RequestType` + `switch`           | `make -C clients/cpp run`                                    |
+| Java       | `java/`             | `enum RequestType` + `switch` (records)       | `clients/java/build.sh && java -cp clients/java/out com.oresoftware.networkmutex.Smoke` |
+| Erlang     | `erlang/`           | atoms + function clauses                      | `make -C clients/erlang test`                                |
+| Elixir     | `elixir/`           | atoms + pattern-matched function heads        | `mix test` (in `clients/elixir/`)                            |
+| OCaml      | `ocaml/`            | variants + pattern matching                   | `make -C clients/ocaml test`                                 |
+| C#         | `csharp/`           | `enum RequestType` / `enum ResponseType`      | `dotnet run --project clients/csharp`                        |
+| F#         | `fsharp/`           | discriminated unions + pattern matching       | `dotnet run --project clients/fsharp`                        |
 
 The TypeScript client also ships a head-to-head benchmark harness
 (`ts/src/compare.ts`) that runs the same workload against
@@ -59,9 +64,10 @@ in Docker if no local Dart SDK is installed.
 
 ## Why an enum (instead of magic strings)?
 
-Adding a new request variant on the broker side (in `src/protocol.rs`) is
-a *compile error* in every client until the client adds the matching
-constructor:
+Adding a new request variant on the broker side (in `src/protocol.rs`) must be
+reflected in every client mirror. Static languages catch much of that through
+exhaustiveness checks; `./clients/check-protocol-parity.sh` catches the shared
+wire discriminator drift for every runtime:
 
 - Rust → enum exhaustiveness is enforced by `match`.
 - TypeScript → `assertNever(value: never): never` makes the `switch`
@@ -75,6 +81,11 @@ constructor:
 - Python → `enum.Enum` request/response discriminators plus typed builders.
 - C++ → `enum class` request/response discriminators and switch helpers.
 - Java → `enum RequestType` / `enum ResponseType` with typed request builders.
+- Erlang → atoms and exhaustive function clauses over known wire tags.
+- Elixir → atoms and pattern-matched function heads over known wire tags.
+- OCaml → variants and pattern matching.
+- C# → enums and switch expressions.
+- F# → discriminated unions and pattern matching.
 
 The upstream `live-mutex` broker switches on bare strings, so a typo
 silently routes to "no handler". This is the structural fix.

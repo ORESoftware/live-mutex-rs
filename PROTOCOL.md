@@ -1,9 +1,9 @@
 # `rust-network-mutex-rs` Wire Protocol
 
 This file is the **single source of truth** for the JSON wire format between
-clients (Rust / TypeScript / Go / Dart / Gleam / Python / C++ / Java) and the
-broker. Every client under `clients/<lang>/` MUST mirror these enum variants
-exactly.
+clients (Rust / TypeScript / Go / Dart / Gleam / Python / C++ / Java / Erlang /
+Elixir / OCaml / C# / F#) and the broker. Every client under `clients/<lang>/`
+MUST mirror these enum variants exactly.
 
 The Rust side is generated from `src/protocol.rs` by serde with:
 
@@ -14,9 +14,10 @@ pub enum Response { … }
 ```
 
 so the Rust types are the canonical schema. The cross-runtime clients all keep
-their own type-safe enum (TS string-literal union, Go typed string + iota, Dart
-sealed classes, Gleam custom types) so we never reach for magic strings the way
-the upstream Node `live-mutex` library does.
+their own type-safe discriminator construct (TS string-literal union, Go typed
+strings, Dart sealed classes, Gleam/Erlang/Elixir/OCaml/.NET variants or enums)
+so we never reach for magic strings the way the upstream Node `live-mutex`
+library does.
 
 ## Transport
 
@@ -172,7 +173,13 @@ client below uses the same pattern in its native idiom:
 | Python     | `enum.Enum` discriminators + typed builders           |
 | C++        | `enum class RequestType` + `switch` helpers           |
 | Java       | `enum RequestType` / `enum ResponseType` builders     |
+| Erlang     | atoms + function clauses                              |
+| Elixir     | atoms + pattern-matched function heads                |
+| OCaml      | variants + pattern matching                           |
+| C#         | `enum RequestType` / `enum ResponseType`              |
+| F#         | discriminated unions + pattern matching               |
 
-Adding a new variant in Rust is a compile error in every client until the
-client adds the matching constructor — that is the property the upstream
-library lacks.
+Adding a new variant in Rust must be reflected in every client mirror. Static
+languages catch much of that through exhaustiveness checks, and
+`./clients/check-protocol-parity.sh` catches shared wire-discriminator drift for
+every runtime — that is the property the upstream library lacks.

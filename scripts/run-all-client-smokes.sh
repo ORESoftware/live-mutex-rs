@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Run the smoke test for every cross-runtime client (TS / Rust / Go / Dart /
-# Gleam / Python / C++ / Java) against a local broker. Each runtime exits
-# non-zero on failure.
+# Run the protocol checks and smoke tests for every cross-runtime client.
+# Live smoke tests run against a local broker; protocol-only seeds are checked
+# offline before the broker probe.
 #
 # Prerequisites: cargo, node, npm, go, gleam, python3, a C++17 compiler, a JDK
-# 17+ (javac), and either dart or docker (the dart smoke runs in
-# `docker run dart:stable …` if no local SDK is available). Missing optional
-# toolchains are skipped with a notice rather than failing the run.
+# 17+ (javac), erlang/erlc, ocamlc, dotnet, and either dart or docker (the dart
+# smoke runs in `docker run dart:stable …` if no local SDK is available).
+# Missing optional toolchains are skipped with a notice rather than failing the
+# run.
 #
 #   ./scripts/run-all-client-smokes.sh
 #
@@ -24,6 +25,41 @@ export LIVE_MUTEX_PORT="$PORT"
 
 echo "==> client protocol parity"
 "$HERE/clients/check-protocol-parity.sh"
+
+echo "==> erlang protocol"
+if command -v erl >/dev/null 2>&1 && command -v erlc >/dev/null 2>&1; then
+  ( cd "$HERE/clients/erlang" && make test )
+else
+  echo "(skipping erlang: erl/erlc not found)"
+fi
+
+echo "==> elixir protocol"
+if command -v mix >/dev/null 2>&1; then
+  ( cd "$HERE/clients/elixir" && mix test )
+else
+  echo "(skipping elixir: mix not found)"
+fi
+
+echo "==> ocaml protocol"
+if command -v ocamlc >/dev/null 2>&1; then
+  ( cd "$HERE/clients/ocaml" && make test )
+else
+  echo "(skipping ocaml: ocamlc not found)"
+fi
+
+echo "==> c# protocol"
+if command -v dotnet >/dev/null 2>&1; then
+  dotnet run --project "$HERE/clients/csharp"
+else
+  echo "(skipping c#: dotnet not found)"
+fi
+
+echo "==> f# protocol"
+if command -v dotnet >/dev/null 2>&1; then
+  dotnet run --project "$HERE/clients/fsharp"
+else
+  echo "(skipping f#: dotnet not found)"
+fi
 
 if ! nc -z "$HOST" "$PORT" 2>/dev/null; then
   echo "FATAL: broker not listening on $HOST:$PORT" >&2

@@ -406,8 +406,8 @@ Implemented:
   increment
   `dd_rust_network_mutex_raft_append_conflict_snapshot_fallbacks_total` before
   the next repair round uses `InstallSnapshot`; conflict
-  responses with impossible `conflictTerm`/`conflictIndex` hints are rejected
-  before repair and counted in
+  responses with impossible `conflictTerm`, `conflictIndex`, or conflict
+  `matchIndex` values are rejected before repair and counted in
   `dd_rust_network_mutex_raft_append_invalid_conflict_responses_total`; invalid
   `AppendEntries(success=true)` responses that underreport the matched boundary
   or carry contradictory conflict hints increment
@@ -1124,11 +1124,11 @@ Append progress and conflict repair emit debug-level `lmx::raft` events with
 the previous and repaired `nextIndex`/`matchIndex`, the sent batch boundary, and
 whether a stale conflict hint was clamped by known follower progress.
 Impossible conflict hints with zero terms/indexes, a `conflictIndex` at or
-beyond the rejected `nextIndex`, or a `conflictTerm` newer than the peer's
-response term are treated as invalid peer responses before leader progress can
-be mutated. Conflict-term hints must include the matching `conflictIndex`;
-term-only hints are rejected because the leader cannot make a precise Raft
-repair from them.
+beyond the rejected `nextIndex`, a rejection `matchIndex` at or beyond the
+rejected `prevLogIndex`, or a `conflictTerm` newer than the peer's response term
+are treated as invalid peer responses before leader progress can be mutated.
+Conflict-term hints must include the matching `conflictIndex`; term-only hints
+are rejected because the leader cannot make a precise Raft repair from them.
 Impossible `AppendEntries(success=true)` responses that report a `matchIndex`
 below the matched previous entry or sent batch are rejected as non-progress and
 counted in the invalid-success metric.

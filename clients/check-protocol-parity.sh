@@ -57,6 +57,11 @@ CLIENT_PROTOCOLS=(
   "Python:clients/python/network_mutex/protocol.py"
   "C++:clients/cpp/include/network_mutex/protocol.hpp"
   "Java:clients/java/src/main/java/com/oresoftware/networkmutex/Protocol.java"
+  "Erlang:clients/erlang/src/network_mutex_protocol.erl"
+  "Elixir:clients/elixir/lib/network_mutex/protocol.ex"
+  "OCaml:clients/ocaml/network_mutex_protocol.ml"
+  "C#:clients/csharp/Protocol.cs"
+  "F#:clients/fsharp/Protocol.fs"
 )
 
 failures=0

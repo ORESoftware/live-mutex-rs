@@ -5653,7 +5653,7 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_stale_conflict_responses_total AppendEntries conflict responses ignored because peer nextIndex had already changed since the failed probe was sent.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_stale_conflict_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_stale_conflict_responses_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_append_invalid_conflict_responses_total AppendEntries conflict responses rejected because conflictTerm or conflictIndex was impossible for the failed probe.\n",
+                "# HELP dd_rust_network_mutex_raft_append_invalid_conflict_responses_total AppendEntries conflict responses rejected because conflictTerm, conflictIndex, or conflict matchIndex was impossible for the failed probe.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_invalid_conflict_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_invalid_conflict_responses_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_append_invalid_success_responses_total AppendEntries success responses rejected because the reported matchIndex could not cover the matched previous entry/sent batch or because success carried conflict hints.\n",
@@ -13372,6 +13372,8 @@ impl BrokerRaft {
                     if let Some(reason) = invalid_append_conflict_hint_reason(
                         conflict_term,
                         conflict_index,
+                        match_index,
+                        prev_log_index,
                         next_index,
                         peer_term,
                     ) {
@@ -19682,6 +19684,8 @@ fn validate_append_entries_shape(
 fn invalid_append_conflict_hint_reason(
     conflict_term: Option<u64>,
     conflict_index: Option<u64>,
+    match_index: u64,
+    prev_log_index: u64,
     current_next_index: u64,
     response_term: u64,
 ) -> Option<&'static str> {
@@ -19698,7 +19702,13 @@ fn invalid_append_conflict_hint_reason(
     if conflict_index == Some(0) {
         return Some("conflictIndex must be >= 1 when present");
     }
-    if conflict_term.is_some() && conflict_index.is_some_and(|index| index >= current_next_index) {
+    if match_index >= current_next_index {
+        return Some("matchIndex must be below rejected nextIndex");
+    }
+    if prev_log_index > 0 && match_index >= prev_log_index {
+        return Some("matchIndex must be below rejected prevLogIndex");
+    }
+    if conflict_index.is_some_and(|index| index >= current_next_index) {
         return Some("conflictIndex must be below rejected nextIndex");
     }
     None
@@ -34150,6 +34160,331 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_rejection_with_no_term_high_conflict_index_does_not_update_progress() {
+        let dir = temp_dir("raft-no-term-high-conflict-index-rejected");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: false,
+                match_index: 5,
+                conflict_index: Some(6),
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate invalid no-term conflict hint rejection");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        server.await.expect("fake peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_conflicts_total, 0);
+        assert_eq!(telemetry.append_conflict_repairs_total, 0);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 1);
+        assert_eq!(telemetry.append_invalid_conflict_responses_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn append_rejection_with_high_match_index_does_not_update_progress() {
+        let dir = temp_dir("raft-high-conflict-match-index-rejected");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: false,
+                match_index: 6,
+                conflict_index: Some(1),
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate invalid high match-index rejection");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        server.await.expect("fake peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_conflicts_total, 0);
+        assert_eq!(telemetry.append_conflict_repairs_total, 0);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 1);
+        assert_eq!(telemetry.append_invalid_conflict_responses_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn append_rejection_with_match_index_at_rejected_prev_does_not_repair_progress() {
+        let dir = temp_dir("raft-conflict-match-index-at-rejected-prev");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+        let before = raft.leader_progress_generation();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: false,
+                match_index: 5,
+                conflict_index: Some(1),
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(peer, 1, 0, Some(5))
+            .await
+            .expect("replicate invalid rejected-prev match-index response");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        assert!(!outcome.progress_changed);
+        server.await.expect("fake peer server");
+        assert_eq!(raft.leader_progress_generation(), before);
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 6);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_conflicts_total, 0);
+        assert_eq!(telemetry.append_conflict_repairs_total, 0);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 1);
+        assert_eq!(telemetry.append_invalid_conflict_responses_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn append_success_underreporting_prev_log_index_does_not_count_target_ack() {
         let dir = temp_dir("raft-append-success-underreports-prev");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -40368,6 +40703,148 @@ mod tests {
             } if lock_uuid == "discovered-lock"
         ));
         follower_server.await.expect("fake follower server");
+        leader_server.await.expect("fake leader server");
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 2);
+        assert_eq!(telemetry.proxy_requests_handled_total, 0);
+        assert_eq!(telemetry.proxy_request_errors_total, 1);
+        assert_eq!(telemetry.proxy_request_retries_total, 0);
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 5);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n3"));
+        }
+        assert_eq!(raft.leader_addr(), Some(leader_addr.to_string()));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follower_proxy_skips_unreachable_peer_and_dials_leader_peer_directly() {
+        let dir = temp_dir("raft-follower-proxy-direct-peer-after-connect-fail");
+        let unused_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused peer addr");
+        let unreachable_addr = unused_listener.local_addr().expect("unused peer addr");
+        drop(unused_listener);
+        let leader_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake leader peer");
+        let leader_addr = leader_listener.local_addr().expect("fake leader peer addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.proxy_retry_budget = Duration::from_millis(500);
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: unreachable_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: leader_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 5;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = None;
+        }
+
+        let leader_server = tokio::spawn(async move {
+            let (stream, peer_addr) = leader_listener
+                .accept()
+                .await
+                .expect("accept direct leader proxy");
+            assert!(
+                peer_addr.ip().is_loopback(),
+                "test should receive a direct peer connection, not an HTTP/LB hop: {peer_addr}"
+            );
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read direct leader proxy request");
+            let rpc: RaftRpc =
+                serde_json::from_str(&line).expect("parse direct leader proxy request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    request_uuid,
+                    request,
+                    wait_ms,
+                    is_acquire: true,
+                    ..
+                } => {
+                    assert_eq!(request_uuid, "direct-peer-proxy");
+                    assert_eq!(wait_ms, 0);
+                    assert!(
+                        matches!(
+                            request,
+                            Request::Lock {
+                                key: Some(ref key),
+                                ..
+                            } if key == "direct-peer-proxy-key"
+                        ),
+                        "unexpected proxied request: {request:?}"
+                    );
+                }
+                other => panic!("unexpected direct leader proxy rpc: {other:?}"),
+            }
+            let body = serde_json::to_vec(&RaftRpcResponse::ProxyResponse {
+                term: 5,
+                response: Some(Response::Lock {
+                    uuid: "direct-peer-proxy".into(),
+                    key: "direct-peer-proxy-key".into(),
+                    acquired: true,
+                    lock_request_count: 0,
+                    lock_uuid: Some("direct-peer-lock".into()),
+                    fencing_token: Some(23),
+                    readers_count: None,
+                    error: None,
+                }),
+                error: None,
+                leader_id: None,
+                leader_addr: None,
+            })
+            .expect("serialize direct leader proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write direct leader proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write direct leader proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush direct leader proxy response");
+        });
+
+        let response = raft
+            .run_ephemeral(
+                single_lock_request("direct-peer-proxy", "direct-peer-proxy-key"),
+                "direct-peer-proxy",
+                Duration::ZERO,
+                true,
+            )
+            .await
+            .expect("follower proxy should skip failed peer and reach leader")
+            .expect("proxied response");
+        assert!(matches!(
+            response,
+            Response::Lock {
+                acquired: true,
+                lock_uuid: Some(ref lock_uuid),
+                ..
+            } if lock_uuid == "direct-peer-lock"
+        ));
         leader_server.await.expect("fake leader server");
         assert!(raft.log.read_entries().expect("entries").is_empty());
         let telemetry = raft.telemetry_snapshot();
@@ -48095,43 +48572,55 @@ mod tests {
     #[test]
     fn invalid_append_conflict_hint_reason_rejects_impossible_values() {
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(0), Some(1), 5, 1),
+            invalid_append_conflict_hint_reason(Some(0), Some(1), 0, 4, 5, 1),
             Some("conflictTerm must be >= 1 when present")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(2), Some(1), 5, 1),
+            invalid_append_conflict_hint_reason(Some(2), Some(1), 0, 4, 5, 1),
             Some("conflictTerm cannot exceed response term")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), None, 5, 1),
+            invalid_append_conflict_hint_reason(Some(1), None, 0, 4, 5, 1),
             Some("conflictIndex is required when conflictTerm is present")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(None, Some(0), 5, 1),
+            invalid_append_conflict_hint_reason(None, Some(0), 0, 4, 5, 1),
             Some("conflictIndex must be >= 1 when present")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), Some(6), 5, 1),
+            invalid_append_conflict_hint_reason(None, Some(4), 5, 4, 5, 1),
+            Some("matchIndex must be below rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(4), 6, 4, 5, 1),
+            Some("matchIndex must be below rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(1), 4, 4, 5, 1),
+            Some("matchIndex must be below rejected prevLogIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), Some(6), 0, 4, 5, 1),
             Some("conflictIndex must be below rejected nextIndex")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), Some(5), 5, 1),
+            invalid_append_conflict_hint_reason(Some(1), Some(5), 0, 4, 5, 1),
             Some("conflictIndex must be below rejected nextIndex")
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(None, Some(6), 5, 1),
+            invalid_append_conflict_hint_reason(None, Some(6), 0, 4, 5, 1),
+            Some("conflictIndex must be below rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(None, Some(5), 0, 4, 5, 1),
+            Some("conflictIndex must be below rejected nextIndex")
+        );
+        assert_eq!(
+            invalid_append_conflict_hint_reason(Some(1), Some(4), 0, 4, 5, 1),
             None
         );
         assert_eq!(
-            invalid_append_conflict_hint_reason(None, Some(5), 5, 1),
-            None
-        );
-        assert_eq!(
-            invalid_append_conflict_hint_reason(Some(1), Some(4), 5, 1),
-            None
-        );
-        assert_eq!(
-            invalid_append_conflict_hint_reason(None, Some(1), 5, 1),
+            invalid_append_conflict_hint_reason(None, Some(1), 0, 4, 5, 1),
             None
         );
     }
