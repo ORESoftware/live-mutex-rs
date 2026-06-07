@@ -625,6 +625,10 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_rejections_total`,
   `dd_rust_network_mutex_raft_install_snapshot_rpc_errors_total`, and
   `dd_rust_network_mutex_raft_install_snapshot_progress_updates_total`;
+  prepared leader-side `InstallSnapshot` payloads are cached only while their
+  checksum and snapshot boundary still match the latest local snapshot, so local
+  compaction snapshots and follower-installed newer snapshots release obsolete
+  prepared payload bytes instead of retaining a stale large buffer;
   follower-side snapshot payloads whose idempotency cache conflicts with a
   retained suffix increment
   `dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total`;

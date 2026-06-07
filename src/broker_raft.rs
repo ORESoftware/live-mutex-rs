@@ -2089,6 +2089,19 @@ struct PreparedInstallSnapshot {
     payload_bytes: Vec<u8>,
 }
 
+fn prepared_install_snapshot_matches(
+    prepared: &PreparedInstallSnapshot,
+    metadata: &RaftSnapshotMetadata,
+    expected_checksum: &str,
+) -> bool {
+    crate::routine_id!("ddl-routine-broker-raft-prepared-snapshot-matches-1");
+    prepared.metadata.last_included_index == metadata.last_included_index
+        && prepared.metadata.last_included_term == metadata.last_included_term
+        && prepared
+            .payload_sha256
+            .eq_ignore_ascii_case(expected_checksum)
+}
+
 #[derive(Debug, Default)]
 struct SharedInstallSnapshotSource {
     prepared: OnceCell<Result<Option<Arc<PreparedInstallSnapshot>>, String>>,
@@ -10864,6 +10877,7 @@ impl BrokerRaft {
                     };
                 }
             };
+            self.clear_prepared_install_snapshot_cache_if_stale(&installed);
             installed_index = installed.last_included_index;
         }
         self.finish_installed_snapshot_payload(term, &leader_id, installed_index, &payload)
@@ -13454,15 +13468,31 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-cached-snapshot-source-1");
         let expected_checksum = metadata.payload_sha256.as_ref()?;
         let cached = self.prepared_install_snapshot_cache.lock().clone()?;
-        if cached.metadata.last_included_index == metadata.last_included_index
-            && cached.metadata.last_included_term == metadata.last_included_term
-            && cached
-                .payload_sha256
-                .eq_ignore_ascii_case(expected_checksum)
-        {
+        if prepared_install_snapshot_matches(&cached, metadata, expected_checksum) {
             Some(cached)
         } else {
             None
+        }
+    }
+
+    fn clear_prepared_install_snapshot_cache_if_stale(&self, metadata: &RaftSnapshotMetadata) {
+        crate::routine_id!("ddl-routine-broker-raft-clear-stale-prepared-snapshot-cache-1");
+        let expected_checksum = metadata.payload_sha256.as_deref();
+        let mut cache = self.prepared_install_snapshot_cache.lock();
+        let stale = cache.as_ref().is_some_and(|cached| {
+            !expected_checksum.is_some_and(|checksum| {
+                prepared_install_snapshot_matches(cached, metadata, checksum)
+            })
+        });
+        if stale {
+            *cache = None;
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                snapshot_index = metadata.last_included_index,
+                snapshot_term = metadata.last_included_term,
+                "raft cleared stale prepared InstallSnapshot payload cache",
+            );
         }
     }
 
@@ -13503,7 +13533,22 @@ impl BrokerRaft {
             payload_sha256,
             payload_bytes,
         });
-        *self.prepared_install_snapshot_cache.lock() = Some(Arc::clone(&prepared));
+        let cacheable = self.log.latest_snapshot().is_some_and(|metadata| {
+            metadata.payload_sha256.as_deref().is_some_and(|checksum| {
+                prepared_install_snapshot_matches(&prepared, &metadata, checksum)
+            })
+        });
+        if cacheable {
+            *self.prepared_install_snapshot_cache.lock() = Some(Arc::clone(&prepared));
+        } else {
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                snapshot_index = prepared.metadata.last_included_index,
+                snapshot_term = prepared.metadata.last_included_term,
+                "raft skipped caching prepared InstallSnapshot payload because latest snapshot changed",
+            );
+        }
         Ok(Some(prepared))
     }
 
@@ -14901,6 +14946,7 @@ impl BrokerRaft {
         let snapshot = self
             .log
             .write_snapshot(commit_index, snapshot_term, payload)?;
+        self.clear_prepared_install_snapshot_cache_if_stale(&snapshot);
         let report = self.log.compact_through(compact_through)?;
         let compaction_us = duration_us_u64(compaction_started.elapsed());
         self.maintenance.lock().last_snapshot_at = Instant::now();
@@ -35951,6 +35997,128 @@ mod tests {
             .contains("dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total 1"));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_install_snapshot_payload_cache_hits_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn install_snapshot_payload_cache_clears_after_local_snapshot_advances() {
+        let dir = temp_dir("raft-install-snapshot-cache-local-advance");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_max_log_entries = 1;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..3 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = 3;
+            runtime.last_applied = 3;
+        }
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("write first local snapshot");
+
+        let first_round = SharedInstallSnapshotSource::default();
+        let first = raft
+            .shared_install_snapshot_source(&first_round)
+            .await
+            .expect("first prepare should succeed")
+            .expect("first snapshot should exist");
+        assert_eq!(first.metadata.last_included_index, 3);
+        assert!(raft.prepared_install_snapshot_cache.lock().is_some());
+
+        for _ in 0..2 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = 5;
+            runtime.last_applied = 5;
+        }
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("write newer local snapshot");
+
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "advancing the latest snapshot should release the old prepared payload"
+        );
+        let second_round = SharedInstallSnapshotSource::default();
+        let second = raft
+            .shared_install_snapshot_source(&second_round)
+            .await
+            .expect("second prepare should succeed")
+            .expect("second snapshot should exist");
+        assert_eq!(second.metadata.last_included_index, 5);
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.install_snapshot_payload_prepares_total, 2);
+        assert_eq!(telemetry.install_snapshot_payload_cache_hits_total, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_payload_cache_clears_after_installed_snapshot_advances() {
+        let dir = temp_dir("raft-install-snapshot-cache-installed-advance");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let mut original_payload = idle_snapshot_payload();
+        original_payload["note"] = json!("old prepared snapshot payload");
+        raft.log
+            .write_snapshot(7, 3, original_payload)
+            .expect("write original snapshot");
+        let prepared = raft
+            .prepare_install_snapshot_source()
+            .expect("prepare original snapshot")
+            .expect("original snapshot should exist");
+        assert_eq!(prepared.metadata.last_included_index, 7);
+        assert!(raft.prepared_install_snapshot_cache.lock().is_some());
+
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 4;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+        let mut newer_payload = idle_snapshot_payload();
+        newer_payload["note"] = json!("newer installed snapshot payload");
+        let newer_bytes = serde_json::to_vec(&newer_payload).expect("snapshot payload bytes");
+        let newer_checksum = sha256_hex(&newer_bytes);
+        let response = raft.handle_install_snapshot(
+            4,
+            "n2".into(),
+            9,
+            4,
+            Some(newer_checksum),
+            0,
+            true,
+            BASE64.encode(newer_bytes),
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::InstallSnapshot {
+                term: 4,
+                success: true,
+                last_included_index: 9
+            }
+        ));
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "installing a newer leader snapshot should release the old prepared payload"
+        );
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("newer snapshot")
+                .last_included_index,
+            9
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
