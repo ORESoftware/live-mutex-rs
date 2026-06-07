@@ -10,7 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -1549,6 +1549,18 @@ fn add_retained_request_identity_entries(
     Ok(())
 }
 
+fn truncate_retained_request_identity_fingerprints(
+    fingerprints: &mut BTreeMap<String, RetainedRequestIdentityFingerprint>,
+    retained_prefix_last_index: u64,
+) {
+    crate::routine_id!("ddl-routine-broker-raft-truncate-retained-request-identity-cache-1");
+    if retained_prefix_last_index == 0 {
+        fingerprints.clear();
+    } else {
+        fingerprints.retain(|_, fingerprint| fingerprint.first_index <= retained_prefix_last_index);
+    }
+}
+
 fn entries_have_client_request_identities(entries: &[RaftLogEntry]) -> bool {
     crate::routine_id!("ddl-routine-broker-raft-entries-have-request-identities-1");
     entries
@@ -2761,6 +2773,7 @@ impl RaftLogStore {
                 );
             }
         }
+        reject_blocking_atomic_temp_path(&log_rewrite_tmp, "raft log rewrite temp")?;
         let snapshot_path = data_dir.join(SNAPSHOT_FILE);
         let hard_state_path = data_dir.join(HARD_STATE_FILE);
         let hard_state_commit_path = data_dir.join(HARD_STATE_COMMIT_FILE);
@@ -2784,6 +2797,7 @@ impl RaftLogStore {
                     );
                 }
             }
+            reject_blocking_atomic_temp_path(&tmp, "raft atomic JSON temp")?;
         }
         let latest_snapshot_file = read_snapshot_file(&snapshot_path)?;
         let snapshot_client_response_fingerprints =
@@ -3084,11 +3098,9 @@ impl RaftLogStore {
     pub fn log_len_bytes(&self) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-log-len-bytes-1");
         let _state = self.state.lock();
-        match fs::metadata(&self.log_path) {
-            Ok(metadata) => Ok(metadata.len()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(err) => Err(err.into()),
-        }
+        Ok(raft_log_file_metadata(&self.log_path)?
+            .map(|metadata| metadata.len())
+            .unwrap_or(0))
     }
 
     fn read_hard_state(&self) -> Result<RaftHardState, BrokerRaftError> {
@@ -3516,8 +3528,21 @@ impl RaftLogStore {
                 .retained_log_entries
                 .extend(incoming[pos..].iter().cloned());
             state.retained_log_entry_bytes.extend(incoming_sizes);
-            state.retained_request_fingerprints =
-                retained_request_identity_fingerprints(&state.retained_log_entries)?;
+            truncate_retained_request_identity_fingerprints(
+                &mut state.retained_request_fingerprints,
+                retained_prefix_last_index,
+            );
+            if let Err(err) = add_retained_request_identity_entries(
+                &mut state.retained_request_fingerprints,
+                &incoming[pos..],
+            ) {
+                if let Err(reload_err) = self.reload_retained_log_from_disk_locked(&mut state) {
+                    return Err(BrokerRaftError::Rpc(format!(
+                        "raft conflict repair cache update failed: {err}; failed to reload retained log from disk: {reload_err}"
+                    )));
+                }
+                return Err(err);
+            }
             if let Some((last_index, last_term)) = state
                 .retained_log_entries
                 .last()
@@ -4013,12 +4038,7 @@ impl BrokerRaftDataDirLock {
     fn acquire_os_lock(data_dir: &Path) -> Result<Self, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-data-dir-lock-acquire-os-1");
         let lock_path = data_dir.join(DATA_DIR_LOCK_FILE);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
+        let mut file = open_data_dir_lock_file(&lock_path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             let error = std::io::Error::last_os_error();
@@ -4077,6 +4097,63 @@ fn broker_raft_data_dir_lock_is_contended(error: &std::io::Error) -> bool {
     }
     let raw = error.raw_os_error();
     raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN)
+}
+
+#[cfg(unix)]
+fn data_dir_lock_file_metadata(path: &Path) -> Result<Option<fs::Metadata>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-data-dir-lock-metadata-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft data-dir lock path {} is a symlink; remove it manually after confirming no BrokerRaft writer is active",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft data-dir lock path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn opened_regular_file_metadata(
+    file: &File,
+    path: &Path,
+    label: &str,
+) -> Result<fs::Metadata, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-opened-regular-file-metadata-1");
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "{label} path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn regular_state_file_open_flags() -> i32 {
+    crate::routine_id!("ddl-routine-broker-raft-regular-state-open-flags-1");
+    libc::O_NOFOLLOW | libc::O_NONBLOCK
+}
+
+#[cfg(unix)]
+fn open_data_dir_lock_file(path: &Path) -> Result<File, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-open-data-dir-lock-file-1");
+    let _existing = data_dir_lock_file_metadata(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    options.custom_flags(regular_state_file_open_flags());
+    let file = options.open(path).map_err(BrokerRaftError::Io)?;
+    opened_regular_file_metadata(&file, path, "raft data-dir lock")?;
+    Ok(file)
 }
 
 #[derive(Default)]
@@ -4431,6 +4508,7 @@ impl BrokerRaft {
                 &err,
             ),
         }
+        reject_blocking_atomic_temp_path(&local_voter_state_tmp, "raft local-voter state temp")?;
         let local_peer = RaftPeerConfig {
             id: config.node_id.clone(),
             addr: configured_local_raft_advertise_addr(&config),
@@ -4505,9 +4583,15 @@ impl BrokerRaft {
             }
             Ok(false) => {}
             Err(err) => {
-                record_json_atomic_tmp_cleanup_error(Some(&telemetry), &learners_tmp, "startup", &err);
+                record_json_atomic_tmp_cleanup_error(
+                    Some(&telemetry),
+                    &learners_tmp,
+                    "startup",
+                    &err,
+                );
             }
         }
+        reject_blocking_atomic_temp_path(&learners_tmp, "raft learners state temp")?;
         let log = Arc::new(log_store);
         validate_retained_log_context_on_open(
             &config.node_id,
@@ -6673,7 +6757,7 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed during startup orphan cleanup, stale cleanup, offset-zero restart/orphan cleanup, offset mismatch, staged byte-limit rejection, or invalid transfer discard.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total Failed attempts to remove follower-side staged InstallSnapshot files; non-zero values can indicate disk pressure, permissions, or stuck part files.\n",
+                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total Failed attempts to remove follower-side staged InstallSnapshot files or durably sync their removal; non-zero values can indicate disk pressure, permissions, or stuck part files.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total Follower-side staged InstallSnapshot files removed because raft.install_snapshot_stale_transfer_ms elapsed without progress.\n",
@@ -12120,25 +12204,22 @@ impl BrokerRaft {
                 last_included_index: current_snapshot_index,
             };
         };
-        if let Err(err) = verify_snapshot_payload_file_checksum(
+        let payload: serde_json::Value = match read_verified_snapshot_payload_file(
             last_included_index,
             &payload_path,
             Some(expected_checksum.clone()),
         ) {
-            self.remove_snapshot_transfer_file(payload_path, "checksum-verification-failed");
-            return RaftRpcResponse::Error {
-                term: self.runtime.lock().current_term,
-                error: err.to_string(),
-            };
-        }
-        let payload: serde_json::Value = match File::open(&payload_path).and_then(|file| {
-            serde_json::from_reader(file).map_err(|err| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
-            })
-        }) {
             Ok(payload) => payload,
             Err(err) => {
-                self.remove_snapshot_transfer_file(payload_path, "payload-json-parse-failed");
+                let cleanup_reason = match &err {
+                    BrokerRaftError::SnapshotChecksumMissing { .. }
+                    | BrokerRaftError::SnapshotChecksumMismatch { .. } => {
+                        "checksum-verification-failed"
+                    }
+                    BrokerRaftError::Json(_) => "payload-json-parse-failed",
+                    _ => "payload-file-read-failed",
+                };
+                self.remove_snapshot_transfer_file(payload_path, cleanup_reason);
                 return RaftRpcResponse::Error {
                     term: self.runtime.lock().current_term,
                     error: err.to_string(),
@@ -14368,11 +14449,16 @@ impl BrokerRaft {
             return Ok(RaftPeerReplicationOutcome::default());
         }
         let prev_log_index = next_index.saturating_sub(1);
+        let max_frame_bytes = raft_rpc_max_frame_bytes();
+        let append_entries_max_bytes = effective_append_entries_max_bytes(
+            self.config.append_entries_max_bytes,
+            max_frame_bytes,
+        );
         let Some((prev_log_term, limited_entries)) =
             self.log.prev_term_entries_and_bytes_from_limited(
                 next_index,
                 self.config.append_entries_max_entries,
-                self.config.append_entries_max_bytes,
+                append_entries_max_bytes,
             )?
         else {
             self.telemetry
@@ -14489,7 +14575,7 @@ impl BrokerRaft {
         let frame = match build_bounded_append_entries_rpc_maybe_blocking(
             &append_meta,
             entries,
-            raft_rpc_max_frame_bytes(),
+            max_frame_bytes,
             offload_frame_build,
         )
         .await
@@ -14592,14 +14678,14 @@ impl BrokerRaft {
                 .append_entries_frame_clamps_total
                 .fetch_add(1, Ordering::Relaxed);
             debug!(
-                target: "lmx::raft",
-                node_id = %self.config.node_id,
-                peer = %peer.id,
-                next_index,
-                prev_log_index,
+            target: "lmx::raft",
+            node_id = %self.config.node_id,
+            peer = %peer.id,
+            next_index,
+            prev_log_index,
                 sent_entries_count,
                 frame_len = frame.frame_len,
-                max_frame_bytes = raft_rpc_max_frame_bytes(),
+                max_frame_bytes,
                 target_index = ?target_index,
                 "raft append entries batch clamped to fit exact frame cap",
             );
@@ -17183,12 +17269,7 @@ impl BrokerRaft {
         }
         let pending_path = pending.path.clone();
         let write_result = (|| -> Result<(), BrokerRaftError> {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&pending_path)?;
+            let mut file = open_snapshot_part_file(&pending_path, true, true, true)?;
             let file_len = file.metadata()?.len();
             if file_len != expected_offset {
                 self.telemetry
@@ -17381,17 +17462,7 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-remove-consumed-snapshot-transfer-1");
         match fs::remove_file(&path) {
             Ok(()) => {
-                if let Some(parent) = path.parent() {
-                    if let Err(err) = sync_dir(parent) {
-                        debug!(
-                            target: "lmx::raft",
-                            node_id = %self.config.node_id,
-                            path = %path.display(),
-                            error = %err,
-                            "failed to sync consumed InstallSnapshot transfer removal directory",
-                        );
-                    }
-                }
+                self.sync_snapshot_transfer_removal_dir(&path, "consumed-transfer");
                 debug!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
@@ -17401,14 +17472,10 @@ impl BrokerRaft {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                self.telemetry
-                    .snapshot_transfer_cleanup_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    path = %path.display(),
-                    error = %err,
+                self.record_snapshot_transfer_cleanup_error(
+                    &path,
+                    "remove-consumed-transfer",
+                    &err,
                     "failed to remove consumed staged InstallSnapshot file",
                 );
             }
@@ -17419,18 +17486,7 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-remove-snapshot-transfer-file-1");
         match fs::remove_file(&path) {
             Ok(()) => {
-                if let Some(parent) = path.parent() {
-                    if let Err(err) = sync_dir(parent) {
-                        debug!(
-                            target: "lmx::raft",
-                            node_id = %self.config.node_id,
-                            path = %path.display(),
-                            reason,
-                            error = %err,
-                            "failed to sync staged InstallSnapshot removal directory",
-                        );
-                    }
-                }
+                self.sync_snapshot_transfer_removal_dir(&path, reason);
                 self.telemetry
                     .snapshot_transfer_cleanups_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -17445,20 +17501,52 @@ impl BrokerRaft {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                self.telemetry
-                    .snapshot_transfer_cleanup_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    path = %path.display(),
+                self.record_snapshot_transfer_cleanup_error(
+                    &path,
                     reason,
-                    error = %err,
+                    &err,
                     "failed to remove staged InstallSnapshot file",
                 );
                 false
             }
         }
+    }
+
+    fn sync_snapshot_transfer_removal_dir(&self, path: &Path, reason: &'static str) {
+        crate::routine_id!("ddl-routine-broker-raft-sync-snapshot-transfer-removal-dir-1");
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(err) = sync_dir(parent) {
+            self.record_snapshot_transfer_cleanup_error(
+                path,
+                reason,
+                &err,
+                "failed to sync staged InstallSnapshot removal directory",
+            );
+        }
+    }
+
+    fn record_snapshot_transfer_cleanup_error(
+        &self,
+        path: &Path,
+        reason: &'static str,
+        err: &dyn std::fmt::Display,
+        message: &'static str,
+    ) {
+        crate::routine_id!("ddl-routine-broker-raft-record-snapshot-cleanup-error-1");
+        self.telemetry
+            .snapshot_transfer_cleanup_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(
+            target: "lmx::raft",
+            node_id = %self.config.node_id,
+            path = %path.display(),
+            reason,
+            error = %err,
+            message,
+            "failed staged InstallSnapshot cleanup",
+        );
     }
 
     fn cleanup_stale_snapshot_transfers(&self, now_ms: u64) -> usize {
@@ -17513,11 +17601,10 @@ impl BrokerRaft {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return 0,
             Err(err) => {
-                debug!(
-                    target: "lmx::raft",
-                    node_id = %self.config.node_id,
-                    data_dir = %self.log.data_dir.display(),
-                    error = %err,
+                self.record_snapshot_transfer_cleanup_error(
+                    &self.log.data_dir,
+                    "stale-orphan-scan",
+                    &err,
                     "failed to scan raft data dir for stale orphaned InstallSnapshot part files",
                 );
                 return 0;
@@ -17528,11 +17615,10 @@ impl BrokerRaft {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) => {
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        data_dir = %self.log.data_dir.display(),
-                        error = %err,
+                    self.record_snapshot_transfer_cleanup_error(
+                        &self.log.data_dir,
+                        "stale-orphan-read-dir-entry",
+                        &err,
                         "failed to read raft data dir entry during stale orphaned InstallSnapshot cleanup",
                     );
                     continue;
@@ -17552,11 +17638,10 @@ impl BrokerRaft {
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(err) => {
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        path = %path.display(),
-                        error = %err,
+                    self.record_snapshot_transfer_cleanup_error(
+                        &path,
+                        "stale-orphan-file-type",
+                        &err,
                         "failed to read stale orphaned InstallSnapshot part file type",
                     );
                     continue;
@@ -17565,18 +17650,24 @@ impl BrokerRaft {
             if !file_type.is_file() {
                 continue;
             }
-            let modified_ms = match entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(system_time_ms)
-            {
-                Some(modified_ms) => modified_ms,
-                None => {
-                    debug!(
-                        target: "lmx::raft",
-                        node_id = %self.config.node_id,
-                        path = %path.display(),
+            let modified_ms = match entry.metadata().and_then(|metadata| metadata.modified()) {
+                Ok(modified_at) => match system_time_ms(modified_at) {
+                    Some(modified_ms) => modified_ms,
+                    None => {
+                        self.record_snapshot_transfer_cleanup_error(
+                            &path,
+                            "stale-orphan-modified-time",
+                            &"modified time is before Unix epoch",
+                            "failed to read stale orphaned InstallSnapshot part file modified time",
+                        );
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    self.record_snapshot_transfer_cleanup_error(
+                        &path,
+                        "stale-orphan-modified-time",
+                        &err,
                         "failed to read stale orphaned InstallSnapshot part file modified time",
                     );
                     continue;
@@ -19070,6 +19161,14 @@ fn raft_rpc_max_frame_bytes() -> usize {
         .unwrap_or(DEFAULT_RAFT_RPC_MAX_FRAME_BYTES)
 }
 
+fn effective_append_entries_max_bytes(
+    configured_max_bytes: usize,
+    max_frame_bytes: usize,
+) -> usize {
+    crate::routine_id!("ddl-routine-broker-raft-effective-append-max-bytes-1");
+    configured_max_bytes.max(1).min(max_frame_bytes.max(1))
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppendEntriesFrameMeta<'a> {
     auth_token: Option<&'a str>,
@@ -20159,10 +20258,9 @@ fn granted_lock_uuid(resp: &Response) -> Option<String> {
 
 fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-snapshot-file-1");
-    if !path.exists() {
+    let Some(file) = open_raft_json_file(path, "snapshot file")? else {
         return Ok(None);
-    }
-    let file = File::open(path)?;
+    };
     let mut snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
     if let Some(expected) = snapshot.metadata.payload_sha256.as_deref() {
         let verified = verify_snapshot_payload_checksum(
@@ -20173,6 +20271,47 @@ fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaf
         snapshot.metadata.payload_sha256 = Some(verified);
     }
     Ok(Some(snapshot))
+}
+
+fn raft_json_file_metadata(
+    path: &Path,
+    label: &'static str,
+) -> Result<Option<fs::Metadata>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-json-file-metadata-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft {label} path {} is a symlink; remove it manually after confirming no Raft writer is active",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft {label} path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn open_raft_json_file(path: &Path, label: &'static str) -> Result<Option<File>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-open-json-file-1");
+    if raft_json_file_metadata(path, label)?.is_none() {
+        return Ok(None);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).truncate(false);
+    #[cfg(unix)]
+    {
+        options.custom_flags(regular_state_file_open_flags());
+    }
+    let file = options.open(path).map_err(BrokerRaftError::Io)?;
+    opened_regular_file_metadata(&file, path, &format!("raft {label}"))?;
+    Ok(Some(file))
 }
 
 fn snapshot_payload_sha256(payload: &serde_json::Value) -> Result<String, BrokerRaftError> {
@@ -20244,14 +20383,15 @@ fn validate_existing_snapshot_matches_install(
     Ok(())
 }
 
-fn verify_snapshot_payload_file_checksum(
+fn read_verified_snapshot_payload_file(
     index: u64,
     path: &Path,
     expected: Option<String>,
-) -> Result<String, BrokerRaftError> {
-    crate::routine_id!("ddl-routine-broker-raft-verify-snapshot-file-sha256-1");
+) -> Result<serde_json::Value, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-read-verified-snapshot-payload-file-1");
     let expected = expected.ok_or(BrokerRaftError::SnapshotChecksumMissing { index })?;
-    let actual = snapshot_payload_file_sha256(path)?;
+    let bytes = read_snapshot_part_file(path)?;
+    let actual = sha256_hex(&bytes);
     if !actual.eq_ignore_ascii_case(&expected) {
         return Err(BrokerRaftError::SnapshotChecksumMismatch {
             index,
@@ -20259,22 +20399,7 @@ fn verify_snapshot_payload_file_checksum(
             actual,
         });
     }
-    Ok(actual)
-}
-
-fn snapshot_payload_file_sha256(path: &Path) -> Result<String, BrokerRaftError> {
-    crate::routine_id!("ddl-routine-broker-raft-snapshot-file-sha256-1");
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex_encode(&hasher.finalize()))
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn decode_snapshot_chunk(data: &str) -> Result<Vec<u8>, BrokerRaftError> {
@@ -20303,7 +20428,7 @@ fn staged_snapshot_chunk_matches(
     let end = offset
         .checked_add(chunk.len() as u64)
         .ok_or_else(|| BrokerRaftError::Rpc("snapshot duplicate chunk range overflowed".into()))?;
-    let mut file = File::open(path)?;
+    let mut file = open_snapshot_part_file(path, true, false, false)?;
     let file_len = file.metadata()?.len();
     if file_len < end {
         return Err(BrokerRaftError::Rpc(format!(
@@ -20314,6 +20439,59 @@ fn staged_snapshot_chunk_matches(
     let mut staged = vec![0; chunk.len()];
     file.read_exact(&mut staged)?;
     Ok(staged == chunk)
+}
+
+fn read_snapshot_part_file(path: &Path) -> Result<Vec<u8>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-read-snapshot-part-file-1");
+    let mut file = open_snapshot_part_file(path, true, false, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn snapshot_part_file_metadata(path: &Path) -> Result<Option<fs::Metadata>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-part-metadata-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft InstallSnapshot part path {} is a symlink; remove it manually after confirming no Raft writer is active",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft InstallSnapshot part path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn open_snapshot_part_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+) -> Result<File, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-open-snapshot-part-file-1");
+    let _existing = snapshot_part_file_metadata(path)?;
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        options.custom_flags(regular_state_file_open_flags());
+    }
+    let file = options.open(path).map_err(BrokerRaftError::Io)?;
+    opened_regular_file_metadata(&file, path, "raft InstallSnapshot part")?;
+    Ok(file)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -20365,10 +20543,9 @@ fn read_hard_state_with_commit_slots(
 
 fn read_hard_state_json(path: &Path) -> Result<RaftHardState, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-hard-state-json-1");
-    if !path.exists() {
+    let Some(file) = open_raft_json_file(path, "hard-state JSON")? else {
         return Ok(RaftHardState::default());
-    }
-    let file = File::open(path)?;
+    };
     Ok(serde_json::from_reader(file)?)
 }
 
@@ -20427,10 +20604,10 @@ fn read_hard_state_commit_slots(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<(Option<RaftHardStateCommitSlot>, u64), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-hard-state-commit-slots-1");
-    if !path.exists() {
+    if hard_state_commit_sidecar_metadata(path)?.is_none() {
         return Ok((None, 0));
     }
-    let mut file = File::open(path)?;
+    let mut file = open_hard_state_commit_sidecar_file(path, true, false, false)?;
     let file_len = file.metadata()?.len();
     let mut bytes = Vec::with_capacity(
         file_len
@@ -20528,9 +20705,9 @@ fn truncate_oversized_hard_state_commit_slots(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) {
     crate::routine_id!("ddl-routine-broker-raft-truncate-oversized-hard-state-commit-slots-1");
-    match OpenOptions::new().write(true).open(path).and_then(|file| {
+    match open_hard_state_commit_sidecar_file(path, false, true, false).and_then(|file| {
         file.set_len(HARD_STATE_COMMIT_FILE_BYTES as u64)?;
-        file.sync_data()
+        file.sync_data().map_err(BrokerRaftError::Io)
     }) {
         Ok(()) => {
             if let Some(telemetry) = telemetry {
@@ -20591,12 +20768,10 @@ fn cached_hard_state_commit_file_is_current(
     path: &Path,
 ) -> Result<bool, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-cached-commit-file-current-1");
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err.into()),
+    let Some(metadata) = hard_state_commit_sidecar_metadata(path)? else {
+        return Ok(false);
     };
-    Ok(metadata.is_file() && file_identity(&metadata) == cached.identity)
+    Ok(file_identity(&metadata) == cached.identity)
 }
 
 fn open_hard_state_commit_file(
@@ -20604,23 +20779,9 @@ fn open_hard_state_commit_file(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<(CachedHardStateCommitFile, bool), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-open-commit-slot-file-1");
-    let created = match fs::metadata(path) {
-        Ok(_) => false,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
-        Err(err) => return Err(err.into()),
-    };
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(BrokerRaftError::InvalidLog(format!(
-            "raft hard-state commit sidecar path {} is not a regular file",
-            path.display()
-        )));
-    }
+    let created = hard_state_commit_sidecar_metadata(path)?.is_none();
+    let file = open_hard_state_commit_sidecar_file(path, false, true, true)?;
+    let metadata = opened_regular_file_metadata(&file, path, "raft hard-state commit sidecar")?;
     if metadata.len() != HARD_STATE_COMMIT_FILE_BYTES as u64 {
         file.set_len(HARD_STATE_COMMIT_FILE_BYTES as u64)?;
     }
@@ -20631,6 +20792,52 @@ fn open_hard_state_commit_file(
             .fetch_add(1, Ordering::Relaxed);
     }
     Ok((CachedHardStateCommitFile { file, identity }, created))
+}
+
+fn hard_state_commit_sidecar_metadata(
+    path: &Path,
+) -> Result<Option<fs::Metadata>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-commit-sidecar-metadata-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft hard-state commit sidecar path {} is a symlink; remove it manually after confirming no Raft writer is active",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft hard-state commit sidecar path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn open_hard_state_commit_sidecar_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    create: bool,
+) -> Result<File, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-open-commit-sidecar-file-1");
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        options.custom_flags(regular_state_file_open_flags());
+    }
+    let file = options.open(path).map_err(BrokerRaftError::Io)?;
+    opened_regular_file_metadata(&file, path, "raft hard-state commit sidecar")?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -20721,10 +20928,9 @@ fn read_staged_learners(
     allow_memory_peer_addrs: bool,
 ) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-staged-learners-1");
-    if !path.exists() {
+    let Some(file) = open_raft_json_file(path, "staged learners state")? else {
         return Ok(Vec::new());
-    }
-    let file = File::open(path)?;
+    };
     let learners_file: RaftLearnersFile = serde_json::from_reader(file)?;
     validate_staged_learner_peers_for_transport(
         learners_file.learners,
@@ -20735,10 +20941,9 @@ fn read_staged_learners(
 
 fn read_local_voter_seen(path: &Path) -> Result<bool, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-local-voter-seen-1");
-    if !path.exists() {
+    let Some(file) = open_raft_json_file(path, "local-voter state")? else {
         return Ok(false);
-    }
-    let file = File::open(path)?;
+    };
     let state: RaftLocalVoterStateFile = serde_json::from_reader(file)?;
     Ok(state.local_voter_seen)
 }
@@ -20786,10 +20991,12 @@ fn read_log_entries(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<Vec<RaftLogEntry>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-log-entries-1");
-    if !path.exists() {
+    if raft_log_file_metadata(path)?.is_none() {
         return Ok(Vec::new());
     }
-    let bytes = fs::read(path)?;
+    let mut file = open_raft_log_file(path, true, false, false, false)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
     let mut entries = Vec::new();
     let mut offset = 0usize;
     while offset < bytes.len() {
@@ -21672,12 +21879,10 @@ fn cached_log_append_file_is_current(
     path: &Path,
 ) -> Result<bool, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-cached-log-append-current-1");
-    let metadata = match fs::metadata(path) {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => return Err(err.into()),
+    let Some(metadata) = raft_log_file_metadata(path)? else {
+        return Ok(false);
     };
-    Ok(metadata.is_file() && file_identity(&metadata) == cached.identity)
+    Ok(file_identity(&metadata) == cached.identity)
 }
 
 fn invalidate_log_append_file_cache(
@@ -21699,20 +21904,11 @@ fn open_log_append_file(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<(CachedLogAppendFile, bool, u64), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-open-log-append-file-1");
-    let (created, original_len) = match fs::metadata(path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(BrokerRaftError::InvalidLog(format!(
-                    "raft log path {} is not a regular file",
-                    path.display()
-                )));
-            }
-            (false, metadata.len())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (true, 0),
-        Err(err) => return Err(err.into()),
+    let (created, original_len) = match raft_log_file_metadata(path)? {
+        Some(metadata) => (false, metadata.len()),
+        None => (true, 0),
     };
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = open_raft_log_file(path, false, false, true, true)?;
     let identity = file_identity(&file.metadata()?);
     if let Some(telemetry) = telemetry {
         telemetry
@@ -21739,15 +21935,19 @@ fn append_serialized_log_entries_with_cache(
         return Ok(());
     }
     let (created, original_len) = match cached.as_ref() {
-        Some(file) if cached_log_append_file_is_current(file, path)? => {
-            (false, file.file.metadata()?.len())
-        }
-        Some(_) => {
-            invalidate_log_append_file_cache(cached, telemetry);
-            let (file, created, original_len) = open_log_append_file(path, telemetry)?;
-            *cached = Some(file);
-            (created, original_len)
-        }
+        Some(file) => match cached_log_append_file_is_current(file, path) {
+            Ok(true) => (false, file.file.metadata()?.len()),
+            Ok(false) => {
+                invalidate_log_append_file_cache(cached, telemetry);
+                let (file, created, original_len) = open_log_append_file(path, telemetry)?;
+                *cached = Some(file);
+                (created, original_len)
+            }
+            Err(err) => {
+                invalidate_log_append_file_cache(cached, telemetry);
+                return Err(err);
+            }
+        },
         None => {
             let (file, created, original_len) = open_log_append_file(path, telemetry)?;
             *cached = Some(file);
@@ -21826,8 +22026,8 @@ fn truncate_and_append_serialized_log_entries(
     telemetry: Option<&BrokerRaftTelemetry>,
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-truncate-append-serialized-log-1");
-    let created = match fs::metadata(path) {
-        Ok(metadata) => {
+    let created = match raft_log_file_metadata(path)? {
+        Some(metadata) => {
             if metadata.len() < prefix_file_len {
                 return Err(BrokerRaftError::InvalidLog(format!(
                     "cannot truncate raft log at byte offset {prefix_file_len}; file only has {} bytes",
@@ -21836,20 +22036,15 @@ fn truncate_and_append_serialized_log_entries(
             }
             false
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && prefix_file_len == 0 => true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        None if prefix_file_len == 0 => true,
+        None => {
             return Err(BrokerRaftError::InvalidLog(format!(
                 "cannot preserve {prefix_file_len} bytes from missing raft log"
             )));
         }
-        Err(err) => return Err(err.into()),
     };
 
-    let mut file = OpenOptions::new()
-        .create(prefix_file_len == 0)
-        .read(true)
-        .write(true)
-        .open(path)?;
+    let mut file = open_raft_log_file(path, true, true, false, prefix_file_len == 0)?;
     file.set_len(prefix_file_len)?;
     file.seek(SeekFrom::Start(prefix_file_len))?;
     let write_result = (|| -> Result<(), BrokerRaftError> {
@@ -21986,12 +22181,64 @@ fn record_log_write_rollback_error(
 
 fn rollback_log_file_len(path: &Path, len: u64, sync_log: bool) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-rollback-log-len-1");
-    let file = OpenOptions::new().write(true).open(path)?;
+    if raft_log_file_metadata(path)?.is_none() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "cannot roll back missing raft log at {}",
+            path.display()
+        )));
+    }
+    let file = open_raft_log_file(path, false, true, false, false)?;
     file.set_len(len)?;
     if sync_log {
         file.sync_data()?;
     }
     Ok(())
+}
+
+fn raft_log_file_metadata(path: &Path) -> Result<Option<fs::Metadata>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-log-file-metadata-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft log path {} is a symlink; remove it manually after confirming no Raft writer is active",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(BrokerRaftError::InvalidLog(format!(
+            "raft log path {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(Some(metadata))
+}
+
+fn open_raft_log_file(
+    path: &Path,
+    read: bool,
+    write: bool,
+    append: bool,
+    create: bool,
+) -> Result<File, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-open-log-file-1");
+    let mut options = OpenOptions::new();
+    options
+        .read(read)
+        .write(write)
+        .append(append)
+        .create(create)
+        .truncate(false);
+    #[cfg(unix)]
+    {
+        options.custom_flags(regular_state_file_open_flags());
+    }
+    let file = options.open(path).map_err(BrokerRaftError::Io)?;
+    opened_regular_file_metadata(&file, path, "raft log")?;
+    Ok(file)
 }
 
 fn cleanup_orphaned_snapshot_part_files(
@@ -22091,8 +22338,9 @@ fn rewrite_log(
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-rewrite-log-1");
     let tmp = log_rewrite_tmp_path(path);
+    prepare_log_rewrite_tmp_for_write(telemetry, &tmp)?;
+    let file = create_exclusive_atomic_temp_file(&tmp)?;
     let write_result = (|| -> Result<(), BrokerRaftError> {
-        let file = File::create(&tmp)?;
         let mut writer = BufWriter::new(file);
         for entry in entries {
             serde_json::to_writer(&mut writer, entry)?;
@@ -22121,6 +22369,58 @@ fn log_rewrite_tmp_path(path: &Path) -> PathBuf {
     path.with_extension("ndjson.tmp")
 }
 
+fn prepare_log_rewrite_tmp_for_write(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    tmp: &Path,
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-prepare-log-rewrite-tmp-1");
+    match cleanup_log_rewrite_tmp_file(tmp) {
+        Ok(true) => {
+            if let Some(telemetry) = telemetry {
+                telemetry
+                    .log_rewrite_temp_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            warn!(
+                target: "lmx::raft",
+                path = %tmp.display(),
+                phase = "prewrite",
+                "removed stale raft log rewrite temp file before rewrite",
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            record_log_rewrite_tmp_cleanup_error(telemetry, tmp, "prewrite", &err);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn reject_blocking_atomic_temp_path(path: &Path, label: &str) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-reject-blocking-temp-path-1");
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if metadata.is_file() {
+        return Ok(());
+    }
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_symlink() {
+        "symlink"
+    } else if metadata.is_dir() {
+        "directory"
+    } else {
+        "non-regular file"
+    };
+    Err(BrokerRaftError::InvalidLog(format!(
+        "{label} path `{}` is a blocking {kind}; remove it manually after confirming no Raft writer is active",
+        path.display()
+    )))
+}
+
 fn cleanup_log_rewrite_tmp_after_error(
     telemetry: Option<&BrokerRaftTelemetry>,
     tmp: &Path,
@@ -22145,7 +22445,11 @@ fn cleanup_log_rewrite_tmp_after_error(
         }
         Ok(false) => {}
         Err(cleanup_error) => {
-            record_log_rewrite_tmp_cleanup_error(telemetry, tmp, phase, &cleanup_error);
+            if let Some(telemetry) = telemetry {
+                telemetry
+                    .log_rewrite_temp_cleanup_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             warn!(
                 target: "lmx::raft",
                 path = %tmp.display(),
@@ -22203,8 +22507,9 @@ fn write_pretty_json_atomic<T: Serialize + ?Sized>(
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-write-json-atomic-1");
     let tmp = json_atomic_tmp_path(path);
+    prepare_json_atomic_tmp_for_write(telemetry, &tmp)?;
+    let file = create_exclusive_atomic_temp_file(&tmp)?;
     let write_result = (|| -> Result<(), BrokerRaftError> {
-        let file = File::create(&tmp)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer_pretty(&mut writer, value)?;
         writer.write_all(b"\n")?;
@@ -22227,6 +22532,34 @@ fn write_pretty_json_atomic<T: Serialize + ?Sized>(
 fn json_atomic_tmp_path(path: &Path) -> PathBuf {
     crate::routine_id!("ddl-routine-broker-raft-json-atomic-tmp-path-1");
     path.with_extension("json.tmp")
+}
+
+fn prepare_json_atomic_tmp_for_write(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    tmp: &Path,
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-prepare-json-tmp-1");
+    match cleanup_json_atomic_tmp_file(tmp) {
+        Ok(true) => {
+            if let Some(telemetry) = telemetry {
+                telemetry
+                    .atomic_json_temp_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            warn!(
+                target: "lmx::raft",
+                path = %tmp.display(),
+                phase = "prewrite",
+                "removed stale raft atomic JSON temp file before write",
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            record_json_atomic_tmp_cleanup_error(telemetry, tmp, "prewrite", &err);
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 fn cleanup_json_atomic_tmp_after_error(
@@ -22253,7 +22586,11 @@ fn cleanup_json_atomic_tmp_after_error(
         }
         Ok(false) => {}
         Err(cleanup_error) => {
-            record_json_atomic_tmp_cleanup_error(telemetry, tmp, phase, &cleanup_error);
+            if let Some(telemetry) = telemetry {
+                telemetry
+                    .atomic_json_temp_cleanup_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             warn!(
                 target: "lmx::raft",
                 path = %tmp.display(),
@@ -22304,6 +22641,15 @@ fn cleanup_json_atomic_tmp_file(tmp: &Path) -> Result<bool, BrokerRaftError> {
     Ok(true)
 }
 
+fn create_exclusive_atomic_temp_file(tmp: &Path) -> Result<File, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-create-exclusive-temp-1");
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .map_err(BrokerRaftError::Io)
+}
+
 fn rename_and_sync_parent(tmp: &Path, path: &Path) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-rename-sync-parent-1");
     rename_and_maybe_sync_parent(tmp, path, true)
@@ -22333,6 +22679,8 @@ fn sync_dir(path: &Path) -> Result<(), BrokerRaftError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::FileTypeExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use serde_json::json;
@@ -22340,6 +22688,22 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("live-mutex-rs-{name}-{}", Uuid::new_v4()))
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("fifo path contains no NUL");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        if rc != 0 {
+            panic!(
+                "mkfifo({}) failed: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
     fn spawn_held_append_entries_peer(
@@ -22770,6 +23134,109 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn broker_open_data_dir_lock_does_not_follow_lock_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-open-data-dir-lock-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.data_dir_lock = true;
+        let lock_path = dir.join(DATA_DIR_LOCK_FILE);
+        let target = dir.join("lock-symlink-target");
+        fs::write(&target, b"do not truncate").expect("write symlink target");
+        unix_fs::symlink(&target, &lock_path).expect("create lock symlink");
+
+        let err = match BrokerRaft::open(cfg.clone()) {
+            Ok(_) => panic!("BrokerRaft open must reject a symlinked data-dir lock path"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("data-dir lock") && message.contains("symlink")),
+            "unexpected lock symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not truncate"
+        );
+        assert!(
+            fs::symlink_metadata(&lock_path)
+                .expect("lock symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "failed open should leave unexpected lock symlink for operator cleanup"
+        );
+
+        fs::remove_file(&lock_path).expect("remove lock symlink");
+        let reopened =
+            BrokerRaft::open(cfg).expect("lock registry should be released after failure");
+        drop(reopened);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_open_rejects_learners_state_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-open-learners-state-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let target = dir.join("learners-state-symlink-target");
+        fs::write(&target, b"{\"learners\":[]}").expect("write symlink target");
+        let learners_path = dir.join(LEARNERS_FILE);
+        unix_fs::symlink(&target, &learners_path).expect("create learners symlink");
+        let cfg = test_raft_config(dir.clone());
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("BrokerRaft open must reject a symlinked learners state path"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("staged learners") && message.contains("symlink")),
+            "unexpected learners symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"{\"learners\":[]}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_open_rejects_local_voter_state_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-open-local-voter-state-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let target = dir.join("local-voter-state-symlink-target");
+        fs::write(&target, b"{\"localVoterSeen\":true}").expect("write symlink target");
+        let local_voter_path = dir.join(LOCAL_VOTER_STATE_FILE);
+        unix_fs::symlink(&target, &local_voter_path).expect("create local-voter symlink");
+        let cfg = test_raft_config(dir.clone());
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("BrokerRaft open must reject a symlinked local-voter state path"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("local-voter") && message.contains("symlink")),
+            "unexpected local-voter symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"{\"localVoterSeen\":true}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn log_open_removes_orphaned_rewrite_tmp_file_without_touching_decoys() {
         let dir = temp_dir("raft-log-open-cleans-orphaned-rewrite-tmp");
@@ -22800,9 +23267,74 @@ mod tests {
         assert!(!tmp.exists());
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.log_rewrite_temp_cleanups_total, 1);
-        assert!(raft
-            .raft_metrics_text()
-            .contains("dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total 1"));
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_log_rewrite_temp_cleanup_errors_total 0")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn log_open_rejects_blocking_rewrite_tmp_directory() {
+        let dir = temp_dir("raft-log-open-blocking-rewrite-tmp-dir");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let tmp = log_rewrite_tmp_path(&dir.join(LOG_FILE));
+        fs::create_dir(&tmp).expect("create blocking rewrite tmp directory");
+
+        let err = RaftLogStore::open(&dir).expect_err("blocking rewrite tmp directory must fail");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log rewrite temp") && message.contains("blocking directory")),
+            "unexpected error for blocking rewrite temp path: {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_counts_rewrite_tmp_cleanup_errors_without_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("raft-log-open-rewrite-tmp-cleanup-error");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let tmp = log_rewrite_tmp_path(&dir.join(LOG_FILE));
+        fs::write(&tmp, b"partial rewrite").expect("write stale rewrite tmp");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let original_mode = fs::metadata(&dir)
+            .expect("raft dir metadata")
+            .permissions()
+            .mode();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))
+            .expect("make raft dir readonly");
+        let open_result = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(original_mode))
+            .expect("restore raft dir permissions");
+
+        let _store = open_result.expect("stuck rewrite temp cleanup should not block open");
+        assert!(
+            tmp.exists(),
+            "stuck rewrite temp file should remain for a later cleanup attempt"
+        );
+        assert_eq!(
+            telemetry
+                .log_rewrite_temp_cleanups_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .log_rewrite_temp_cleanup_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -22832,9 +23364,78 @@ mod tests {
         assert!(decoy.exists());
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.atomic_json_temp_cleanups_total, 4);
-        assert!(raft
-            .raft_metrics_text()
-            .contains("dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total 4"));
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total 4"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_atomic_json_temp_cleanup_errors_total 0")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_counts_atomic_json_tmp_cleanup_errors_without_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("raft-log-open-json-tmp-cleanup-error");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let tmp = json_atomic_tmp_path(&dir.join(HARD_STATE_FILE));
+        fs::write(&tmp, b"partial hard state").expect("write stale hard-state tmp");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let original_mode = fs::metadata(&dir)
+            .expect("raft dir metadata")
+            .permissions()
+            .mode();
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))
+            .expect("make raft dir readonly");
+        let open_result = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(original_mode))
+            .expect("restore raft dir permissions");
+
+        let _store = open_result.expect("stuck JSON temp cleanup should not block open");
+        assert!(
+            tmp.exists(),
+            "stuck JSON temp file should remain for a later cleanup attempt"
+        );
+        assert_eq!(
+            telemetry
+                .atomic_json_temp_cleanups_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .atomic_json_temp_cleanup_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_open_rejects_blocking_local_voter_tmp_directory() {
+        let dir = temp_dir("raft-open-blocking-local-voter-tmp-dir");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let local_voter_tmp = json_atomic_tmp_path(&dir.join(LOCAL_VOTER_STATE_FILE));
+        fs::create_dir(&local_voter_tmp).expect("create blocking local-voter tmp directory");
+        let cfg = test_raft_config(dir.clone());
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("blocking local-voter tmp directory must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft local-voter state temp") && message.contains("blocking directory")),
+            "unexpected error for blocking local-voter temp path: {err:?}"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -28164,7 +28765,7 @@ mod tests {
     }
 
     #[test]
-    fn open_does_not_clear_removed_vote_in_memory_when_hard_state_write_fails() {
+    fn open_rejects_blocking_hard_state_tmp_before_clearing_removed_vote() {
         let dir = temp_dir("raft-open-clears-removed-vote-hard-state-fails");
         let mut cfg = test_raft_config(dir.clone());
         cfg.peers = vec![
@@ -28185,9 +28786,15 @@ mod tests {
         fs::create_dir_all(dir.join(HARD_STATE_FILE).with_extension("json.tmp"))
             .expect("block hard-state temp path");
 
-        let opened = BrokerRaft::open(cfg);
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("blocking hard-state temp directory must fail"),
+            Err(err) => err,
+        };
 
-        assert!(matches!(opened, Err(BrokerRaftError::Io(_))));
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft atomic JSON temp") && message.contains("blocking directory")),
+            "unexpected error for blocking hard-state temp path: {err:?}"
+        );
         assert_eq!(
             read_hard_state(&dir.join(HARD_STATE_FILE)).expect("read hard state"),
             initial_state
@@ -32395,6 +33002,49 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_log_does_not_follow_runtime_rewrite_tmp_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-rewrite-runtime-tmp-symlink");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(1, RaftCommand::Noop).expect("append first");
+        store.append(1, RaftCommand::Noop).expect("append second");
+        let target = dir.join("rewrite-symlink-target");
+        fs::write(&target, b"do not rewrite").expect("write symlink target");
+        let tmp = log_rewrite_tmp_path(&dir.join(LOG_FILE));
+        unix_fs::symlink(&target, &tmp).expect("create rewrite tmp symlink");
+
+        let err = store
+            .replace_all(&[])
+            .expect_err("rewrite temp symlink must not be followed");
+
+        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not rewrite"
+        );
+        assert!(
+            fs::symlink_metadata(&tmp)
+                .expect("tmp symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "failed rewrite must leave the unexpected symlink for operator cleanup"
+        );
+        assert_eq!(
+            store
+                .read_entries()
+                .expect("entries")
+                .iter()
+                .map(|entry| (entry.index, entry.term))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (2, 1)]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn append_entries_conflict_repair_reloads_cache_after_truncate_error() {
         let dir = temp_dir("raft-conflict-repair-reload-after-error");
@@ -32480,6 +33130,67 @@ mod tests {
         assert_eq!(
             fs::read(&path).expect("read rolled back log"),
             b"prefix\n".to_vec()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncate_and_append_does_not_follow_main_log_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-log-truncate-append-symlink");
+        fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("truncate-append-symlink-target");
+        fs::write(&target, b"do not truncate append").expect("write symlink target");
+        let path = dir.join(LOG_FILE);
+        unix_fs::symlink(&target, &path).expect("create main log symlink");
+
+        let err = truncate_and_append_serialized_log_entries(
+            &path,
+            0,
+            b"{\"index\":1,\"term\":1,\"createdAtMs\":0,\"command\":{\"type\":\"noop\"}}\n",
+            1,
+            true,
+            None,
+        )
+        .expect_err("truncate+append must not follow main log symlink");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected truncate+append symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not truncate append"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_log_file_len_does_not_follow_main_log_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-log-rollback-symlink");
+        fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("rollback-symlink-target");
+        fs::write(&target, b"do not roll back").expect("write symlink target");
+        let path = dir.join(LOG_FILE);
+        unix_fs::symlink(&target, &path).expect("create main log symlink");
+
+        let err = rollback_log_file_len(&path, 0, true)
+            .expect_err("rollback must not follow main log symlink");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected rollback symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not roll back"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -33112,6 +33823,88 @@ mod tests {
     }
 
     #[test]
+    fn retained_request_identity_cache_truncates_suffix_incrementally() {
+        let kept_request = single_lock_request("truncate-kept", "truncate-kept-key");
+        let kept_fingerprint = request_fingerprint(&kept_request).expect("kept fingerprint");
+        let truncated_request = single_lock_request("truncate-old", "truncate-old-key");
+        let truncated_fingerprint =
+            request_fingerprint(&truncated_request).expect("truncated fingerprint");
+        let new_request = single_lock_request("truncate-new", "truncate-new-key");
+        let new_fingerprint = request_fingerprint(&new_request).expect("new fingerprint");
+
+        let mut fingerprints = BTreeMap::from([
+            (
+                "kept-request".to_string(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: kept_fingerprint.clone(),
+                    first_index: 1,
+                },
+            ),
+            (
+                "truncated-request".to_string(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: truncated_fingerprint,
+                    first_index: 3,
+                },
+            ),
+        ]);
+
+        truncate_retained_request_identity_fingerprints(&mut fingerprints, 2);
+        assert_eq!(
+            fingerprints.keys().cloned().collect::<Vec<_>>(),
+            vec!["kept-request".to_string()]
+        );
+
+        add_retained_request_identity_entries(
+            &mut fingerprints,
+            &[
+                RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 1,
+                        request: kept_request,
+                        grant: None,
+                        request_id: "kept-request".into(),
+                        request_fingerprint: kept_fingerprint.clone(),
+                    },
+                },
+                RaftLogEntry {
+                    index: 4,
+                    term: 2,
+                    created_at_ms: 11,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: new_request,
+                        grant: None,
+                        request_id: "new-request".into(),
+                        request_fingerprint: new_fingerprint.clone(),
+                    },
+                },
+            ],
+        )
+        .expect("add repaired suffix identities");
+
+        let kept = fingerprints
+            .get("kept-request")
+            .expect("kept request fingerprint");
+        assert_eq!(kept.request_fingerprint, kept_fingerprint);
+        assert_eq!(
+            kept.first_index, 1,
+            "suffix retry should not move an existing prefix identity forward"
+        );
+        let new = fingerprints
+            .get("new-request")
+            .expect("new request fingerprint");
+        assert_eq!(new.request_fingerprint, new_fingerprint);
+        assert_eq!(new.first_index, 4);
+
+        truncate_retained_request_identity_fingerprints(&mut fingerprints, 0);
+        assert!(fingerprints.is_empty());
+    }
+
+    #[test]
     fn append_entries_repair_replaces_truncated_request_identity_cache() {
         let dir = temp_dir("raft-append-request-id-repair-cache");
         let store = RaftLogStore::open(&dir).expect("open store");
@@ -33302,6 +34095,289 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn broker_open_data_dir_lock_rejects_fifo_without_blocking() {
+        let dir = temp_dir("raft-open-data-dir-lock-fifo");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.data_dir_lock = true;
+        let lock_path = dir.join(DATA_DIR_LOCK_FILE);
+        create_fifo(&lock_path);
+
+        let err = match BrokerRaft::open(cfg.clone()) {
+            Ok(_) => panic!("BrokerRaft open must reject a FIFO data-dir lock path"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("data-dir lock") && message.contains("not a regular file")),
+            "unexpected lock FIFO error: {err:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&lock_path)
+                .expect("lock FIFO metadata")
+                .file_type()
+                .is_fifo(),
+            "failed open should leave unexpected FIFO for operator cleanup"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_main_log_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-main-log-open-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let target = dir.join("main-log-symlink-target");
+        fs::write(&target, b"not a raft log").expect("write symlink target");
+        let log_path = dir.join(LOG_FILE);
+        unix_fs::symlink(&target, &log_path).expect("create main log symlink");
+
+        let err = RaftLogStore::open(&dir).expect_err("main log symlink must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected main log symlink recovery error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"not a raft log"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_main_log_fifo_without_blocking() {
+        let dir = temp_dir("raft-main-log-open-fifo");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let log_path = dir.join(LOG_FILE);
+        create_fifo(&log_path);
+
+        let err = RaftLogStore::open(&dir).expect_err("main log FIFO must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("not a regular file")),
+            "unexpected main log FIFO recovery error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&log_path)
+            .expect("log FIFO metadata")
+            .file_type()
+            .is_fifo());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_len_bytes_rejects_replaced_main_log_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-log-len-symlink");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        store.append(1, RaftCommand::Noop).expect("append first");
+        let log_path = dir.join(LOG_FILE);
+        let target = dir.join("log-len-symlink-target");
+        fs::write(&target, b"not the raft log").expect("write symlink target");
+        fs::remove_file(&log_path).expect("remove log path");
+        unix_fs::symlink(&target, &log_path).expect("replace log path with symlink");
+
+        let err = store
+            .log_len_bytes()
+            .expect_err("log_len_bytes must not follow replaced main log symlink");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected log length symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"not the raft log"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_snapshot_file_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-snapshot-file-open-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let payload = idle_snapshot_payload();
+        let snapshot = RaftSnapshotFile {
+            metadata: RaftSnapshotMetadata {
+                last_included_index: 7,
+                last_included_term: 3,
+                created_at_ms: 10,
+                payload_sha256: Some(payload_checksum(&payload)),
+            },
+            payload,
+        };
+        let target = dir.join("snapshot-file-symlink-target");
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&snapshot).expect("snapshot json"),
+        )
+        .expect("write symlink target");
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        unix_fs::symlink(&target, &snapshot_path).expect("create snapshot symlink");
+
+        let err = RaftLogStore::open(&dir).expect_err("snapshot symlink must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("snapshot file") && message.contains("symlink")),
+            "unexpected snapshot symlink recovery error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&snapshot_path)
+            .expect("snapshot symlink metadata")
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_snapshot_file_fifo_without_blocking() {
+        let dir = temp_dir("raft-snapshot-file-open-fifo");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let snapshot_path = dir.join(SNAPSHOT_FILE);
+        create_fifo(&snapshot_path);
+
+        let err = RaftLogStore::open(&dir).expect_err("snapshot FIFO must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("snapshot file") && message.contains("not a regular file")),
+            "unexpected snapshot FIFO recovery error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&snapshot_path)
+            .expect("snapshot FIFO metadata")
+            .file_type()
+            .is_fifo());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_hard_state_json_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-hard-state-json-open-symlink");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let hard_state = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 0,
+        };
+        let target = dir.join("hard-state-json-symlink-target");
+        fs::write(
+            &target,
+            serde_json::to_vec_pretty(&hard_state).expect("hard state json"),
+        )
+        .expect("write symlink target");
+        let hard_state_path = dir.join(HARD_STATE_FILE);
+        unix_fs::symlink(&target, &hard_state_path).expect("create hard-state symlink");
+
+        let err = RaftLogStore::open(&dir).expect_err("hard-state symlink must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("hard-state") && message.contains("symlink")),
+            "unexpected hard-state symlink recovery error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&hard_state_path)
+            .expect("hard-state symlink metadata")
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_rejects_hard_state_json_fifo_without_blocking() {
+        let dir = temp_dir("raft-hard-state-json-open-fifo");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let hard_state_path = dir.join(HARD_STATE_FILE);
+        create_fifo(&hard_state_path);
+
+        let err = RaftLogStore::open(&dir).expect_err("hard-state FIFO must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("hard-state") && message.contains("not a regular file")),
+            "unexpected hard-state FIFO recovery error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&hard_state_path)
+            .expect("hard-state FIFO metadata")
+            .file_type()
+            .is_fifo());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_append_does_not_follow_main_log_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-main-log-append-symlink");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let target = dir.join("main-log-append-symlink-target");
+        fs::write(&target, b"do not append").expect("write symlink target");
+        let log_path = dir.join(LOG_FILE);
+        unix_fs::symlink(&target, &log_path).expect("create main log symlink");
+
+        let err = store
+            .append(1, RaftCommand::Noop)
+            .expect_err("main log symlink must not receive appended entries");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected main log symlink append error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not append"
+        );
+        assert_eq!(store.last_index(), 0);
+        assert_eq!(store.last_term(), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_append_rejects_replaced_main_log_fifo_without_blocking() {
+        let dir = temp_dir("raft-main-log-append-fifo");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let log_path = dir.join(LOG_FILE);
+        create_fifo(&log_path);
+
+        let err = store
+            .append(1, RaftCommand::Noop)
+            .expect_err("main log FIFO must not receive appended entries");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("not a regular file")),
+            "unexpected main log FIFO append error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&log_path)
+            .expect("log FIFO metadata")
+            .file_type()
+            .is_fifo());
+        assert_eq!(store.last_index(), 0);
+        assert_eq!(store.last_term(), 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn append_log_cache_rejects_replaced_path() {
         let dir = temp_dir("raft-append-log-cache-replaced");
@@ -33349,6 +34425,52 @@ mod tests {
                 .load(Ordering::Relaxed),
             1,
             "stale cached append handle should be dropped before the failed reopen"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_log_cache_rejects_replaced_symlink_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-append-log-cache-replaced-symlink");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
+        let log_path = dir.join(LOG_FILE);
+        store
+            .append(1, RaftCommand::Noop)
+            .expect("warm append cache");
+        let target = dir.join("append-cache-symlink-target");
+        fs::write(&target, b"do not append through cache").expect("write symlink target");
+        fs::remove_file(&log_path).expect("remove cached log path");
+        unix_fs::symlink(&target, &log_path).expect("replace log path with symlink");
+
+        let err = store
+            .append(1, RaftCommand::Noop)
+            .expect_err("replaced symlink path must not write through cached handle");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("raft log path") && message.contains("symlink")),
+            "unexpected replaced log symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not append through cache"
+        );
+        assert_eq!(store.last_index(), 1);
+        assert_eq!(
+            telemetry
+                .log_append_file_cache_invalidations_total
+                .load(Ordering::Relaxed),
+            1,
+            "stale cached append handle should be dropped before returning the symlink error"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -33536,6 +34658,15 @@ mod tests {
         assert_eq!(oversized_first[0].index, 1);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn effective_append_entries_max_bytes_respects_frame_cap() {
+        assert_eq!(effective_append_entries_max_bytes(1024, 4096), 1024);
+        assert_eq!(effective_append_entries_max_bytes(4096, 1024), 1024);
+        assert_eq!(effective_append_entries_max_bytes(usize::MAX, 2048), 2048);
+        assert_eq!(effective_append_entries_max_bytes(0, 2048), 1);
+        assert_eq!(effective_append_entries_max_bytes(2048, 0), 1);
     }
 
     #[test]
@@ -33950,6 +35081,19 @@ mod tests {
         let raft = BrokerRaft::open(cfg).expect("open raft");
         raft.log.append(7, RaftCommand::Noop).expect("append one");
         raft.log.append(7, RaftCommand::Noop).expect("append two");
+        let repaired_entry_bytes = {
+            let entries = raft
+                .log
+                .read_entries()
+                .expect("read entries for byte check");
+            assert_eq!(
+                entries.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            let lens =
+                serialized_log_entry_lens(std::slice::from_ref(&entries[1])).expect("entry lens");
+            lens[0] as u64
+        };
         {
             let mut runtime = raft.runtime.lock();
             runtime.current_term = 7;
@@ -34092,6 +35236,10 @@ mod tests {
         assert_eq!(
             telemetry.append_entries_sent_total, 1,
             "conflict repair should send only the missing suffix entry, not the full log"
+        );
+        assert_eq!(
+            telemetry.append_entries_log_bytes_total, repaired_entry_bytes,
+            "conflict repair should count only the repaired suffix entry bytes, not the full log"
         );
         assert_eq!(telemetry.append_entries_conflicts_total, 1);
         assert_eq!(telemetry.append_conflict_repairs_total, 1);
@@ -49509,6 +50657,256 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn handle_install_snapshot_removes_orphaned_staged_part_symlink_on_first_chunk() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-install-snapshot-first-chunk-symlink");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = sha256_hex(&bytes);
+        let key = snapshot_transfer_key("n2", 7, 2, &checksum);
+        let staged_path = raft.snapshot_transfer_path(&key);
+        let target = dir.join("staged-part-symlink-target");
+        fs::write(&target, b"do not overwrite").expect("write symlink target");
+        unix_fs::symlink(&target, &staged_path).expect("create staged part symlink");
+
+        let response = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            0,
+            true,
+            BASE64.encode(&bytes),
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 7,
+            }
+        ));
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not overwrite"
+        );
+        assert!(
+            !staged_path.exists(),
+            "offset-zero orphan cleanup and consumed-file cleanup should leave no staged path"
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("installed snapshot")
+                .last_included_index,
+            7
+        );
+        assert_eq!(
+            raft.telemetry_snapshot().snapshot_transfer_cleanups_total,
+            1
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_install_snapshot_duplicate_chunk_does_not_follow_replaced_staged_part_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-install-snapshot-duplicate-chunk-symlink");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = sha256_hex(&bytes);
+        let split = bytes.len() / 2;
+        let first_chunk = &bytes[..split];
+
+        let first = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            0,
+            false,
+            BASE64.encode(first_chunk),
+        );
+        assert!(matches!(
+            first,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+        let staged_path = {
+            let transfers = raft.snapshot_transfers.lock();
+            transfers
+                .values()
+                .next()
+                .expect("pending transfer")
+                .path
+                .clone()
+        };
+        let target = dir.join("duplicate-chunk-symlink-target");
+        fs::write(&target, b"do not read").expect("write symlink target");
+        fs::remove_file(&staged_path).expect("remove staged part");
+        unix_fs::symlink(&target, &staged_path).expect("replace staged part with symlink");
+
+        let duplicate = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            0,
+            false,
+            BASE64.encode(first_chunk),
+        );
+
+        assert!(
+            matches!(&duplicate, RaftRpcResponse::Error { error, .. } if error.contains("InstallSnapshot part path") && error.contains("symlink")),
+            "unexpected response: {duplicate:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not read"
+        );
+        assert!(
+            !staged_path.exists(),
+            "duplicate read failure should remove the staged symlink path"
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert_eq!(
+            raft.telemetry_snapshot()
+                .install_snapshot_staged_file_mismatches_total,
+            1
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_install_snapshot_duplicate_chunk_rejects_replaced_staged_part_fifo_without_blocking()
+    {
+        let dir = temp_dir("raft-install-snapshot-duplicate-chunk-fifo");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let payload = idle_snapshot_payload();
+        let bytes = serde_json::to_vec(&payload).expect("snapshot bytes");
+        let checksum = sha256_hex(&bytes);
+        let split = bytes.len() / 2;
+        let first_chunk = &bytes[..split];
+
+        let first = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum.clone()),
+            0,
+            false,
+            BASE64.encode(first_chunk),
+        );
+        assert!(matches!(
+            first,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 0,
+            }
+        ));
+        let staged_path = {
+            let transfers = raft.snapshot_transfers.lock();
+            transfers
+                .values()
+                .next()
+                .expect("pending transfer")
+                .path
+                .clone()
+        };
+        fs::remove_file(&staged_path).expect("remove staged part");
+        create_fifo(&staged_path);
+
+        let duplicate = raft.handle_install_snapshot(
+            2,
+            "n2".into(),
+            7,
+            2,
+            Some(checksum),
+            0,
+            false,
+            BASE64.encode(first_chunk),
+        );
+
+        assert!(
+            matches!(&duplicate, RaftRpcResponse::Error { error, .. } if error.contains("InstallSnapshot part path") && error.contains("not a regular file")),
+            "unexpected response: {duplicate:?}"
+        );
+        assert!(
+            !staged_path.exists(),
+            "duplicate read failure should remove the staged FIFO path"
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert_eq!(
+            raft.telemetry_snapshot()
+                .install_snapshot_staged_file_mismatches_total,
+            1
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_verified_snapshot_payload_file_does_not_follow_part_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-read-verified-snapshot-part-symlink");
+        fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("verified-payload-symlink-target");
+        let target_bytes = serde_json::to_vec(&idle_snapshot_payload()).expect("snapshot bytes");
+        fs::write(&target, &target_bytes).expect("write symlink target");
+        let path = dir.join(format!(
+            "{}{}{}",
+            SNAPSHOT_PART_FILE_PREFIX, "payload", SNAPSHOT_PART_FILE_SUFFIX
+        ));
+        unix_fs::symlink(&target, &path).expect("create staged part symlink");
+        let checksum = sha256_hex(&target_bytes);
+
+        let err = read_verified_snapshot_payload_file(7, &path, Some(checksum))
+            .expect_err("verified payload read must not follow staged part symlink");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("InstallSnapshot part path") && message.contains("symlink")),
+            "unexpected symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            target_bytes
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("part symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "direct helper should leave unexpected symlink for caller cleanup"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn handle_install_snapshot_cleans_stale_partial_transfer_before_new_chunk() {
         let dir = temp_dir("raft-handle-install-snapshot-stale-transfer");
@@ -49704,6 +51102,59 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_transfer_removal_sync_failures_are_counted_and_exported() {
+        let dir = temp_dir("raft-snapshot-transfer-removal-sync-failure");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let missing_parent_path = dir.join("missing-parent").join(format!(
+            "{}gone{}",
+            SNAPSHOT_PART_FILE_PREFIX, SNAPSHOT_PART_FILE_SUFFIX
+        ));
+
+        raft.sync_snapshot_transfer_removal_dir(&missing_parent_path, "test-sync-failure");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_cleanup_errors_total, 1);
+
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total 1"),
+            "removal sync failure counter should be exported"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_orphaned_snapshot_sweep_scan_failures_are_counted_and_exported() {
+        let dir = temp_dir("raft-stale-orphaned-transfer-scan-failure");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        fs::remove_dir_all(&dir).expect("remove raft data dir");
+        fs::write(&dir, b"not a directory").expect("replace data dir with a file");
+
+        let removed = raft.cleanup_orphaned_stale_snapshot_part_files(
+            unix_ms() + 90 * 60 * 1_000,
+            1,
+            BTreeSet::new(),
+        );
+
+        assert_eq!(removed, 0);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_cleanup_errors_total, 1);
+
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total 1"),
+            "orphan sweep scan failure counter should be exported"
+        );
+
+        let _ = fs::remove_file(dir);
     }
 
     #[test]
@@ -54286,6 +55737,108 @@ mod tests {
     }
 
     #[test]
+    fn changed_hard_state_write_removes_stale_runtime_json_tmp_before_atomic_write() {
+        let dir = temp_dir("raft-hard-state-runtime-stale-json-tmp");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
+        let initial_state = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        let changed_state = RaftHardState {
+            current_term: 8,
+            voted_for: Some("n3".into()),
+            commit_index: 43,
+        };
+        store
+            .write_hard_state(&initial_state)
+            .expect("write initial hard state");
+        let stale_tmp = json_atomic_tmp_path(&dir.join(HARD_STATE_FILE));
+        fs::write(&stale_tmp, b"stale hard-state temp").expect("write stale temp");
+
+        store
+            .write_hard_state(&changed_state)
+            .expect("stale regular temp should be cleaned before exclusive write");
+
+        assert!(!stale_tmp.exists());
+        assert_eq!(
+            telemetry
+                .atomic_json_temp_cleanups_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            store.read_hard_state().expect("read cached hard state"),
+            changed_state
+        );
+        assert_eq!(
+            read_hard_state(&dir.join(HARD_STATE_FILE)).expect("read durable hard state"),
+            changed_state
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_state_write_does_not_follow_runtime_atomic_json_tmp_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-hard-state-runtime-json-tmp-symlink");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let initial_state = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        let changed_state = RaftHardState {
+            current_term: 8,
+            voted_for: Some("n3".into()),
+            commit_index: 43,
+        };
+        store
+            .write_hard_state(&initial_state)
+            .expect("write initial hard state");
+        let target = dir.join("hard-state-symlink-target");
+        fs::write(&target, b"do not overwrite").expect("write symlink target");
+        let tmp = json_atomic_tmp_path(&dir.join(HARD_STATE_FILE));
+        unix_fs::symlink(&target, &tmp).expect("create hard-state tmp symlink");
+
+        let err = store
+            .write_hard_state(&changed_state)
+            .expect_err("atomic JSON temp symlink must not be followed");
+
+        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not overwrite"
+        );
+        assert!(
+            fs::symlink_metadata(&tmp)
+                .expect("tmp symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "failed write must leave the unexpected symlink for operator cleanup"
+        );
+        assert_eq!(
+            store.read_hard_state().expect("read cached hard state"),
+            initial_state
+        );
+        assert_eq!(
+            read_hard_state(&dir.join(HARD_STATE_FILE)).expect("read durable hard state"),
+            initial_state
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn hard_state_commit_only_updates_use_bounded_commit_slots() {
         let dir = temp_dir("raft-hard-state-commit-slots");
         let telemetry = Arc::new(BrokerRaftTelemetry::default());
@@ -54824,7 +56377,7 @@ mod tests {
             .write_hard_state(&committed)
             .expect_err("commit-only hard state must hit durable sidecar");
 
-        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert!(matches!(err, BrokerRaftError::InvalidLog(_)));
         assert_eq!(
             store.read_hard_state().expect("read cached hard state"),
             base
@@ -54845,6 +56398,210 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_state_commit_slot_write_does_not_follow_sidecar_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-hard-state-commit-slot-symlink");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
+        let base = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        let committed = RaftHardState {
+            commit_index: 99,
+            ..base.clone()
+        };
+        store
+            .write_hard_state(&base)
+            .expect("write base hard state");
+        let target = dir.join("commit-slot-symlink-target");
+        fs::write(&target, b"do not overwrite").expect("write symlink target");
+        let slot_path = dir.join(HARD_STATE_COMMIT_FILE);
+        unix_fs::symlink(&target, &slot_path).expect("create commit sidecar symlink");
+
+        let err = store
+            .write_hard_state(&committed)
+            .expect_err("commit sidecar symlink must not be followed");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("commit sidecar") && message.contains("symlink")),
+            "unexpected commit sidecar symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not overwrite"
+        );
+        assert!(
+            fs::symlink_metadata(&slot_path)
+                .expect("slot symlink metadata")
+                .file_type()
+                .is_symlink(),
+            "failed write must leave the unexpected symlink for operator cleanup"
+        );
+        assert_eq!(
+            store.read_hard_state().expect("read cached hard state"),
+            base
+        );
+        assert_eq!(
+            read_hard_state_json(&dir.join(HARD_STATE_FILE)).expect("read JSON base hard state"),
+            base
+        );
+        assert_eq!(
+            telemetry
+                .hard_state_commit_slot_write_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .hard_state_commit_slot_writes_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_state_commit_slot_write_rejects_sidecar_fifo_without_blocking() {
+        let dir = temp_dir("raft-hard-state-commit-slot-fifo");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
+        let base = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        let committed = RaftHardState {
+            commit_index: 99,
+            ..base.clone()
+        };
+        store
+            .write_hard_state(&base)
+            .expect("write base hard state");
+        let slot_path = dir.join(HARD_STATE_COMMIT_FILE);
+        create_fifo(&slot_path);
+
+        let err = store
+            .write_hard_state(&committed)
+            .expect_err("commit sidecar FIFO must be rejected");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("commit sidecar") && message.contains("not a regular file")),
+            "unexpected commit sidecar FIFO error: {err:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&slot_path)
+                .expect("slot FIFO metadata")
+                .file_type()
+                .is_fifo(),
+            "failed write must leave the unexpected FIFO for operator cleanup"
+        );
+        assert_eq!(
+            store.read_hard_state().expect("read cached hard state"),
+            base
+        );
+        assert_eq!(
+            read_hard_state_json(&dir.join(HARD_STATE_FILE)).expect("read JSON base hard state"),
+            base
+        );
+        assert_eq!(
+            telemetry
+                .hard_state_commit_slot_write_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry
+                .hard_state_commit_slot_writes_total
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_state_commit_slot_recovery_rejects_sidecar_symlink() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = temp_dir("raft-hard-state-commit-slot-recovery-symlink");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let base = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        store
+            .write_hard_state(&base)
+            .expect("write base hard state");
+        drop(store);
+        let target = dir.join("commit-slot-recovery-symlink-target");
+        fs::write(&target, b"do not read as sidecar").expect("write symlink target");
+        let slot_path = dir.join(HARD_STATE_COMMIT_FILE);
+        unix_fs::symlink(&target, &slot_path).expect("create recovery sidecar symlink");
+
+        let err = RaftLogStore::open(&dir).expect_err("sidecar symlink must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("commit sidecar") && message.contains("symlink")),
+            "unexpected commit sidecar recovery symlink error: {err:?}"
+        );
+        assert_eq!(
+            fs::read(&target).expect("read symlink target"),
+            b"do not read as sidecar"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_state_commit_slot_recovery_rejects_sidecar_fifo_without_blocking() {
+        let dir = temp_dir("raft-hard-state-commit-slot-recovery-fifo");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let base = RaftHardState {
+            current_term: 7,
+            voted_for: Some("n2".into()),
+            commit_index: 42,
+        };
+        store
+            .write_hard_state(&base)
+            .expect("write base hard state");
+        drop(store);
+        let slot_path = dir.join(HARD_STATE_COMMIT_FILE);
+        create_fifo(&slot_path);
+
+        let err = RaftLogStore::open(&dir).expect_err("sidecar FIFO must fail recovery");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("commit sidecar") && message.contains("not a regular file")),
+            "unexpected commit sidecar recovery FIFO error: {err:?}"
+        );
+        assert!(fs::symlink_metadata(&slot_path)
+            .expect("slot FIFO metadata")
+            .file_type()
+            .is_fifo());
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -54893,7 +56650,7 @@ mod tests {
             .write_hard_state(&second_commit)
             .expect_err("replaced commit sidecar path must not write through cached handle");
 
-        assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert!(matches!(err, BrokerRaftError::InvalidLog(_)));
         assert_eq!(
             store.read_hard_state().expect("read cached hard state"),
             first_commit,

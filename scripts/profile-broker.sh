@@ -17,11 +17,13 @@ bench_keys="${BENCH_KEYS:-256}"
 bench_duration_ms="${BENCH_DURATION_MS:-10000}"
 bench_ttl_ms="${BENCH_TTL_MS:-5000}"
 bench_io_timeout_ms="${BENCH_IO_TIMEOUT_MS:-5000}"
+bench_http_keepalive="${BENCH_HTTP_KEEPALIVE:-false}"
 capture_metrics="${CAPTURE_METRICS:-true}"
 metrics_timeout_s="${METRICS_TIMEOUT_SECONDS:-2}"
 sample_seconds="${SAMPLE_SECONDS:-8}"
 sample_interval_ms="${SAMPLE_INTERVAL_MS:-1}"
 perf_freq="${PERF_FREQ:-997}"
+bench_raft_metrics="${BENCH_RAFT_METRICS:-}"
 
 mkdir -p "$out_dir"
 
@@ -51,6 +53,8 @@ usage() {
   echo "env: RAFT_HTTP_BASE_PORT=$raft_http_base_port RAFT_RPC_BASE_PORT=$raft_rpc_base_port RAFT_SYNC_LOG=$raft_sync_log" >&2
   echo "env: RAFT_BENCH_ROUTE=$raft_bench_route # leader|round-robin for PROFILE_TARGET=raft" >&2
   echo "env: BENCH_WORKERS=$bench_workers BENCH_KEYS=$bench_keys BENCH_DURATION_MS=$bench_duration_ms" >&2
+  echo "env: BENCH_HTTP_KEEPALIVE=$bench_http_keepalive" >&2
+  echo "env: BENCH_RAFT_METRICS=${bench_raft_metrics:-<CAPTURE_METRICS>}" >&2
   echo "env: CAPTURE_METRICS=$capture_metrics METRICS_TIMEOUT_SECONDS=$metrics_timeout_s" >&2
 }
 
@@ -82,6 +86,16 @@ case "$raft_bench_route" in
     ;;
 esac
 
+case "$bench_http_keepalive" in
+  true | false) ;;
+  1) bench_http_keepalive=true ;;
+  0) bench_http_keepalive=false ;;
+  *)
+    echo "BENCH_HTTP_KEEPALIVE must be true or false; got $bench_http_keepalive" >&2
+    exit 2
+    ;;
+esac
+
 artifact_label="$profile_target"
 if [ "$profile_target" = "raft" ]; then
   artifact_label="raft-$raft_bench_route"
@@ -93,6 +107,17 @@ case "$capture_metrics" in
   0) capture_metrics=false ;;
   *)
     echo "CAPTURE_METRICS must be true or false; got $capture_metrics" >&2
+    exit 2
+    ;;
+esac
+
+bench_raft_metrics="${bench_raft_metrics:-$capture_metrics}"
+case "$bench_raft_metrics" in
+  true | false) ;;
+  1) bench_raft_metrics=true ;;
+  0) bench_raft_metrics=false ;;
+  *)
+    echo "BENCH_RAFT_METRICS must be true or false; got $bench_raft_metrics" >&2
     exit 2
     ;;
 esac
@@ -420,6 +445,8 @@ start_benchmark() {
       BENCH_DURATION_MS="$bench_duration_ms" \
       BENCH_TTL_MS="$bench_ttl_ms" \
       BENCH_IO_TIMEOUT_MS="$bench_io_timeout_ms" \
+      BENCH_HTTP_KEEPALIVE="$bench_http_keepalive" \
+      BENCH_RAFT_METRICS="$bench_raft_metrics" \
       "target/$profile/examples/redis_vs_raft_bench" >"$bench_log" 2>&1 &
   else
     BENCH_TARGET=broker \
@@ -429,6 +456,7 @@ start_benchmark() {
       BENCH_DURATION_MS="$bench_duration_ms" \
       BENCH_TTL_MS="$bench_ttl_ms" \
       BENCH_IO_TIMEOUT_MS="$bench_io_timeout_ms" \
+      BENCH_HTTP_KEEPALIVE="$bench_http_keepalive" \
       "target/$profile/examples/redis_vs_raft_bench" >"$bench_log" 2>&1 &
   fi
   bench_pid=$!

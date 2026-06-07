@@ -9,6 +9,9 @@
 //! The HTTP paths default to one short-lived connection per request, matching
 //! the simple LB-facing API. Set BENCH_HTTP_KEEPALIVE=true to reuse one HTTP
 //! socket per worker per endpoint during server-side CPU profiling.
+//! Set BENCH_RAFT_METRICS=true to scrape BrokerRaft `/metrics` before and
+//! after the Raft run and print selected replication/proxy/compaction deltas,
+//! plus per-successful-cycle efficiency ratios.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -61,6 +64,7 @@ struct Config {
     target: Target,
     auth_token: Option<String>,
     http_keep_alive: bool,
+    capture_raft_metrics: bool,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +81,7 @@ struct Summary {
     not_acquired: u64,
     errors: u64,
     latencies_us: Vec<u64>,
+    metric_lines: Vec<String>,
 }
 
 impl Summary {
@@ -147,6 +152,7 @@ async fn main() {
     ) {
         let summary = run_raft(config.clone()).await;
         print_summary("raft", &summary, config.duration);
+        print_metric_lines(&summary.metric_lines);
         raft_summary = Some(summary);
     }
     if matches!(config.target, Target::All) {
@@ -199,6 +205,7 @@ impl Config {
                 .or_else(|| env_string("BENCH_RAFT_AUTH_TOKEN"))
                 .or_else(|| env_string("LMX_LIVE_RAFT_AUTH_TOKEN")),
             http_keep_alive: env_bool("BENCH_HTTP_KEEPALIVE", false),
+            capture_raft_metrics: env_bool("BENCH_RAFT_METRICS", false),
         }
     }
 }
@@ -320,7 +327,20 @@ async fn run_broker(config: Config) -> Summary {
 
 async fn run_raft(config: Config) -> Summary {
     let endpoints = raft_benchmark_endpoints(&config).await;
-    run_http_target(config, "raft", endpoints).await
+    let before = if config.capture_raft_metrics {
+        Some(capture_raft_metric_snapshot(&config, "before").await)
+    } else {
+        None
+    };
+    let mut summary = run_http_target(config.clone(), "raft", endpoints).await;
+    if let Some(before) = before {
+        let after = capture_raft_metric_snapshot(&config, "after").await;
+        summary.metric_lines = raft_metric_delta_lines(&before, &after);
+        summary
+            .metric_lines
+            .extend(raft_metric_per_cycle_lines(&before, &after, summary.ok));
+    }
+    summary
 }
 
 async fn raft_benchmark_endpoints(config: &Config) -> Vec<String> {
@@ -627,6 +647,358 @@ fn print_ratio(a_name: &str, a: &Summary, b_name: &str, b: &Summary) {
     );
 }
 
+fn print_metric_lines(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+#[derive(Debug, Default)]
+struct MetricSnapshot {
+    successful_endpoints: usize,
+    values: BTreeMap<String, f64>,
+    errors: Vec<String>,
+}
+
+const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
+    (
+        "append_rpc",
+        "dd_rust_network_mutex_raft_append_entries_requests_total",
+    ),
+    (
+        "append_batches",
+        "dd_rust_network_mutex_raft_append_entries_batches_total",
+    ),
+    (
+        "append_entries",
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    ),
+    (
+        "append_log_bytes",
+        "dd_rust_network_mutex_raft_append_entries_log_bytes_total",
+    ),
+    (
+        "append_success",
+        "dd_rust_network_mutex_raft_append_entries_successes_total",
+    ),
+    (
+        "append_conflicts",
+        "dd_rust_network_mutex_raft_append_entries_conflicts_total",
+    ),
+    (
+        "append_rpc_errors",
+        "dd_rust_network_mutex_raft_append_entries_rpc_errors_total",
+    ),
+    (
+        "follower_conflicts",
+        "dd_rust_network_mutex_raft_follower_append_conflicts_total",
+    ),
+    (
+        "follower_rewrites",
+        "dd_rust_network_mutex_raft_follower_append_rewrites_total",
+    ),
+    (
+        "follower_appended",
+        "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
+    ),
+    (
+        "follower_rewritten",
+        "dd_rust_network_mutex_raft_follower_append_rewritten_entries_total",
+    ),
+    (
+        "follower_truncated",
+        "dd_rust_network_mutex_raft_follower_append_truncated_entries_total",
+    ),
+    (
+        "follower_sender_rejects",
+        "dd_rust_network_mutex_raft_follower_append_sender_rejections_total",
+    ),
+    (
+        "snapshot_chunks",
+        "dd_rust_network_mutex_raft_install_snapshot_chunks_total",
+    ),
+    (
+        "snapshot_bytes",
+        "dd_rust_network_mutex_raft_install_snapshot_bytes_total",
+    ),
+    (
+        "snapshot_success",
+        "dd_rust_network_mutex_raft_install_snapshot_successes_total",
+    ),
+    (
+        "proxy_forwarded",
+        "dd_rust_network_mutex_raft_proxy_requests_forwarded_total",
+    ),
+    (
+        "proxy_errors",
+        "dd_rust_network_mutex_raft_proxy_request_errors_total",
+    ),
+    (
+        "quorum_waits",
+        "dd_rust_network_mutex_raft_replication_quorum_waits_total",
+    ),
+    (
+        "quorum_ms",
+        "dd_rust_network_mutex_raft_replication_quorum_wait_ms_total",
+    ),
+    (
+        "compactions",
+        "dd_rust_network_mutex_raft_log_compactions_total",
+    ),
+    (
+        "rewrite_tmp_cleanups",
+        "dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total",
+    ),
+    (
+        "log_rollbacks",
+        "dd_rust_network_mutex_raft_log_write_rollbacks_total",
+    ),
+    (
+        "log_append_opens",
+        "dd_rust_network_mutex_raft_log_append_file_opens_total",
+    ),
+    (
+        "log_append_cache_invalidations",
+        "dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total",
+    ),
+    (
+        "commit_slot_writes",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total",
+    ),
+    (
+        "commit_slot_bytes",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total",
+    ),
+    (
+        "commit_slot_errors",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_write_errors_total",
+    ),
+    (
+        "commit_slot_opens",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_file_opens_total",
+    ),
+    (
+        "commit_slot_recoveries",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_recoveries_total",
+    ),
+    (
+        "commit_slot_invalid_recoveries",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_invalid_recoveries_total",
+    ),
+    (
+        "commit_slot_truncations",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_truncations_total",
+    ),
+    ("log_bytes", "dd_rust_network_mutex_raft_log_bytes"),
+    (
+        "retained_entries",
+        "dd_rust_network_mutex_raft_log_retained_entries",
+    ),
+    (
+        "peer_max_lag",
+        "dd_rust_network_mutex_raft_peer_max_lag_entries",
+    ),
+];
+
+async fn capture_raft_metric_snapshot(config: &Config, phase: &str) -> MetricSnapshot {
+    let mut snapshot = MetricSnapshot::default();
+    for endpoint in &config.raft_addrs {
+        match timeout(
+            config.io_timeout,
+            http_request(
+                endpoint,
+                "GET",
+                "/metrics",
+                None,
+                config.auth_token.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok((status, body))) if status / 100 == 2 => {
+                snapshot.successful_endpoints += 1;
+                merge_metric_values(&mut snapshot.values, parse_prometheus_metrics(&body));
+            }
+            Ok(Ok((status, body))) => snapshot.errors.push(format!(
+                "{phase} scrape {endpoint}/metrics returned HTTP {status}: {}",
+                body.trim()
+            )),
+            Ok(Err(err)) => snapshot
+                .errors
+                .push(format!("{phase} scrape {endpoint}/metrics failed: {err}")),
+            Err(_) => snapshot.errors.push(format!(
+                "{phase} scrape {endpoint}/metrics timed out after {:?}",
+                config.io_timeout
+            )),
+        }
+    }
+    snapshot
+}
+
+fn parse_prometheus_metrics(text: &str) -> BTreeMap<String, f64> {
+    let mut values = BTreeMap::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(raw_name) = parts.next() else {
+            continue;
+        };
+        let Some(raw_value) = parts.next() else {
+            continue;
+        };
+        let Some(name) = raw_name.split('{').next() else {
+            continue;
+        };
+        let Ok(value) = raw_value.parse::<f64>() else {
+            continue;
+        };
+        if value.is_finite() {
+            *values.entry(name.to_string()).or_insert(0.0) += value;
+        }
+    }
+    values
+}
+
+fn merge_metric_values(dst: &mut BTreeMap<String, f64>, src: BTreeMap<String, f64>) {
+    for (name, value) in src {
+        *dst.entry(name).or_insert(0.0) += value;
+    }
+}
+
+fn raft_metric_delta_lines(before: &MetricSnapshot, after: &MetricSnapshot) -> Vec<String> {
+    let mut lines = vec![format!(
+        "[raft-metrics] sampled_endpoints_before={} sampled_endpoints_after={}",
+        before.successful_endpoints, after.successful_endpoints
+    )];
+    for error in &before.errors {
+        lines.push(format!("[raft-metrics] {error}"));
+    }
+    for error in &after.errors {
+        lines.push(format!("[raft-metrics] {error}"));
+    }
+
+    let mut current = String::from("[raft-metrics]");
+    for (label, metric_name) in RAFT_BENCH_METRICS {
+        let before_value = before.values.get(*metric_name).copied().unwrap_or(0.0);
+        let after_value = after.values.get(*metric_name).copied().unwrap_or(0.0);
+        let part = format!(
+            " {label}={}",
+            format_metric_delta(after_value - before_value)
+        );
+        if current.len() + part.len() > 160 {
+            lines.push(current);
+            current = String::from("[raft-metrics]");
+        }
+        current.push_str(&part);
+    }
+    if current != "[raft-metrics]" {
+        lines.push(current);
+    }
+    lines
+}
+
+const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
+    (
+        "append_rpc",
+        "dd_rust_network_mutex_raft_append_entries_requests_total",
+    ),
+    (
+        "append_entries",
+        "dd_rust_network_mutex_raft_append_entries_sent_total",
+    ),
+    (
+        "append_log_bytes",
+        "dd_rust_network_mutex_raft_append_entries_log_bytes_total",
+    ),
+    (
+        "follower_appended",
+        "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
+    ),
+    (
+        "follower_rewrites",
+        "dd_rust_network_mutex_raft_follower_append_rewrites_total",
+    ),
+    (
+        "quorum_waits",
+        "dd_rust_network_mutex_raft_replication_quorum_waits_total",
+    ),
+    (
+        "proxy_forwarded",
+        "dd_rust_network_mutex_raft_proxy_requests_forwarded_total",
+    ),
+    (
+        "snapshot_chunks",
+        "dd_rust_network_mutex_raft_install_snapshot_chunks_total",
+    ),
+    (
+        "commit_slot_writes",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total",
+    ),
+    (
+        "commit_slot_bytes",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total",
+    ),
+    (
+        "log_append_opens",
+        "dd_rust_network_mutex_raft_log_append_file_opens_total",
+    ),
+];
+
+fn raft_metric_per_cycle_lines(
+    before: &MetricSnapshot,
+    after: &MetricSnapshot,
+    successful_cycles: u64,
+) -> Vec<String> {
+    if successful_cycles == 0 {
+        return vec![
+            "[raft-metrics-per-cycle] unavailable because raft completed 0 successful cycles"
+                .into(),
+        ];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = format!("[raft-metrics-per-cycle] cycles={successful_cycles}");
+    for (label, metric_name) in RAFT_BENCH_PER_CYCLE_METRICS {
+        let delta = metric_delta(before, after, metric_name);
+        let part = format!(
+            " {label}={}",
+            format_metric_rate(delta / successful_cycles as f64)
+        );
+        if current.len() + part.len() > 160 {
+            lines.push(current);
+            current = String::from("[raft-metrics-per-cycle]");
+        }
+        current.push_str(&part);
+    }
+    lines.push(current);
+    lines
+}
+
+fn metric_delta(before: &MetricSnapshot, after: &MetricSnapshot, metric_name: &str) -> f64 {
+    after.values.get(metric_name).copied().unwrap_or(0.0)
+        - before.values.get(metric_name).copied().unwrap_or(0.0)
+}
+
+fn format_metric_delta(value: f64) -> String {
+    if (value.fract()).abs() < 0.000_001 {
+        format!("{value:+.0}")
+    } else {
+        format!("{value:+.3}")
+    }
+}
+
+fn format_metric_rate(value: f64) -> String {
+    if value.abs() < 0.000_001 {
+        "0".into()
+    } else if (value.fract()).abs() < 0.000_001 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.3}")
+    }
+}
+
 fn percentile_ms(values: &[u64], p: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
@@ -693,6 +1065,7 @@ Configuration is environment driven:\n\
   BENCH_IO_TIMEOUT_MS=5000\n\
   BENCH_HTTP_AUTH_TOKEN=<token>\n\
   BENCH_HTTP_KEEPALIVE=false\n\
+  BENCH_RAFT_METRICS=false\n\
 \n\
 Example:\n\
   BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
@@ -1211,6 +1584,208 @@ mod tests {
         assert_eq!(parse_bool("0"), Some(false));
         assert_eq!(parse_bool("off"), Some(false));
         assert_eq!(parse_bool("maybe"), None);
+    }
+
+    #[test]
+    fn parse_prometheus_metrics_ignores_comments_and_sums_labeled_series() {
+        let metrics = parse_prometheus_metrics(
+            "\
+# HELP ignored help line\n\
+dd_rust_network_mutex_raft_append_entries_requests_total 4\n\
+histogram_bucket{le=\"1\"} 2\n\
+histogram_bucket{le=\"2\"} 3\n\
+bad_without_value\n\
+bad_value nope\n\
+nan_value NaN\n",
+        );
+
+        assert_eq!(
+            metrics["dd_rust_network_mutex_raft_append_entries_requests_total"],
+            4.0
+        );
+        assert_eq!(metrics["histogram_bucket"], 5.0);
+        assert!(!metrics.contains_key("bad_without_value"));
+        assert!(!metrics.contains_key("bad_value"));
+        assert!(!metrics.contains_key("nan_value"));
+    }
+
+    #[test]
+    fn raft_metric_delta_lines_report_selected_benchmark_counters() {
+        let mut before = MetricSnapshot {
+            successful_endpoints: 3,
+            ..MetricSnapshot::default()
+        };
+        before.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_requests_total".into(),
+            10.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_proxy_requests_forwarded_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
+            3.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_rewrites_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
+            11.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
+            2048.0,
+        );
+        before
+            .values
+            .insert("dd_rust_network_mutex_raft_log_bytes".into(), 2048.5);
+
+        let mut after = MetricSnapshot {
+            successful_endpoints: 3,
+            ..MetricSnapshot::default()
+        };
+        after.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_requests_total".into(),
+            42.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_proxy_requests_forwarded_total".into(),
+            5.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
+            7.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_rewrites_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
+            29.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
+            8.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
+            8192.0,
+        );
+        after
+            .values
+            .insert("dd_rust_network_mutex_raft_log_bytes".into(), 4096.75);
+
+        let joined = raft_metric_delta_lines(&before, &after).join("\n");
+
+        assert!(joined.contains("sampled_endpoints_before=3 sampled_endpoints_after=3"));
+        assert!(joined.contains("append_rpc=+32"));
+        assert!(joined.contains("proxy_forwarded=+4"));
+        assert!(joined.contains("follower_conflicts=+4"));
+        assert!(joined.contains("follower_rewrites=+1"));
+        assert!(joined.contains("follower_appended=+18"));
+        assert!(joined.contains("commit_slot_writes=+6"));
+        assert!(joined.contains("commit_slot_bytes=+6144"));
+        assert!(joined.contains("log_bytes=+2048.250"));
+    }
+
+    #[test]
+    fn raft_metric_per_cycle_lines_report_efficiency_ratios() {
+        let mut before = MetricSnapshot::default();
+        before.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_requests_total".into(),
+            10.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_sent_total".into(),
+            20.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_log_bytes_total".into(),
+            1000.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
+            12.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_rewrites_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_proxy_requests_forwarded_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
+            5.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
+            5120.0,
+        );
+
+        let mut after = MetricSnapshot::default();
+        after.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_requests_total".into(),
+            16.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_sent_total".into(),
+            32.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_log_bytes_total".into(),
+            1402.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
+            32.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_follower_append_rewrites_total".into(),
+            6.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_proxy_requests_forwarded_total".into(),
+            8.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
+            13.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
+            13312.0,
+        );
+
+        let joined = raft_metric_per_cycle_lines(&before, &after, 4).join("\n");
+
+        assert!(joined.contains("[raft-metrics-per-cycle] cycles=4"));
+        assert!(joined.contains("append_rpc=1.500"));
+        assert!(joined.contains("append_entries=3"));
+        assert!(joined.contains("append_log_bytes=100.500"));
+        assert!(joined.contains("follower_appended=5"));
+        assert!(joined.contains("follower_rewrites=1"));
+        assert!(joined.contains("proxy_forwarded=1.500"));
+        assert!(joined.contains("commit_slot_writes=2"));
+        assert!(joined.contains("commit_slot_bytes=2048"));
+    }
+
+    #[test]
+    fn raft_metric_per_cycle_lines_explain_zero_success_case() {
+        let line =
+            raft_metric_per_cycle_lines(&MetricSnapshot::default(), &MetricSnapshot::default(), 0)
+                .join("\n");
+
+        assert!(line.contains("unavailable because raft completed 0 successful cycles"));
     }
 
     #[tokio::test]

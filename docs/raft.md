@@ -972,8 +972,10 @@ The current leader write path is still serialized, and each committed lock
 operation is durably written before applying. Followers now receive incremental
 log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
-`append_entries_max_entries` and `append_entries_max_bytes`, and target-index
-replication plus no-target heartbeat/post-commit fanout can send up to
+`append_entries_max_entries` and `append_entries_max_bytes`; the effective byte
+budget is also capped by the Raft peer RPC frame limit so the leader does not
+select a suffix batch that cannot fit on the wire. Target-index replication plus
+no-target heartbeat/post-commit fanout can send up to
 `append_entries_max_inline_batches` bounded batches sequentially to the same
 peer before yielding back to the outer quorum or fanout loop.
 This preserves per-peer AppendEntries ordering while avoiding one fan-out/join
@@ -984,15 +986,19 @@ building and again before counting/sending each `AppendEntries` batch, so
 membership churn does not waste outbound replication work on removed peers. The
 loopback cluster tests now include a bootstrapped learner that catches up over
 multiple bounded `AppendEntries` batches without any `InstallSnapshot` fallback,
-covering the retained-suffix performance path end to end. The
-leader serves `prevLogTerm`, bounded entry
+covering the retained-suffix performance path end to end. That test also bounds
+the leader-side `AppendEntries` entry-count and serialized-byte deltas against
+the leader's retained log size, so repeatedly sending retained history would
+trip CI instead of hiding behind a passing catch-up result. The leader serves
+`prevLogTerm`, bounded entry
 batches, commit-range reads, and retained-term conflict hints from a validated
 in-memory retained-log cache, using index lower-bound lookups for retained
 suffix/range selection plus exact retained-index lookup for `prevLogTerm`,
 avoiding repeated filesystem parsing in the hot replication/apply path. The
 retained cache also tracks each entry's serialized JSON byte length so
-`append_entries_max_bytes` enforcement does not repeatedly reserialize old log
-entries while building catch-up batches. Follower-side staged-learner validation
+`append_entries_max_bytes` and peer-frame cap enforcement do not repeatedly
+reserialize old log entries while building catch-up batches. Follower-side
+staged-learner validation
 replays unapplied membership context in bounded retained-log windows before
 accepting learner entries, then validates the bounded incoming entries by
 borrow, so a long unapplied suffix does not require one giant temporary vector
@@ -1026,8 +1032,10 @@ the log file at the retained-prefix byte offset and appends the leader suffix
 instead of rewriting the full retained log. The in-memory retained entries,
 serialized-byte cache, term indexes, and retained request-id fingerprint cache
 are truncated and extended in place after the disk write succeeds, so conflict
-repair does not clone or rescan a large retained prefix. If that write path
-reports an error, the retained log/index/byte/idempotency cache is reloaded
+repair does not clone or rescan a large retained prefix. Unit coverage also
+asserts the leader-side AppendEntries log-byte counter equals only the repaired
+suffix entry bytes during conflict repair, not the full local log. If that write
+path reports an error, the retained log/index/byte/idempotency cache is reloaded
 from disk before the follower returns the failure. Same-term command conflicts
 at an already-retained index are treated as malformed AppendEntries rather than
 as a matching prefix, so a corrupted leader frame cannot hide divergent command
@@ -1285,7 +1293,20 @@ leader readiness response for each local node. These snapshots make perf or
 flamegraph output easier to correlate with quorum waits, AppendEntries volume,
 snapshot fallback, compaction, and follower lag. Set `CAPTURE_METRICS=false` to
 disable this capture, or `METRICS_TIMEOUT_SECONDS=...` to tune the scrape
-timeout.
+timeout. When profiling BrokerRaft, the script also passes
+`BENCH_RAFT_METRICS=${CAPTURE_METRICS}` by default so
+`redis_vs_raft_bench` prints a compact before/after delta for selected Raft
+AppendEntries, follower conflict-repair, quorum, proxy, snapshot, and compaction
+metrics in the benchmark stdout. The benchmark also prints a
+`[raft-metrics-per-cycle]` line that divides selected deltas by successful
+acquire/release cycles, including AppendEntries requests, replicated log
+entries, replicated log bytes, follower appended entries, follower suffix
+rewrites, proxy forwards, snapshot chunks, commit-slot writes, commit-slot
+bytes, and append-log file opens. That line is the quickest check for
+accidental full-log send behavior:
+`append_log_bytes` per cycle should stay tied to the new entries being
+replicated, not to the total retained history. Override with
+`BENCH_RAFT_METRICS=false` if the run should avoid any extra `/metrics` scrapes.
 
 Use the same benchmark knobs for both scripts, for example:
 
@@ -1300,7 +1321,9 @@ By default, the Broker/BrokerRaft HTTP benchmark path uses short-lived HTTP
 connections so the reported cycle cost includes the exposed LB-facing transport
 shape. Set `BENCH_HTTP_KEEPALIVE=true` to reuse one HTTP connection per worker
 per endpoint and reduce client-side TCP setup noise when comparing regular
-Broker CPU cost with BrokerRaft quorum, proxy, and durable-log cost.
+Broker CPU cost with BrokerRaft quorum, proxy, and durable-log cost. The
+profiling script forwards this knob to `redis_vs_raft_bench` for both
+`PROFILE_TARGET=broker` and `PROFILE_TARGET=raft`.
 
 For manual benchmark runs, `BENCH_RAFT` accepts either one endpoint, such as a
 real LB service or leader-preferred HTTP port, or a comma-separated list of node

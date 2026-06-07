@@ -1847,6 +1847,11 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
         "dd_rust_network_mutex_raft_append_entries_sent_total",
     )
     .await;
+    let before_sent_bytes = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_log_bytes_total",
+    )
+    .await;
     let before_fallbacks = current_metric(
         cluster.http_ports[leader],
         "dd_rust_network_mutex_raft_append_snapshot_fallbacks_total",
@@ -1876,6 +1881,11 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
     let after_sent = current_metric(
         cluster.http_ports[leader],
         "dd_rust_network_mutex_raft_append_entries_sent_total",
+    )
+    .await;
+    let after_sent_bytes = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_append_entries_log_bytes_total",
     )
     .await;
     let after_fallbacks = current_metric(
@@ -1913,6 +1923,21 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
     assert!(
         after_sent.saturating_sub(before_sent) >= stage_target,
         "learner catch-up should send the retained log entries rather than one full-log rewrite; before={before_sent} after={after_sent} target={stage_target}"
+    );
+    let sent_delta = after_sent.saturating_sub(before_sent);
+    let sent_bytes_delta = after_sent_bytes.saturating_sub(before_sent_bytes);
+    let leader_log_bytes = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_log_bytes",
+    )
+    .await;
+    assert!(
+        sent_delta <= stage_target.saturating_mul(3),
+        "learner catch-up should not repeatedly send the retained history; before={before_sent} after={after_sent} target={stage_target}"
+    );
+    assert!(
+        sent_bytes_delta <= leader_log_bytes.saturating_mul(3),
+        "learner catch-up should keep AppendEntries bytes proportional to retained log size, not retained history times catch-up batches; before_bytes={before_sent_bytes} after_bytes={after_sent_bytes} leader_log_bytes={leader_log_bytes} target={stage_target}"
     );
 
     let progress = http_get_json(cluster.http_ports[leader], "/raft/progress")
