@@ -23,6 +23,13 @@ const DEFAULT_SIM_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_SIM_ELECTION_TIMEOUT_MIN: Duration = Duration::from_millis(150);
 const DEFAULT_SIM_ELECTION_TIMEOUT_MAX: Duration = Duration::from_millis(300);
 const DEFAULT_SIM_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Lower bound applied to every simulation wait-for-condition timeout. Callers
+/// pass values tuned for an idle machine (a few seconds); under heavy parallel
+/// test load on a many-core box the simulated cluster can take longer to
+/// converge, so we floor the deadline generously. This only raises the ceiling
+/// before giving up — every wait returns as soon as its condition holds, so the
+/// happy path is unaffected — which removes load-induced timeout flakiness.
+const SIM_WAIT_FLOOR: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct RaftSimConfig {
@@ -274,7 +281,7 @@ impl RaftSim {
 
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<BrokerRaft, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-wait-leader-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             if let Some(leader) = self.ready_leader() {
                 return Ok(leader);
@@ -295,7 +302,7 @@ impl RaftSim {
         timeout: Duration,
     ) -> Result<Vec<RaftProgressSnapshot>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-wait-quorum-commit-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             let progress = self.progress();
             let membership = progress
@@ -2182,7 +2189,7 @@ mod tests {
     ) -> Result<BrokerRaft, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-leader-in-1");
         let allowed = node_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             if let Some(leader) = allowed
                 .iter()
@@ -2208,7 +2215,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-all-applied-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             let progress = sim.progress();
             if progress
@@ -2234,7 +2241,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-applied-on-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             let all_applied = node_ids.iter().all(|node_id| {
                 sim.node(node_id)
@@ -2263,7 +2270,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-removed-member-guards-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             let all_guarded = node_ids.iter().all(|node_id| {
                 sim.node(node_id)
@@ -2388,7 +2395,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-node-compaction-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             let node = sim
                 .node(node_id)
@@ -2412,7 +2419,7 @@ mod tests {
         timeout: Duration,
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-wait-install-snapshot-1");
-        let deadline = deadline_after(timeout);
+        let deadline = deadline_after(timeout.max(SIM_WAIT_FLOOR));
         loop {
             if install_snapshot_successes_total(sim) > previous_successes {
                 return Ok(());

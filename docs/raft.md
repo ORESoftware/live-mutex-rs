@@ -10,6 +10,33 @@ the in-process broker state is changed. Followers can receive HTTP lock
 requests from a round-robin load balancer and proxy them to the current
 leader.
 
+## Load-balancer leader routing
+
+A dumb round-robin LB works because followers transparently proxy writes to the
+leader. To route directly to the leader (skipping the proxy hop), a smarter LB
+has two options:
+
+- **Health-check probe:** `GET /raft/leaderz` returns `200` only on the ready
+  leader and `503` otherwise. Use it as the LB health check so traffic lands on
+  the leader. `GET /raft/status` exposes `isLeader`/`leaderId`/`leaderAddr` for
+  discovery.
+- **Response headers:** every HTTP response carries the responding node's view
+  of leadership, so a client or LB can learn the leader from any response (e.g.
+  a normal `/v1/lock`) without a separate probe:
+  - `X-Raft-Node-Id`
+  - `X-Raft-Role: leader|candidate|follower`
+  - `X-Raft-Term`, `X-Raft-Commit-Index`, `X-Raft-Last-Applied`
+  - `X-Raft-Last-Log-Index`, `X-Raft-Last-Log-Term`
+  - `X-Raft-Leader-Ready: true|false` (whether this node can currently serve writes)
+  - `X-Raft-Leader-Quorum-Age-Ms` on leaders, and `X-Raft-Leader-Quorum-Timeout-Ms`
+  - `X-Raft-Membership-Joint`
+  - `X-Raft-Sync-Log`, `X-Raft-Sync-Commit`, `X-Raft-Unsafe-Durability`
+  - `X-Raft-Leader-Id` / `X-Raft-Leader-Addr` (the leader this node knows of)
+
+  The hint can be briefly stale during a failover; the follower proxy fallback
+  still guarantees correctness regardless of where a request lands. The raw TCP
+  lock protocol carries no leader header — it relies on the follower proxy.
+
 ## Implementation Status
 
 BrokerRaft implements the core Raft consensus mechanics used by this broker
@@ -150,7 +177,9 @@ Implemented:
 - post-commit `AppendEntries` fan-out so followers learn the updated
   `leaderCommit` promptly after quorum commit, with bounded inline
   `AppendEntries` catch-up for lagging no-target heartbeat/post-commit fanout
-  peers before yielding,
+  peers before yielding; yielded lagging peers now schedule another coalesced
+  post-commit fan-out worker even if the original detached task finishes after
+  the previous worker has gone idle,
 - loopback failover coverage now waits for surviving voters' `commitIndex` and
   `lastApplied` to converge across acquire, release, and reacquire operations
   after the old leader is killed,
@@ -243,6 +272,10 @@ Implemented:
   `raft.install_snapshot_max_staged_transfers`, with rejected transfer starts
   counted in
   `dd_rust_network_mutex_raft_install_snapshot_staged_transfer_limit_rejections_total`,
+- already-installed or older `InstallSnapshot` chunks are acknowledged before
+  staged byte/transfer-slot pressure is enforced, after sender and chunk
+  validation. This keeps harmless snapshot retries from being rejected because
+  unrelated transfers are occupying the follower's staging pool,
 - incomplete staged `InstallSnapshot` transfers, including matching orphaned
   part files left on disk but no longer tracked in memory, that make no progress
   for `raft.install_snapshot_stale_transfer_ms` are swept proactively by the
@@ -482,9 +515,8 @@ Implemented:
   `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total`,
   while immediate retry rotation across skipped candidates is counted in
   `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total`;
-  no-target
-  heartbeat/post-commit AppendEntries or snapshot catch-up attempts skipped
-  because the peer already has an in-flight pooled RPC are counted in
+  foreground target, heartbeat/post-commit AppendEntries, or snapshot catch-up
+  attempts skipped because the peer already has an in-flight pooled RPC are counted in
   `dd_rust_network_mutex_raft_replication_busy_peer_skips_total`; no-target
   heartbeat/post-commit inline catch-up progress rounds, local-tail reaches, and
   max-inline-batch yields are counted in
@@ -625,6 +657,9 @@ Implemented:
   `dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total`,
   `dd_rust_network_mutex_raft_log_compaction_cadence_triggers_total`,
   `dd_rust_network_mutex_raft_log_compaction_safety_skips_total`,
+  `dd_rust_network_mutex_raft_log_compaction_no_commit_skips_total`,
+  `dd_rust_network_mutex_raft_log_compaction_unapplied_commit_skips_total`,
+  `dd_rust_network_mutex_raft_log_compaction_trailing_suffix_skips_total`,
   `dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total`,
   `dd_rust_network_mutex_raft_log_write_rollbacks_total`,
   `dd_rust_network_mutex_raft_log_write_rollback_errors_total`,
@@ -791,8 +826,8 @@ Implemented:
 
 Still missing:
 
-- broader hot-path pipelining beyond bounded per-peer fanout/catch-up and the
-  serialized commit/apply lane,
+- broader hot-path pipelining beyond bounded/coalesced per-peer fanout/catch-up
+  and the serialized commit/apply lane,
 - production hardening comparable to etcd or ZooKeeper.
 
 That means BrokerRaft should currently be treated as an experimental
@@ -859,6 +894,15 @@ balancer, so stale LB routing cannot create a proxy loop.
 An old leader that cannot observe quorum for an election-timeout window steps
 down, causing `/raft/leaderz` to return 503 instead of keeping a partitioned
 leader in the preferred LB target set.
+Every Raft HTTP response also includes routing/debug headers:
+`X-Raft-Node-Id`, `X-Raft-Role`, `X-Raft-Term`, `X-Raft-Commit-Index`,
+`X-Raft-Last-Applied`, `X-Raft-Last-Log-Index`, `X-Raft-Last-Log-Term`,
+`X-Raft-Leader-Ready`, `X-Raft-Leader-Quorum-Age-Ms` on leaders,
+`X-Raft-Leader-Quorum-Timeout-Ms`, `X-Raft-Membership-Joint`,
+`X-Raft-Sync-Log`, `X-Raft-Sync-Commit`, `X-Raft-Unsafe-Durability`, and,
+when known, `X-Raft-Leader-Id` / `X-Raft-Leader-Addr`. A load balancer can log
+these headers or use them to converge toward the leader without parsing JSON
+response bodies.
 Likewise, a leader that can still contact peers but cannot commit a specific
 client proposal steps down before returning `QuorumUnavailable`; that response
 means the request was not applied locally, but, as with normal Raft client
@@ -1173,6 +1217,17 @@ PROFILE_TARGET=raft scripts/profile-broker.sh perf
 PROFILE_TARGET=raft RAFT_SYNC_LOG=false scripts/profile-broker.sh flamegraph
 ```
 
+For BrokerRaft server profiling, `RAFT_BENCH_ROUTE=leader` is the default and
+drives the benchmark at the current `/raft/leaderz` HTTP node while profiling
+that leader process. Set `RAFT_BENCH_ROUTE=round-robin` to drive acquire/release
+requests across all three local HTTP nodes and include follower proxy overhead
+while still profiling the elected leader:
+
+```bash
+PROFILE_TARGET=raft RAFT_BENCH_ROUTE=leader scripts/profile-broker.sh perf
+PROFILE_TARGET=raft RAFT_BENCH_ROUTE=round-robin scripts/profile-broker.sh perf
+```
+
 `scripts/profile-broker.sh` also captures before/after endpoint artifacts in
 `target/profiles` by default. For a regular Broker profile it writes
 `broker-before.metrics.prom`, `broker-after.metrics.prom`, and status HTML. For
@@ -1189,6 +1244,7 @@ Use the same benchmark knobs for both scripts, for example:
 ```bash
 BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
 PROFILE_TARGET=raft BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
+PROFILE_TARGET=raft RAFT_BENCH_ROUTE=round-robin BENCH_WORKERS=16 BENCH_KEYS=256 BENCH_DURATION_MS=10000 scripts/profile-broker.sh perf
 ```
 
 For manual benchmark runs, `BENCH_RAFT` accepts either one endpoint, such as a

@@ -11,6 +11,7 @@ raft_http_base_port="${RAFT_HTTP_BASE_PORT:-6972}"
 raft_rpc_base_port="${RAFT_RPC_BASE_PORT:-7980}"
 raft_data_root="${RAFT_DATA_ROOT:-$out_dir/raft-profile-cluster}"
 raft_sync_log="${RAFT_SYNC_LOG:-true}"
+raft_bench_route="${RAFT_BENCH_ROUTE:-leader}"
 bench_workers="${BENCH_WORKERS:-8}"
 bench_keys="${BENCH_KEYS:-256}"
 bench_duration_ms="${BENCH_DURATION_MS:-10000}"
@@ -48,6 +49,7 @@ usage() {
   echo "usage: $0 [sample|perf|flamegraph]" >&2
   echo "env: PROFILE_TARGET=$profile_target PROFILE=$profile OUT_DIR=$out_dir BROKER_HOST=$broker_host BROKER_HTTP_PORT=$broker_http_port" >&2
   echo "env: RAFT_HTTP_BASE_PORT=$raft_http_base_port RAFT_RPC_BASE_PORT=$raft_rpc_base_port RAFT_SYNC_LOG=$raft_sync_log" >&2
+  echo "env: RAFT_BENCH_ROUTE=$raft_bench_route # leader|round-robin for PROFILE_TARGET=raft" >&2
   echo "env: BENCH_WORKERS=$bench_workers BENCH_KEYS=$bench_keys BENCH_DURATION_MS=$bench_duration_ms" >&2
   echo "env: CAPTURE_METRICS=$capture_metrics METRICS_TIMEOUT_SECONDS=$metrics_timeout_s" >&2
 }
@@ -70,6 +72,20 @@ case "$raft_sync_log" in
     exit 2
     ;;
 esac
+
+case "$raft_bench_route" in
+  leader | leader-preferred | leader_preferred) raft_bench_route=leader ;;
+  round-robin | round_robin | rr | lb) raft_bench_route=round-robin ;;
+  *)
+    echo "RAFT_BENCH_ROUTE must be leader or round-robin; got $raft_bench_route" >&2
+    exit 2
+    ;;
+esac
+
+artifact_label="$profile_target"
+if [ "$profile_target" = "raft" ]; then
+  artifact_label="raft-$raft_bench_route"
+fi
 
 case "$capture_metrics" in
   true | false) ;;
@@ -241,6 +257,17 @@ wait_for_raft_leader() {
   return 1
 }
 
+raft_benchmark_endpoint_list() {
+  local endpoint_list=""
+  for port in "${raft_http_ports[@]}"; do
+    if [ -n "$endpoint_list" ]; then
+      endpoint_list="$endpoint_list,"
+    fi
+    endpoint_list="$endpoint_list$broker_host:$port"
+  done
+  printf '%s' "$endpoint_list"
+}
+
 build_binaries() {
   cargo build --no-default-features --profile "$profile" \
     --bin dd-rust-network-mutex \
@@ -375,12 +402,19 @@ start_raft_cluster() {
 }
 
 start_benchmark() {
-  bench_log="$out_dir/$profile_target-bench.out"
+  bench_log="$out_dir/$artifact_label-bench.out"
   rm -f "$bench_log"
   capture_profile_artifacts before
   if [ "$profile_target" = "raft" ]; then
+    local raft_bench_endpoints
+    if [ "$raft_bench_route" = "leader" ]; then
+      raft_bench_endpoints="$broker_host:$raft_leader_http_port"
+    else
+      raft_bench_endpoints="$(raft_benchmark_endpoint_list)"
+    fi
     BENCH_TARGET=raft \
-      BENCH_RAFT="$broker_host:$raft_leader_http_port" \
+      BENCH_RAFT="$raft_bench_endpoints" \
+      BENCH_RAFT_ROUTE="$raft_bench_route" \
       BENCH_WORKERS="$bench_workers" \
       BENCH_KEYS="$bench_keys" \
       BENCH_DURATION_MS="$bench_duration_ms" \
@@ -418,7 +452,7 @@ esac
 
 case "$mode" in
   sample)
-    out="$out_dir/$profile_target-server.sample.txt"
+    out="$out_dir/$artifact_label-server.sample.txt"
     rm -f "$out"
     start_benchmark
     sample_status=0
@@ -431,7 +465,7 @@ case "$mode" in
     echo "$out"
     ;;
   perf)
-    out="$out_dir/$profile_target-server.perf.data"
+    out="$out_dir/$artifact_label-server.perf.data"
     start_benchmark
     perf record -F "$perf_freq" -g -p "$profile_pid" -o "$out" -- sleep "$sample_seconds"
     finish_benchmark
@@ -439,7 +473,7 @@ case "$mode" in
     echo "$out"
     ;;
   flamegraph)
-    out="$out_dir/$profile_target-server.svg"
+    out="$out_dir/$artifact_label-server.svg"
     start_benchmark
     timeout "$sample_seconds" flamegraph --pid "$profile_pid" --output "$out" || status=$?
     finish_benchmark

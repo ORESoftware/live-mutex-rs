@@ -946,6 +946,241 @@ async fn raft_lb_round_robin_survives_leader_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_http_responses_carry_leader_role_headers() {
+    // Every HTTP response stamps the node's Raft role and last-known leader so a
+    // load balancer can learn the leader from any response (not just a probe).
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let cluster = start_cluster().await;
+    let leader = wait_for_leader(&cluster).await;
+    let leader_id = cluster.peers[leader].id.clone();
+    let leader_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status");
+
+    // The leader advertises itself as the ready leader.
+    assert_eq!(
+        http_response_header(cluster.http_ports[leader], "/raft/status", "x-raft-node-id").await,
+        Some(leader_id.clone()),
+    );
+    assert_eq!(
+        http_response_header(cluster.http_ports[leader], "/raft/status", "x-raft-role").await,
+        Some("leader".to_string()),
+    );
+    assert_eq!(
+        http_response_header(cluster.http_ports[leader], "/raft/status", "x-raft-term").await,
+        leader_status["currentTerm"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-commit-index"
+        )
+        .await,
+        leader_status["commitIndex"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-last-applied"
+        )
+        .await,
+        leader_status["lastApplied"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-last-log-index"
+        )
+        .await,
+        leader_status["lastLogIndex"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-last-log-term"
+        )
+        .await,
+        leader_status["lastLogTerm"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-leader-ready"
+        )
+        .await,
+        Some("true".to_string()),
+    );
+    let leader_quorum_age_ms = http_response_header(
+        cluster.http_ports[leader],
+        "/raft/status",
+        "x-raft-leader-quorum-age-ms",
+    )
+    .await
+    .expect("leader quorum-age header")
+    .parse::<u64>()
+    .expect("leader quorum-age header should be numeric");
+    let leader_quorum_timeout_ms = leader_status["leaderQuorumTimeoutMs"]
+        .as_u64()
+        .expect("leader quorum timeout in status");
+    assert!(
+        leader_quorum_age_ms <= leader_quorum_timeout_ms,
+        "ready leader quorum age should be within timeout; age={leader_quorum_age_ms}, timeout={leader_quorum_timeout_ms}"
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-leader-quorum-timeout-ms"
+        )
+        .await,
+        Some(leader_quorum_timeout_ms.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-membership-joint"
+        )
+        .await,
+        leader_status["membershipJoint"]
+            .as_bool()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-sync-log"
+        )
+        .await,
+        leader_status["syncLog"]
+            .as_bool()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-sync-commit"
+        )
+        .await,
+        leader_status["syncCommit"]
+            .as_bool()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-unsafe-durability"
+        )
+        .await,
+        leader_status["unsafeDurability"]
+            .as_bool()
+            .map(|value| value.to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-leader-id"
+        )
+        .await,
+        Some(leader_id.clone()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[leader],
+            "/raft/status",
+            "x-raft-leader-addr"
+        )
+        .await,
+        Some(cluster.peers[leader].addr.clone()),
+    );
+
+    // A follower reports the follower role but still points at the leader. Allow
+    // a brief window for heartbeat-driven leader-hint propagation.
+    let follower = (0..cluster.http_ports.len())
+        .find(|idx| *idx != leader)
+        .expect("a follower exists in a 3-node cluster");
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[follower],
+            "/raft/status",
+            "x-raft-node-id"
+        )
+        .await,
+        Some(cluster.peers[follower].id.clone()),
+    );
+    assert_eq!(
+        http_response_header(cluster.http_ports[follower], "/raft/status", "x-raft-role").await,
+        Some("follower".to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[follower],
+            "/raft/status",
+            "x-raft-leader-ready"
+        )
+        .await,
+        Some("false".to_string()),
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[follower],
+            "/raft/status",
+            "x-raft-leader-quorum-age-ms"
+        )
+        .await,
+        None,
+        "followers should not advertise local leader quorum freshness"
+    );
+    assert_eq!(
+        http_response_header(
+            cluster.http_ports[follower],
+            "/raft/status",
+            "x-raft-leader-quorum-timeout-ms"
+        )
+        .await,
+        leader_status["leaderQuorumTimeoutMs"]
+            .as_u64()
+            .map(|value| value.to_string()),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let hinted = http_response_header(
+            cluster.http_ports[follower],
+            "/raft/status",
+            "x-raft-leader-id",
+        )
+        .await;
+        if hinted.as_deref() == Some(leader_id.as_str()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "follower should advertise the leader id via header; saw {hinted:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raft_follower_proxy_survives_leaderless_failover_window() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let tuning = RaftClusterTuning {
@@ -1479,6 +1714,58 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
         }),
         "leader progress should show node-4 as a caught-up staged learner: {progress:?}"
     );
+
+    let (status, membership) = http_post_json(
+        cluster.http_ports[leader],
+        "/raft/membership",
+        json!({"peers": cluster.peers.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "snapshot-caught learner should promote through joint consensus: {membership:?}"
+    );
+    assert_eq!(membership["clusterSize"].as_u64(), Some(4));
+    assert_eq!(membership["quorumSize"].as_u64(), Some(3));
+    let all_nodes = vec![0, 1, 2, 3];
+    let expected_ids = cluster
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_simple_membership(&cluster, &all_nodes, &expected_ids, 4, 3).await;
+
+    let promoted_key = format!("raft-snapshot-promoted-{}", uuid::Uuid::new_v4());
+    let (status, acquire) = http_post_json(
+        cluster.http_ports[3],
+        "/v1/lock",
+        json!({"key": promoted_key, "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "snapshot-promoted voter should accept a proxied or local write: {acquire:?}"
+    );
+    assert_eq!(
+        acquire["acquired"], true,
+        "snapshot-promoted voter write should commit: {acquire:?}"
+    );
+    let promoted_lock_uuid = acquire["lockUuid"].as_str().unwrap().to_string();
+    let (status, release) = http_post_json(
+        cluster.http_ports[3],
+        "/v1/unlock",
+        json!({"key": promoted_key, "lockUuid": promoted_lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "snapshot-promoted voter should release through the Raft quorum: {release:?}"
+    );
+    assert_eq!(
+        release["unlocked"], true,
+        "snapshot-promoted voter release should commit: {release:?}"
+    );
+    wait_for_zero_holders_and_waiters_among(&cluster, &all_nodes).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2055,6 +2342,23 @@ async fn http_request(
         .map(|(_, body)| body.to_string())
         .unwrap_or_default();
     Ok((status, body))
+}
+
+/// Issue a GET and return the value of a single response header (case-insensitive
+/// name match, trimmed value), or `None` if the header is absent.
+async fn http_response_header(port: u16, path: &str, header: &str) -> Option<String> {
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    stream.write_all(request.as_bytes()).await.ok()?;
+    stream.flush().await.ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.ok()?;
+    let head = raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(&raw);
+    let needle = format!("{}:", header.to_ascii_lowercase());
+    head.lines()
+        .find(|line| line.to_ascii_lowercase().starts_with(&needle))
+        .map(|line| line.split_once(':').map(|(_, v)| v.trim().to_string()))
+        .flatten()
 }
 
 async fn proxy_http_once(

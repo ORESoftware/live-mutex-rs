@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Request as AxumRequest, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response as AxumResponse},
     routing::{get, post},
     Json, Router,
@@ -450,6 +451,10 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
             )
             .route("/v1/lock", post(raft_http_acquire))
             .route("/v1/unlock", post(raft_http_release))
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                raft_leader_response_headers,
+            ))
             .with_state(app_state);
         let listener = TcpListener::bind(addr).await?;
         listeners_bound += 1;
@@ -1134,6 +1139,103 @@ async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
         Json(body).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
+/// Middleware that stamps the local node's Raft role and last-known leader onto
+/// every HTTP response, so a load balancer or client can learn who the leader is
+/// from any response (e.g. a normal `/v1/lock`) without a separate probe:
+///   - `X-Raft-Node-Id`                  — this node's configured Raft id.
+///   - `X-Raft-Role: leader|candidate|follower` — this node's current Raft role.
+///   - `X-Raft-Term`, `X-Raft-Commit-Index`, `X-Raft-Last-Applied`.
+///   - `X-Raft-Last-Log-Index`, `X-Raft-Last-Log-Term`.
+///   - `X-Raft-Leader-Ready: true|false`  — whether this node, as leader, can
+///     currently serve writes (false on followers and quorum-less leaders).
+///   - `X-Raft-Leader-Quorum-Age-Ms` / `X-Raft-Leader-Quorum-Timeout-Ms`.
+///   - `X-Raft-Leader-Id` / `X-Raft-Leader-Addr` — the leader this node knows of.
+/// The hint can be briefly stale during a failover; the follower proxy fallback
+/// still guarantees correctness regardless of where the request lands.
+async fn raft_leader_response_headers(
+    State(state): State<RaftAppState>,
+    request: AxumRequest,
+    next: Next,
+) -> AxumResponse {
+    crate::routine_id!("ddl-routine-server-raft-leader-headers-1");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    let progress = state.raft.progress_snapshot();
+    insert_raft_response_header(headers, "x-raft-node-id", &progress.node_id);
+    insert_raft_response_header(headers, "x-raft-role", &progress.role);
+    insert_raft_response_header(headers, "x-raft-term", progress.current_term.to_string());
+    insert_raft_response_header(
+        headers,
+        "x-raft-commit-index",
+        progress.commit_index.to_string(),
+    );
+    insert_raft_response_header(
+        headers,
+        "x-raft-last-applied",
+        progress.last_applied.to_string(),
+    );
+    insert_raft_response_header(
+        headers,
+        "x-raft-last-log-index",
+        progress.last_log_index.to_string(),
+    );
+    insert_raft_response_header(
+        headers,
+        "x-raft-last-log-term",
+        progress.last_log_term.to_string(),
+    );
+    headers.insert(
+        "x-raft-leader-ready",
+        HeaderValue::from_static(if progress.is_leader_ready {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+    if let Some(age_ms) = progress.leader_quorum_age_ms {
+        insert_raft_response_header(headers, "x-raft-leader-quorum-age-ms", age_ms.to_string());
+    }
+    insert_raft_response_header(
+        headers,
+        "x-raft-leader-quorum-timeout-ms",
+        progress.leader_quorum_timeout_ms.to_string(),
+    );
+    insert_raft_response_header(
+        headers,
+        "x-raft-membership-joint",
+        progress.membership_joint.to_string(),
+    );
+    insert_raft_response_header(headers, "x-raft-sync-log", progress.sync_log.to_string());
+    insert_raft_response_header(
+        headers,
+        "x-raft-sync-commit",
+        progress.sync_commit.to_string(),
+    );
+    insert_raft_response_header(
+        headers,
+        "x-raft-unsafe-durability",
+        progress.unsafe_durability.to_string(),
+    );
+    if let Some(leader_id) = progress.leader_id.as_ref() {
+        insert_raft_response_header(headers, "x-raft-leader-id", leader_id);
+    }
+    if let Some(leader_addr) = progress.leader_addr.as_ref() {
+        insert_raft_response_header(headers, "x-raft-leader-addr", leader_addr);
+    }
+    response
+}
+
+fn insert_raft_response_header(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: impl AsRef<str>,
+) {
+    crate::routine_id!("ddl-routine-server-insert-raft-response-header-1");
+    if let Ok(value) = HeaderValue::from_str(value.as_ref()) {
+        headers.insert(name, value);
     }
 }
 
