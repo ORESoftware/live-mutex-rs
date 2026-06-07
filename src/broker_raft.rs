@@ -231,18 +231,48 @@ impl BrokerRaftConfig {
 
     pub fn validate(&self) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-validate-1");
+        self.validate_for_peer_transport(false)
+    }
+
+    fn validate_for_peer_transport(
+        &self,
+        allow_memory_peer_addrs: bool,
+    ) -> Result<(), BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-validate-transport-1");
         if !self.enabled {
             return Ok(());
         }
-        if self.node_id.trim().is_empty() {
+        let node_id = self.node_id.trim();
+        if node_id.is_empty() {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.node_id cannot be empty when Raft is enabled".into(),
             ));
+        }
+        if let Err(message) = validate_raft_node_id(node_id) {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "raft.node_id `{}` is invalid: {message}",
+                self.node_id
+            )));
         }
         if self.bind_addr.is_none() {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.bind_addr is required when Raft is enabled".into(),
             ));
+        }
+        if let Some(addr) = self.advertise_addr.as_deref() {
+            if addr.trim().is_empty() {
+                return Err(BrokerRaftError::InvalidConfig(
+                    "raft.advertise_addr must not be empty or whitespace-only when configured"
+                        .into(),
+                ));
+            }
+            if let Err(message) =
+                validate_raft_peer_addr_for_transport(addr, allow_memory_peer_addrs)
+            {
+                return Err(BrokerRaftError::InvalidConfig(format!(
+                    "raft.advertise_addr has invalid addr `{addr}`: {message}"
+                )));
+            }
         }
         if self
             .peer_token
@@ -253,16 +283,17 @@ impl BrokerRaftConfig {
                 "raft.peer_token must not be empty or whitespace-only when configured".into(),
             ));
         }
-        let peers = validate_membership_peers(self.peers.clone())?;
-        if !peers.iter().any(|p| p.id == self.node_id) {
-            let local_prefix = raft_client_id_prefix(&self.node_id);
+        let peers =
+            validate_membership_peers_for_transport(self.peers.clone(), allow_memory_peer_addrs)?;
+        if !peers.iter().any(|p| p.id == node_id) {
+            let local_prefix = raft_client_id_prefix(node_id);
             if let Some(peer) = peers
                 .iter()
                 .find(|peer| raft_client_id_prefix(&peer.id) == local_prefix)
             {
                 return Err(BrokerRaftError::InvalidConfig(format!(
                     "raft.node_id `{}` derives the same client-id prefix as raft peer `{}`; rename one node id",
-                    self.node_id, peer.id
+                    node_id, peer.id
                 )));
             }
         }
@@ -275,6 +306,11 @@ impl BrokerRaftConfig {
             return Err(BrokerRaftError::InvalidConfig(
                 "raft.election_timeout_min_ms must be less than raft.election_timeout_max_ms"
                     .into(),
+            ));
+        }
+        if self.heartbeat_interval.is_zero() {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.heartbeat_interval_ms must be greater than 0".into(),
             ));
         }
         if self.heartbeat_interval >= self.election_timeout_min {
@@ -887,8 +923,17 @@ fn add_peers_until_quorum(ack_ids: &mut BTreeSet<String>, peers: &[RaftPeerConfi
     }
 }
 
+#[cfg(test)]
 fn validate_membership_peers(
     peers: Vec<RaftPeerConfig>,
+) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-membership-peers-1");
+    validate_membership_peers_for_transport(peers, false)
+}
+
+fn validate_membership_peers_for_transport(
+    peers: Vec<RaftPeerConfig>,
+    allow_memory_peer_addrs: bool,
 ) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-membership-peers-1");
     // A cluster needs at least 3 voters for failover. Even sizes (4, 6, ...) are
@@ -916,10 +961,24 @@ fn validate_membership_peers(
                 "raft peer id cannot be empty".into(),
             ));
         }
+        if let Err(message) = validate_raft_node_id(&peer.id) {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "raft peer id `{}` is invalid: {message}",
+                peer.id
+            )));
+        }
         if peer.addr.is_empty() {
             return Err(BrokerRaftError::InvalidConfig(format!(
                 "raft peer `{}` has an empty addr",
                 peer.id
+            )));
+        }
+        if let Err(message) =
+            validate_raft_peer_addr_for_transport(&peer.addr, allow_memory_peer_addrs)
+        {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "raft peer `{}` has invalid addr `{}`: {message}",
+                peer.id, peer.addr
             )));
         }
         if !ids.insert(peer.id.clone()) {
@@ -939,6 +998,120 @@ fn validate_membership_peers(
     let normalized = normalize_peers(normalized);
     validate_raft_client_id_prefixes(&normalized)?;
     Ok(normalized)
+}
+
+fn validate_raft_node_id(id: &str) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-node-id-1");
+    if id.is_empty() {
+        return Err("cannot be empty".into());
+    }
+    if id.chars().any(char::is_whitespace) {
+        return Err("must not contain whitespace".into());
+    }
+    if id.chars().any(char::is_control) {
+        return Err("must not contain control characters".into());
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Err("must not contain path separators".into());
+    }
+    Ok(())
+}
+
+fn validate_raft_node_id_set(
+    ids: Vec<String>,
+    subject: &str,
+) -> Result<BTreeSet<String>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-node-id-set-1");
+    if ids.is_empty() {
+        return Err(BrokerRaftError::InvalidConfig(format!(
+            "{subject} requires at least one id"
+        )));
+    }
+    let mut normalized = BTreeSet::new();
+    for id in ids {
+        let id = id.trim().to_string();
+        if let Err(message) = validate_raft_node_id(&id) {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "{subject} id `{id}` is invalid: {message}"
+            )));
+        }
+        normalized.insert(id);
+    }
+    Ok(normalized)
+}
+
+fn validate_raft_peer_addr_for_transport(
+    addr: &str,
+    allow_memory_peer_addrs: bool,
+) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-peer-addr-1");
+    if let Some(node_name) = addr.strip_prefix("memory://") {
+        if !allow_memory_peer_addrs {
+            return Err(
+                "memory:// peer addresses are only valid for the in-memory Raft simulator".into(),
+            );
+        }
+        if let Err(message) = validate_raft_node_id(node_name) {
+            return Err(format!("memory:// peer address node name {message}"));
+        }
+        return Ok(());
+    }
+
+    if let Some(after_open) = addr.strip_prefix('[') {
+        let Some(close) = after_open.find(']') else {
+            return Err("bracketed IPv6 peer address must include a closing `]`".into());
+        };
+        let host = &after_open[..close];
+        let suffix = &after_open[close + 1..];
+        validate_raft_peer_addr_host(host)?;
+        if !suffix.starts_with(':') || suffix.len() == 1 {
+            return Err("bracketed IPv6 peer address must be formatted as [addr]:port".into());
+        }
+        return validate_raft_peer_addr_port(&suffix[1..]);
+    }
+
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err("peer address must be formatted as host:port".into());
+    };
+    validate_raft_peer_addr_host(host)?;
+    if host.contains(':') {
+        return Err("IPv6 peer addresses must be formatted as [addr]:port".into());
+    }
+    if host.contains('[') || host.contains(']') {
+        return Err("peer address host must not contain brackets unless it is [addr]:port".into());
+    }
+    validate_raft_peer_addr_port(port)
+}
+
+fn validate_raft_peer_addr_host(host: &str) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-peer-addr-host-1");
+    if host.is_empty() {
+        return Err("peer address host cannot be empty".into());
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err("peer address host must not contain whitespace".into());
+    }
+    if host.chars().any(char::is_control) {
+        return Err("peer address host must not contain control characters".into());
+    }
+    if host.contains('/') || host.contains('\\') {
+        return Err("peer address host must not contain URL or path separators".into());
+    }
+    Ok(())
+}
+
+fn validate_raft_peer_addr_port(port: &str) -> Result<(), String> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-peer-addr-port-1");
+    if port.is_empty() {
+        return Err("peer address port cannot be empty".into());
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| "peer address port must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        return Err("peer address port must be greater than 0".into());
+    }
+    Ok(())
 }
 
 fn validate_raft_client_id_prefixes(peers: &[RaftPeerConfig]) -> Result<(), BrokerRaftError> {
@@ -971,9 +1144,19 @@ fn raft_client_id_prefix(node_id: &str) -> u64 {
     (stable_node_jitter(node_id, 0) & 0xffff).max(1)
 }
 
+#[cfg(test)]
 fn validate_staged_learner_peers(
     learners: Vec<RaftPeerConfig>,
     active_peers: &[RaftPeerConfig],
+) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-staged-learners-1");
+    validate_staged_learner_peers_for_transport(learners, active_peers, false)
+}
+
+fn validate_staged_learner_peers_for_transport(
+    learners: Vec<RaftPeerConfig>,
+    active_peers: &[RaftPeerConfig],
+    allow_memory_peer_addrs: bool,
 ) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-staged-learners-1");
     let active_ids = active_peers
@@ -995,10 +1178,24 @@ fn validate_staged_learner_peers(
                 "raft learner id cannot be empty".into(),
             ));
         }
+        if let Err(message) = validate_raft_node_id(&peer.id) {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "raft learner id `{}` is invalid: {message}",
+                peer.id
+            )));
+        }
         if peer.addr.trim().is_empty() {
             return Err(BrokerRaftError::InvalidConfig(format!(
                 "raft learner `{}` addr cannot be empty",
                 peer.id
+            )));
+        }
+        if let Err(message) =
+            validate_raft_peer_addr_for_transport(&peer.addr, allow_memory_peer_addrs)
+        {
+            return Err(BrokerRaftError::InvalidConfig(format!(
+                "raft learner `{}` has invalid addr `{}`: {message}",
+                peer.id, peer.addr
             )));
         }
         if active_ids.contains(&peer.id) {
@@ -1034,18 +1231,29 @@ fn validate_staged_learner_peers(
     Ok(normalized)
 }
 
+#[cfg(test)]
 fn validate_raft_membership(membership: RaftMembership) -> Result<RaftMembership, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-validate-membership-1");
+    validate_raft_membership_for_transport(membership, false)
+}
+
+fn validate_raft_membership_for_transport(
+    membership: RaftMembership,
+    allow_memory_peer_addrs: bool,
+) -> Result<RaftMembership, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-membership-1");
     match membership {
         RaftMembership::Simple { peers } => Ok(RaftMembership::Simple {
-            peers: validate_membership_peers(peers)?,
+            peers: validate_membership_peers_for_transport(peers, allow_memory_peer_addrs)?,
         }),
         RaftMembership::Joint {
             old_peers,
             new_peers,
         } => {
-            let old_peers = validate_membership_peers(old_peers)?;
-            let new_peers = validate_membership_peers(new_peers)?;
+            let old_peers =
+                validate_membership_peers_for_transport(old_peers, allow_memory_peer_addrs)?;
+            let new_peers =
+                validate_membership_peers_for_transport(new_peers, allow_memory_peer_addrs)?;
             validate_joint_membership_cross_addresses(&old_peers, &new_peers)?;
             let mut joint_peers = old_peers.clone();
             joint_peers.extend(new_peers.clone());
@@ -1084,10 +1292,10 @@ fn validate_raft_command(command: &RaftCommand) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-command-1");
     match command {
         RaftCommand::SetMembership { membership } => {
-            validate_raft_membership(membership.clone())?;
+            validate_raft_membership_for_transport(membership.clone(), true)?;
         }
         RaftCommand::SetStagedLearners { learners } => {
-            validate_staged_learner_peers(learners.clone(), &[])?;
+            validate_staged_learner_peers_for_transport(learners.clone(), &[], true)?;
         }
         RaftCommand::ClientRequestWithIdentity {
             request,
@@ -1124,6 +1332,7 @@ fn validate_raft_command(command: &RaftCommand) -> Result<(), BrokerRaftError> {
 fn validate_staged_learner_entries_against_membership<'a>(
     mut membership: RaftMembership,
     entries: impl IntoIterator<Item = &'a RaftLogEntry>,
+    allow_memory_peer_addrs: bool,
 ) -> Result<RaftMembership, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-learner-entry-context-1");
     for entry in entries {
@@ -1131,7 +1340,11 @@ fn validate_staged_learner_entries_against_membership<'a>(
             RaftCommand::SetMembership {
                 membership: next_membership,
             } => {
-                membership = validate_raft_membership(next_membership.clone()).map_err(|err| {
+                membership = validate_raft_membership_for_transport(
+                    next_membership.clone(),
+                    allow_memory_peer_addrs,
+                )
+                .map_err(|err| {
                     BrokerRaftError::InvalidAppendEntries(format!(
                         "entry index {} has invalid membership command: {err}",
                         entry.index
@@ -1139,13 +1352,17 @@ fn validate_staged_learner_entries_against_membership<'a>(
                 })?;
             }
             RaftCommand::SetStagedLearners { learners } => {
-                validate_staged_learner_peers(learners.clone(), &membership.validation_peers())
-                    .map_err(|err| {
-                        BrokerRaftError::InvalidAppendEntries(format!(
-                            "entry index {} has staged learners invalid for active membership: {err}",
-                            entry.index
-                        ))
-                    })?;
+                validate_staged_learner_peers_for_transport(
+                    learners.clone(),
+                    &membership.validation_peers(),
+                    allow_memory_peer_addrs,
+                )
+                .map_err(|err| {
+                    BrokerRaftError::InvalidAppendEntries(format!(
+                        "entry index {} has staged learners invalid for active membership: {err}",
+                        entry.index
+                    ))
+                })?;
             }
             RaftCommand::Noop
             | RaftCommand::ClientRequest { .. }
@@ -1336,6 +1553,7 @@ fn validate_retained_log_context_on_open(
     recovered_membership: RaftMembership,
     snapshot_client_response_fingerprints: BTreeMap<String, String>,
     snapshot_index: u64,
+    allow_memory_peer_addrs: bool,
     telemetry: &BrokerRaftTelemetry,
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-validate-open-log-context-1");
@@ -1416,7 +1634,11 @@ fn validate_retained_log_context_on_open(
             )));
         }
         checked_entries = checked_entries.saturating_add(entries.len() as u64);
-        match validate_staged_learner_entries_against_membership(membership, &entries) {
+        match validate_staged_learner_entries_against_membership(
+            membership,
+            &entries,
+            allow_memory_peer_addrs,
+        ) {
             Ok(next_membership) => membership = next_membership,
             Err(err) => {
                 let elapsed_us = duration_us_u64(started.elapsed());
@@ -3808,13 +4030,33 @@ pub struct BrokerRaft {
 }
 
 impl BrokerRaft {
-    pub fn open(mut config: BrokerRaftConfig) -> Result<Self, BrokerRaftError> {
+    pub fn open(config: BrokerRaftConfig) -> Result<Self, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-open-1");
+        Self::open_with_optional_in_memory_transport(config, None)
+    }
+
+    pub(crate) fn open_in_memory(
+        config: BrokerRaftConfig,
+        transport: Arc<RaftInMemoryNetwork>,
+    ) -> Result<Self, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-open-in-memory-1");
+        Self::open_with_optional_in_memory_transport(config, Some(transport))
+    }
+
+    fn open_with_optional_in_memory_transport(
+        mut config: BrokerRaftConfig,
+        in_memory_transport: Option<Arc<RaftInMemoryNetwork>>,
+    ) -> Result<Self, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-open-with-transport-1");
+        let allow_memory_peer_addrs = in_memory_transport.is_some();
         config.node_id = config.node_id.trim().to_string();
         if config.enabled || !config.peers.is_empty() {
-            config.peers = validate_membership_peers(config.peers.clone())?;
+            config.peers = validate_membership_peers_for_transport(
+                config.peers.clone(),
+                allow_memory_peer_addrs,
+            )?;
         }
-        config.validate()?;
+        config.validate_for_peer_transport(allow_memory_peer_addrs)?;
         let data_dir_lock = if config.data_dir_lock {
             Some(Arc::new(BrokerRaftDataDirLock::acquire(&config.data_dir)?))
         } else {
@@ -3835,11 +4077,16 @@ impl BrokerRaft {
         if let Some(snapshot_file) = &snapshot_file {
             Broker::validate_raft_snapshot_payload(&snapshot_file.payload)
                 .map_err(BrokerRaftError::BrokerSnapshot)?;
-            if let Some(membership) = membership_from_snapshot_payload(&snapshot_file.payload)? {
+            if let Some(membership) = membership_from_snapshot_payload_for_transport(
+                &snapshot_file.payload,
+                allow_memory_peer_addrs,
+            )? {
                 recovered_membership = membership;
             }
-            snapshot_staged_learners =
-                staged_learners_from_snapshot_payload(&snapshot_file.payload)?;
+            snapshot_staged_learners = staged_learners_from_snapshot_payload_for_transport(
+                &snapshot_file.payload,
+                allow_memory_peer_addrs,
+            )?;
             snapshot_client_responses =
                 client_responses_from_snapshot_payload(&snapshot_file.payload)?;
         }
@@ -3851,6 +4098,7 @@ impl BrokerRaft {
             read_staged_learners(
                 &config.data_dir.join(LEARNERS_FILE),
                 &recovered_membership.validation_peers(),
+                allow_memory_peer_addrs,
             )?
         };
         let local_voter_state_path = config.data_dir.join(LOCAL_VOTER_STATE_FILE);
@@ -3929,6 +4177,7 @@ impl BrokerRaft {
             recovered_membership.clone(),
             snapshot_client_response_fingerprints,
             snapshot_index,
+            allow_memory_peer_addrs,
             telemetry.as_ref(),
         )?;
         let now = Instant::now();
@@ -3975,7 +4224,7 @@ impl BrokerRaft {
             apply_snapshot_lock: Arc::new(Mutex::new(())),
             post_commit_fanout: Arc::new(Mutex::new(PostCommitFanoutState::default())),
             rpc_connections: Arc::new(Mutex::new(BTreeMap::new())),
-            in_memory_transport: None,
+            in_memory_transport,
             snapshot_transfers: Arc::new(Mutex::new(BTreeMap::new())),
             prepared_install_snapshot_cache: Arc::new(Mutex::new(None)),
             client_request_batch: Arc::new(Mutex::new(ClientRequestBatchState::default())),
@@ -3997,10 +4246,16 @@ impl BrokerRaft {
             raft.broker
                 .install_raft_snapshot(&snapshot_file.payload)
                 .map_err(BrokerRaftError::BrokerSnapshot)?;
-            if let Some(membership) = membership_from_snapshot_payload(&snapshot_file.payload)? {
+            if let Some(membership) = membership_from_snapshot_payload_for_transport(
+                &snapshot_file.payload,
+                allow_memory_peer_addrs,
+            )? {
                 raft.apply_membership(membership)?;
             }
-            if let Some(learners) = staged_learners_from_snapshot_payload(&snapshot_file.payload)? {
+            if let Some(learners) = staged_learners_from_snapshot_payload_for_transport(
+                &snapshot_file.payload,
+                allow_memory_peer_addrs,
+            )? {
                 raft.apply_staged_learners(learners)?;
             }
             raft.restore_client_response_cache(snapshot_client_responses)?;
@@ -6436,9 +6691,9 @@ impl BrokerRaft {
         Ok(())
     }
 
-    pub(crate) fn attach_in_memory_transport(&mut self, transport: Arc<RaftInMemoryNetwork>) {
-        crate::routine_id!("ddl-routine-broker-raft-attach-in-memory-transport-1");
-        self.in_memory_transport = Some(transport);
+    fn allows_in_memory_peer_addrs(&self) -> bool {
+        crate::routine_id!("ddl-routine-broker-raft-allows-memory-peer-addrs-1");
+        self.in_memory_transport.is_some()
     }
 
     pub(crate) fn spawn_in_memory_raft_tasks(&self) -> Vec<JoinHandle<()>> {
@@ -6895,7 +7150,8 @@ impl BrokerRaft {
         peers: Vec<RaftPeerConfig>,
     ) -> Result<u64, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-change-membership-1");
-        let new_peers = validate_membership_peers(peers)?;
+        let new_peers =
+            validate_membership_peers_for_transport(peers, self.allows_in_memory_peer_addrs())?;
         self.ensure_leader_ready_async().await?;
         let _commit_guard = self.lock_serialized_commit_lane("change_membership").await;
         self.apply_visible_durable_commit_index_blocking().await?;
@@ -7045,12 +7301,17 @@ impl BrokerRaft {
             .clone()
             .into_iter()
             .collect::<BTreeMap<_, _>>();
-        for peer in validate_staged_learner_peers(peers, &active_peers)? {
+        for peer in validate_staged_learner_peers_for_transport(
+            peers,
+            &active_peers,
+            self.allows_in_memory_peer_addrs(),
+        )? {
             learners_by_id.insert(peer.id.clone(), peer);
         }
-        let learners = validate_staged_learner_peers(
+        let learners = validate_staged_learner_peers_for_transport(
             learners_by_id.values().cloned().collect(),
             &active_peers,
+            self.allows_in_memory_peer_addrs(),
         )?;
         let target_index = self
             .append_replicate_commit_apply(RaftCommand::SetStagedLearners {
@@ -7107,12 +7368,8 @@ impl BrokerRaft {
         ids: Vec<String>,
     ) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-remove-staged-learners-1");
+        let ids = validate_raft_node_id_set(ids, "raft learner removal")?;
         self.ensure_leader_ready_async().await?;
-        if ids.is_empty() {
-            return Err(BrokerRaftError::InvalidConfig(
-                "raft learner removal requires at least one id".into(),
-            ));
-        }
         let _commit_guard = self
             .lock_serialized_commit_lane("remove_staged_learners")
             .await;
@@ -7124,20 +7381,26 @@ impl BrokerRaft {
                 "cannot remove raft learners while joint consensus is active".into(),
             ));
         }
-        let ids = ids
-            .into_iter()
-            .map(|id| id.trim().to_string())
-            .collect::<BTreeSet<_>>();
         let active_peers = self.active_peers();
-        let learners = validate_staged_learner_peers(
-            self.runtime
-                .lock()
-                .staged_learners
-                .values()
+        let current_learners = self.runtime.lock().staged_learners.clone();
+        if !current_learners.keys().any(|id| ids.contains(id)) {
+            let commit_index = self.runtime.lock().commit_index;
+            debug!(
+                target: "lmx::raft",
+                node_id = %self.config.node_id,
+                commit_index,
+                requested_ids = ?ids,
+                "raft learner removal did not match any staged learners; skipping no-op consensus entry",
+            );
+            return Ok(current_learners.into_values().collect());
+        }
+        let learners = validate_staged_learner_peers_for_transport(
+            current_learners
+                .into_values()
                 .filter(|peer| !ids.contains(&peer.id))
-                .cloned()
                 .collect(),
             &active_peers,
+            self.allows_in_memory_peer_addrs(),
         )?;
         self.append_replicate_commit_apply(RaftCommand::SetStagedLearners {
             learners: learners.clone(),
@@ -7152,7 +7415,11 @@ impl BrokerRaft {
         active_peers: &[RaftPeerConfig],
     ) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-persist-staged-learners-active-1");
-        let learners = validate_staged_learner_peers(learners.to_vec(), active_peers)?;
+        let learners = validate_staged_learner_peers_for_transport(
+            learners.to_vec(),
+            active_peers,
+            self.allows_in_memory_peer_addrs(),
+        )?;
         write_staged_learners(
             &self.log.data_dir,
             &self.log.data_dir.join(LEARNERS_FILE),
@@ -7168,7 +7435,11 @@ impl BrokerRaft {
             .iter()
             .map(|peer| peer.id.clone())
             .collect::<BTreeSet<_>>();
-        let learners = validate_staged_learner_peers(learners, &active_peers)?;
+        let learners = validate_staged_learner_peers_for_transport(
+            learners,
+            &active_peers,
+            self.allows_in_memory_peer_addrs(),
+        )?;
         let learner_ids = learners
             .iter()
             .map(|peer| peer.id.clone())
@@ -9665,10 +9936,12 @@ impl BrokerRaft {
         entries: &[RaftLogEntry],
     ) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-validate-append-learners-1");
-        if !entries
-            .iter()
-            .any(|entry| matches!(entry.command, RaftCommand::SetStagedLearners { .. }))
-        {
+        if !entries.iter().any(|entry| {
+            matches!(
+                entry.command,
+                RaftCommand::SetMembership { .. } | RaftCommand::SetStagedLearners { .. }
+            )
+        }) {
             return Ok(());
         }
         let (last_applied, mut membership) = {
@@ -9684,8 +9957,11 @@ impl BrokerRaft {
                     .saturating_sub(1),
             );
             let context_entries = self.log.entries_range(context_start, context_end)?;
-            membership =
-                validate_staged_learner_entries_against_membership(membership, &context_entries)?;
+            membership = validate_staged_learner_entries_against_membership(
+                membership,
+                &context_entries,
+                self.allows_in_memory_peer_addrs(),
+            )?;
             context_start = context_end.saturating_add(1);
         }
         validate_staged_learner_entries_against_membership(
@@ -9693,6 +9969,7 @@ impl BrokerRaft {
             entries
                 .iter()
                 .filter(|entry| entry.index > last_applied && entry.index > prev_log_index),
+            self.allows_in_memory_peer_addrs(),
         )
         .map(|_| ())
     }
@@ -10384,14 +10661,20 @@ impl BrokerRaft {
                 };
             }
         };
-        if let Err(err) = membership_from_snapshot_payload(&payload) {
+        if let Err(err) = membership_from_snapshot_payload_for_transport(
+            &payload,
+            self.allows_in_memory_peer_addrs(),
+        ) {
             self.remove_snapshot_transfer_file(payload_path, "invalid-membership-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
                 error: err.to_string(),
             };
         }
-        if let Err(err) = staged_learners_from_snapshot_payload(&payload) {
+        if let Err(err) = staged_learners_from_snapshot_payload_for_transport(
+            &payload,
+            self.allows_in_memory_peer_addrs(),
+        ) {
             self.remove_snapshot_transfer_file(payload_path, "invalid-staged-learners-payload");
             return RaftRpcResponse::Error {
                 term: self.runtime.lock().current_term,
@@ -10539,8 +10822,14 @@ impl BrokerRaft {
     ) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-apply-installed-snapshot-1");
         Broker::validate_raft_snapshot_payload(payload).map_err(BrokerRaftError::BrokerSnapshot)?;
-        let snapshot_membership = membership_from_snapshot_payload(payload)?;
-        let snapshot_learners = staged_learners_from_snapshot_payload(payload)?;
+        let snapshot_membership = membership_from_snapshot_payload_for_transport(
+            payload,
+            self.allows_in_memory_peer_addrs(),
+        )?;
+        let snapshot_learners = staged_learners_from_snapshot_payload_for_transport(
+            payload,
+            self.allows_in_memory_peer_addrs(),
+        )?;
         let snapshot_client_responses = client_responses_from_snapshot_payload(payload)?;
         validate_snapshot_client_response_entries(&snapshot_client_responses)?;
         let (hard_state, should_apply) = {
@@ -15566,7 +15855,8 @@ impl BrokerRaft {
 
     fn apply_membership(&self, membership: RaftMembership) -> Result<(), BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-apply-membership-1");
-        let membership = validate_raft_membership(membership)?;
+        let membership =
+            validate_raft_membership_for_transport(membership, self.allows_in_memory_peer_addrs())?;
         let active_peers = membership.active_peers();
         let active_ids: BTreeSet<String> =
             active_peers.iter().map(|peer| peer.id.clone()).collect();
@@ -17025,32 +17315,47 @@ fn base64_padded_len(raw_len: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn membership_from_snapshot_payload(
+fn membership_from_snapshot_payload_for_transport(
     payload: &serde_json::Value,
+    allow_memory_peer_addrs: bool,
 ) -> Result<Option<RaftMembership>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-membership-from-snapshot-1");
     let Some(value) = payload.get("membership") else {
         return Ok(None);
     };
     let membership: RaftMembership = serde_json::from_value(value.clone())?;
-    Ok(Some(validate_raft_membership(membership)?))
+    Ok(Some(validate_raft_membership_for_transport(
+        membership,
+        allow_memory_peer_addrs,
+    )?))
 }
 
+#[cfg(test)]
 fn staged_learners_from_snapshot_payload(
     payload: &serde_json::Value,
+) -> Result<Option<Vec<RaftPeerConfig>>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-learners-from-snapshot-1");
+    staged_learners_from_snapshot_payload_for_transport(payload, false)
+}
+
+fn staged_learners_from_snapshot_payload_for_transport(
+    payload: &serde_json::Value,
+    allow_memory_peer_addrs: bool,
 ) -> Result<Option<Vec<RaftPeerConfig>>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-learners-from-snapshot-1");
     let Some(value) = payload.get("stagedLearners") else {
         return Ok(None);
     };
     let learners: Vec<RaftPeerConfig> = serde_json::from_value(value.clone())?;
-    let active_peers = match membership_from_snapshot_payload(payload)? {
-        Some(membership) => membership.validation_peers(),
-        None => Vec::new(),
-    };
-    Ok(Some(validate_staged_learner_peers(
+    let active_peers =
+        match membership_from_snapshot_payload_for_transport(payload, allow_memory_peer_addrs)? {
+            Some(membership) => membership.validation_peers(),
+            None => Vec::new(),
+        };
+    Ok(Some(validate_staged_learner_peers_for_transport(
         learners,
         &active_peers,
+        allow_memory_peer_addrs,
     )?))
 }
 
@@ -17965,6 +18270,7 @@ fn write_hard_state_commit_slot_with_cache(
 fn read_staged_learners(
     path: &Path,
     active_peers: &[RaftPeerConfig],
+    allow_memory_peer_addrs: bool,
 ) -> Result<Vec<RaftPeerConfig>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-staged-learners-1");
     if !path.exists() {
@@ -17972,7 +18278,11 @@ fn read_staged_learners(
     }
     let file = File::open(path)?;
     let learners_file: RaftLearnersFile = serde_json::from_reader(file)?;
-    validate_staged_learner_peers(learners_file.learners, active_peers)
+    validate_staged_learner_peers_for_transport(
+        learners_file.learners,
+        active_peers,
+        allow_memory_peer_addrs,
+    )
 }
 
 fn read_local_voter_seen(path: &Path) -> Result<bool, BrokerRaftError> {
@@ -20348,6 +20658,13 @@ mod tests {
         }
     }
 
+    fn test_peer_addr(id: &str, addr: &str) -> RaftPeerConfig {
+        RaftPeerConfig {
+            id: id.into(),
+            addr: addr.into(),
+        }
+    }
+
     fn five_test_peers() -> Vec<RaftPeerConfig> {
         vec![
             test_peer("n1", 7980),
@@ -20996,6 +21313,188 @@ mod tests {
     }
 
     #[test]
+    fn membership_validation_rejects_malformed_peer_addresses() {
+        let no_port = validate_membership_peers(vec![
+            test_peer_addr("n1", "node-1"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer address without a port must be rejected");
+        assert!(matches!(
+            no_port,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer `n1`")
+                    && message.contains("host:port")
+        ));
+
+        let bad_port = validate_membership_peers(vec![
+            test_peer_addr("n1", "node-1:not-a-port"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer address with a non-numeric port must be rejected");
+        assert!(matches!(
+            bad_port,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer `n1`")
+                    && message.contains("1 to 65535")
+        ));
+
+        let zero_port = validate_membership_peers(vec![
+            test_peer_addr("n1", "node-1:0"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer address with port zero must be rejected");
+        assert!(matches!(
+            zero_port,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer `n1`")
+                    && message.contains("greater than 0")
+        ));
+
+        let unbracketed_ipv6 = validate_membership_peers(vec![
+            test_peer_addr("n1", "::1:7980"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("IPv6 peer addresses must be bracketed");
+        assert!(matches!(
+            unbracketed_ipv6,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("[addr]:port")
+        ));
+
+        let url_like_addr = validate_membership_peers(vec![
+            test_peer_addr("n1", "http://node-1:7980"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer addresses should be raw TCP host:port targets, not URLs");
+        assert!(matches!(
+            url_like_addr,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer `n1`")
+                    && message.contains("URL or path separators")
+        ));
+    }
+
+    #[test]
+    fn membership_validation_rejects_malformed_peer_ids_and_memory_names() {
+        let whitespace_id = validate_membership_peers(vec![
+            test_peer_addr("node 1", "node-1:7980"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer ids must not contain whitespace");
+        assert!(matches!(
+            whitespace_id,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer id `node 1`")
+                    && message.contains("whitespace")
+        ));
+
+        let path_id = validate_membership_peers(vec![
+            test_peer_addr("node/1", "node-1:7980"),
+            test_peer("n2", 7981),
+            test_peer("n3", 7982),
+        ])
+        .expect_err("peer ids must not contain path separators");
+        assert!(matches!(
+            path_id,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer id `node/1`")
+                    && message.contains("path separators")
+        ));
+
+        let path_memory_name = validate_membership_peers_for_transport(
+            vec![
+                test_peer_addr("n1", "memory://../node-1"),
+                test_peer_addr("n2", "memory://node-2"),
+                test_peer_addr("n3", "memory://node-3"),
+            ],
+            true,
+        )
+        .expect_err("memory transport peer names must stay path-safe");
+        assert!(matches!(
+            path_memory_name,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft peer `n1`")
+                    && message.contains("memory://")
+                    && message.contains("path separators")
+        ));
+    }
+
+    #[test]
+    fn membership_validation_accepts_bracketed_ipv6_and_restricts_sim_memory_addresses() {
+        let ipv6 = validate_membership_peers(vec![
+            test_peer_addr("n1", "[::1]:7980"),
+            test_peer_addr("n2", "[2001:db8::1]:7981"),
+            test_peer_addr("n3", "node-3:7982"),
+        ])
+        .expect("bracketed IPv6 peer addresses should be valid");
+        assert_eq!(ipv6[0].addr, "[::1]:7980");
+
+        let memory_peers = vec![
+            test_peer_addr("node-1", "memory://node-1"),
+            test_peer_addr("node-2", "memory://node-2"),
+            test_peer_addr("node-3", "memory://node-3"),
+        ];
+        let production_memory = validate_membership_peers(memory_peers.clone())
+            .expect_err("memory transport addresses must not pass production validation");
+        assert!(matches!(
+            production_memory,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("memory://")
+                    && message.contains("in-memory Raft simulator")
+        ));
+
+        let memory = validate_membership_peers_for_transport(memory_peers, true)
+            .expect("in-memory Raft simulator peer addresses should stay valid");
+        assert_eq!(memory[2].addr, "memory://node-3");
+    }
+
+    #[test]
+    fn staged_learner_validation_rejects_malformed_peer_address() {
+        let err = validate_staged_learner_peers(
+            vec![test_peer_addr("n4", "node-4")],
+            &[
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+        )
+        .expect_err("staged learner address without a port must be rejected");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft learner `n4`")
+                    && message.contains("host:port")
+        ));
+    }
+
+    #[test]
+    fn staged_learner_validation_rejects_malformed_peer_id() {
+        let err = validate_staged_learner_peers(
+            vec![test_peer_addr("n/4", "node-4:7984")],
+            &[
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+            ],
+        )
+        .expect_err("staged learner ids must not contain path separators");
+
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft learner id `n/4`")
+                    && message.contains("path separators")
+        ));
+    }
+
+    #[test]
     fn membership_validation_rejects_duplicates_and_allows_even_configs() {
         let duplicate = validate_membership_peers(vec![
             test_peer("n1", 7980),
@@ -21127,6 +21626,7 @@ mod tests {
                     }],
                 },
             }],
+            false,
         )
         .expect_err("learner must not reuse an old-config joint voter address");
 
@@ -21259,6 +21759,115 @@ mod tests {
             err,
             BrokerRaftError::InvalidConfig(message)
                 if message.contains("snapshot_interval_ms")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_zero_heartbeat_interval() {
+        let dir = temp_dir("raft-config-zero-heartbeat-interval");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.heartbeat_interval = Duration::ZERO;
+
+        let err = cfg
+            .validate()
+            .expect_err("zero heartbeat interval must be rejected");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("heartbeat_interval_ms")
+                    && message.contains("greater than 0")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_malformed_advertise_addr() {
+        let dir = temp_dir("raft-config-bad-advertise-addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.advertise_addr = Some("http://node-1:7980".into());
+
+        let err = cfg
+            .validate()
+            .expect_err("advertise_addr should be a raw host:port target, not a URL");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("advertise_addr")
+                    && message.contains("URL or path separators")
+        ));
+
+        cfg.advertise_addr = Some(" ".into());
+        let err = cfg
+            .validate()
+            .expect_err("blank advertise_addr should be rejected");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("advertise_addr")
+                    && message.contains("whitespace-only")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_malformed_node_id() {
+        let dir = temp_dir("raft-config-bad-node-id");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.node_id = "node/1".into();
+
+        let err = cfg
+            .validate()
+            .expect_err("node_id should be a stable token, not a path-like string");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("node_id")
+                    && message.contains("node/1")
+                    && message.contains("path separators")
+        ));
+
+        cfg.node_id = "node 1".into();
+        let err = cfg
+            .validate()
+            .expect_err("node_id should not contain whitespace");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("node_id")
+                    && message.contains("node 1")
+                    && message.contains("whitespace")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_memory_peer_addr_outside_simulator() {
+        let dir = temp_dir("raft-config-memory-peer-addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.advertise_addr = Some("memory://n1".into());
+        cfg.peers = vec![
+            test_peer_addr("n1", "memory://n1"),
+            test_peer_addr("n2", "memory://n2"),
+            test_peer_addr("n3", "memory://n3"),
+        ];
+
+        let err = cfg
+            .validate()
+            .expect_err("production config must reject simulator-only peer addresses");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("memory://")
+                    && message.contains("in-memory Raft simulator")
         ));
 
         let _ = fs::remove_dir_all(dir);
@@ -22727,6 +23336,80 @@ mod tests {
             err,
             BrokerRaftError::InvalidConfig(message) if message.contains("joint consensus")
         ));
+        assert!(raft.log.read_entries().expect("read entries").is_empty());
+        assert_eq!(raft.staged_learners(), vec![learner]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn remove_staged_learners_rejects_invalid_ids_without_appending() {
+        let dir = temp_dir("raft-remove-learners-invalid-ids");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let learner = test_peer("n4", 7983);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime
+                .staged_learners
+                .insert(learner.id.clone(), learner.clone());
+        }
+        raft.note_leader_quorum_observed();
+
+        let blank_err = raft
+            .remove_staged_learners(vec![" ".into()])
+            .await
+            .expect_err("blank learner removal id must be rejected");
+        assert!(matches!(
+            blank_err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft learner removal")
+                    && message.contains("cannot be empty")
+        ));
+
+        let path_err = raft
+            .remove_staged_learners(vec!["n/4".into()])
+            .await
+            .expect_err("path-like learner removal id must be rejected");
+        assert!(matches!(
+            path_err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("raft learner removal")
+                    && message.contains("path separators")
+        ));
+
+        assert!(raft.log.read_entries().expect("read entries").is_empty());
+        assert_eq!(raft.staged_learners(), vec![learner]);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn remove_staged_learners_noops_unknown_ids_without_appending() {
+        let dir = temp_dir("raft-remove-learners-unknown-noop");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let learner = test_peer("n4", 7983);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime
+                .staged_learners
+                .insert(learner.id.clone(), learner.clone());
+        }
+        raft.note_leader_quorum_observed();
+
+        let learners = raft
+            .remove_staged_learners(vec!["n5".into()])
+            .await
+            .expect("valid unknown learner removal id should be an idempotent no-op");
+
+        assert_eq!(learners, vec![learner.clone()]);
         assert!(raft.log.read_entries().expect("read entries").is_empty());
         assert_eq!(raft.staged_learners(), vec![learner]);
 
@@ -26708,6 +27391,58 @@ mod tests {
         assert!(raft.raft_metrics_text().contains(
             "dd_rust_network_mutex_raft_append_entries_context_invalid_staged_learners_total 1"
         ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_rejects_simulator_memory_membership_on_production_follower() {
+        let dir = temp_dir("raft-append-memory-membership-production");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = None;
+            runtime.last_applied = 0;
+        }
+
+        let response = raft.handle_append_entries(
+            1,
+            "n2".into(),
+            0,
+            0,
+            vec![RaftLogEntry {
+                index: 1,
+                term: 1,
+                created_at_ms: 10,
+                command: RaftCommand::SetMembership {
+                    membership: RaftMembership::from_simple(vec![
+                        test_peer_addr("n1", "memory://n1"),
+                        test_peer_addr("n2", "memory://n2"),
+                        test_peer_addr("n3", "memory://n3"),
+                    ]),
+                },
+            }],
+            0,
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::Error {
+                term: 1,
+                error
+            } if error.contains("memory://")
+                && error.contains("in-memory Raft simulator")
+        ));
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_malformed_requests_total, 1);
+        assert_eq!(
+            telemetry.append_entries_context_invalid_staged_learners_total,
+            1
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -38434,6 +39169,41 @@ mod tests {
             "same-id hints should use the current active peer address, not a stale cached address"
         );
         assert!(!candidates.iter().any(|peer| peer.addr == "127.0.0.1:9000"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn proxy_candidate_peers_without_hint_rotate_direct_active_peers() {
+        let dir = temp_dir("raft-proxy-candidate-no-hint-rotation");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.node_id = "n2".into();
+        cfg.peers = vec![
+            test_peer_addr("n1", "node-1.raft:7980"),
+            test_peer_addr("n2", "node-2.raft:7980"),
+            test_peer_addr("n3", "node-3.raft:7980"),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+
+        let first_round = raft.proxy_candidate_peers(None, 0);
+        assert_eq!(
+            first_round
+                .iter()
+                .map(|peer| (peer.id.as_str(), peer.addr.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("n1", "node-1.raft:7980"), ("n3", "node-3.raft:7980")],
+            "without a leader hint, followers should dial direct active peer addresses"
+        );
+
+        let second_round = raft.proxy_candidate_peers(None, 1);
+        assert_eq!(
+            second_round
+                .iter()
+                .map(|peer| (peer.id.as_str(), peer.addr.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("n3", "node-3.raft:7980"), ("n1", "node-1.raft:7980")],
+            "retry attempts should rotate candidates instead of hammering one peer"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }

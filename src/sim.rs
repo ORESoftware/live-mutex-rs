@@ -156,8 +156,7 @@ impl RaftSim {
             raft_config.peer_token = config.peer_token.clone();
             raft_config.peers = peers.clone();
 
-            let mut node = BrokerRaft::open(raft_config)?;
-            node.attach_in_memory_transport(Arc::clone(&network));
+            let node = BrokerRaft::open_in_memory(raft_config, Arc::clone(&network))?;
             network.register(node.clone());
             nodes.insert(peer.id.clone(), node);
         }
@@ -212,8 +211,7 @@ impl RaftSim {
         self.network.unregister(node_id);
         self.nodes.remove(node_id);
 
-        let mut node = BrokerRaft::open(config)?;
-        node.attach_in_memory_transport(Arc::clone(&self.network));
+        let node = BrokerRaft::open_in_memory(config, Arc::clone(&self.network))?;
         self.network.register(node.clone());
         self.tasks
             .insert(node_id.to_string(), node.spawn_in_memory_raft_tasks());
@@ -245,8 +243,7 @@ impl RaftSim {
         config.data_dir_lock = false;
         config.peers = template.active_peers();
 
-        let mut node = BrokerRaft::open(config)?;
-        node.attach_in_memory_transport(Arc::clone(&self.network));
+        let node = BrokerRaft::open_in_memory(config, Arc::clone(&self.network))?;
         self.network.register(node.clone());
         self.tasks
             .insert(node_id.clone(), node.spawn_in_memory_raft_tasks());
@@ -353,17 +350,63 @@ impl RaftSim {
         is_acquire: bool,
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-leader-1");
-        let leader = self.wait_for_leader(DEFAULT_SIM_REQUEST_TIMEOUT).await?;
-        leader
-            .run_ephemeral(request, request_uuid, wait, is_acquire)
-            .await
-            .map_err(Into::into)
+        let deadline = deadline_after(DEFAULT_SIM_REQUEST_TIMEOUT);
+        let mut last_not_leader: Option<BrokerRaftError> = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                if let Some(err) = last_not_leader {
+                    return Err(err.into());
+                }
+                return Err(RaftSimError::Timeout {
+                    operation: "ready raft leader",
+                    timeout_ms: duration_ms_u64(DEFAULT_SIM_REQUEST_TIMEOUT),
+                });
+            }
+            let leader = self
+                .wait_for_leader(deadline.saturating_duration_since(now))
+                .await?;
+            match leader
+                .run_ephemeral(request.clone(), request_uuid, wait, is_acquire)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err @ BrokerRaftError::NotLeader { .. }) => {
+                    last_not_leader = Some(err);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     pub async fn change_membership(&self, peers: Vec<RaftPeerConfig>) -> Result<u64, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-change-membership-1");
-        let leader = self.wait_for_leader(DEFAULT_SIM_REQUEST_TIMEOUT).await?;
-        leader.change_membership(peers).await.map_err(Into::into)
+        let deadline = deadline_after(DEFAULT_SIM_REQUEST_TIMEOUT);
+        let mut last_not_leader: Option<BrokerRaftError> = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                if let Some(err) = last_not_leader {
+                    return Err(err.into());
+                }
+                return Err(RaftSimError::Timeout {
+                    operation: "ready raft leader",
+                    timeout_ms: duration_ms_u64(DEFAULT_SIM_REQUEST_TIMEOUT),
+                });
+            }
+            let leader = self
+                .wait_for_leader(deadline.saturating_duration_since(now))
+                .await?;
+            match leader.change_membership(peers.clone()).await {
+                Ok(index) => return Ok(index),
+                Err(err @ BrokerRaftError::NotLeader { .. }) => {
+                    last_not_leader = Some(err);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     pub async fn acquire(&self, key: impl Into<String>) -> Result<RaftSimLock, RaftSimError> {
