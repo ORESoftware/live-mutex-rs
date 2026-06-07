@@ -62,6 +62,8 @@ CLIENT_PROTOCOLS=(
   "OCaml:clients/ocaml/network_mutex_protocol.ml"
   "C#:clients/csharp/Protocol.cs"
   "F#:clients/fsharp/Protocol.fs"
+  "Shell:clients/shell/live_mutex_client.sh"
+  "PowerShell:clients/powershell/LiveMutexClient.ps1"
 )
 
 failures=0

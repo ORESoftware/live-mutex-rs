@@ -120,5 +120,15 @@ else
   echo "(skipping dart: neither dart SDK nor docker available)"
 fi
 
+echo "==> shell smoke"
+"$HERE/clients/shell/smoke.sh"
+
+echo "==> powershell smoke"
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh "$HERE/clients/powershell/smoke.ps1"
+else
+  echo "(skipping powershell: pwsh not found)"
+fi
+
 echo
 echo "==> all client smokes OK"

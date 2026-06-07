@@ -1,6 +1,6 @@
 # `rust-network-mutex-rs` clients
 
-Thirteen language clients/seeds that all speak the same JSON wire protocol (see
+Fifteen language clients/seeds that all speak the same JSON wire protocol (see
 `../PROTOCOL.md`) to the Rust broker. Each client mirrors the Rust
 `Request` / `Response` enum in its native idiom — **no magic strings**,
 unlike the upstream Node `live-mutex` library which uses `if (data.type
@@ -21,6 +21,8 @@ unlike the upstream Node `live-mutex` library which uses `if (data.type
 | OCaml      | `ocaml/`            | variants + pattern matching                   | `make -C clients/ocaml test`                                 |
 | C#         | `csharp/`           | `enum RequestType` / `enum ResponseType`      | `dotnet run --project clients/csharp`                        |
 | F#         | `fsharp/`           | discriminated unions + pattern matching       | `dotnet run --project clients/fsharp`                        |
+| Shell      | `shell/`            | `LMX_REQ_*` / `LMX_RES_*` bash constants      | `./clients/shell/smoke.sh`                                   |
+| PowerShell | `powershell/`       | `$LmxReq` / `$LmxRes` constant tables         | `pwsh ./clients/powershell/smoke.ps1`                        |
 
 The TypeScript client also ships a head-to-head benchmark harness
 (`ts/src/compare.ts`) that runs the same workload against
@@ -86,6 +88,8 @@ wire discriminator drift for every runtime:
 - OCaml → variants and pattern matching.
 - C# → enums and switch expressions.
 - F# → discriminated unions and pattern matching.
+- Shell → `LMX_REQ_*` / `LMX_RES_*` readonly constants used to build every frame.
+- PowerShell → `$LmxReq` / `$LmxRes` constant tables used to build every frame.
 
 The upstream `live-mutex` broker switches on bare strings, so a typo
 silently routes to "no handler". This is the structural fix.

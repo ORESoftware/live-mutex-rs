@@ -262,7 +262,7 @@ Implemented:
   cleanup on restart plus invalid transfer discards such as offset mismatches,
   checksum failures, and staged byte-limit rejections, so abandoned chunk
   transfers do not leak disk indefinitely; successful removals sync the parent
-  directory, and discarded files increment
+  directory, and consumed or discarded files increment
   `dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total`,
 - duplicate non-final `InstallSnapshot` chunks, including delayed duplicate
   first chunks, are idempotently acknowledged without appending bytes twice or
@@ -357,6 +357,10 @@ Implemented:
 - if the final membership removes the local leader, the API returns the committed
   final membership index after applying the step-down instead of attempting
   leader-only post-promotion catch-up from a removed node,
+- self-removal pre-apply fan-out preserves trusted per-peer `matchIndex`
+  progress and resumes lagging peers from `matchIndex + 1`, while still
+  resetting untrusted progress above the local log tail to the retained-log
+  floor,
 - failed membership changes before joint consensus becomes active remove only
   transient learners added for that attempt and preserve any operator-staged
   learner already recorded on disk,
@@ -448,6 +452,7 @@ Implemented:
   `dd_rust_network_mutex_raft_append_entries_wire_bytes_total`,
   `dd_rust_network_mutex_raft_append_entries_frame_build_us_total`,
   `dd_rust_network_mutex_raft_append_entries_frame_build_blocking_tasks_total`,
+  `dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total`,
   `dd_rust_network_mutex_raft_append_entries_request_us_total`,
   `dd_rust_network_mutex_raft_append_entries_frame_clamps_total`,
   `dd_rust_network_mutex_raft_append_entries_successes_total`,
@@ -624,6 +629,12 @@ Implemented:
   debug-level events with request id and leader hint fields; removed-member
   public request rejections log as a separate client counter because they do not
   attempt follower-to-leader proxying,
+- Raft `/metrics` counters for snapshot-backed log compaction health:
+  `dd_rust_network_mutex_raft_log_compaction_failures_total` and
+  `dd_rust_network_mutex_raft_log_compaction_trim_failures_total`; these should
+  normally stay at zero, and non-zero trim failures mean a snapshot was already
+  available but the log rewrite/rename step failed, so the next maintenance pass
+  can retry trimming once the disk/path issue clears,
 - Raft `/metrics` counters for follower-side `AppendEntries` conflict
   responses and suffix repair work:
   `dd_rust_network_mutex_raft_follower_append_conflicts_total`,
@@ -638,6 +649,7 @@ Implemented:
   `dd_rust_network_mutex_raft_install_snapshot_wire_bytes_total`,
   `dd_rust_network_mutex_raft_install_snapshot_frame_build_us_total`,
   `dd_rust_network_mutex_raft_install_snapshot_frame_build_blocking_tasks_total`,
+  `dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total`,
   `dd_rust_network_mutex_raft_install_snapshot_request_us_total`,
   `dd_rust_network_mutex_raft_install_snapshot_payload_prepares_total`,
   `dd_rust_network_mutex_raft_install_snapshot_payload_cache_hits_total`,
@@ -650,18 +662,23 @@ Implemented:
   prepared leader-side `InstallSnapshot` payloads are cached only while their
   checksum and snapshot boundary still match the latest local snapshot, so local
   compaction snapshots and follower-installed newer snapshots release obsolete
-  prepared payload bytes instead of retaining a stale large buffer; if the latest
-  local snapshot advances while a chunked leader-side `InstallSnapshot` stream
-  is in progress, the stream stops before building another stale chunk and the
-  next replication pass prepares the newer snapshot;
+  prepared payload bytes instead of retaining a stale large buffer; leadership
+  loss through `RequestVote`, `AppendEntries`, `InstallSnapshot`, committed
+  membership removal, or explicit step-down also releases the prepared payload so
+  former leaders do not retain large serialized snapshots while acting as
+  followers; if the latest local snapshot advances while a chunked leader-side
+  `InstallSnapshot` stream is in progress, the stream stops before building
+  another stale chunk and the next replication pass prepares the newer snapshot;
   follower-side snapshot payloads whose idempotency cache conflicts with a
   retained suffix increment
   `dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total`;
   frame-build microseconds measure cumulative time spent sizing/building
   leader-side snapshot chunk frames before the peer RPC wait begins, large chunk
-  frame builds are thresholded onto Tokio's blocking pool, and request
-  microseconds measure cumulative time awaiting leader-side snapshot chunk RPC
-  attempts;
+  frame builds are thresholded onto Tokio's blocking pool, frame size estimate
+  mismatches are counted in
+  `dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total`, and
+  request microseconds measure cumulative time awaiting leader-side snapshot
+  chunk RPC attempts;
   configured raw snapshot chunks whose serialized Raft RPC frame would exceed
   the frame cap after base64/JSON overhead are clamped by exact frame sizing and
   counted in
@@ -690,6 +707,13 @@ Implemented:
   `dd_rust_network_mutex_raft_log_compaction_unapplied_commit_skips_total`,
   `dd_rust_network_mutex_raft_log_compaction_trailing_suffix_skips_total`,
   `dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total`,
+  `dd_rust_network_mutex_raft_log_full_reads_total`,
+  `dd_rust_network_mutex_raft_log_full_read_bytes_total`,
+  `dd_rust_network_mutex_raft_log_full_read_entries_total`,
+  `dd_rust_network_mutex_raft_log_full_rewrites_total`,
+  `dd_rust_network_mutex_raft_log_full_rewrite_failures_total`,
+  `dd_rust_network_mutex_raft_log_full_rewrite_bytes_total`,
+  `dd_rust_network_mutex_raft_log_full_rewrite_entries_total`,
   `dd_rust_network_mutex_raft_log_write_rollbacks_total`,
   `dd_rust_network_mutex_raft_log_write_rollback_errors_total`,
   `dd_rust_network_mutex_raft_log_append_file_opens_total`,
@@ -974,8 +998,11 @@ log suffixes instead of a full-log rewrite on every append. Lagging followers
 receive bounded `AppendEntries` batches, controlled by
 `append_entries_max_entries` and `append_entries_max_bytes`; the effective byte
 budget is also capped by the Raft peer RPC frame limit so the leader does not
-select a suffix batch that cannot fit on the wire. Target-index replication plus
-no-target heartbeat/post-commit fanout can send up to
+select a suffix batch that cannot fit on the wire. After `prevLogTerm` is known,
+the leader also subtracts the exact empty-frame JSON envelope and comma overhead
+before selecting retained suffix entries, while still leaving one entry for the
+existing snapshot-fallback path if that single entry is too large.
+Target-index replication plus no-target heartbeat/post-commit fanout can send up to
 `append_entries_max_inline_batches` bounded batches sequentially to the same
 peer before yielding back to the outer quorum or fanout loop.
 This preserves per-peer AppendEntries ordering while avoiding one fan-out/join
@@ -996,9 +1023,9 @@ in-memory retained-log cache, using index lower-bound lookups for retained
 suffix/range selection plus exact retained-index lookup for `prevLogTerm`,
 avoiding repeated filesystem parsing in the hot replication/apply path. The
 retained cache also tracks each entry's serialized JSON byte length so
-`append_entries_max_bytes` and peer-frame cap enforcement do not repeatedly
-reserialize old log entries while building catch-up batches. Follower-side
-staged-learner validation
+`append_entries_max_bytes` and peer-frame cap enforcement, including the
+frame-envelope trim, do not repeatedly reserialize old log entries while
+building catch-up batches. Follower-side staged-learner validation
 replays unapplied membership context in bounded retained-log windows before
 accepting learner entries, then validates the bounded incoming entries by
 borrow, so a long unapplied suffix does not require one giant temporary vector
@@ -1006,13 +1033,16 @@ or a second incoming-entry copy; startup retained-log context validation uses
 the same bounded window pattern for staged-learner and request-id checks before
 committed replay.
 Exact AppendEntries frame-cap sizing
-uses a borrowed serializable frame view, so the binary-search cap check does not
-clone candidate entry vectors before the final outbound RPC is selected. The
-selected outbound AppendEntries frame carries pre-serialized bytes into the peer
-connection, avoiding a second JSON serialization before socket write. Large
-AppendEntries frame builds are thresholded onto Tokio's blocking pool so JSON
-sizing/serialization for lagging-follower catch-up does not pin a core async
-worker. Prebuilt
+uses retained entry byte-length caches plus the empty-frame envelope length to
+preselect batches before cloning and to build the outbound frame with one final
+JSON serialization. The final serialization verifies the cached byte math before
+socket write, so stale byte-length cache state fails closed instead of sending an
+oversized frame; the leader repairs the retained byte-length cache and retries
+once, counting
+`dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total` when this
+path is hit. Large AppendEntries frame builds are thresholded onto Tokio's
+blocking pool so JSON serialization for lagging-follower catch-up does not pin a
+core async worker. Prebuilt
 `AppendEntries` and `InstallSnapshot` frames carry only a small request-kind
 marker for response matching, avoiding a duplicate owned RPC clone of the
 already-serialized payload. Slow
@@ -1055,11 +1085,18 @@ indexed retained-log slice instead of clone-filtering the full retained cache.
 Leader snapshot fan-out prepares the snapshot payload once per replication round
 and shares the serialized bytes across peers that fall back to
 `InstallSnapshot`, so two lagging peers do not reread and reserialize the same
-snapshot independently. Exact snapshot chunk frame-cap sizing precomputes fixed
-JSON overhead and uses padded base64 length for candidate chunks, so the
-binary-search cap check no longer base64-encodes throwaway chunks before the
-final outbound RPC is selected. The selected snapshot chunk also reuses its
-serialized JSON bytes for the socket write.
+snapshot independently. The snapshot file read is consistency-checked against
+the in-memory latest-snapshot metadata before and after the disk read, so large
+payload deserialization does not hold the hot log-state mutex and stable
+metadata/file drift is rejected instead of silently using a stale snapshot.
+Checksum verification and leader-side outbound payload preparation share the
+same canonical serialized payload bytes, so `InstallSnapshot` preparation does
+not serialize the same snapshot payload again after verification.
+Exact snapshot chunk frame-cap sizing precomputes fixed JSON overhead and uses
+padded base64 length to select the largest fitting raw chunk directly, so sizing
+does not binary-search or base64-encode throwaway chunks before the final
+outbound RPC is selected. The selected snapshot chunk also reuses its serialized
+JSON bytes for the socket write.
 Follower snapshot staging treats duplicate already-covered non-final chunks as
 idempotent only when their bytes match the already staged range; divergent
 duplicate retries are rejected and counted before the partial transfer is
@@ -1073,7 +1110,19 @@ prefix before writing a fresh snapshot, so disk cleanup does not wait for the
 next snapshot cadence when the old entries are already safely covered.
 Compaction counters plus retained-log gauges let CPU profiles be correlated
 with actual disk-retention pressure. Unbounded full-log read/replace helpers
-are test-only; production replication uses bounded suffix or exact range reads.
+are test-only or startup/recovery-only, and
+`dd_rust_network_mutex_raft_log_full_reads_total`,
+`dd_rust_network_mutex_raft_log_full_read_bytes_total`, and
+`dd_rust_network_mutex_raft_log_full_read_entries_total` expose any completed
+full retained-log scans, while
+`dd_rust_network_mutex_raft_log_full_rewrites_total`,
+`dd_rust_network_mutex_raft_log_full_rewrite_failures_total`,
+`dd_rust_network_mutex_raft_log_full_rewrite_bytes_total`, and
+`dd_rust_network_mutex_raft_log_full_rewrite_entries_total` expose completed
+full retained-log rewrites plus failed rewrite attempts from compaction,
+snapshot install, or test-only replacement. These should not increase during
+steady-state replication; production replication uses bounded suffix or exact
+range reads and truncate-append suffix repair.
 The leader can coalesce concurrent client requests into
 bounded append/replicate/commit batches. Under load, the serialized write lane
 drains up to `client_batch_max_entries * client_pipeline_max_batches` pending
@@ -1296,14 +1345,21 @@ disable this capture, or `METRICS_TIMEOUT_SECONDS=...` to tune the scrape
 timeout. When profiling BrokerRaft, the script also passes
 `BENCH_RAFT_METRICS=${CAPTURE_METRICS}` by default so
 `redis_vs_raft_bench` prints a compact before/after delta for selected Raft
-AppendEntries, follower conflict-repair, quorum, proxy, snapshot, and compaction
-metrics in the benchmark stdout. The benchmark also prints a
+AppendEntries, frame-size mismatch, follower conflict-repair, quorum, proxy,
+snapshot, and compaction metrics in the benchmark stdout. Compaction failure
+and trim-failure deltas should stay at zero during healthy runs; non-zero
+frame-size mismatch deltas mean a cached byte-size estimate was repaired or a
+snapshot chunk estimate disagreed with the final frame size. Full-log read and
+rewrite deltas, including rewrite failures, should stay at zero during the
+benchmark window; non-zero values indicate
+startup/recovery/compaction/snapshot-install/test-only paths were reached while
+measuring or a rewrite path failed. The benchmark also prints a
 `[raft-metrics-per-cycle]` line that divides selected deltas by successful
 acquire/release cycles, including AppendEntries requests, replicated log
 entries, replicated log bytes, follower appended entries, follower suffix
 rewrites, proxy forwards, snapshot chunks, commit-slot writes, commit-slot
-bytes, and append-log file opens. That line is the quickest check for
-accidental full-log send behavior:
+bytes, append-log file opens, full-log reads, and full-log rewrites. That line
+is the quickest check for accidental full-log send behavior:
 `append_log_bytes` per cycle should stay tied to the new entries being
 replicated, not to the total retained history. Override with
 `BENCH_RAFT_METRICS=false` if the run should avoid any extra `/metrics` scrapes.
@@ -1455,4 +1511,9 @@ ids for later replicated `DropClient` cleanup, but their old HTTP response
 channels are not resurrected after restart or snapshot install. The metrics
 `dd_rust_network_mutex_raft_log_compacted_bytes_total` and
 `dd_rust_network_mutex_raft_log_compaction_us_total` let perf runs correlate log
-space reclaimed with snapshot/rewrite CPU and I/O cost.
+space reclaimed with snapshot/rewrite CPU and I/O cost. The counters
+`dd_rust_network_mutex_raft_log_compaction_failures_total` and
+`dd_rust_network_mutex_raft_log_compaction_trim_failures_total` make failed
+snapshot-write or snapshot-covered trim attempts visible; if a trim fails after
+the snapshot file is durable, a later maintenance tick retries against that
+already-written snapshot instead of requiring a fresh snapshot payload.

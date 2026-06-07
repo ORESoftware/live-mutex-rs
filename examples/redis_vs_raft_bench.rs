@@ -690,6 +690,10 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_append_entries_rpc_errors_total",
     ),
     (
+        "append_frame_mismatches",
+        "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total",
+    ),
+    (
         "follower_conflicts",
         "dd_rust_network_mutex_raft_follower_append_conflicts_total",
     ),
@@ -726,6 +730,10 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_install_snapshot_successes_total",
     ),
     (
+        "snapshot_frame_mismatches",
+        "dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total",
+    ),
+    (
         "proxy_forwarded",
         "dd_rust_network_mutex_raft_proxy_requests_forwarded_total",
     ),
@@ -746,6 +754,14 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_log_compactions_total",
     ),
     (
+        "compaction_failures",
+        "dd_rust_network_mutex_raft_log_compaction_failures_total",
+    ),
+    (
+        "compaction_trim_failures",
+        "dd_rust_network_mutex_raft_log_compaction_trim_failures_total",
+    ),
+    (
         "rewrite_tmp_cleanups",
         "dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total",
     ),
@@ -760,6 +776,34 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
     (
         "log_append_cache_invalidations",
         "dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total",
+    ),
+    (
+        "full_log_reads",
+        "dd_rust_network_mutex_raft_log_full_reads_total",
+    ),
+    (
+        "full_log_read_bytes",
+        "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+    ),
+    (
+        "full_log_read_entries",
+        "dd_rust_network_mutex_raft_log_full_read_entries_total",
+    ),
+    (
+        "full_log_rewrites",
+        "dd_rust_network_mutex_raft_log_full_rewrites_total",
+    ),
+    (
+        "full_log_rewrite_failures",
+        "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+    ),
+    (
+        "full_log_rewrite_bytes",
+        "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
+    ),
+    (
+        "full_log_rewrite_entries",
+        "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
     ),
     (
         "commit_slot_writes",
@@ -943,6 +987,26 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
     (
         "log_append_opens",
         "dd_rust_network_mutex_raft_log_append_file_opens_total",
+    ),
+    (
+        "full_log_reads",
+        "dd_rust_network_mutex_raft_log_full_reads_total",
+    ),
+    (
+        "full_log_read_bytes",
+        "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+    ),
+    (
+        "full_log_rewrites",
+        "dd_rust_network_mutex_raft_log_full_rewrites_total",
+    ),
+    (
+        "full_log_rewrite_failures",
+        "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+    ),
+    (
+        "full_log_rewrite_bytes",
+        "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
     ),
 ];
 
@@ -1624,6 +1688,10 @@ nan_value NaN\n",
             1.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total".into(),
+            0.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
             3.0,
         );
@@ -1643,6 +1711,46 @@ nan_value NaN\n",
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
             2048.0,
         );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_compaction_failures_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_compaction_trim_failures_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            2048.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_entries_total".into(),
+            12.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total".into(),
+            0.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
+            1024.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            4.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total".into(),
+            1.0,
+        );
         before
             .values
             .insert("dd_rust_network_mutex_raft_log_bytes".into(), 2048.5);
@@ -1658,6 +1766,10 @@ nan_value NaN\n",
         after.values.insert(
             "dd_rust_network_mutex_raft_proxy_requests_forwarded_total".into(),
             5.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total".into(),
+            2.0,
         );
         after.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
@@ -1679,6 +1791,46 @@ nan_value NaN\n",
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
             8192.0,
         );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_compaction_failures_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_compaction_trim_failures_total".into(),
+            2.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            4096.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_entries_total".into(),
+            17.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
+            3072.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            11.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total".into(),
+            4.0,
+        );
         after
             .values
             .insert("dd_rust_network_mutex_raft_log_bytes".into(), 4096.75);
@@ -1688,11 +1840,22 @@ nan_value NaN\n",
         assert!(joined.contains("sampled_endpoints_before=3 sampled_endpoints_after=3"));
         assert!(joined.contains("append_rpc=+32"));
         assert!(joined.contains("proxy_forwarded=+4"));
+        assert!(joined.contains("append_frame_mismatches=+2"));
         assert!(joined.contains("follower_conflicts=+4"));
         assert!(joined.contains("follower_rewrites=+1"));
         assert!(joined.contains("follower_appended=+18"));
         assert!(joined.contains("commit_slot_writes=+6"));
         assert!(joined.contains("commit_slot_bytes=+6144"));
+        assert!(joined.contains("snapshot_frame_mismatches=+3"));
+        assert!(joined.contains("compaction_failures=+2"));
+        assert!(joined.contains("compaction_trim_failures=+1"));
+        assert!(joined.contains("full_log_reads=+1"));
+        assert!(joined.contains("full_log_read_bytes=+2048"));
+        assert!(joined.contains("full_log_read_entries=+5"));
+        assert!(joined.contains("full_log_rewrites=+2"));
+        assert!(joined.contains("full_log_rewrite_failures=+1"));
+        assert!(joined.contains("full_log_rewrite_bytes=+2048"));
+        assert!(joined.contains("full_log_rewrite_entries=+7"));
         assert!(joined.contains("log_bytes=+2048.250"));
     }
 
@@ -1731,6 +1894,26 @@ nan_value NaN\n",
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
             5120.0,
         );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            2048.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total".into(),
+            0.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
+            1024.0,
+        );
 
         let mut after = MetricSnapshot::default();
         after.values.insert(
@@ -1765,6 +1948,26 @@ nan_value NaN\n",
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
             13312.0,
         );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            2048.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total".into(),
+            0.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
+            1024.0,
+        );
 
         let joined = raft_metric_per_cycle_lines(&before, &after, 4).join("\n");
 
@@ -1777,6 +1980,11 @@ nan_value NaN\n",
         assert!(joined.contains("proxy_forwarded=1.500"));
         assert!(joined.contains("commit_slot_writes=2"));
         assert!(joined.contains("commit_slot_bytes=2048"));
+        assert!(joined.contains("full_log_reads=0"));
+        assert!(joined.contains("full_log_read_bytes=0"));
+        assert!(joined.contains("full_log_rewrites=0"));
+        assert!(joined.contains("full_log_rewrite_failures=0"));
+        assert!(joined.contains("full_log_rewrite_bytes=0"));
     }
 
     #[test]

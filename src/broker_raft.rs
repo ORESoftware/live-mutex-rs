@@ -467,6 +467,7 @@ pub struct RaftTelemetrySnapshot {
     pub append_entries_wire_bytes_total: u64,
     pub append_entries_frame_build_us_total: u64,
     pub append_entries_frame_build_blocking_tasks_total: u64,
+    pub append_entries_frame_size_mismatches_total: u64,
     pub append_entries_request_us_total: u64,
     pub append_entries_frame_clamps_total: u64,
     pub append_entries_successes_total: u64,
@@ -505,6 +506,7 @@ pub struct RaftTelemetrySnapshot {
     pub install_snapshot_wire_bytes_total: u64,
     pub install_snapshot_frame_build_us_total: u64,
     pub install_snapshot_frame_build_blocking_tasks_total: u64,
+    pub install_snapshot_frame_size_mismatches_total: u64,
     pub install_snapshot_request_us_total: u64,
     pub install_snapshot_payload_prepares_total: u64,
     pub install_snapshot_payload_cache_hits_total: u64,
@@ -631,6 +633,8 @@ pub struct RaftTelemetrySnapshot {
     pub log_compacted_entries_total: u64,
     pub log_compacted_bytes_total: u64,
     pub log_compaction_us_total: u64,
+    pub log_compaction_failures_total: u64,
+    pub log_compaction_trim_failures_total: u64,
     pub log_compaction_threshold_triggers_total: u64,
     pub log_compaction_cadence_triggers_total: u64,
     pub log_compaction_safety_skips_total: u64,
@@ -638,6 +642,13 @@ pub struct RaftTelemetrySnapshot {
     pub log_compaction_unapplied_commit_skips_total: u64,
     pub log_compaction_trailing_suffix_skips_total: u64,
     pub log_retained_byte_cache_repairs_total: u64,
+    pub log_full_reads_total: u64,
+    pub log_full_read_bytes_total: u64,
+    pub log_full_read_entries_total: u64,
+    pub log_full_rewrites_total: u64,
+    pub log_full_rewrite_failures_total: u64,
+    pub log_full_rewrite_entries_total: u64,
+    pub log_full_rewrite_bytes_total: u64,
     pub log_write_rollbacks_total: u64,
     pub log_write_rollback_errors_total: u64,
     pub log_append_file_opens_total: u64,
@@ -1847,6 +1858,14 @@ pub enum BrokerRaftError {
         frame_bytes: usize,
         max_frame_bytes: usize,
     },
+    #[error(
+        "{rpc} frame size estimator returned {estimated_bytes} bytes but serialized body has {actual_bytes} bytes"
+    )]
+    FrameSizeEstimateMismatch {
+        rpc: &'static str,
+        estimated_bytes: usize,
+        actual_bytes: usize,
+    },
     #[error("invalid persisted raft log: {0}")]
     InvalidLog(String),
     #[error("raft learner `{peer_id}` did not catch up to index {target_index} before promotion")]
@@ -2278,7 +2297,7 @@ pub struct RaftLogEntry {
     pub command: RaftCommand,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RaftSnapshotMetadata {
     pub last_included_index: u64,
@@ -2293,6 +2312,13 @@ pub struct RaftSnapshotMetadata {
 struct RaftSnapshotFile {
     metadata: RaftSnapshotMetadata,
     payload: serde_json::Value,
+}
+
+#[derive(Debug)]
+struct RaftSnapshotPayloadFile {
+    snapshot: RaftSnapshotFile,
+    payload_sha256: String,
+    payload_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2326,6 +2352,7 @@ struct BrokerRaftTelemetry {
     append_entries_wire_bytes_total: AtomicU64,
     append_entries_frame_build_us_total: AtomicU64,
     append_entries_frame_build_blocking_tasks_total: AtomicU64,
+    append_entries_frame_size_mismatches_total: AtomicU64,
     append_entries_request_us_total: AtomicU64,
     append_entries_frame_clamps_total: AtomicU64,
     append_entries_successes_total: AtomicU64,
@@ -2364,6 +2391,7 @@ struct BrokerRaftTelemetry {
     install_snapshot_wire_bytes_total: AtomicU64,
     install_snapshot_frame_build_us_total: AtomicU64,
     install_snapshot_frame_build_blocking_tasks_total: AtomicU64,
+    install_snapshot_frame_size_mismatches_total: AtomicU64,
     install_snapshot_request_us_total: AtomicU64,
     install_snapshot_payload_prepares_total: AtomicU64,
     install_snapshot_payload_cache_hits_total: AtomicU64,
@@ -2490,6 +2518,8 @@ struct BrokerRaftTelemetry {
     log_compacted_entries_total: AtomicU64,
     log_compacted_bytes_total: AtomicU64,
     log_compaction_us_total: AtomicU64,
+    log_compaction_failures_total: AtomicU64,
+    log_compaction_trim_failures_total: AtomicU64,
     log_compaction_threshold_triggers_total: AtomicU64,
     log_compaction_cadence_triggers_total: AtomicU64,
     log_compaction_safety_skips_total: AtomicU64,
@@ -2497,6 +2527,13 @@ struct BrokerRaftTelemetry {
     log_compaction_unapplied_commit_skips_total: AtomicU64,
     log_compaction_trailing_suffix_skips_total: AtomicU64,
     log_retained_byte_cache_repairs_total: AtomicU64,
+    log_full_reads_total: AtomicU64,
+    log_full_read_bytes_total: AtomicU64,
+    log_full_read_entries_total: AtomicU64,
+    log_full_rewrites_total: AtomicU64,
+    log_full_rewrite_failures_total: AtomicU64,
+    log_full_rewrite_entries_total: AtomicU64,
+    log_full_rewrite_bytes_total: AtomicU64,
     log_write_rollbacks_total: AtomicU64,
     log_write_rollback_errors_total: AtomicU64,
     log_append_file_opens_total: AtomicU64,
@@ -2973,8 +3010,92 @@ impl RaftLogStore {
 
     fn latest_snapshot_file(&self) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-latest-snapshot-file-1");
-        let _state = self.state.lock();
-        read_snapshot_file(&self.snapshot_path)
+        for attempt in 0..3 {
+            let metadata_before = self.state.lock().latest_snapshot.clone();
+            let snapshot = read_snapshot_file(&self.snapshot_path)?;
+            let metadata_after = self.state.lock().latest_snapshot.clone();
+            if snapshot_file_matches_metadata(snapshot.as_ref(), metadata_after.as_ref()) {
+                return Ok(snapshot);
+            }
+            if metadata_before != metadata_after {
+                debug!(
+                    target: "lmx::raft",
+                    path = %self.snapshot_path.display(),
+                    attempt,
+                    before = ?metadata_before,
+                    after = ?metadata_after,
+                    file_metadata = ?snapshot.as_ref().map(|snapshot| &snapshot.metadata),
+                    "raft snapshot file changed while reading; retrying consistent read",
+                );
+                continue;
+            }
+            return Err(snapshot_file_metadata_mismatch_error(
+                &self.snapshot_path,
+                metadata_after.as_ref(),
+                snapshot.as_ref().map(|snapshot| &snapshot.metadata),
+            ));
+        }
+        let expected = self.state.lock().latest_snapshot.clone();
+        let snapshot = read_snapshot_file(&self.snapshot_path)?;
+        if snapshot_file_matches_metadata(snapshot.as_ref(), expected.as_ref()) {
+            return Ok(snapshot);
+        }
+        Err(snapshot_file_metadata_mismatch_error(
+            &self.snapshot_path,
+            expected.as_ref(),
+            snapshot.as_ref().map(|snapshot| &snapshot.metadata),
+        ))
+    }
+
+    fn latest_snapshot_payload_file(
+        &self,
+    ) -> Result<Option<RaftSnapshotPayloadFile>, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-latest-snapshot-payload-file-1");
+        for attempt in 0..3 {
+            let metadata_before = self.state.lock().latest_snapshot.clone();
+            let snapshot = read_snapshot_file_with_payload_bytes(&self.snapshot_path)?;
+            let metadata_after = self.state.lock().latest_snapshot.clone();
+            if snapshot_file_matches_metadata(
+                snapshot.as_ref().map(|snapshot| &snapshot.snapshot),
+                metadata_after.as_ref(),
+            ) {
+                return Ok(snapshot);
+            }
+            if metadata_before != metadata_after {
+                debug!(
+                    target: "lmx::raft",
+                    path = %self.snapshot_path.display(),
+                    attempt,
+                    before = ?metadata_before,
+                    after = ?metadata_after,
+                    file_metadata = ?snapshot.as_ref().map(|snapshot| &snapshot.snapshot.metadata),
+                    "raft snapshot payload file changed while reading; retrying consistent read",
+                );
+                continue;
+            }
+            return Err(snapshot_file_metadata_mismatch_error(
+                &self.snapshot_path,
+                metadata_after.as_ref(),
+                snapshot
+                    .as_ref()
+                    .map(|snapshot| &snapshot.snapshot.metadata),
+            ));
+        }
+        let expected = self.state.lock().latest_snapshot.clone();
+        let snapshot = read_snapshot_file_with_payload_bytes(&self.snapshot_path)?;
+        if snapshot_file_matches_metadata(
+            snapshot.as_ref().map(|snapshot| &snapshot.snapshot),
+            expected.as_ref(),
+        ) {
+            return Ok(snapshot);
+        }
+        Err(snapshot_file_metadata_mismatch_error(
+            &self.snapshot_path,
+            expected.as_ref(),
+            snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.snapshot.metadata),
+        ))
     }
 
     #[cfg(test)]
@@ -3080,6 +3201,29 @@ impl RaftLogStore {
             next_index,
             max_entries,
             max_bytes,
+        )
+    }
+
+    fn prev_term_entries_and_bytes_from_limited_with_append_entries_budgets<F>(
+        &self,
+        next_index: u64,
+        max_entries: usize,
+        budgets_for_prev_term: F,
+    ) -> Result<Option<(u64, LimitedLogEntries)>, BrokerRaftError>
+    where
+        F: FnOnce(u64) -> Result<LimitedLogByteBudgets, BrokerRaftError>,
+    {
+        crate::routine_id!("ddl-routine-broker-raft-prev-term-limited-entries-payload-bytes-1");
+        let state = self.state.lock();
+        prev_term_entries_and_bytes_limited_cached_with_budgets(
+            &state.retained_log_entries,
+            &state.retained_log_entry_bytes,
+            state.latest_snapshot.as_ref(),
+            state.last_index,
+            state.last_term,
+            next_index,
+            max_entries,
+            budgets_for_prev_term,
         )
     }
 
@@ -3995,6 +4139,17 @@ impl RaftLogStore {
             "repaired retained Raft log entry byte-size cache"
         );
         Ok(())
+    }
+
+    fn repair_retained_log_entry_byte_cache(
+        &self,
+        reason: &'static str,
+    ) -> Result<bool, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-repair-retained-byte-cache-explicit-1");
+        let mut state = self.state.lock();
+        let before = state.retained_log_entry_bytes.clone();
+        self.repair_retained_log_entry_byte_cache_if_needed(&mut state, reason)?;
+        Ok(state.retained_log_entry_bytes != before)
     }
 }
 
@@ -5411,6 +5566,10 @@ impl BrokerRaft {
                 .telemetry
                 .append_entries_frame_build_blocking_tasks_total
                 .load(Ordering::Relaxed),
+            append_entries_frame_size_mismatches_total: self
+                .telemetry
+                .append_entries_frame_size_mismatches_total
+                .load(Ordering::Relaxed),
             append_entries_request_us_total: self
                 .telemetry
                 .append_entries_request_us_total
@@ -5562,6 +5721,10 @@ impl BrokerRaft {
             install_snapshot_frame_build_blocking_tasks_total: self
                 .telemetry
                 .install_snapshot_frame_build_blocking_tasks_total
+                .load(Ordering::Relaxed),
+            install_snapshot_frame_size_mismatches_total: self
+                .telemetry
+                .install_snapshot_frame_size_mismatches_total
                 .load(Ordering::Relaxed),
             install_snapshot_request_us_total: self
                 .telemetry
@@ -6058,6 +6221,14 @@ impl BrokerRaft {
                 .telemetry
                 .log_compaction_us_total
                 .load(Ordering::Relaxed),
+            log_compaction_failures_total: self
+                .telemetry
+                .log_compaction_failures_total
+                .load(Ordering::Relaxed),
+            log_compaction_trim_failures_total: self
+                .telemetry
+                .log_compaction_trim_failures_total
+                .load(Ordering::Relaxed),
             log_compaction_threshold_triggers_total: self
                 .telemetry
                 .log_compaction_threshold_triggers_total
@@ -6085,6 +6256,31 @@ impl BrokerRaft {
             log_retained_byte_cache_repairs_total: self
                 .telemetry
                 .log_retained_byte_cache_repairs_total
+                .load(Ordering::Relaxed),
+            log_full_reads_total: self.telemetry.log_full_reads_total.load(Ordering::Relaxed),
+            log_full_read_bytes_total: self
+                .telemetry
+                .log_full_read_bytes_total
+                .load(Ordering::Relaxed),
+            log_full_read_entries_total: self
+                .telemetry
+                .log_full_read_entries_total
+                .load(Ordering::Relaxed),
+            log_full_rewrites_total: self
+                .telemetry
+                .log_full_rewrites_total
+                .load(Ordering::Relaxed),
+            log_full_rewrite_failures_total: self
+                .telemetry
+                .log_full_rewrite_failures_total
+                .load(Ordering::Relaxed),
+            log_full_rewrite_entries_total: self
+                .telemetry
+                .log_full_rewrite_entries_total
+                .load(Ordering::Relaxed),
+            log_full_rewrite_bytes_total: self
+                .telemetry
+                .log_full_rewrite_bytes_total
                 .load(Ordering::Relaxed),
             log_write_rollbacks_total: self
                 .telemetry
@@ -6260,6 +6456,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_frame_build_blocking_tasks_total Large leader-side InstallSnapshot chunk frame builds offloaded to Tokio's blocking pool.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_frame_build_blocking_tasks_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_frame_build_blocking_tasks_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total Leader-side InstallSnapshot frame builds whose size estimate differed from the serialized RPC body.\n",
+                "# TYPE dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total counter\n",
+                "dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_install_snapshot_request_us_total Cumulative microseconds spent awaiting leader-side InstallSnapshot chunk RPC attempts.\n",
                 "# TYPE dd_rust_network_mutex_raft_install_snapshot_request_us_total counter\n",
                 "dd_rust_network_mutex_raft_install_snapshot_request_us_total {}\n",
@@ -6431,6 +6630,7 @@ impl BrokerRaft {
             snapshot.install_snapshot_wire_bytes_total,
             snapshot.install_snapshot_frame_build_us_total,
             snapshot.install_snapshot_frame_build_blocking_tasks_total,
+            snapshot.install_snapshot_frame_size_mismatches_total,
             snapshot.install_snapshot_request_us_total,
             snapshot.install_snapshot_payload_prepares_total,
             snapshot.install_snapshot_payload_cache_hits_total,
@@ -6538,6 +6738,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_entries_frame_build_blocking_tasks_total Large leader-side AppendEntries frame builds offloaded to Tokio's blocking pool.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_entries_frame_build_blocking_tasks_total counter\n",
                 "dd_rust_network_mutex_raft_append_entries_frame_build_blocking_tasks_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total Leader-side AppendEntries frame builds whose cached size estimate differed from the serialized RPC body.\n",
+                "# TYPE dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total counter\n",
+                "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_append_entries_request_us_total Cumulative microseconds spent awaiting leader-side AppendEntries RPC attempts.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_entries_request_us_total counter\n",
                 "dd_rust_network_mutex_raft_append_entries_request_us_total {}\n",
@@ -6703,6 +6906,12 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_compaction_us_total Cumulative microseconds spent writing snapshots and compacting local Raft logs.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_compaction_us_total counter\n",
                 "dd_rust_network_mutex_raft_log_compaction_us_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_compaction_failures_total Snapshot-backed Raft log compaction attempts that failed while writing the snapshot or trimming the log.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_compaction_failures_total counter\n",
+                "dd_rust_network_mutex_raft_log_compaction_failures_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_compaction_trim_failures_total Snapshot-backed Raft log compaction attempts where a snapshot was available but trimming the log failed.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_compaction_trim_failures_total counter\n",
+                "dd_rust_network_mutex_raft_log_compaction_trim_failures_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total Log compaction maintenance checks where entry or byte thresholds were reached.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total counter\n",
                 "dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total {}\n",
@@ -6724,6 +6933,27 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total In-memory retained Raft log entry byte-size caches repaired from retained entries before snapshot install or compaction.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total counter\n",
                 "dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_reads_total Full retained Raft log file scans completed during startup, recovery, or test-only inspection; should not increase during steady-state replication.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_reads_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_reads_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_read_bytes_total Raft log file bytes read by completed full retained-log scans.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_read_bytes_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_read_bytes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_read_entries_total Retained Raft log entries loaded by completed full retained-log scans.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_read_entries_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_read_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_rewrites_total Full retained Raft log rewrites completed during compaction, snapshot install, or test-only replacement; should not increase during steady-state replication.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_rewrites_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_rewrites_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_rewrite_failures_total Full retained Raft log rewrite attempts that failed before the replacement file was durably renamed into place.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_rewrite_failures_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_rewrite_failures_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_rewrite_entries_total Retained Raft log entries written by completed full retained-log rewrites.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_rewrite_entries_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_rewrite_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_full_rewrite_bytes_total Raft log file bytes written by completed full retained-log rewrites, including newline delimiters.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_full_rewrite_bytes_total counter\n",
+                "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_write_rollbacks_total Raft log append or suffix-repair writes that rolled the file length back after write, flush, file sync, or parent-directory sync failure.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_write_rollbacks_total counter\n",
                 "dd_rust_network_mutex_raft_log_write_rollbacks_total {}\n",
@@ -6754,7 +6984,7 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total Failed attempts to truncate an unterminated malformed trailing Raft log record during recovery.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total counter\n",
                 "dd_rust_network_mutex_raft_log_trailing_partial_recovery_errors_total {}\n",
-                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed during startup orphan cleanup, stale cleanup, offset-zero restart/orphan cleanup, offset mismatch, staged byte-limit rejection, or invalid transfer discard.\n",
+                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed after successful consumption, startup orphan cleanup, stale cleanup, offset-zero restart/orphan cleanup, offset mismatch, staged byte-limit rejection, or invalid transfer discard.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total Failed attempts to remove follower-side staged InstallSnapshot files or durably sync their removal; non-zero values can indicate disk pressure, permissions, or stuck part files.\n",
@@ -6811,6 +7041,7 @@ impl BrokerRaft {
             snapshot.append_entries_wire_bytes_total,
             snapshot.append_entries_frame_build_us_total,
             snapshot.append_entries_frame_build_blocking_tasks_total,
+            snapshot.append_entries_frame_size_mismatches_total,
             snapshot.append_entries_request_us_total,
             snapshot.append_entries_frame_clamps_total,
             snapshot.append_entries_successes_total,
@@ -6866,6 +7097,8 @@ impl BrokerRaft {
             snapshot.log_compacted_entries_total,
             snapshot.log_compacted_bytes_total,
             snapshot.log_compaction_us_total,
+            snapshot.log_compaction_failures_total,
+            snapshot.log_compaction_trim_failures_total,
             snapshot.log_compaction_threshold_triggers_total,
             snapshot.log_compaction_cadence_triggers_total,
             snapshot.log_compaction_safety_skips_total,
@@ -6873,6 +7106,13 @@ impl BrokerRaft {
             snapshot.log_compaction_unapplied_commit_skips_total,
             snapshot.log_compaction_trailing_suffix_skips_total,
             snapshot.log_retained_byte_cache_repairs_total,
+            snapshot.log_full_reads_total,
+            snapshot.log_full_read_bytes_total,
+            snapshot.log_full_read_entries_total,
+            snapshot.log_full_rewrites_total,
+            snapshot.log_full_rewrite_failures_total,
+            snapshot.log_full_rewrite_entries_total,
+            snapshot.log_full_rewrite_bytes_total,
             snapshot.log_write_rollbacks_total,
             snapshot.log_write_rollback_errors_total,
             snapshot.log_append_file_opens_total,
@@ -9034,6 +9274,7 @@ impl BrokerRaft {
             return;
         }
         let fallback_next_index = self.retained_replication_floor_next_index().max(1);
+        let local_last_index = self.log.last_index();
         let mut changed = false;
         {
             let mut runtime = self.runtime.lock();
@@ -9053,8 +9294,20 @@ impl BrokerRaft {
                             match_index: 0,
                         });
                 let before = *progress;
-                progress.match_index = 0;
-                progress.next_index = fallback_next_index;
+                match trusted_peer_match_index(*progress, local_last_index) {
+                    Some(match_index) if match_index >= target_index => {}
+                    Some(match_index) => {
+                        progress.match_index = match_index;
+                        progress.next_index = match_index
+                            .saturating_add(1)
+                            .max(fallback_next_index)
+                            .min(local_last_index.saturating_add(1).max(1));
+                    }
+                    None => {
+                        progress.match_index = 0;
+                        progress.next_index = fallback_next_index;
+                    }
+                }
                 changed |= *progress != before;
             }
         }
@@ -10718,9 +10971,11 @@ impl BrokerRaft {
             };
         }
 
-        if runtime.leader_id.as_ref().is_some_and(|leader_id| {
-            leader_id != &candidate_id && Instant::now() < runtime.election_deadline
-        }) {
+        if term == runtime.current_term
+            && runtime.leader_id.as_ref().is_some_and(|leader_id| {
+                leader_id != &candidate_id && Instant::now() < runtime.election_deadline
+            })
+        {
             return RaftRpcResponse::RequestVote {
                 term: runtime.current_term,
                 vote_granted: false,
@@ -10794,7 +11049,11 @@ impl BrokerRaft {
                 runtime.voted_for.clone()
             }
         };
+        let mut clear_prepared_snapshot_cache = None;
         if term > runtime.current_term {
+            if runtime.role == RaftRole::Leader {
+                clear_prepared_snapshot_cache = Some(term);
+            }
             runtime.current_term = term;
             runtime.role = RaftRole::Follower;
             runtime.leader_id = None;
@@ -10807,6 +11066,9 @@ impl BrokerRaft {
         self.publish_runtime_role_cache(&runtime);
         self.publish_leader_peer_hint_cache(&runtime);
         drop(runtime);
+        if let Some(term) = clear_prepared_snapshot_cache {
+            self.clear_prepared_install_snapshot_cache("request-vote", term);
+        }
 
         let mut vote_granted = granted;
         if sync_after_vote {
@@ -11121,6 +11383,7 @@ impl BrokerRaft {
     ) -> Result<u64, RaftRpcResponse> {
         crate::routine_id!("ddl-routine-broker-raft-prepare-append-1");
         let apply_after_prepare;
+        let mut clear_prepared_snapshot_cache = None;
         let prepared_commit_index = {
             let mut runtime = self.runtime.lock();
             if self.local_seen_voter_is_removed(&runtime) {
@@ -11258,6 +11521,9 @@ impl BrokerRaft {
             };
             runtime.commit_index = runtime.commit_index.max(durable_commit_index);
             apply_after_prepare = runtime.commit_index > runtime.last_applied;
+            if runtime.role == RaftRole::Leader {
+                clear_prepared_snapshot_cache = Some(runtime.current_term);
+            }
             runtime.role = RaftRole::Follower;
             runtime.leader_id = Some(leader_id.to_string());
             runtime.election_deadline = self.next_election_deadline();
@@ -11265,6 +11531,9 @@ impl BrokerRaft {
             self.publish_leader_peer_hint_cache(&runtime);
             runtime.commit_index
         };
+        if let Some(term) = clear_prepared_snapshot_cache {
+            self.clear_prepared_install_snapshot_cache("append-entries", term);
+        }
         if apply_after_prepare {
             if let Err(err) = self.apply_committed_and_maybe_compact_locked(false, false) {
                 return Err(RaftRpcResponse::Error {
@@ -11623,6 +11892,7 @@ impl BrokerRaft {
     ) -> Result<(), RaftRpcResponse> {
         crate::routine_id!("ddl-routine-broker-raft-accept-install-snapshot-sender-1");
         let mut discard_other_leaders = false;
+        let mut clear_prepared_snapshot_cache = None;
         {
             let mut runtime = self.runtime.lock();
             if self.local_seen_voter_is_removed(&runtime) {
@@ -11760,10 +12030,16 @@ impl BrokerRaft {
                 discard_other_leaders = true;
             }
             self.publish_role_cache(RaftRole::Follower, runtime.current_term);
+            if runtime.role == RaftRole::Leader {
+                clear_prepared_snapshot_cache = Some(runtime.current_term);
+            }
             runtime.role = RaftRole::Follower;
             runtime.leader_id = Some(leader_id.to_string());
             runtime.election_deadline = self.next_election_deadline();
             self.publish_leader_peer_hint_cache(&runtime);
+        }
+        if let Some(term) = clear_prepared_snapshot_cache {
+            self.clear_prepared_install_snapshot_cache("install-snapshot-sender", term);
         }
         if discard_other_leaders {
             let removed =
@@ -14356,6 +14632,78 @@ impl BrokerRaft {
         snapshot_source: Arc<SharedInstallSnapshotSource>,
         connection_policy: RaftReplicationConnectionPolicy,
     ) -> Result<RaftPeerReplicationOutcome, BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-replicate-peer-repairing-1");
+        for attempt in 0..2 {
+            match self
+                .replicate_one_batch_to_peer_with_snapshot_source_inner(
+                    peer.clone(),
+                    term,
+                    leader_commit,
+                    target_index,
+                    Arc::clone(&snapshot_source),
+                    connection_policy,
+                )
+                .await
+            {
+                Err(
+                    err @ BrokerRaftError::FrameSizeEstimateMismatch {
+                        rpc: "appendEntries",
+                        estimated_bytes,
+                        actual_bytes,
+                    },
+                ) => {
+                    self.telemetry
+                        .append_entries_frame_size_mismatches_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    if attempt == 0 {
+                        let cache_repaired = self.log.repair_retained_log_entry_byte_cache(
+                            "append-entries-frame-size-mismatch",
+                        )?;
+                        warn!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            peer = %peer.id,
+                            term,
+                            leader_commit,
+                            target_index = ?target_index,
+                            estimated_bytes,
+                            actual_bytes,
+                            cache_repaired,
+                            "raft ran retained log byte-size cache repair after AppendEntries frame estimate mismatch",
+                        );
+                        continue;
+                    }
+                    self.telemetry
+                        .append_entries_rpc_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        term,
+                        leader_commit,
+                        target_index = ?target_index,
+                        estimated_bytes,
+                        actual_bytes,
+                        "raft AppendEntries frame estimate mismatch persisted after byte-cache repair",
+                    );
+                    return Err(err);
+                }
+                result => return result,
+            }
+        }
+        Ok(RaftPeerReplicationOutcome::default())
+    }
+
+    async fn replicate_one_batch_to_peer_with_snapshot_source_inner(
+        &self,
+        peer: RaftPeerConfig,
+        term: u64,
+        leader_commit: u64,
+        target_index: Option<u64>,
+        snapshot_source: Arc<SharedInstallSnapshotSource>,
+        connection_policy: RaftReplicationConnectionPolicy,
+    ) -> Result<RaftPeerReplicationOutcome, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-replicate-peer-1");
         let local_last_index = self.log.last_index();
         let max_next_index = local_last_index.saturating_add(1).max(1);
@@ -14450,15 +14798,32 @@ impl BrokerRaft {
         }
         let prev_log_index = next_index.saturating_sub(1);
         let max_frame_bytes = raft_rpc_max_frame_bytes();
-        let append_entries_max_bytes = effective_append_entries_max_bytes(
-            self.config.append_entries_max_bytes,
-            max_frame_bytes,
-        );
-        let Some((prev_log_term, limited_entries)) =
-            self.log.prev_term_entries_and_bytes_from_limited(
+        let leader_peer = self.local_outbound_peer();
+        let Some((prev_log_term, mut limited_entries)) = self
+            .log
+            .prev_term_entries_and_bytes_from_limited_with_append_entries_budgets(
                 next_index,
                 self.config.append_entries_max_entries,
-                append_entries_max_bytes,
+                |prev_log_term| {
+                    let append_meta = AppendEntriesFrameMeta {
+                        auth_token: self.config.peer_token.as_deref(),
+                        term,
+                        leader_id: &leader_peer.id,
+                        leader_addr: &leader_peer.addr,
+                        prev_log_index,
+                        prev_log_term,
+                        leader_commit,
+                    };
+                    let entry_payload_budget =
+                        append_entries_frame_entry_budget(&append_meta, max_frame_bytes)?;
+                    Ok(LimitedLogByteBudgets::append_entries_payload(
+                        effective_append_entries_max_bytes(
+                            self.config.append_entries_max_bytes,
+                            max_frame_bytes,
+                        ),
+                        entry_payload_budget,
+                    ))
+                },
             )?
         else {
             self.telemetry
@@ -14490,9 +14855,8 @@ impl BrokerRaft {
                 )
                 .await;
         };
-        let entries = limited_entries.entries;
-        let entry_bytes = limited_entries.entry_bytes;
-        if entries
+        if limited_entries
+            .entries
             .first()
             .is_some_and(|entry| entry.index != next_index)
         {
@@ -14509,7 +14873,7 @@ impl BrokerRaft {
                 next_index,
                 prev_log_index,
                 local_last_index,
-                first_retained_index = entries.first().map(|entry| entry.index).unwrap_or(0),
+                first_retained_index = limited_entries.entries.first().map(|entry| entry.index).unwrap_or(0),
                 target_index = ?target_index,
                 "raft append snapshot fallback because retained log suffix does not cover nextIndex",
             );
@@ -14538,7 +14902,6 @@ impl BrokerRaft {
                 return Ok(RaftPeerReplicationOutcome::default());
             }
         }
-        let leader_peer = self.local_outbound_peer();
         let append_meta = AppendEntriesFrameMeta {
             auth_token: self.config.peer_token.as_deref(),
             term,
@@ -14548,6 +14911,14 @@ impl BrokerRaft {
             prev_log_term,
             leader_commit,
         };
+        limited_entries = trim_limited_log_entries_to_frame_budget(
+            limited_entries,
+            &append_meta,
+            max_frame_bytes,
+        )?;
+        let selected_log_bytes = limited_entries.serialized_bytes;
+        let entries = limited_entries.entries;
+        let entry_bytes = limited_entries.entry_bytes;
         #[cfg(test)]
         self.run_append_entries_before_frame_build_hook();
         if connection_policy == RaftReplicationConnectionPolicy::SkipBusy
@@ -14563,18 +14934,17 @@ impl BrokerRaft {
             return Ok(RaftPeerReplicationOutcome::default());
         }
         let frame_build_started = Instant::now();
-        let offload_frame_build = should_offload_append_entries_frame_build(
-            entries.len(),
-            limited_entries.serialized_bytes,
-        );
+        let offload_frame_build =
+            should_offload_append_entries_frame_build(entries.len(), selected_log_bytes);
         if offload_frame_build {
             self.telemetry
                 .append_entries_frame_build_blocking_tasks_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let frame = match build_bounded_append_entries_rpc_maybe_blocking(
+        let frame = match build_preselected_append_entries_rpc_maybe_blocking(
             &append_meta,
             entries,
+            entry_bytes,
             max_frame_bytes,
             offload_frame_build,
         )
@@ -14641,6 +15011,31 @@ impl BrokerRaft {
                     )
                     .await;
             }
+            Err(
+                err @ BrokerRaftError::FrameSizeEstimateMismatch {
+                    rpc: "appendEntries",
+                    estimated_bytes,
+                    actual_bytes,
+                },
+            ) => {
+                let frame_build_elapsed = frame_build_started.elapsed();
+                self.telemetry
+                    .append_entries_frame_build_us_total
+                    .fetch_add(duration_us_u64(frame_build_elapsed), Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    peer = %peer.id,
+                    next_index,
+                    prev_log_index,
+                    target_index = ?target_index,
+                    estimated_bytes,
+                    actual_bytes,
+                    frame_build_us = duration_us_u64(frame_build_elapsed),
+                    "raft AppendEntries frame estimate mismatch detected before send",
+                );
+                return Err(err);
+            }
             Err(err) => {
                 let frame_build_elapsed = frame_build_started.elapsed();
                 self.telemetry
@@ -14665,14 +15060,7 @@ impl BrokerRaft {
         };
         let sent_match_index = frame.sent_match_index;
         let sent_entries_count = frame.entries_len;
-        let sent_log_bytes = if sent_entries_count == entry_bytes.len() {
-            limited_entries.serialized_bytes
-        } else {
-            entry_bytes
-                .iter()
-                .take(sent_entries_count)
-                .fold(0usize, |sum, bytes| sum.saturating_add(*bytes))
-        };
+        let sent_log_bytes = selected_log_bytes;
         if frame.frame_clamped {
             self.telemetry
                 .append_entries_frame_clamps_total
@@ -15308,6 +15696,25 @@ impl BrokerRaft {
         }
     }
 
+    fn clear_prepared_install_snapshot_cache(&self, reason: &'static str, term: u64) -> bool {
+        crate::routine_id!("ddl-routine-broker-raft-clear-prepared-snapshot-cache-1");
+        let mut cache = self.prepared_install_snapshot_cache.lock();
+        let Some(cached) = cache.take() else {
+            return false;
+        };
+        debug!(
+            target: "lmx::raft",
+            node_id = %self.config.node_id,
+            reason,
+            term,
+            snapshot_index = cached.metadata.last_included_index,
+            snapshot_term = cached.metadata.last_included_term,
+            payload_bytes = cached.payload_bytes.len(),
+            "raft cleared prepared InstallSnapshot payload cache",
+        );
+        true
+    }
+
     fn prepared_install_snapshot_is_current(&self, snapshot: &PreparedInstallSnapshot) -> bool {
         crate::routine_id!("ddl-routine-broker-raft-prepared-snapshot-current-1");
         let Some(metadata) = self.log.latest_snapshot() else {
@@ -15334,14 +15741,9 @@ impl BrokerRaft {
         }
 
         let started = Instant::now();
-        let Some(snapshot) = self.log.latest_snapshot_file()? else {
+        let Some(snapshot) = self.log.latest_snapshot_payload_file()? else {
             return Ok(None);
         };
-        let payload_sha256 = match snapshot.metadata.payload_sha256.clone() {
-            Some(checksum) => checksum,
-            None => snapshot_payload_sha256(&snapshot.payload)?,
-        };
-        let payload_bytes = serde_json::to_vec(&snapshot.payload)?;
         self.telemetry
             .install_snapshot_payload_prepares_total
             .fetch_add(1, Ordering::Relaxed);
@@ -15351,11 +15753,11 @@ impl BrokerRaft {
             .fetch_add(elapsed_us, Ordering::Relaxed);
         self.telemetry
             .install_snapshot_payload_prepare_bytes_total
-            .fetch_add(payload_bytes.len() as u64, Ordering::Relaxed);
+            .fetch_add(snapshot.payload_bytes.len() as u64, Ordering::Relaxed);
         let prepared = Arc::new(PreparedInstallSnapshot {
-            metadata: snapshot.metadata,
-            payload_sha256,
-            payload_bytes,
+            metadata: snapshot.snapshot.metadata,
+            payload_sha256: snapshot.payload_sha256,
+            payload_bytes: snapshot.payload_bytes,
         });
         let cacheable = self.log.latest_snapshot().is_some_and(|metadata| {
             metadata.payload_sha256.as_deref().is_some_and(|checksum| {
@@ -15624,6 +16026,38 @@ impl BrokerRaft {
                         );
                     }
                     chunk
+                }
+                Err(
+                    err @ BrokerRaftError::FrameSizeEstimateMismatch {
+                        rpc: "installSnapshot",
+                        estimated_bytes,
+                        actual_bytes,
+                    },
+                ) => {
+                    let frame_build_elapsed = frame_build_started.elapsed();
+                    self.telemetry
+                        .install_snapshot_frame_build_us_total
+                        .fetch_add(duration_us_u64(frame_build_elapsed), Ordering::Relaxed);
+                    self.telemetry
+                        .install_snapshot_frame_size_mismatches_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.telemetry
+                        .install_snapshot_rpc_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        peer = %peer.id,
+                        offset,
+                        configured_chunk_bytes = configured_chunk_size,
+                        max_frame_bytes,
+                        frame_build_us = duration_us_u64(frame_build_elapsed),
+                        target_index = ?target_index,
+                        estimated_bytes,
+                        actual_bytes,
+                        "raft InstallSnapshot frame estimate mismatch detected before send",
+                    );
+                    return Err(err);
                 }
                 Err(err) => {
                     let frame_build_elapsed = frame_build_started.elapsed();
@@ -16797,7 +17231,24 @@ impl BrokerRaft {
             let covered_entries = self.log.retained_entries_through_len(compact_through);
             if covered_entries > 0 {
                 let compaction_started = Instant::now();
-                let report = self.log.compact_through(compact_through)?;
+                let report = match self.log.compact_through(compact_through) {
+                    Ok(report) => report,
+                    Err(err) => {
+                        self.record_compaction_failure(
+                            "trim-existing-snapshot",
+                            periodic,
+                            threshold_reached,
+                            commit_index,
+                            last_applied,
+                            compact_through,
+                            retained_entries,
+                            bytes,
+                            &err,
+                            true,
+                        );
+                        return Err(err);
+                    }
+                };
                 let compaction_us = duration_us_u64(compaction_started.elapsed());
                 self.maintenance.lock().last_snapshot_at = Instant::now();
                 self.telemetry
@@ -16879,11 +17330,46 @@ impl BrokerRaft {
             },
         });
         let compaction_started = Instant::now();
-        let snapshot = self
+        let snapshot = match self
             .log
-            .write_snapshot(commit_index, snapshot_term, payload)?;
+            .write_snapshot(commit_index, snapshot_term, payload)
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                self.record_compaction_failure(
+                    "write-snapshot",
+                    periodic,
+                    threshold_reached,
+                    commit_index,
+                    last_applied,
+                    compact_through,
+                    retained_entries,
+                    bytes,
+                    &err,
+                    false,
+                );
+                return Err(err);
+            }
+        };
         self.clear_prepared_install_snapshot_cache_if_stale(&snapshot);
-        let report = self.log.compact_through(compact_through)?;
+        let report = match self.log.compact_through(compact_through) {
+            Ok(report) => report,
+            Err(err) => {
+                self.record_compaction_failure(
+                    "trim-new-snapshot",
+                    periodic,
+                    threshold_reached,
+                    commit_index,
+                    last_applied,
+                    compact_through,
+                    retained_entries,
+                    bytes,
+                    &err,
+                    true,
+                );
+                return Err(err);
+            }
+        };
         let compaction_us = duration_us_u64(compaction_started.elapsed());
         self.maintenance.lock().last_snapshot_at = Instant::now();
         self.telemetry
@@ -16912,6 +17398,48 @@ impl BrokerRaft {
             "raft log compacted",
         );
         Ok(())
+    }
+
+    fn record_compaction_failure(
+        &self,
+        phase: &'static str,
+        periodic: bool,
+        threshold_reached: bool,
+        commit_index: u64,
+        last_applied: u64,
+        compact_through: u64,
+        retained_entries: usize,
+        log_bytes: u64,
+        error: &BrokerRaftError,
+        trim_failed: bool,
+    ) {
+        crate::routine_id!("ddl-routine-broker-raft-compaction-failure-1");
+        self.telemetry
+            .log_compaction_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+        if trim_failed {
+            self.telemetry
+                .log_compaction_trim_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        warn!(
+            target: "lmx::raft",
+            node_id = %self.config.node_id,
+            phase,
+            periodic,
+            threshold_reached,
+            commit_index,
+            last_applied,
+            compact_through,
+            trailing_log_entries = self.config.trailing_log_entries,
+            retained_entries,
+            log_bytes,
+            snapshot_max_log_bytes = self.config.snapshot_max_log_bytes,
+            snapshot_max_log_entries = self.config.snapshot_max_log_entries,
+            trim_failed,
+            error = %error,
+            "raft log compaction failed",
+        );
     }
 
     fn record_compaction_safety_skip(
@@ -17463,6 +17991,9 @@ impl BrokerRaft {
         match fs::remove_file(&path) {
             Ok(()) => {
                 self.sync_snapshot_transfer_removal_dir(&path, "consumed-transfer");
+                self.telemetry
+                    .snapshot_transfer_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
                 debug!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
@@ -18221,6 +18752,7 @@ impl BrokerRaft {
                 Some(&self.telemetry),
             )?;
         }
+        let mut clear_prepared_snapshot_cache = None;
         {
             let mut runtime = self.runtime.lock();
             let before_progress = runtime.leader_progress.clone();
@@ -18299,6 +18831,9 @@ impl BrokerRaft {
             }
             if !self_is_active {
                 self.publish_role_cache(RaftRole::Follower, runtime.current_term);
+                if runtime.role == RaftRole::Leader {
+                    clear_prepared_snapshot_cache = Some(runtime.current_term);
+                }
                 runtime.role = RaftRole::Follower;
                 runtime.leader_id = None;
                 runtime.voted_for = None;
@@ -18311,6 +18846,9 @@ impl BrokerRaft {
                 self.note_leader_progress_changed();
             }
             self.publish_leader_peer_hint_cache(&runtime);
+        }
+        if let Some(term) = clear_prepared_snapshot_cache {
+            self.clear_prepared_install_snapshot_cache("membership-removal", term);
         }
         self.retain_rpc_connections_for_active_peers(self_is_active, &active_peers);
         Ok(())
@@ -18375,6 +18913,7 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-step-down-1");
         self.publish_role_cache(RaftRole::Follower, term);
         let mut apply_after_step_down = false;
+        let mut clear_prepared_snapshot_cache = None;
         {
             let _append_guard = self.leader_append_lock.lock();
             let mut runtime = self.runtime.lock();
@@ -18421,6 +18960,9 @@ impl BrokerRaft {
                     .read_hard_state()
                     .map(|state| state.commit_index)
                     .unwrap_or(runtime.commit_index);
+                if runtime.role == RaftRole::Leader {
+                    clear_prepared_snapshot_cache = Some(term);
+                }
                 runtime.current_term = term;
                 runtime.role = RaftRole::Follower;
                 runtime.voted_for = next_voted_for;
@@ -18444,6 +18986,9 @@ impl BrokerRaft {
                 self.publish_runtime_role_cache(&runtime);
                 self.publish_leader_peer_hint_cache(&runtime);
             }
+        }
+        if let Some(term) = clear_prepared_snapshot_cache {
+            self.clear_prepared_install_snapshot_cache("step-down", term);
         }
         if apply_after_step_down {
             if let Err(err) = self.apply_committed_and_maybe_compact_locked(false, false) {
@@ -19169,6 +19714,64 @@ fn effective_append_entries_max_bytes(
     configured_max_bytes.max(1).min(max_frame_bytes.max(1))
 }
 
+fn append_entries_payload_bytes_from_entry_lens(entry_bytes: &[usize]) -> usize {
+    crate::routine_id!("ddl-routine-broker-raft-append-payload-bytes-from-lens-1");
+    entry_bytes
+        .iter()
+        .fold(0usize, |sum, bytes| sum.saturating_add(*bytes))
+        .saturating_add(entry_bytes.len().saturating_sub(1))
+}
+
+fn append_entries_frame_entry_budget(
+    meta: &AppendEntriesFrameMeta<'_>,
+    max_frame_bytes: usize,
+) -> Result<usize, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-append-frame-entry-budget-1");
+    let empty_frame_len = append_entries_frame_len(meta, &[], 0)?;
+    Ok(max_frame_bytes
+        .max(1)
+        .saturating_sub(empty_frame_len)
+        .max(1))
+}
+
+fn trim_limited_log_entries_to_frame_budget(
+    mut limited: LimitedLogEntries,
+    meta: &AppendEntriesFrameMeta<'_>,
+    max_frame_bytes: usize,
+) -> Result<LimitedLogEntries, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-trim-limited-entries-frame-budget-1");
+    validate_retained_log_entry_bytes_len(limited.entries.len(), limited.entry_bytes.len())?;
+    if limited.entries.len() <= 1 {
+        return Ok(limited);
+    }
+    let budget = append_entries_frame_entry_budget(meta, max_frame_bytes)?;
+    let mut payload_bytes = append_entries_payload_bytes_from_entry_lens(&limited.entry_bytes);
+    while limited.entries.len() > 1 && payload_bytes > budget {
+        let removed_bytes = limited.entry_bytes.pop().ok_or_else(|| {
+            BrokerRaftError::InvalidLog(
+                "retained log byte-size cache was empty while trimming AppendEntries batch".into(),
+            )
+        })?;
+        let removed_entry = limited.entries.pop().ok_or_else(|| {
+            BrokerRaftError::InvalidLog(
+                "retained log entries were empty while trimming AppendEntries batch".into(),
+            )
+        })?;
+        debug!(
+            target: "lmx::raft",
+            removed_index = removed_entry.index,
+            removed_term = removed_entry.term,
+            removed_bytes,
+            payload_bytes_before = payload_bytes,
+            budget,
+            "trimmed AppendEntries candidate entry before frame serialization",
+        );
+        limited.serialized_bytes = limited.serialized_bytes.saturating_sub(removed_bytes);
+        payload_bytes = payload_bytes.saturating_sub(removed_bytes.saturating_add(1));
+    }
+    Ok(limited)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AppendEntriesFrameMeta<'a> {
     auth_token: Option<&'a str>,
@@ -19269,6 +19872,7 @@ impl Write for CountingWriter {
     }
 }
 
+#[cfg(test)]
 fn build_bounded_append_entries_rpc(
     meta: &AppendEntriesFrameMeta<'_>,
     entries: Vec<RaftLogEntry>,
@@ -19313,26 +19917,54 @@ fn build_bounded_append_entries_rpc(
     Ok(best)
 }
 
+fn build_preselected_append_entries_rpc(
+    meta: &AppendEntriesFrameMeta<'_>,
+    entries: Vec<RaftLogEntry>,
+    entry_bytes: Vec<usize>,
+    max_frame_bytes: usize,
+) -> Result<AppendEntriesFrame, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-preselected-append-rpc-1");
+    validate_retained_log_entry_bytes_len(entries.len(), entry_bytes.len())?;
+    let frame_budget = max_frame_bytes.max(1);
+    let empty_frame_len = append_entries_frame_len(meta, &[], 0)?;
+    let frame_len =
+        empty_frame_len.saturating_add(append_entries_payload_bytes_from_entry_lens(&entry_bytes));
+    if frame_len > frame_budget {
+        if entries.is_empty() {
+            return Err(BrokerRaftError::Rpc(format!(
+                "empty AppendEntries RPC frame has {} bytes, exceeding configured max frame bytes {frame_budget}",
+                frame_len
+            )));
+        }
+        return Err(BrokerRaftError::AppendEntriesFrameTooLarge {
+            frame_bytes: frame_len,
+            max_frame_bytes: frame_budget,
+        });
+    }
+    append_entries_frame_with_len(meta, &entries, entries.len(), frame_len)
+}
+
 fn should_offload_append_entries_frame_build(entries_len: usize, serialized_bytes: usize) -> bool {
     crate::routine_id!("ddl-routine-broker-raft-offload-append-frame-build-1");
     entries_len >= APPEND_ENTRIES_BLOCKING_FRAME_BUILD_ENTRIES
         || serialized_bytes >= APPEND_ENTRIES_BLOCKING_FRAME_BUILD_BYTES
 }
 
-async fn build_bounded_append_entries_rpc_maybe_blocking(
+async fn build_preselected_append_entries_rpc_maybe_blocking(
     meta: &AppendEntriesFrameMeta<'_>,
     entries: Vec<RaftLogEntry>,
+    entry_bytes: Vec<usize>,
     max_frame_bytes: usize,
     offload: bool,
 ) -> Result<AppendEntriesFrame, BrokerRaftError> {
-    crate::routine_id!("ddl-routine-broker-raft-bounded-append-rpc-maybe-blocking-1");
+    crate::routine_id!("ddl-routine-broker-raft-preselected-append-rpc-maybe-blocking-1");
     if !offload {
-        return build_bounded_append_entries_rpc(meta, entries, max_frame_bytes);
+        return build_preselected_append_entries_rpc(meta, entries, entry_bytes, max_frame_bytes);
     }
     let meta = OwnedAppendEntriesFrameMeta::from_borrowed(meta);
     tokio::task::spawn_blocking(move || {
         let meta = meta.as_borrowed();
-        build_bounded_append_entries_rpc(&meta, entries, max_frame_bytes)
+        build_preselected_append_entries_rpc(&meta, entries, entry_bytes, max_frame_bytes)
     })
     .await
     .map_err(|err| {
@@ -19398,10 +20030,11 @@ fn append_entries_frame_with_len(
         .unwrap_or(meta.prev_log_index);
     let body = serde_json::to_vec(&append_entries_frame_view(meta, entries, entries_len))?;
     if body.len() != frame_len {
-        return Err(BrokerRaftError::Rpc(format!(
-            "AppendEntries frame size estimator returned {frame_len} bytes but serialized body has {} bytes",
-            body.len()
-        )));
+        return Err(BrokerRaftError::FrameSizeEstimateMismatch {
+            rpc: "appendEntries",
+            estimated_bytes: frame_len,
+            actual_bytes: body.len(),
+        });
     }
     Ok(AppendEntriesFrame {
         request_kind: RaftRpcRequestKind::AppendEntries,
@@ -19566,20 +20199,9 @@ fn build_bounded_install_snapshot_rpc(
         )));
     }
 
-    let mut low = 1usize;
-    let mut high = requested;
-    let mut best = None;
-    while low <= high {
-        let mid = low + (high - low) / 2;
-        let candidate_frame_len = sizer.frame_len(mid);
-        if candidate_frame_len <= frame_budget {
-            best = Some((mid, candidate_frame_len));
-            low = mid.saturating_add(1);
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-    let Some((best_raw_len, best_frame_len)) = best else {
+    let Some((best_raw_len, best_frame_len)) =
+        install_snapshot_largest_fitting_raw_chunk(&sizer, requested, frame_budget)
+    else {
         let one_byte_frame_len = sizer.frame_len(1);
         return Err(BrokerRaftError::Rpc(format!(
             "single-byte InstallSnapshot RPC frame has {} bytes, exceeding configured max frame bytes {frame_budget}",
@@ -19595,6 +20217,42 @@ fn build_bounded_install_snapshot_rpc(
     )?;
     best.frame_clamped = true;
     Ok(best)
+}
+
+fn install_snapshot_largest_fitting_raw_chunk(
+    sizer: &InstallSnapshotFrameSizer,
+    requested: usize,
+    frame_budget: usize,
+) -> Option<(usize, usize)> {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-largest-fitting-raw-chunk-1");
+    let frame_budget = frame_budget.max(1);
+    let remaining = sizer.payload_len.saturating_sub(sizer.offset);
+    let requested = requested.min(remaining);
+    if requested == 0 {
+        let frame_len = sizer.frame_len(0);
+        return (frame_len <= frame_budget).then_some((0, frame_len));
+    }
+    let requested_frame_len = sizer.frame_len(requested);
+    if requested_frame_len <= frame_budget {
+        return Some((requested, requested_frame_len));
+    }
+
+    let max_non_final_raw_len = remaining.saturating_sub(1);
+    let candidate = max_base64_raw_len_for_encoded_budget(
+        frame_budget.saturating_sub(sizer.empty_not_done_frame_len),
+    )
+    .min(requested)
+    .min(max_non_final_raw_len);
+    if candidate == 0 {
+        return None;
+    }
+    let frame_len = sizer.frame_len(candidate);
+    (frame_len <= frame_budget).then_some((candidate, frame_len))
+}
+
+fn max_base64_raw_len_for_encoded_budget(encoded_budget: usize) -> usize {
+    crate::routine_id!("ddl-routine-broker-raft-max-base64-raw-len-1");
+    (encoded_budget / 4).saturating_mul(3)
 }
 
 fn should_offload_install_snapshot_frame_build(raw_chunk_bytes: usize) -> bool {
@@ -19722,10 +20380,11 @@ fn install_snapshot_chunk_frame_with_len(
     let data = BASE64.encode(&payload_bytes[offset..end]);
     let body = serde_json::to_vec(&install_snapshot_frame_view(meta, offset, done, &data))?;
     if body.len() != frame_len {
-        return Err(BrokerRaftError::Rpc(format!(
-            "InstallSnapshot frame size estimator returned {frame_len} bytes but serialized body has {} bytes",
-            body.len()
-        )));
+        return Err(BrokerRaftError::FrameSizeEstimateMismatch {
+            rpc: "installSnapshot",
+            estimated_bytes: frame_len,
+            actual_bytes: body.len(),
+        });
     }
     Ok(InstallSnapshotChunkFrame {
         request_kind: RaftRpcRequestKind::InstallSnapshot,
@@ -20258,19 +20917,60 @@ fn granted_lock_uuid(resp: &Response) -> Option<String> {
 
 fn read_snapshot_file(path: &Path) -> Result<Option<RaftSnapshotFile>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-read-snapshot-file-1");
+    Ok(read_snapshot_file_with_payload_bytes(path)?.map(|snapshot| snapshot.snapshot))
+}
+
+fn read_snapshot_file_with_payload_bytes(
+    path: &Path,
+) -> Result<Option<RaftSnapshotPayloadFile>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-read-snapshot-file-payload-bytes-1");
     let Some(file) = open_raft_json_file(path, "snapshot file")? else {
         return Ok(None);
     };
     let mut snapshot: RaftSnapshotFile = serde_json::from_reader(file)?;
+    let payload_bytes = serde_json::to_vec(&snapshot.payload)?;
+    let payload_sha256 = sha256_hex(&payload_bytes);
     if let Some(expected) = snapshot.metadata.payload_sha256.as_deref() {
-        let verified = verify_snapshot_payload_checksum(
-            snapshot.metadata.last_included_index,
-            &snapshot.payload,
-            Some(expected.to_string()),
-        )?;
-        snapshot.metadata.payload_sha256 = Some(verified);
+        if !payload_sha256.eq_ignore_ascii_case(expected) {
+            return Err(BrokerRaftError::SnapshotChecksumMismatch {
+                index: snapshot.metadata.last_included_index,
+                expected: expected.to_string(),
+                actual: payload_sha256,
+            });
+        }
+        snapshot.metadata.payload_sha256 = Some(payload_sha256.clone());
     }
-    Ok(Some(snapshot))
+    Ok(Some(RaftSnapshotPayloadFile {
+        snapshot,
+        payload_sha256,
+        payload_bytes,
+    }))
+}
+
+fn snapshot_file_matches_metadata(
+    snapshot: Option<&RaftSnapshotFile>,
+    metadata: Option<&RaftSnapshotMetadata>,
+) -> bool {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-file-metadata-match-1");
+    match (snapshot, metadata) {
+        (None, None) => true,
+        (Some(snapshot), Some(metadata)) => snapshot.metadata == *metadata,
+        _ => false,
+    }
+}
+
+fn snapshot_file_metadata_mismatch_error(
+    path: &Path,
+    expected: Option<&RaftSnapshotMetadata>,
+    actual: Option<&RaftSnapshotMetadata>,
+) -> BrokerRaftError {
+    crate::routine_id!("ddl-routine-broker-raft-snapshot-file-metadata-mismatch-1");
+    BrokerRaftError::InvalidLog(format!(
+        "raft latest snapshot file {} does not match in-memory snapshot metadata: expected {:?}, found {:?}",
+        path.display(),
+        expected,
+        actual
+    ))
 }
 
 fn raft_json_file_metadata(
@@ -21022,6 +21722,17 @@ fn read_log_entries(
         offset = next_offset;
     }
     validate_persisted_log_entries(&entries)?;
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .log_full_reads_total
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .log_full_read_bytes_total
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        telemetry
+            .log_full_read_entries_total
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+    }
     Ok(entries)
 }
 
@@ -21120,6 +21831,30 @@ struct LimitedLogEntries {
     serialized_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LimitedLogByteBudgets {
+    max_serialized_bytes: usize,
+    max_payload_bytes: Option<usize>,
+}
+
+impl LimitedLogByteBudgets {
+    fn entry_json(max_serialized_bytes: usize) -> Self {
+        crate::routine_id!("ddl-routine-broker-raft-limited-log-budget-entry-json-1");
+        Self {
+            max_serialized_bytes,
+            max_payload_bytes: None,
+        }
+    }
+
+    fn append_entries_payload(max_serialized_bytes: usize, max_payload_bytes: usize) -> Self {
+        crate::routine_id!("ddl-routine-broker-raft-limited-log-budget-append-payload-1");
+        Self {
+            max_serialized_bytes,
+            max_payload_bytes: Some(max_payload_bytes),
+        }
+    }
+}
+
 fn entries_from_limited_cached(
     entries: &[RaftLogEntry],
     entry_bytes: &[usize],
@@ -21148,6 +21883,23 @@ fn entries_from_limited_cached_with_bytes(
     max_bytes: usize,
 ) -> Result<LimitedLogEntries, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-entries-limited-cached-bytes-1");
+    entries_from_limited_cached_with_byte_budget(
+        entries,
+        entry_bytes,
+        index,
+        max_entries,
+        LimitedLogByteBudgets::entry_json(max_bytes),
+    )
+}
+
+fn entries_from_limited_cached_with_byte_budget(
+    entries: &[RaftLogEntry],
+    entry_bytes: &[usize],
+    index: u64,
+    max_entries: usize,
+    budgets: LimitedLogByteBudgets,
+) -> Result<LimitedLogEntries, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-entries-limited-cached-byte-budget-1");
     if entry_bytes.len() != entries.len() {
         return Err(BrokerRaftError::InvalidLog(format!(
             "retained log byte-size cache has {} entries for {} retained log entries",
@@ -21157,17 +21909,34 @@ fn entries_from_limited_cached_with_bytes(
     }
     let index = index.max(1);
     let max_entries = max_entries.max(1);
-    let max_bytes = max_bytes.max(1);
+    let max_serialized_bytes = budgets.max_serialized_bytes.max(1);
+    let max_payload_bytes = budgets.max_payload_bytes.map(|max_bytes| max_bytes.max(1));
     let start = retained_entry_lower_bound(entries, index);
     let selected_capacity = max_entries.min(entries.len().saturating_sub(start));
     let mut selected = Vec::with_capacity(selected_capacity);
     let mut selected_entry_bytes = Vec::with_capacity(selected_capacity);
+    let mut selected_budget_bytes = 0usize;
     let mut selected_bytes = 0usize;
     for (entry, entry_size) in entries[start..].iter().zip(&entry_bytes[start..]) {
-        if !selected.is_empty() && selected_bytes.saturating_add(*entry_size) > max_bytes {
+        let separator_bytes = if max_payload_bytes.is_some() && !selected.is_empty() {
+            1
+        } else {
+            0
+        };
+        let candidate_budget_bytes = selected_budget_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(*entry_size);
+        let candidate_serialized_bytes = selected_bytes.saturating_add(*entry_size);
+        let payload_budget_exceeded = max_payload_bytes
+            .map(|max_bytes| candidate_budget_bytes > max_bytes)
+            .unwrap_or(false);
+        if !selected.is_empty()
+            && (candidate_serialized_bytes > max_serialized_bytes || payload_budget_exceeded)
+        {
             break;
         }
-        selected_bytes = selected_bytes.saturating_add(*entry_size);
+        selected_budget_bytes = candidate_budget_bytes;
+        selected_bytes = candidate_serialized_bytes;
         selected.push(entry.clone());
         selected_entry_bytes.push(*entry_size);
         if selected.len() >= max_entries {
@@ -21223,6 +21992,32 @@ fn prev_term_entries_and_bytes_limited_cached(
     max_bytes: usize,
 ) -> Result<Option<(u64, LimitedLogEntries)>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-prev-term-limited-cached-bytes-1");
+    prev_term_entries_and_bytes_limited_cached_with_budgets(
+        entries,
+        entry_bytes,
+        latest_snapshot,
+        last_index,
+        last_term,
+        next_index,
+        max_entries,
+        |_| Ok(LimitedLogByteBudgets::entry_json(max_bytes)),
+    )
+}
+
+fn prev_term_entries_and_bytes_limited_cached_with_budgets<F>(
+    entries: &[RaftLogEntry],
+    entry_bytes: &[usize],
+    latest_snapshot: Option<&RaftSnapshotMetadata>,
+    last_index: u64,
+    last_term: u64,
+    next_index: u64,
+    max_entries: usize,
+    budgets_for_prev_term: F,
+) -> Result<Option<(u64, LimitedLogEntries)>, BrokerRaftError>
+where
+    F: FnOnce(u64) -> Result<LimitedLogByteBudgets, BrokerRaftError>,
+{
+    crate::routine_id!("ddl-routine-broker-raft-prev-term-limited-cached-dynamic-bytes-1");
     let next_index = next_index.max(1);
     let prev_log_index = next_index.saturating_sub(1);
     if prev_log_index == last_index {
@@ -21249,16 +22044,15 @@ fn prev_term_entries_and_bytes_limited_cached(
     let Some(prev_log_term) = prev_log_term else {
         return Ok(None);
     };
-    Ok(Some((
-        prev_log_term,
-        entries_from_limited_cached_with_bytes(
-            entries,
-            entry_bytes,
-            next_index,
-            max_entries,
-            max_bytes,
-        )?,
-    )))
+    let budgets = budgets_for_prev_term(prev_log_term)?;
+    let limited_entries = entries_from_limited_cached_with_byte_budget(
+        entries,
+        entry_bytes,
+        next_index,
+        max_entries,
+        budgets,
+    )?;
+    Ok(Some((prev_log_term, limited_entries)))
 }
 
 fn serialized_log_entry_len(entry: &RaftLogEntry) -> Result<usize, BrokerRaftError> {
@@ -22330,6 +23124,40 @@ fn is_snapshot_part_file_name(name: &str) -> bool {
     name.starts_with(SNAPSHOT_PART_FILE_PREFIX) && name.ends_with(SNAPSHOT_PART_FILE_SUFFIX)
 }
 
+struct CountingWrite<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> CountingWrite<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CountingWrite<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.bytes_written = self.bytes_written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn rewrite_log(
     path: &Path,
     entries: &[RaftLogEntry],
@@ -22338,30 +23166,80 @@ fn rewrite_log(
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-rewrite-log-1");
     let tmp = log_rewrite_tmp_path(path);
-    prepare_log_rewrite_tmp_for_write(telemetry, &tmp)?;
-    let file = create_exclusive_atomic_temp_file(&tmp)?;
-    let write_result = (|| -> Result<(), BrokerRaftError> {
-        let mut writer = BufWriter::new(file);
+    if let Err(err) = prepare_log_rewrite_tmp_for_write(telemetry, &tmp) {
+        record_full_log_rewrite_failure(telemetry, path, "prepare-temp", entries.len(), &err);
+        return Err(err);
+    }
+    let file = match create_exclusive_atomic_temp_file(&tmp) {
+        Ok(file) => file,
+        Err(err) => {
+            record_full_log_rewrite_failure(telemetry, path, "create-temp", entries.len(), &err);
+            return Err(err);
+        }
+    };
+    let write_result = (|| -> Result<u64, BrokerRaftError> {
+        let mut writer = CountingWrite::new(BufWriter::new(file));
         for entry in entries {
             serde_json::to_writer(&mut writer, entry)?;
             writer.write_all(b"\n")?;
         }
         writer.flush()?;
+        let bytes_written = writer.bytes_written();
+        let writer = writer.into_inner();
         let file = writer.into_inner().map_err(|err| err.into_error())?;
         if sync_log {
             file.sync_all()?;
         }
-        Ok(())
+        Ok(bytes_written)
     })();
-    if let Err(err) = write_result {
-        cleanup_log_rewrite_tmp_after_error(telemetry, &tmp, "write", &err);
-        return Err(err);
-    }
+    let bytes_written = match write_result {
+        Ok(bytes_written) => bytes_written,
+        Err(err) => {
+            record_full_log_rewrite_failure(telemetry, path, "write", entries.len(), &err);
+            cleanup_log_rewrite_tmp_after_error(telemetry, &tmp, "write", &err);
+            return Err(err);
+        }
+    };
     if let Err(err) = rename_and_maybe_sync_parent(&tmp, path, sync_log) {
+        record_full_log_rewrite_failure(telemetry, path, "rename", entries.len(), &err);
         cleanup_log_rewrite_tmp_after_error(telemetry, &tmp, "rename", &err);
         return Err(err);
     }
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .log_full_rewrites_total
+            .fetch_add(1, Ordering::Relaxed);
+        telemetry
+            .log_full_rewrite_entries_total
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        telemetry
+            .log_full_rewrite_bytes_total
+            .fetch_add(bytes_written, Ordering::Relaxed);
+    }
     Ok(())
+}
+
+fn record_full_log_rewrite_failure(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    path: &Path,
+    phase: &'static str,
+    entries_len: usize,
+    error: &BrokerRaftError,
+) {
+    crate::routine_id!("ddl-routine-broker-raft-record-full-log-rewrite-failure-1");
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .log_full_rewrite_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    warn!(
+        target: "lmx::raft",
+        path = %path.display(),
+        phase,
+        entries = entries_len,
+        error = %error,
+        "raft full retained-log rewrite failed",
+    );
 }
 
 fn log_rewrite_tmp_path(path: &Path) -> PathBuf {
@@ -22894,6 +23772,25 @@ mod tests {
                 "idleKeysPrunedTotal": 13
             }
         })
+    }
+
+    fn cache_test_install_snapshot_payload(raft: &BrokerRaft) {
+        let mut payload = idle_snapshot_payload();
+        payload["note"] = json!("prepared outbound snapshot cache");
+        raft.log
+            .write_snapshot(7, 3, payload)
+            .expect("write cached test snapshot");
+        let prepared = raft
+            .prepare_install_snapshot_source()
+            .expect("prepare cached test snapshot")
+            .expect("cached test snapshot should exist");
+        assert_eq!(prepared.metadata.last_included_index, 7);
+        assert_eq!(prepared.metadata.last_included_term, 3);
+        assert!(!prepared.payload_bytes.is_empty());
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_some(),
+            "test setup should populate the prepared snapshot cache"
+        );
     }
 
     fn payload_checksum(payload: &serde_json::Value) -> String {
@@ -25290,8 +26187,10 @@ mod tests {
         let dir = temp_dir("raft-membership-removes-local-node");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
         {
             let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
             runtime.role = RaftRole::Leader;
             runtime.leader_id = Some("n1".into());
             runtime.voted_for = Some("n1".into());
@@ -25338,6 +26237,10 @@ mod tests {
             assert!(runtime.staged_learners.is_empty());
             assert!(!runtime.membership.contains_id("n1"));
         }
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "membership removal should release former leader outbound snapshot payload bytes"
+        );
         assert!(raft.rpc_connections.lock().is_empty());
 
         let _ = fs::remove_dir_all(dir);
@@ -28076,6 +28979,103 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn membership_fanout_reset_preserves_trusted_progress() {
+        let dir = temp_dir("raft-membership-fanout-preserves-progress");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(2, RaftCommand::Noop).expect("append seed");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.membership = RaftMembership::from_simple(vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ]);
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 5,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n3".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 3,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n4".into(),
+                RaftPeerProgress {
+                    next_index: 101,
+                    match_index: 100,
+                },
+            );
+        }
+
+        let before_generation = raft.leader_progress_generation();
+        raft.reset_membership_fanout_progress(
+            &[
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ],
+            2,
+            5,
+        );
+
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(
+                runtime.leader_progress.get("n2").copied(),
+                Some(RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 5,
+                }),
+                "already caught-up peer should not be rewound before membership fanout"
+            );
+            assert_eq!(
+                runtime.leader_progress.get("n3").copied(),
+                Some(RaftPeerProgress {
+                    next_index: 4,
+                    match_index: 3,
+                }),
+                "partially caught-up peer should resume at trusted matchIndex + 1"
+            );
+            assert_eq!(
+                runtime.leader_progress.get("n4").copied(),
+                Some(RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                }),
+                "untrusted progress above the local tail must still reset to the retained floor"
+            );
+        }
+        assert_ne!(
+            raft.leader_progress_generation(),
+            before_generation,
+            "rewinding only stale peers should still wake catch-up waiters"
+        );
+
+        let after_generation = raft.leader_progress_generation();
+        raft.reset_membership_fanout_progress(&[test_peer("n2", 7981)], 2, 5);
+        assert_eq!(
+            raft.leader_progress_generation(),
+            after_generation,
+            "fully caught-up peers should not advance the progress generation"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn change_membership_returns_committed_index_when_final_config_removes_local_node() {
         let dir = temp_dir("raft-membership-removes-local-leader");
@@ -30508,18 +31508,18 @@ mod tests {
     }
 
     #[test]
-    fn request_vote_higher_term_candidate_rejected_after_fresh_known_leader() {
+    fn request_vote_higher_term_candidate_advances_past_fresh_known_leader() {
         let dir = temp_dir("raft-higher-term-candidate-fresh-known-leader");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
-        let (initial_state, initial_deadline) = {
+        let initial_state = {
             let mut runtime = raft.runtime.lock();
             runtime.current_term = 3;
             runtime.voted_for = None;
             runtime.role = RaftRole::Follower;
             runtime.leader_id = Some("n2".into());
             runtime.election_deadline = Instant::now() + Duration::from_secs(60);
-            (runtime.hard_state(), runtime.election_deadline)
+            runtime.hard_state()
         };
         raft.log
             .write_hard_state(&initial_state)
@@ -30529,22 +31529,26 @@ mod tests {
         assert!(matches!(
             response,
             RaftRpcResponse::RequestVote {
-                term: 3,
-                vote_granted: false
+                term: 4,
+                vote_granted: true
             }
         ));
 
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
-            initial_state
+            RaftHardState {
+                current_term: 4,
+                voted_for: Some("n3".into()),
+                commit_index: 0,
+            }
         );
         {
             let runtime = raft.runtime.lock();
-            assert_eq!(runtime.current_term, 3);
-            assert_eq!(runtime.voted_for, None);
+            assert_eq!(runtime.current_term, 4);
+            assert_eq!(runtime.voted_for.as_deref(), Some("n3"));
             assert_eq!(runtime.role, RaftRole::Follower);
-            assert_eq!(runtime.leader_id.as_deref(), Some("n2"));
-            assert_eq!(runtime.election_deadline, initial_deadline);
+            assert_eq!(runtime.leader_id, None);
+            assert!(runtime.election_deadline > Instant::now());
         }
 
         let _ = fs::remove_dir_all(dir);
@@ -32837,7 +33841,13 @@ mod tests {
     #[test]
     fn failed_snapshot_install_after_snapshot_rename_is_recoverable() {
         let dir = temp_dir("raft-log-snapshot-install-rewrite-failure");
-        let store = RaftLogStore::open(&dir).expect("open store");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
         for term in [1, 1, 2, 2] {
             store.append(term, RaftCommand::Noop).expect("append");
         }
@@ -32849,6 +33859,17 @@ mod tests {
             .install_snapshot_from_leader(3, 9, Some(payload_checksum(&payload)), payload)
             .expect_err("blocked log rewrite should fail after snapshot rename");
         assert!(matches!(err, BrokerRaftError::Io(_)));
+        assert_eq!(
+            telemetry
+                .log_full_rewrite_failures_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            telemetry.log_full_rewrites_total.load(Ordering::Relaxed),
+            0,
+            "failed snapshot install must not count as a completed full rewrite"
+        );
         assert_eq!(
             store
                 .latest_snapshot()
@@ -32996,6 +34017,100 @@ mod tests {
                 state.retained_log_entry_bytes,
                 serialized_log_entry_lens(&state.retained_log_entries)
                     .expect("serialize repaired entries")
+            );
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_conflict_repair_does_not_increment_full_log_read_metrics() {
+        let dir = temp_dir("raft-conflict-repair-no-full-log-read-metrics");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+        let store = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        )
+        .expect("open store");
+        for term in [1, 1, 3, 3] {
+            store.append(term, RaftCommand::Noop).expect("append");
+        }
+
+        let report = store
+            .append_entries_from_leader(
+                2,
+                1,
+                2,
+                0,
+                vec![
+                    RaftLogEntry {
+                        index: 3,
+                        term: 2,
+                        created_at_ms: 10,
+                        command: RaftCommand::Noop,
+                    },
+                    RaftLogEntry {
+                        index: 4,
+                        term: 2,
+                        created_at_ms: 11,
+                        command: RaftCommand::Noop,
+                    },
+                ],
+            )
+            .expect("conflict repair should use retained state and truncate-append");
+
+        assert!(report.success);
+        assert_eq!(report.rewritten_entries, 2);
+        assert_eq!(
+            telemetry.log_full_reads_total.load(Ordering::Relaxed),
+            0,
+            "conflict repair must not scan the full log file"
+        );
+        assert_eq!(
+            telemetry.log_full_read_bytes_total.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .log_full_read_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry.log_full_rewrites_total.load(Ordering::Relaxed),
+            0,
+            "conflict repair must not rewrite the full retained log"
+        );
+        assert_eq!(
+            telemetry
+                .log_full_rewrite_failures_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .log_full_rewrite_bytes_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .log_full_rewrite_entries_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        {
+            let state = store.state.lock();
+            assert_eq!(state.last_index, 4);
+            assert_eq!(state.last_term, 2);
+            assert_eq!(
+                state
+                    .retained_log_entries
+                    .iter()
+                    .map(|entry| (entry.index, entry.term))
+                    .collect::<Vec<_>>(),
+                vec![(1, 1), (2, 1), (3, 2), (4, 2)]
             );
         }
 
@@ -33429,6 +34544,78 @@ mod tests {
         assert!(raft
             .raft_metrics_text()
             .contains("dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_metrics_count_startup_full_log_scan() {
+        let dir = temp_dir("raft-startup-full-log-read-metric");
+        let entries = vec![noop_entry(1, 1), noop_entry(2, 1), noop_entry(3, 2)];
+        write_raw_log(&dir, &entries);
+        let log_bytes = fs::metadata(dir.join(LOG_FILE))
+            .expect("log metadata")
+            .len();
+
+        let raft = BrokerRaft::open(test_raft_config(dir.clone())).expect("open raft");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_full_reads_total, 1);
+        assert_eq!(telemetry.log_full_read_bytes_total, log_bytes);
+        assert_eq!(telemetry.log_full_read_entries_total, entries.len() as u64);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_full_reads_total 1"));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total {log_bytes}"
+        )));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_log_full_read_entries_total {}",
+            entries.len()
+        )));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_metrics_count_compaction_full_log_rewrite() {
+        let dir = temp_dir("raft-compaction-full-log-rewrite-metric");
+        let raft = BrokerRaft::open(test_raft_config(dir.clone())).expect("open raft");
+        for _ in 0..3 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        raft.log
+            .write_snapshot(2, 1, idle_snapshot_payload())
+            .expect("write snapshot");
+
+        raft.log
+            .compact_to_latest_snapshot()
+            .expect("compaction should rewrite retained suffix");
+
+        let (retained_entries, retained_bytes) = {
+            let state = raft.log.state.lock();
+            (
+                state.retained_log_entries.len() as u64,
+                retained_prefix_file_len(
+                    &state.retained_log_entry_bytes,
+                    state.retained_log_entry_bytes.len(),
+                )
+                .expect("retained suffix bytes"),
+            )
+        };
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_full_rewrites_total, 1);
+        assert_eq!(telemetry.log_full_rewrite_failures_total, 0);
+        assert_eq!(telemetry.log_full_rewrite_entries_total, retained_entries);
+        assert_eq!(telemetry.log_full_rewrite_bytes_total, retained_bytes);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_full_rewrites_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_full_rewrite_failures_total 0"));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total {retained_entries}"
+        )));
+        assert!(metrics.contains(&format!(
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total {retained_bytes}"
+        )));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -34667,6 +35854,254 @@ mod tests {
         assert_eq!(effective_append_entries_max_bytes(usize::MAX, 2048), 2048);
         assert_eq!(effective_append_entries_max_bytes(0, 2048), 1);
         assert_eq!(effective_append_entries_max_bytes(2048, 0), 1);
+    }
+
+    #[test]
+    fn append_entries_candidate_trim_accounts_for_frame_overhead() {
+        let entries = (1..=4)
+            .map(|index| noop_entry(index, 2))
+            .collect::<Vec<_>>();
+        let entry_bytes = serialized_log_entry_lens(&entries).expect("entry byte lens");
+        let serialized_bytes = entry_bytes.iter().sum::<usize>();
+        let meta = AppendEntriesFrameMeta {
+            auth_token: Some("trim-token"),
+            term: 2,
+            leader_id: "node-1",
+            leader_addr: "127.0.0.1:7980",
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+        };
+        let two_entry_frame_len =
+            append_entries_frame_len(&meta, &entries, 2).expect("two-entry frame len");
+        let three_entry_frame_len =
+            append_entries_frame_len(&meta, &entries, 3).expect("three-entry frame len");
+        assert!(three_entry_frame_len > two_entry_frame_len);
+
+        let trimmed = trim_limited_log_entries_to_frame_budget(
+            LimitedLogEntries {
+                entries: entries.clone(),
+                entry_bytes: entry_bytes.clone(),
+                serialized_bytes,
+            },
+            &meta,
+            two_entry_frame_len,
+        )
+        .expect("trim to exact frame budget");
+
+        assert_eq!(
+            trimmed
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(trimmed.entry_bytes, entry_bytes[..2]);
+        assert_eq!(
+            trimmed.serialized_bytes,
+            entry_bytes[..2].iter().sum::<usize>()
+        );
+        let frame =
+            build_bounded_append_entries_rpc(&meta, trimmed.entries.clone(), two_entry_frame_len)
+                .expect("trimmed frame should fit without builder clamp");
+        assert_eq!(frame.entries_len, 2);
+        assert!(!frame.frame_clamped);
+
+        let tiny = trim_limited_log_entries_to_frame_budget(
+            LimitedLogEntries {
+                entries,
+                entry_bytes,
+                serialized_bytes,
+            },
+            &meta,
+            1,
+        )
+        .expect("tiny frame cap still leaves first entry for snapshot fallback");
+        assert_eq!(
+            tiny.entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn preselected_append_entries_frame_uses_cached_lens_for_exact_fit() {
+        let entries = (1..=2)
+            .map(|index| noop_entry(index, 2))
+            .collect::<Vec<_>>();
+        let entry_bytes = serialized_log_entry_lens(&entries).expect("entry byte lens");
+        let meta = AppendEntriesFrameMeta {
+            auth_token: Some("trim-token"),
+            term: 2,
+            leader_id: "node-1",
+            leader_addr: "127.0.0.1:7980",
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+        };
+        let exact_frame_len =
+            append_entries_frame_len(&meta, &entries, entries.len()).expect("exact frame len");
+        let frame = build_preselected_append_entries_rpc(
+            &meta,
+            entries.clone(),
+            entry_bytes,
+            exact_frame_len,
+        )
+        .expect("preselected exact frame should fit");
+
+        assert_eq!(frame.entries_len, 2);
+        assert_eq!(frame.frame_len, exact_frame_len);
+        assert!(!frame.frame_clamped);
+        assert_eq!(
+            frame.body,
+            build_bounded_append_entries_rpc(&meta, entries, exact_frame_len)
+                .expect("bounded exact frame")
+                .body
+        );
+    }
+
+    #[test]
+    fn preselected_append_entries_frame_rejects_oversize_and_stale_lens() {
+        let entries = vec![noop_entry(1, 2)];
+        let entry_bytes = serialized_log_entry_lens(&entries).expect("entry byte lens");
+        let meta = AppendEntriesFrameMeta {
+            auth_token: Some("trim-token"),
+            term: 2,
+            leader_id: "node-1",
+            leader_addr: "127.0.0.1:7980",
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+        };
+        let one_entry_frame_len =
+            append_entries_frame_len(&meta, &entries, 1).expect("one-entry frame len");
+        let err = build_preselected_append_entries_rpc(
+            &meta,
+            entries.clone(),
+            entry_bytes.clone(),
+            one_entry_frame_len.saturating_sub(1),
+        )
+        .expect_err("one-entry oversize should fall back to snapshot");
+        assert!(matches!(
+            err,
+            BrokerRaftError::AppendEntriesFrameTooLarge { .. }
+        ));
+
+        let stale_lens = vec![entry_bytes[0].saturating_sub(1).max(1)];
+        let err = build_preselected_append_entries_rpc(&meta, entries, stale_lens, usize::MAX)
+            .expect_err("stale cached byte length should be detected");
+        match err {
+            BrokerRaftError::FrameSizeEstimateMismatch {
+                rpc,
+                estimated_bytes,
+                actual_bytes,
+            } => {
+                assert_eq!(rpc, "appendEntries");
+                assert!(estimated_bytes < actual_bytes);
+                assert_eq!(actual_bytes, one_entry_frame_len);
+            }
+            other => panic!("unexpected stale-lens error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_entries_payload_budget_selects_frame_fit_before_clone() {
+        let dir = temp_dir("raft-append-frame-budget-select");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        for _ in 0..4 {
+            store.append(2, RaftCommand::Noop).expect("append");
+        }
+        let entries = store.read_entries().expect("read entries");
+        let entry_bytes = serialized_log_entry_lens(&entries).expect("entry byte lens");
+        let meta = AppendEntriesFrameMeta {
+            auth_token: Some("trim-token"),
+            term: 2,
+            leader_id: "node-1",
+            leader_addr: "127.0.0.1:7980",
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+        };
+        let two_entry_frame_len =
+            append_entries_frame_len(&meta, &entries, 2).expect("two-entry frame len");
+        assert!(
+            append_entries_frame_len(&meta, &entries, 3).expect("three-entry frame len")
+                > two_entry_frame_len
+        );
+
+        let mut observed_prev_term = None;
+        let (prev_term, limited) = store
+            .prev_term_entries_and_bytes_from_limited_with_append_entries_budgets(
+                1,
+                8,
+                |prev_log_term| {
+                    observed_prev_term = Some(prev_log_term);
+                    let meta = AppendEntriesFrameMeta {
+                        prev_log_term,
+                        ..meta
+                    };
+                    let payload_budget =
+                        append_entries_frame_entry_budget(&meta, two_entry_frame_len)?;
+                    Ok(LimitedLogByteBudgets::append_entries_payload(
+                        usize::MAX,
+                        payload_budget,
+                    ))
+                },
+            )
+            .expect("read limited entries with payload budget")
+            .expect("prev term should exist");
+
+        assert_eq!(observed_prev_term, Some(0));
+        assert_eq!(prev_term, 0);
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(limited.entry_bytes, entry_bytes[..2]);
+        assert_eq!(
+            limited.serialized_bytes,
+            entry_bytes[..2].iter().sum::<usize>()
+        );
+
+        let trimmed = trim_limited_log_entries_to_frame_budget(limited, &meta, two_entry_frame_len)
+            .expect("payload-selected entries should already fit");
+        assert_eq!(trimmed.entries.len(), 2);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_payload_budget_keeps_configured_entry_byte_limit_separate() {
+        let entries = (1..=4)
+            .map(|index| noop_entry(index, 2))
+            .collect::<Vec<_>>();
+        let entry_bytes = serialized_log_entry_lens(&entries).expect("entry byte lens");
+        let two_entry_serialized_bytes = entry_bytes[..2].iter().sum::<usize>();
+        let limited = entries_from_limited_cached_with_byte_budget(
+            &entries,
+            &entry_bytes,
+            1,
+            8,
+            LimitedLogByteBudgets::append_entries_payload(two_entry_serialized_bytes, usize::MAX),
+        )
+        .expect("select with independent budgets");
+
+        assert_eq!(
+            limited
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(limited.serialized_bytes, two_entry_serialized_bytes);
     }
 
     #[test]
@@ -36084,6 +37519,144 @@ mod tests {
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.post_commit_fanout_rounds_total, 2);
         assert_eq!(telemetry.fanout_replication_inline_yields_total, 2);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn append_entries_frame_estimate_mismatch_repairs_byte_cache_and_retries() {
+        let dir = temp_dir("raft-append-frame-estimate-repair");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let unused_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unused peer addr");
+        let unused_addr = unused_listener.local_addr().expect("unused peer addr");
+        drop(unused_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: unused_addr.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let entry = raft.log.append(1, RaftCommand::Noop).expect("append noop");
+        let target_index = entry.index;
+        let expected_entry_bytes = {
+            let state = raft.log.state.lock();
+            serialized_log_entry_lens(&state.retained_log_entries)
+                .expect("expected retained byte cache")
+        };
+        {
+            let mut state = raft.log.state.lock();
+            state.retained_log_entry_bytes[0] = expected_entry_bytes[0].saturating_sub(1).max(1);
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries after cache repair");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let (term, match_index, entry_indexes) = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    let match_index = entries
+                        .last()
+                        .map(|entry| entry.index)
+                        .unwrap_or(prev_log_index);
+                    (
+                        term,
+                        match_index,
+                        entries.iter().map(|entry| entry.index).collect::<Vec<_>>(),
+                    )
+                }
+                other => panic!("unexpected rpc after cache repair: {other:?}"),
+            };
+            assert_eq!(entry_indexes, vec![target_index]);
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index,
+                conflict_index: None,
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let outcome = raft
+            .replicate_to_peer(
+                RaftPeerConfig {
+                    id: "n2".into(),
+                    addr: peer_addr.to_string(),
+                },
+                1,
+                0,
+                Some(target_index),
+            )
+            .await
+            .expect("replication should repair cache and retry");
+        assert!(outcome.contacted);
+        assert!(outcome.target_reached);
+        server.await.expect("fake peer server");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_frame_size_mismatches_total, 1);
+        assert_eq!(telemetry.log_retained_byte_cache_repairs_total, 1);
+        assert_eq!(telemetry.append_entries_rpc_errors_total, 0);
+        assert_eq!(telemetry.append_entries_batches_total, 1);
+        assert_eq!(
+            raft.log.state.lock().retained_log_entry_bytes,
+            expected_entry_bytes
+        );
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_log_retained_byte_cache_repairs_total 1")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -41322,6 +42895,62 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn install_snapshot_payload_prepare_computes_checksumless_snapshot_bytes() {
+        let dir = temp_dir("raft-install-snapshot-prepare-checksumless");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let mut payload = idle_snapshot_payload();
+        payload["note"] = json!("legacy checksumless snapshot payload");
+        let expected_bytes = serde_json::to_vec(&payload).expect("payload bytes");
+        let expected_checksum = sha256_hex(&expected_bytes);
+        raft.log
+            .write_snapshot(11, 5, payload)
+            .expect("write checksummed source snapshot");
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(SNAPSHOT_FILE)).expect("read snapshot file"))
+                .expect("snapshot json");
+        legacy["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("payloadSha256");
+        fs::write(
+            dir.join(SNAPSHOT_FILE),
+            serde_json::to_vec_pretty(&legacy).expect("legacy snapshot bytes"),
+        )
+        .expect("write checksumless legacy snapshot");
+        {
+            let mut state = raft.log.state.lock();
+            state
+                .latest_snapshot
+                .as_mut()
+                .expect("latest snapshot metadata")
+                .payload_sha256 = None;
+        }
+
+        let prepared = raft
+            .prepare_install_snapshot_source()
+            .expect("prepare checksumless snapshot")
+            .expect("snapshot should exist");
+
+        assert_eq!(prepared.metadata.last_included_index, 11);
+        assert_eq!(prepared.metadata.last_included_term, 5);
+        assert_eq!(prepared.payload_sha256, expected_checksum);
+        assert_eq!(prepared.payload_bytes, expected_bytes);
+        assert_eq!(
+            raft.telemetry_snapshot()
+                .install_snapshot_payload_prepare_bytes_total,
+            prepared.payload_bytes.len() as u64
+        );
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "checksumless latest snapshot metadata should not be cached as checksum-matched"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn install_snapshot_payload_cache_clears_after_local_snapshot_advances() {
         let dir = temp_dir("raft-install-snapshot-cache-local-advance");
@@ -41440,6 +43069,111 @@ mod tests {
                 .last_included_index,
             9
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn request_vote_demotion_clears_prepared_install_snapshot_cache() {
+        let dir = temp_dir("raft-request-vote-clears-prepared-snapshot-cache");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.voted_for = Some("n1".into());
+        }
+
+        let response =
+            raft.handle_request_vote_from_peer(4, "n2".into(), "127.0.0.1:7981".into(), 7, 3);
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::RequestVote { term: 4, .. }
+        ));
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "higher-term RequestVote demotion should release outbound snapshot payload bytes"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 4);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_ne!(runtime.voted_for.as_deref(), Some("n1"));
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn append_entries_demotion_clears_prepared_install_snapshot_cache() {
+        let dir = temp_dir("raft-append-clears-prepared-snapshot-cache");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.voted_for = Some("n1".into());
+        }
+
+        let response = raft.handle_append_entries(4, "n2".into(), 7, 3, Vec::new(), 0);
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::AppendEntries {
+                term: 4,
+                success: true,
+                ..
+            }
+        ));
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "valid AppendEntries demotion should release outbound snapshot payload bytes"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 4);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n2"));
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_sender_demotion_clears_prepared_install_snapshot_cache() {
+        let dir = temp_dir("raft-install-snapshot-sender-clears-prepared-cache");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.voted_for = Some("n1".into());
+        }
+        let leader_addr = raft.active_peer_addr_for_id("n2");
+
+        raft.accept_validated_install_snapshot_sender(4, "n2", &leader_addr)
+            .expect("accept valid snapshot sender");
+
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "valid InstallSnapshot sender demotion should release outbound snapshot payload bytes"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 4);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n2"));
+        }
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -48345,6 +50079,31 @@ mod tests {
     }
 
     #[test]
+    fn latest_snapshot_file_rejects_stable_metadata_drift() {
+        let dir = temp_dir("raft-latest-snapshot-file-metadata-drift");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let mut latest_payload = idle_snapshot_payload();
+        latest_payload["note"] = json!("latest in-memory snapshot metadata");
+        store
+            .write_snapshot(9, 4, latest_payload)
+            .expect("write latest snapshot");
+        let mut stale_payload = idle_snapshot_payload();
+        stale_payload["note"] = json!("stale snapshot file");
+        write_raw_snapshot(&dir, 7, 3, stale_payload);
+
+        let err = store
+            .latest_snapshot_file()
+            .expect_err("stable snapshot file/metadata drift should be rejected");
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidLog(message) if message.contains("does not match in-memory snapshot metadata")),
+            "unexpected error: {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn write_snapshot_is_idempotent_for_same_index_term_and_payload() {
         let dir = temp_dir("raft-snapshot-idempotent-same-payload");
         let store = RaftLogStore::open(&dir).expect("open store");
@@ -50653,6 +52412,14 @@ mod tests {
         assert!(raft.snapshot_transfers.lock().is_empty());
         assert!(!staged_path.exists());
         assert!(snapshot_part_files(&dir).is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
+        assert_eq!(telemetry.snapshot_transfer_cleanup_errors_total, 0);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total 0")
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -50711,7 +52478,7 @@ mod tests {
         );
         assert_eq!(
             raft.telemetry_snapshot().snapshot_transfer_cleanups_total,
-            1
+            2
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -51620,7 +53387,7 @@ mod tests {
             0
         );
         assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
-        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
         let metrics = raft.raft_metrics_text();
         assert!(
             metrics.contains("dd_rust_network_mutex_raft_install_snapshot_staged_chunks_total 3")
@@ -51808,10 +53575,10 @@ mod tests {
         );
         assert_eq!(telemetry.install_snapshot_duplicate_chunks_total, 0);
         assert_eq!(telemetry.install_snapshot_offset_mismatches_total, 0);
-        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 2);
         assert!(raft
             .raft_metrics_text()
-            .contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 1"));
+            .contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 2"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -52062,6 +53829,7 @@ mod tests {
         assert!(telemetry.install_snapshot_request_us_total > 0);
         assert_eq!(telemetry.install_snapshot_progress_updates_total, 1);
         assert_eq!(telemetry.install_snapshot_frame_chunk_clamps_total, 0);
+        assert_eq!(telemetry.install_snapshot_frame_size_mismatches_total, 0);
         assert_eq!(
             telemetry.install_snapshot_frame_build_blocking_tasks_total,
             0
@@ -52085,6 +53853,8 @@ mod tests {
         assert!(metrics.contains(
             "dd_rust_network_mutex_raft_install_snapshot_frame_build_blocking_tasks_total 0"
         ));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_install_snapshot_frame_size_mismatches_total 0"));
         assert!(metrics.contains(&format!(
             "dd_rust_network_mutex_raft_install_snapshot_request_us_total {}",
             telemetry.install_snapshot_request_us_total
@@ -53178,6 +54948,21 @@ mod tests {
                 .expect("borrowed snapshot frame len"),
             mid_view_bytes.len()
         );
+        let bad_len = mid_view_bytes.len().saturating_sub(1);
+        let err = install_snapshot_chunk_frame_with_len(&meta, &payload, 64, 128, bad_len)
+            .expect_err("stale snapshot frame length should be detected");
+        match err {
+            BrokerRaftError::FrameSizeEstimateMismatch {
+                rpc,
+                estimated_bytes,
+                actual_bytes,
+            } => {
+                assert_eq!(rpc, "installSnapshot");
+                assert_eq!(estimated_bytes, bad_len);
+                assert_eq!(actual_bytes, mid_view_bytes.len());
+            }
+            other => panic!("unexpected snapshot frame mismatch error: {other:?}"),
+        }
 
         let final_offset = payload.len() - 37;
         let final_chunk = install_snapshot_chunk_frame(&meta, &payload, final_offset, 37)
@@ -53237,6 +55022,57 @@ mod tests {
                 .contains("single-byte InstallSnapshot RPC frame"),
             "unexpected error: {too_small}"
         );
+    }
+
+    #[test]
+    fn install_snapshot_largest_fitting_raw_chunk_matches_bruteforce() {
+        let payload = (0..257).map(|value| value as u8).collect::<Vec<_>>();
+        let checksum = sha256_hex(&payload);
+        let meta = InstallSnapshotFrameMeta {
+            auth_token: Some("peer-token-for-sizing"),
+            term: 4,
+            leader_id: "node-with-a-long-ish-id",
+            leader_addr: "127.0.0.1:7980",
+            last_included_index: 7,
+            last_included_term: 3,
+            payload_sha256: &checksum,
+        };
+
+        for offset in [0usize, 1, 3, 64, payload.len().saturating_sub(1)] {
+            let remaining = payload.len().saturating_sub(offset);
+            let sizer =
+                InstallSnapshotFrameSizer::new(&meta, offset, payload.len()).expect("sizer");
+            for requested in [0usize, 1, 2, 3, 7, 17, 64, remaining] {
+                let requested = requested.min(remaining);
+                let max_cap = sizer
+                    .frame_len(requested)
+                    .max(sizer.frame_len(requested.min(remaining).max(1).min(remaining)))
+                    .saturating_add(32);
+                for cap in (1..=max_cap).step_by(7).chain([
+                    sizer.frame_len(0),
+                    sizer.frame_len(1.min(remaining)),
+                    sizer.frame_len(requested),
+                    max_cap,
+                ]) {
+                    let raw_range: Box<dyn Iterator<Item = usize>> = if requested == 0 {
+                        Box::new(0..=0)
+                    } else {
+                        Box::new(1..=requested)
+                    };
+                    let expected = raw_range
+                        .filter_map(|raw_len| {
+                            let frame_len = sizer.frame_len(raw_len);
+                            (frame_len <= cap.max(1)).then_some((raw_len, frame_len))
+                        })
+                        .max_by_key(|(raw_len, _)| *raw_len);
+                    assert_eq!(
+                        install_snapshot_largest_fitting_raw_chunk(&sizer, requested, cap),
+                        expected,
+                        "offset={offset} requested={requested} cap={cap}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -58197,6 +60033,7 @@ mod tests {
         let dir = temp_dir("raft-stepdown-hard-state-fails");
         let cfg = test_raft_config(dir.clone());
         let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
         let (initial_state, initial_deadline) = {
             let mut runtime = raft.runtime.lock();
             runtime.current_term = 3;
@@ -58229,6 +60066,40 @@ mod tests {
             assert_eq!(runtime.election_deadline, initial_deadline);
         }
         assert_cached_role_term(&raft, RaftRole::Leader, 3);
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_some(),
+            "failed durable step-down should preserve the still-leader prepared snapshot cache"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn step_down_clears_prepared_install_snapshot_cache() {
+        let dir = temp_dir("raft-stepdown-clears-prepared-snapshot-cache");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        cache_test_install_snapshot_payload(&raft);
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 3;
+            runtime.voted_for = Some("n1".into());
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+        }
+
+        raft.step_down(4, Some("n2".into()));
+
+        assert!(
+            raft.prepared_install_snapshot_cache.lock().is_none(),
+            "durable step-down should release outbound snapshot payload bytes"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 4);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(runtime.leader_id.as_deref(), Some("n2"));
+        }
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -59508,6 +61379,8 @@ mod tests {
         assert_eq!(telemetry.log_compacted_bytes_total, compacted_bytes);
         assert_eq!(telemetry.log_compaction_threshold_triggers_total, 1);
         assert_eq!(telemetry.log_compaction_cadence_triggers_total, 0);
+        assert_eq!(telemetry.log_compaction_failures_total, 0);
+        assert_eq!(telemetry.log_compaction_trim_failures_total, 0);
         assert_eq!(telemetry.log_compaction_safety_skips_total, 0);
         assert_eq!(telemetry.log_compaction_no_commit_skips_total, 0);
         assert_eq!(telemetry.log_compaction_unapplied_commit_skips_total, 0);
@@ -59525,6 +61398,8 @@ mod tests {
             "dd_rust_network_mutex_raft_log_compacted_bytes_total {compacted_bytes}"
         )));
         assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_us_total "));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_failures_total 0"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_trim_failures_total 0"));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_log_compaction_threshold_triggers_total 1"));
         assert!(
@@ -59551,6 +61426,71 @@ mod tests {
         assert!(metrics.contains("dd_rust_network_mutex_raft_last_log_index 5"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_latest_snapshot_index 5"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_eligible_index 4"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn compaction_trim_failure_after_snapshot_is_observable_and_retried() {
+        let dir = temp_dir("raft-compaction-trim-failure-retry");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_max_log_entries = 1;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..3 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.commit_index = 3;
+            runtime.last_applied = 3;
+            runtime.current_term = 1;
+        }
+        let rewrite_tmp = log_rewrite_tmp_path(&dir.join(LOG_FILE));
+        fs::create_dir_all(&rewrite_tmp).expect("block log rewrite temp path");
+
+        let err = raft
+            .snapshot_and_compact_if_needed(false)
+            .expect_err("blocked rewrite temp path should fail trim after snapshot write");
+        assert!(
+            matches!(err, BrokerRaftError::Io(_)),
+            "unexpected compaction failure: {err:?}"
+        );
+        assert_eq!(
+            raft.log
+                .latest_snapshot()
+                .expect("snapshot should be written before trim failure")
+                .last_included_index,
+            3
+        );
+        assert_eq!(
+            raft.log
+                .read_entries()
+                .expect("entries remain untrimmed")
+                .len(),
+            3
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_compactions_total, 0);
+        assert_eq!(telemetry.log_compaction_failures_total, 1);
+        assert_eq!(telemetry.log_compaction_trim_failures_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_failures_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compaction_trim_failures_total 1"));
+
+        fs::remove_dir_all(&rewrite_tmp).expect("unblock log rewrite temp path");
+        raft.snapshot_and_compact_if_needed(false)
+            .expect("next pass trims entries covered by the already-written snapshot");
+        assert!(raft
+            .log
+            .read_entries()
+            .expect("entries after retry")
+            .is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.log_compactions_total, 1);
+        assert_eq!(telemetry.log_compaction_failures_total, 1);
+        assert_eq!(telemetry.log_compaction_trim_failures_total, 1);
 
         let _ = fs::remove_dir_all(dir);
     }
