@@ -485,6 +485,7 @@ pub struct RaftTelemetrySnapshot {
     pub append_conflict_clamps_total: u64,
     pub append_conflict_high_clamps_total: u64,
     pub append_stale_conflict_responses_total: u64,
+    pub append_stale_success_responses_total: u64,
     pub append_invalid_conflict_responses_total: u64,
     pub append_invalid_success_responses_total: u64,
     pub append_capped_success_responses_total: u64,
@@ -2370,6 +2371,7 @@ struct BrokerRaftTelemetry {
     append_conflict_clamps_total: AtomicU64,
     append_conflict_high_clamps_total: AtomicU64,
     append_stale_conflict_responses_total: AtomicU64,
+    append_stale_success_responses_total: AtomicU64,
     append_invalid_conflict_responses_total: AtomicU64,
     append_invalid_success_responses_total: AtomicU64,
     append_capped_success_responses_total: AtomicU64,
@@ -3967,9 +3969,12 @@ impl RaftLogStore {
         payload: serde_json::Value,
     ) -> Result<RaftSnapshotMetadata, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-install-snapshot-log-1");
-        let mut state = self.state.lock();
         let verified_payload_sha256 =
             verify_snapshot_payload_checksum(last_included_index, &payload, payload_sha256)?;
+        let snapshot_client_response_fingerprints = validate_snapshot_client_response_entries(
+            &client_responses_from_snapshot_payload(&payload)?,
+        )?;
+        let mut state = self.state.lock();
         if let Some(existing) = state
             .latest_snapshot
             .as_ref()
@@ -4002,9 +4007,6 @@ impl RaftLogStore {
         } else {
             (Vec::new(), Vec::new())
         };
-        let snapshot_client_response_fingerprints = validate_snapshot_client_response_entries(
-            &client_responses_from_snapshot_payload(&payload)?,
-        )?;
         if let Err(err) = validate_client_request_identity_entries(
             snapshot_client_response_fingerprints.clone(),
             &retained,
@@ -5638,6 +5640,10 @@ impl BrokerRaft {
                 .telemetry
                 .append_stale_conflict_responses_total
                 .load(Ordering::Relaxed),
+            append_stale_success_responses_total: self
+                .telemetry
+                .append_stale_success_responses_total
+                .load(Ordering::Relaxed),
             append_invalid_conflict_responses_total: self
                 .telemetry
                 .append_invalid_conflict_responses_total
@@ -6393,6 +6399,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_append_stale_conflict_responses_total AppendEntries conflict responses ignored because peer nextIndex had already changed since the failed probe was sent.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_stale_conflict_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_stale_conflict_responses_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_append_stale_success_responses_total AppendEntries success responses ignored because peer nextIndex had already been repaired below the probe that succeeded.\n",
+                "# TYPE dd_rust_network_mutex_raft_append_stale_success_responses_total counter\n",
+                "dd_rust_network_mutex_raft_append_stale_success_responses_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_append_invalid_conflict_responses_total AppendEntries conflict responses rejected because conflictTerm, conflictIndex, or conflict matchIndex was impossible for the failed probe.\n",
                 "# TYPE dd_rust_network_mutex_raft_append_invalid_conflict_responses_total counter\n",
                 "dd_rust_network_mutex_raft_append_invalid_conflict_responses_total {}\n",
@@ -6609,6 +6618,7 @@ impl BrokerRaft {
             snapshot.append_conflict_clamps_total,
             snapshot.append_conflict_high_clamps_total,
             snapshot.append_stale_conflict_responses_total,
+            snapshot.append_stale_success_responses_total,
             snapshot.append_invalid_conflict_responses_total,
             snapshot.append_invalid_success_responses_total,
             snapshot.append_capped_success_responses_total,
@@ -15262,6 +15272,31 @@ impl BrokerRaft {
                             progress_changed: false,
                         });
                     }
+                    if let Some(current) = runtime.leader_progress.get(&peer.id) {
+                        if current.next_index < next_index {
+                            self.telemetry
+                                .append_stale_success_responses_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                target: "lmx::raft",
+                                node_id = %self.config.node_id,
+                                peer = %peer.id,
+                                term,
+                                request_next_index = next_index,
+                                current_next_index = current.next_index,
+                                current_match_index = current.match_index,
+                                acknowledged_match_index,
+                                sent_match_index,
+                                target_index = ?target_index,
+                                "raft ignored stale append success because peer nextIndex was already repaired below the probe",
+                            );
+                            return Ok(RaftPeerReplicationOutcome {
+                                contacted: true,
+                                target_reached: false,
+                                progress_changed: false,
+                            });
+                        }
+                    }
                     self.telemetry
                         .append_entries_successes_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -16893,20 +16928,32 @@ impl BrokerRaft {
             return Ok(());
         }
 
-        if let Some(snapshot_file) = self.log.latest_snapshot_file()? {
-            let snapshot_index = snapshot_file.metadata.last_included_index;
+        if let Some(snapshot) = self.log.latest_snapshot() {
+            let snapshot_index = snapshot.last_included_index;
             let should_apply_snapshot = {
                 let runtime = self.runtime.lock();
                 durable_commit_index >= snapshot_index && runtime.last_applied < snapshot_index
             };
             if should_apply_snapshot {
                 let _guard = self.apply_snapshot_lock.lock();
-                let should_apply_snapshot = {
-                    let runtime = self.runtime.lock();
-                    durable_commit_index >= snapshot_index && runtime.last_applied < snapshot_index
-                };
-                if should_apply_snapshot {
-                    self.apply_installed_snapshot_payload(snapshot_index, &snapshot_file.payload)?;
+                if let Some(snapshot) = self.log.latest_snapshot() {
+                    let snapshot_index = snapshot.last_included_index;
+                    let should_apply_snapshot = {
+                        let runtime = self.runtime.lock();
+                        durable_commit_index >= snapshot_index
+                            && runtime.last_applied < snapshot_index
+                    };
+                    if should_apply_snapshot {
+                        let snapshot_file = self.log.latest_snapshot_file()?.ok_or_else(|| {
+                            BrokerRaftError::InvalidLog(format!(
+                                "latest snapshot metadata at index {snapshot_index} has no snapshot file"
+                            ))
+                        })?;
+                        self.apply_installed_snapshot_payload(
+                            snapshot_file.metadata.last_included_index,
+                            &snapshot_file.payload,
+                        )?;
+                    }
                 }
             }
         }
@@ -39439,6 +39486,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_append_success_does_not_overwrite_newer_conflict_repair() {
+        let dir = temp_dir("raft-stale-success-keeps-repaired-next-index");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake peer");
+        let peer_addr = listener.local_addr().expect("fake peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let peer = cfg.peers[1].clone();
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..5 {
+            raft.log.append(1, RaftCommand::Noop).expect("append");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 6,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept fake peer");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read append entries");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse append entries");
+            let term = match rpc {
+                RaftRpc::AppendEntries {
+                    term,
+                    prev_log_index,
+                    entries,
+                    ..
+                } => {
+                    assert_eq!(prev_log_index, 5);
+                    assert!(entries.is_empty());
+                    term
+                }
+                other => panic!("unexpected rpc: {other:?}"),
+            };
+            request_seen_tx.send(()).expect("signal append request");
+            reply_rx.await.expect("wait for local progress repair");
+            let response = RaftRpcResponse::AppendEntries {
+                term,
+                success: true,
+                match_index: 5,
+                conflict_index: None,
+                conflict_term: None,
+            };
+            let body = serde_json::to_vec(&response).expect("serialize append response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write append response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write append newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush append response");
+        });
+
+        let node = raft.clone();
+        let replicate =
+            tokio::spawn(async move { node.replicate_to_peer(peer, 1, 0, Some(5)).await });
+        request_seen_rx
+            .await
+            .expect("append request should be sent");
+
+        {
+            let mut runtime = raft.runtime.lock();
+            let progress = runtime.leader_progress.get_mut("n2").expect("progress");
+            progress.next_index = 3;
+        }
+        raft.note_leader_progress_changed();
+        let progress_generation_after_repair = raft.leader_progress_generation();
+
+        reply_tx.send(()).expect("release stale success response");
+        let outcome = replicate
+            .await
+            .expect("replicate task")
+            .expect("replicate result");
+        assert!(outcome.contacted);
+        assert!(!outcome.target_reached);
+        assert!(!outcome.progress_changed);
+        server.await.expect("fake peer server");
+        assert_eq!(
+            raft.leader_progress_generation(),
+            progress_generation_after_repair,
+            "stale success must not create another progress generation"
+        );
+        let progress = raft
+            .runtime
+            .lock()
+            .leader_progress
+            .get("n2")
+            .copied()
+            .expect("progress");
+        assert_eq!(progress.match_index, 0);
+        assert_eq!(progress.next_index, 3);
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.append_entries_successes_total, 0);
+        assert_eq!(telemetry.append_stale_success_responses_total, 1);
+        assert_eq!(telemetry.append_progress_updates_total, 0);
+        assert!(raft
+            .raft_metrics_text()
+            .contains("dd_rust_network_mutex_raft_append_stale_success_responses_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn append_rejection_without_conflict_hint_does_not_rewind_next_index() {
         let dir = temp_dir("raft-no-hint-rejection-keeps-next-index");
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -48532,6 +48712,66 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn visible_durable_commit_below_snapshot_does_not_read_snapshot_payload() {
+        let dir = temp_dir("raft-visible-durable-below-snapshot-no-payload-read");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log
+            .write_snapshot(5, 1, idle_snapshot_payload())
+            .expect("write snapshot metadata");
+        fs::write(&raft.log.snapshot_path, b"{not valid snapshot json")
+            .expect("corrupt snapshot payload");
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 1,
+            })
+            .expect("persist durable commit below snapshot");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = 1;
+            runtime.last_applied = 1;
+        }
+
+        raft.apply_visible_durable_commit_index()
+            .expect("durable commit below snapshot should not parse snapshot payload");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn visible_durable_commit_already_applied_snapshot_does_not_read_snapshot_payload() {
+        let dir = temp_dir("raft-visible-durable-applied-snapshot-no-payload-read");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        raft.log
+            .write_snapshot(5, 1, idle_snapshot_payload())
+            .expect("write snapshot metadata");
+        fs::write(&raft.log.snapshot_path, b"{not valid snapshot json")
+            .expect("corrupt snapshot payload");
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 1,
+                voted_for: None,
+                commit_index: 5,
+            })
+            .expect("persist durable snapshot commit");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = 5;
+            runtime.last_applied = 5;
+        }
+
+        raft.apply_visible_durable_commit_index()
+            .expect("already-applied snapshot should not be parsed again");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn change_membership_rechecks_durable_membership_after_commit_lock_wait() {
         let dir = temp_dir("raft-change-membership-post-lock-durable-sync");
@@ -49938,6 +50178,94 @@ mod tests {
         assert_eq!(store.last_term(), 2);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn assert_install_snapshot_rejection_before_log_state_lock<F>(
+        dir_name: &str,
+        payload: serde_json::Value,
+        payload_sha256: Option<String>,
+        matches_error: F,
+    ) where
+        F: FnOnce(BrokerRaftError) -> bool + Send + 'static,
+    {
+        let dir = temp_dir(dir_name);
+        let store = Arc::new(RaftLogStore::open(&dir).expect("open store"));
+        let state_guard = store.state.lock();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let store_for_thread = Arc::clone(&store);
+        let handle = std::thread::spawn(move || {
+            started_tx.send(()).expect("signal snapshot install start");
+            let err = store_for_thread
+                .install_snapshot_from_leader(2, 1, payload_sha256, payload)
+                .expect_err("snapshot install should be rejected");
+            done_tx
+                .send(matches_error(err))
+                .expect("signal snapshot install result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot install thread should start");
+        assert!(
+            done_rx
+                .recv_timeout(Duration::from_millis(500))
+                .expect("invalid snapshot should not wait behind log state lock"),
+            "invalid snapshot returned an unexpected error"
+        );
+        drop(state_guard);
+        handle
+            .join()
+            .expect("snapshot install thread should finish");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_rejects_bad_checksum_before_waiting_for_log_state_lock() {
+        assert_install_snapshot_rejection_before_log_state_lock(
+            "raft-install-snapshot-checksum-before-lock",
+            idle_snapshot_payload(),
+            Some("0".repeat(64)),
+            |err| {
+                matches!(
+                    err,
+                    BrokerRaftError::SnapshotChecksumMismatch { index: 2, .. }
+                )
+            },
+        );
+    }
+
+    #[test]
+    fn install_snapshot_rejects_bad_client_response_cache_before_waiting_for_log_state_lock() {
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![
+            ClientResponseSnapshotEntry {
+                request_id: "duplicate-snapshot-request".into(),
+                request_fingerprint: "fingerprint-a".into(),
+                response: None,
+            },
+            ClientResponseSnapshotEntry {
+                request_id: "duplicate-snapshot-request".into(),
+                request_fingerprint: "fingerprint-b".into(),
+                response: None,
+            },
+        ])
+        .expect("client response payload");
+        let checksum = payload_checksum(&payload);
+
+        assert_install_snapshot_rejection_before_log_state_lock(
+            "raft-install-snapshot-client-cache-before-lock",
+            payload,
+            Some(checksum),
+            |err| {
+                matches!(
+                    err,
+                    BrokerRaftError::InvalidLog(message)
+                        if message.contains("duplicates request id")
+                )
+            },
+        );
     }
 
     #[test]

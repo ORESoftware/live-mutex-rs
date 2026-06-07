@@ -416,7 +416,10 @@ Implemented:
   `dd_rust_network_mutex_raft_append_conflict_high_clamps_total`; conflict
   responses for older in-flight probes are ignored when the peer's `nextIndex`
   has already changed and counted in
-  `dd_rust_network_mutex_raft_append_stale_conflict_responses_total`; conflict
+  `dd_rust_network_mutex_raft_append_stale_conflict_responses_total`; success
+  responses for older in-flight probes are ignored when a newer conflict repair
+  has already moved the peer's `nextIndex` below the probe, and counted in
+  `dd_rust_network_mutex_raft_append_stale_success_responses_total`; conflict
   hints that prove the follower is below the retained snapshot/log floor
   increment
   `dd_rust_network_mutex_raft_append_conflict_snapshot_fallbacks_total` before
@@ -823,6 +826,14 @@ Implemented:
 - `InstallSnapshot` receive handling runs on the blocking pool as well, keeping
   large chunk writes, checksum verification, JSON parsing, snapshot install, and
   retained-log rewrite work off core async peer-RPC workers,
+- final follower-side `InstallSnapshot` payload checksum and snapshot
+  idempotency-cache validation happen before the durable log-state mutex is
+  acquired, so malformed or corrupt snapshot transfers do not queue behind a
+  concurrent append, compaction, or retained-log rewrite,
+- visible durable-commit synchronization checks latest snapshot metadata before
+  reading the snapshot file, so vote/admission/status paths do not parse large
+  snapshot payloads when the durable commit is below the snapshot boundary or
+  that snapshot is already applied,
 - periodic snapshot/compaction maintenance also runs on the blocking pool, so
   snapshot serialization and retained-log rewrites do not pin an async worker;
   production apply, final `InstallSnapshot` apply, and snapshot/compaction paths
@@ -1212,7 +1223,9 @@ Conflict-term hints must include the matching `conflictIndex`; term-only hints
 are rejected because the leader cannot make a precise Raft repair from them.
 Impossible `AppendEntries(success=true)` responses that report a `matchIndex`
 below the matched previous entry or sent batch are rejected as non-progress and
-counted in the invalid-success metric.
+counted in the invalid-success metric. Delayed success responses whose probe has
+already been superseded by a lower `nextIndex` conflict repair are also ignored
+before leader progress can be re-advanced.
 Hard state is cached after startup and after successful durable writes; an
 identical term/vote/commit write is elided, while a changed hard state still
 uses the same fsync and atomic rename path before the cache is updated.
