@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -340,13 +341,24 @@ impl RaftSim {
         is_acquire: bool,
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-node-1");
-        let node = self
-            .nodes
-            .get(node_id)
-            .ok_or_else(|| RaftSimError::NodeNotFound(node_id.to_string()))?;
-        node.run_ephemeral(request, request_uuid, wait, is_acquire)
-            .await
-            .map_err(Into::into)
+        retry_sim_response(
+            "raft node response",
+            DEFAULT_SIM_REQUEST_TIMEOUT,
+            |_| {
+                let request = request.clone();
+                async move {
+                    let node = self
+                        .nodes
+                        .get(node_id)
+                        .ok_or_else(|| RaftSimError::NodeNotFound(node_id.to_string()))?;
+                    node.run_ephemeral(request, request_uuid, wait, is_acquire)
+                        .await
+                        .map_err(Into::into)
+                }
+            },
+            |_| false,
+        )
+        .await
     }
 
     pub async fn run_on_leader(
@@ -357,38 +369,30 @@ impl RaftSim {
         is_acquire: bool,
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-leader-1");
-        let deadline = deadline_after(DEFAULT_SIM_REQUEST_TIMEOUT);
-        let mut last_transient_leader_error: Option<BrokerRaftError> = None;
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                if let Some(err) = last_transient_leader_error {
-                    return Err(err.into());
+        retry_sim_response(
+            "ready raft leader",
+            DEFAULT_SIM_REQUEST_TIMEOUT,
+            |remaining| {
+                let request = request.clone();
+                async move {
+                    let leader = self.wait_for_leader(remaining).await?;
+                    leader
+                        .run_ephemeral(request, request_uuid, wait, is_acquire)
+                        .await
+                        .map_err(Into::into)
                 }
-                return Err(RaftSimError::Timeout {
-                    operation: "ready raft leader",
-                    timeout_ms: duration_ms_u64(DEFAULT_SIM_REQUEST_TIMEOUT),
-                });
-            }
-            let leader = self
-                .wait_for_leader(deadline.saturating_duration_since(now))
-                .await?;
-            match leader
-                .run_ephemeral(request.clone(), request_uuid, wait, is_acquire)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(err @ BrokerRaftError::NotLeader { .. }) => {
-                    last_transient_leader_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(err @ BrokerRaftError::QuorumUnavailable { .. }) => {
-                    last_transient_leader_error = Some(err);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
+            },
+            |err| {
+                matches!(
+                    err,
+                    RaftSimError::Raft(
+                        BrokerRaftError::NotLeader { .. }
+                            | BrokerRaftError::QuorumUnavailable { .. }
+                    )
+                )
+            },
+        )
+        .await
     }
 
     pub async fn change_membership(&self, peers: Vec<RaftPeerConfig>) -> Result<u64, RaftSimError> {
@@ -569,6 +573,51 @@ fn deadline_after(timeout: Duration) -> tokio::time::Instant {
         .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
 }
 
+async fn retry_sim_response<F, Fut, R>(
+    operation: &'static str,
+    timeout: Duration,
+    mut call: F,
+    mut retry_error: R,
+) -> Result<Option<Response>, RaftSimError>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: Future<Output = Result<Option<Response>, RaftSimError>>,
+    R: FnMut(&RaftSimError) -> bool,
+{
+    crate::routine_id!("ddl-routine-raft-sim-retry-response-1");
+    let deadline = deadline_after(timeout);
+    let mut last_retryable_error = None;
+    let mut saw_pending_response = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            if let Some(err) = last_retryable_error {
+                return Err(err);
+            }
+            if saw_pending_response {
+                return Ok(None);
+            }
+            return Err(RaftSimError::Timeout {
+                operation,
+                timeout_ms: duration_ms_u64(timeout),
+            });
+        }
+
+        match call(deadline.saturating_duration_since(now)).await {
+            Ok(Some(response)) => return Ok(Some(response)),
+            Ok(None) => {
+                saw_pending_response = true;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) if retry_error(&err) => {
+                last_retryable_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
 fn duration_ms_u64(duration: Duration) -> u64 {
     crate::routine_id!("ddl-routine-raft-sim-duration-ms-1");
     duration.as_millis().min(u64::MAX as u128) as u64
@@ -578,6 +627,10 @@ fn duration_ms_u64(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use crate::RaftMembership;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_memory_cluster_elects_leader_and_replicates_lock() {
@@ -646,6 +699,77 @@ mod tests {
             .expect("proxied follower request")
             .expect("broker response");
         assert!(matches!(response, Response::Lock { acquired: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn retry_sim_response_retries_pending_until_response_arrives() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response = Response::Auth {
+            uuid: "retry-pending".to_string(),
+            ok: true,
+            error: None,
+        };
+
+        let result = retry_sim_response(
+            "pending response",
+            Duration::from_secs(1),
+            |_| {
+                let attempts = Arc::clone(&attempts);
+                let response = response.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Ok(None)
+                    } else {
+                        Ok(Some(response))
+                    }
+                }
+            },
+            |_| false,
+        )
+        .await
+        .expect("pending response retry should not error")
+        .expect("response should arrive");
+
+        assert!(matches!(result, Response::Auth { ok: true, .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_sim_response_retries_configured_transient_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let response = Response::Auth {
+            uuid: "retry-error".to_string(),
+            ok: true,
+            error: None,
+        };
+
+        let result = retry_sim_response(
+            "transient leader error",
+            Duration::from_secs(1),
+            |_| {
+                let attempts = Arc::clone(&attempts);
+                let response = response.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < 2 {
+                        Err(RaftSimError::Raft(BrokerRaftError::NotLeader {
+                            leader_id: Some("node-2".to_string()),
+                            leader_addr: None,
+                        }))
+                    } else {
+                        Ok(Some(response))
+                    }
+                }
+            },
+            |err| matches!(err, RaftSimError::Raft(BrokerRaftError::NotLeader { .. })),
+        )
+        .await
+        .expect("transient leader errors should retry")
+        .expect("response should arrive");
+
+        assert!(matches!(result, Response::Auth { ok: true, .. }));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

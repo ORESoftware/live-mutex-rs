@@ -168,19 +168,20 @@ BENCH_TARGET=raft BENCH_RAFT=127.0.0.1:6972,127.0.0.1:6973,127.0.0.1:6974 \
   cargo run --release --example redis_vs_raft_bench --no-default-features
 ```
 
-Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. The HTTP clients
-open one short-lived connection per request, which matches the simple LB-facing
-API but means the number is not a pure consensus-cost measurement. It is useful
-for the practical “what does the exposed lock service cost?” comparison. Pass a
-single `BENCH_RAFT` endpoint for a real LB service or leader-preferred profiling.
-Pass a comma-separated list to round-robin benchmark traffic across node HTTP
-ports per HTTP request, so acquire and release in one cycle may hit different
-nodes and include follower proxy cost. Set `BENCH_RAFT_ROUTE=leader` with a
-comma-separated endpoint list to model a leader-aware LB: the harness probes
-`/raft/leaderz` and collapses traffic to the ready leader when one is found,
-falling back to round-robin if no endpoint reports leader readiness. Set
-`BENCH_IO_TIMEOUT_MS` to cap each network operation when an endpoint is missing
-or unhealthy.
+Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. By default the
+HTTP clients open one short-lived connection per request, which matches the
+simple LB-facing API but means the number includes connection setup cost. Set
+`BENCH_HTTP_KEEPALIVE=true` to reuse per-worker HTTP sockets per endpoint when
+you want to reduce client-side TCP churn and isolate Broker versus BrokerRaft
+server work more closely. Pass a single `BENCH_RAFT` endpoint for a real LB
+service or leader-preferred profiling. Pass a comma-separated list to
+round-robin benchmark traffic across node HTTP ports per HTTP request, so
+acquire and release in one cycle may hit different nodes and include follower
+proxy cost. Set `BENCH_RAFT_ROUTE=leader` with a comma-separated endpoint list
+to model a leader-aware LB: the harness probes `/raft/leaderz` and collapses
+traffic to the ready leader when one is found, falling back to round-robin if no
+endpoint reports leader readiness. Set `BENCH_IO_TIMEOUT_MS` to cap each network
+operation when an endpoint is missing or unhealthy.
 
 For CPU profiles, use `scripts/profile-broker.sh` to launch and profile either
 a regular Broker server or a local three-node BrokerRaft cluster under the same

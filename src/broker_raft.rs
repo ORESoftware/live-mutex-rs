@@ -643,7 +643,9 @@ pub struct RaftTelemetrySnapshot {
     pub log_append_file_opens_total: u64,
     pub log_append_file_cache_invalidations_total: u64,
     pub log_rewrite_temp_cleanups_total: u64,
+    pub log_rewrite_temp_cleanup_errors_total: u64,
     pub atomic_json_temp_cleanups_total: u64,
+    pub atomic_json_temp_cleanup_errors_total: u64,
     pub log_trailing_partial_recoveries_total: u64,
     pub log_trailing_partial_recovery_errors_total: u64,
     pub hard_state_commit_slot_writes_total: u64,
@@ -655,6 +657,7 @@ pub struct RaftTelemetrySnapshot {
     pub hard_state_commit_slot_truncations_total: u64,
     pub hard_state_commit_slot_truncation_errors_total: u64,
     pub snapshot_transfer_cleanups_total: u64,
+    pub snapshot_transfer_cleanup_errors_total: u64,
     pub snapshot_transfer_stale_cleanups_total: u64,
     pub snapshot_transfer_superseded_leader_cleanups_total: u64,
 }
@@ -2487,7 +2490,9 @@ struct BrokerRaftTelemetry {
     log_append_file_opens_total: AtomicU64,
     log_append_file_cache_invalidations_total: AtomicU64,
     log_rewrite_temp_cleanups_total: AtomicU64,
+    log_rewrite_temp_cleanup_errors_total: AtomicU64,
     atomic_json_temp_cleanups_total: AtomicU64,
+    atomic_json_temp_cleanup_errors_total: AtomicU64,
     log_trailing_partial_recoveries_total: AtomicU64,
     log_trailing_partial_recovery_errors_total: AtomicU64,
     hard_state_commit_slot_writes_total: AtomicU64,
@@ -2499,6 +2504,7 @@ struct BrokerRaftTelemetry {
     hard_state_commit_slot_truncations_total: AtomicU64,
     hard_state_commit_slot_truncation_errors_total: AtomicU64,
     snapshot_transfer_cleanups_total: AtomicU64,
+    snapshot_transfer_cleanup_errors_total: AtomicU64,
     snapshot_transfer_stale_cleanups_total: AtomicU64,
     snapshot_transfer_superseded_leader_cleanups_total: AtomicU64,
 }
@@ -2726,7 +2732,8 @@ impl RaftLogStore {
         crate::routine_id!("ddl-routine-broker-raft-log-open-1");
         let data_dir = data_dir.into();
         fs::create_dir_all(&data_dir)?;
-        let orphaned_snapshot_parts = cleanup_orphaned_snapshot_part_files(&data_dir)?;
+        let orphaned_snapshot_parts =
+            cleanup_orphaned_snapshot_part_files(&data_dir, telemetry.as_deref())?;
         if orphaned_snapshot_parts > 0 {
             if let Some(telemetry) = telemetry.as_deref() {
                 telemetry
@@ -2735,22 +2742,46 @@ impl RaftLogStore {
             }
         }
         let log_path = data_dir.join(LOG_FILE);
-        if cleanup_log_rewrite_tmp_file(&log_rewrite_tmp_path(&log_path))? {
-            if let Some(telemetry) = telemetry.as_deref() {
-                telemetry
-                    .log_rewrite_temp_cleanups_total
-                    .fetch_add(1, Ordering::Relaxed);
+        let log_rewrite_tmp = log_rewrite_tmp_path(&log_path);
+        match cleanup_log_rewrite_tmp_file(&log_rewrite_tmp) {
+            Ok(true) => {
+                if let Some(telemetry) = telemetry.as_deref() {
+                    telemetry
+                        .log_rewrite_temp_cleanups_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                record_log_rewrite_tmp_cleanup_error(
+                    telemetry.as_deref(),
+                    &log_rewrite_tmp,
+                    "startup",
+                    &err,
+                );
             }
         }
         let snapshot_path = data_dir.join(SNAPSHOT_FILE);
         let hard_state_path = data_dir.join(HARD_STATE_FILE);
         let hard_state_commit_path = data_dir.join(HARD_STATE_COMMIT_FILE);
         for path in [&snapshot_path, &hard_state_path] {
-            if cleanup_json_atomic_tmp_file(&json_atomic_tmp_path(path))? {
-                if let Some(telemetry) = telemetry.as_deref() {
-                    telemetry
-                        .atomic_json_temp_cleanups_total
-                        .fetch_add(1, Ordering::Relaxed);
+            let tmp = json_atomic_tmp_path(path);
+            match cleanup_json_atomic_tmp_file(&tmp) {
+                Ok(true) => {
+                    if let Some(telemetry) = telemetry.as_deref() {
+                        telemetry
+                            .atomic_json_temp_cleanups_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    record_json_atomic_tmp_cleanup_error(
+                        telemetry.as_deref(),
+                        &tmp,
+                        "startup",
+                        &err,
+                    );
                 }
             }
         }
@@ -4385,10 +4416,20 @@ impl BrokerRaft {
             )?
         };
         let local_voter_state_path = config.data_dir.join(LOCAL_VOTER_STATE_FILE);
-        if cleanup_json_atomic_tmp_file(&json_atomic_tmp_path(&local_voter_state_path))? {
-            telemetry
-                .atomic_json_temp_cleanups_total
-                .fetch_add(1, Ordering::Relaxed);
+        let local_voter_state_tmp = json_atomic_tmp_path(&local_voter_state_path);
+        match cleanup_json_atomic_tmp_file(&local_voter_state_tmp) {
+            Ok(true) => {
+                telemetry
+                    .atomic_json_temp_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(err) => record_json_atomic_tmp_cleanup_error(
+                Some(&telemetry),
+                &local_voter_state_tmp,
+                "startup",
+                &err,
+            ),
         }
         let local_peer = RaftPeerConfig {
             id: config.node_id.clone(),
@@ -4455,10 +4496,17 @@ impl BrokerRaft {
         }
 
         let learners_path = config.data_dir.join(LEARNERS_FILE);
-        if cleanup_json_atomic_tmp_file(&json_atomic_tmp_path(&learners_path))? {
-            telemetry
-                .atomic_json_temp_cleanups_total
-                .fetch_add(1, Ordering::Relaxed);
+        let learners_tmp = json_atomic_tmp_path(&learners_path);
+        match cleanup_json_atomic_tmp_file(&learners_tmp) {
+            Ok(true) => {
+                telemetry
+                    .atomic_json_temp_cleanups_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                record_json_atomic_tmp_cleanup_error(Some(&telemetry), &learners_tmp, "startup", &err);
+            }
         }
         let log = Arc::new(log_store);
         validate_retained_log_context_on_open(
@@ -5974,9 +6022,17 @@ impl BrokerRaft {
                 .telemetry
                 .log_rewrite_temp_cleanups_total
                 .load(Ordering::Relaxed),
+            log_rewrite_temp_cleanup_errors_total: self
+                .telemetry
+                .log_rewrite_temp_cleanup_errors_total
+                .load(Ordering::Relaxed),
             atomic_json_temp_cleanups_total: self
                 .telemetry
                 .atomic_json_temp_cleanups_total
+                .load(Ordering::Relaxed),
+            atomic_json_temp_cleanup_errors_total: self
+                .telemetry
+                .atomic_json_temp_cleanup_errors_total
                 .load(Ordering::Relaxed),
             log_trailing_partial_recoveries_total: self
                 .telemetry
@@ -6021,6 +6077,10 @@ impl BrokerRaft {
             snapshot_transfer_cleanups_total: self
                 .telemetry
                 .snapshot_transfer_cleanups_total
+                .load(Ordering::Relaxed),
+            snapshot_transfer_cleanup_errors_total: self
+                .telemetry
+                .snapshot_transfer_cleanup_errors_total
                 .load(Ordering::Relaxed),
             snapshot_transfer_stale_cleanups_total: self
                 .telemetry
@@ -6595,9 +6655,15 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total Stale or failed Raft full-log rewrite temp files removed locally.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_log_rewrite_temp_cleanups_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_rewrite_temp_cleanup_errors_total Failed attempts to remove stale or failed Raft full-log rewrite temp files.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_rewrite_temp_cleanup_errors_total counter\n",
+                "dd_rust_network_mutex_raft_log_rewrite_temp_cleanup_errors_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total Stale or failed Raft atomic JSON temp files removed locally for hard-state, snapshot, learner sidecar, or local-voter marker writes.\n",
                 "# TYPE dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_atomic_json_temp_cleanups_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_atomic_json_temp_cleanup_errors_total Failed attempts to remove stale or failed Raft atomic JSON temp files.\n",
+                "# TYPE dd_rust_network_mutex_raft_atomic_json_temp_cleanup_errors_total counter\n",
+                "dd_rust_network_mutex_raft_atomic_json_temp_cleanup_errors_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_trailing_partial_recoveries_total Unterminated malformed trailing Raft log records discarded during full-log read recovery.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_trailing_partial_recoveries_total counter\n",
                 "dd_rust_network_mutex_raft_log_trailing_partial_recoveries_total {}\n",
@@ -6607,6 +6673,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total Follower-side staged InstallSnapshot files removed during startup orphan cleanup, stale cleanup, offset-zero restart/orphan cleanup, offset mismatch, staged byte-limit rejection, or invalid transfer discard.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total Failed attempts to remove follower-side staged InstallSnapshot files; non-zero values can indicate disk pressure, permissions, or stuck part files.\n",
+                "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total counter\n",
+                "dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total Follower-side staged InstallSnapshot files removed because raft.install_snapshot_stale_transfer_ms elapsed without progress.\n",
                 "# TYPE dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total counter\n",
                 "dd_rust_network_mutex_raft_snapshot_transfer_stale_cleanups_total {}\n",
@@ -6725,10 +6794,13 @@ impl BrokerRaft {
             snapshot.log_append_file_opens_total,
             snapshot.log_append_file_cache_invalidations_total,
             snapshot.log_rewrite_temp_cleanups_total,
+            snapshot.log_rewrite_temp_cleanup_errors_total,
             snapshot.atomic_json_temp_cleanups_total,
+            snapshot.atomic_json_temp_cleanup_errors_total,
             snapshot.log_trailing_partial_recoveries_total,
             snapshot.log_trailing_partial_recovery_errors_total,
             snapshot.snapshot_transfer_cleanups_total,
+            snapshot.snapshot_transfer_cleanup_errors_total,
             snapshot.snapshot_transfer_stale_cleanups_total,
             snapshot.snapshot_transfer_superseded_leader_cleanups_total,
             retained_entries,
@@ -17329,7 +17401,10 @@ impl BrokerRaft {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                debug!(
+                self.telemetry
+                    .snapshot_transfer_cleanup_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
                     path = %path.display(),
@@ -17370,7 +17445,10 @@ impl BrokerRaft {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
             Err(err) => {
-                debug!(
+                self.telemetry
+                    .snapshot_transfer_cleanup_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
                     path = %path.display(),
@@ -21916,7 +21994,10 @@ fn rollback_log_file_len(path: &Path, len: u64, sync_log: bool) -> Result<(), Br
     Ok(())
 }
 
-fn cleanup_orphaned_snapshot_part_files(data_dir: &Path) -> Result<usize, BrokerRaftError> {
+fn cleanup_orphaned_snapshot_part_files(
+    data_dir: &Path,
+    telemetry: Option<&BrokerRaftTelemetry>,
+) -> Result<usize, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-cleanup-orphaned-snapshot-parts-1");
     let entries = match fs::read_dir(data_dir) {
         Ok(entries) => entries,
@@ -21925,7 +22006,18 @@ fn cleanup_orphaned_snapshot_part_files(data_dir: &Path) -> Result<usize, Broker
     };
     let mut removed = 0usize;
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                record_startup_snapshot_transfer_cleanup_error(
+                    telemetry,
+                    data_dir,
+                    "read-dir-entry",
+                    &err,
+                );
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -21933,19 +22025,57 @@ fn cleanup_orphaned_snapshot_part_files(data_dir: &Path) -> Result<usize, Broker
         if !is_snapshot_part_file_name(name) {
             continue;
         }
-        if !entry.file_type()?.is_file() {
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                record_startup_snapshot_transfer_cleanup_error(telemetry, &path, "file-type", &err);
+                continue;
+            }
+        };
+        if !file_type.is_file() {
             continue;
         }
-        match fs::remove_file(entry.path()) {
+        match fs::remove_file(&path) {
             Ok(()) => removed += 1,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                record_startup_snapshot_transfer_cleanup_error(
+                    telemetry,
+                    &path,
+                    "remove-file",
+                    &err,
+                );
+            }
         }
     }
     if removed > 0 {
-        sync_dir(data_dir)?;
+        if let Err(err) = sync_dir(data_dir) {
+            record_startup_snapshot_transfer_cleanup_error(telemetry, data_dir, "sync-dir", &err);
+        }
     }
     Ok(removed)
+}
+
+fn record_startup_snapshot_transfer_cleanup_error(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    path: &Path,
+    reason: &'static str,
+    err: &dyn std::fmt::Display,
+) {
+    crate::routine_id!("ddl-routine-broker-raft-startup-snapshot-cleanup-error-1");
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .snapshot_transfer_cleanup_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    warn!(
+        target: "lmx::raft",
+        path = %path.display(),
+        reason,
+        error = %err,
+        "failed to clean orphaned staged InstallSnapshot file during startup",
+    );
 }
 
 fn is_snapshot_part_file_name(name: &str) -> bool {
@@ -22015,16 +22145,38 @@ fn cleanup_log_rewrite_tmp_after_error(
         }
         Ok(false) => {}
         Err(cleanup_error) => {
+            record_log_rewrite_tmp_cleanup_error(telemetry, tmp, phase, &cleanup_error);
             warn!(
                 target: "lmx::raft",
                 path = %tmp.display(),
                 phase,
                 error = %error,
                 cleanup_error = %cleanup_error,
-                "failed to remove raft log rewrite temp file",
+                "failed to remove raft log rewrite temp file after rewrite error",
             );
         }
     }
+}
+
+fn record_log_rewrite_tmp_cleanup_error(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    path: &Path,
+    phase: &str,
+    err: &dyn std::fmt::Display,
+) {
+    crate::routine_id!("ddl-routine-broker-raft-log-rewrite-cleanup-error-1");
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .log_rewrite_temp_cleanup_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    warn!(
+        target: "lmx::raft",
+        path = %path.display(),
+        phase,
+        error = %err,
+        "failed to remove raft log rewrite temp file",
+    );
 }
 
 fn cleanup_log_rewrite_tmp_file(tmp: &Path) -> Result<bool, BrokerRaftError> {
@@ -22101,16 +22253,38 @@ fn cleanup_json_atomic_tmp_after_error(
         }
         Ok(false) => {}
         Err(cleanup_error) => {
+            record_json_atomic_tmp_cleanup_error(telemetry, tmp, phase, &cleanup_error);
             warn!(
                 target: "lmx::raft",
                 path = %tmp.display(),
                 phase,
                 error = %error,
                 cleanup_error = %cleanup_error,
-                "failed to remove raft atomic JSON temp file",
+                "failed to remove raft atomic JSON temp file after write error",
             );
         }
     }
+}
+
+fn record_json_atomic_tmp_cleanup_error(
+    telemetry: Option<&BrokerRaftTelemetry>,
+    path: &Path,
+    phase: &str,
+    err: &dyn std::fmt::Display,
+) {
+    crate::routine_id!("ddl-routine-broker-raft-json-cleanup-error-1");
+    if let Some(telemetry) = telemetry {
+        telemetry
+            .atomic_json_temp_cleanup_errors_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    warn!(
+        target: "lmx::raft",
+        path = %path.display(),
+        phase,
+        error = %err,
+        "failed to remove raft atomic JSON temp file",
+    );
 }
 
 fn cleanup_json_atomic_tmp_file(tmp: &Path) -> Result<bool, BrokerRaftError> {
@@ -22485,6 +22659,55 @@ mod tests {
         assert!(wrong_prefix.exists());
         assert!(matching_directory.exists());
         assert!(snapshot_part_files(&dir).is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_open_counts_snapshot_part_cleanup_errors_without_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("raft-log-open-counts-snapshot-cleanup-errors");
+        fs::create_dir_all(&dir).expect("create raft dir");
+        let orphan = dir.join(format!(
+            "{}stuck{}",
+            SNAPSHOT_PART_FILE_PREFIX, SNAPSHOT_PART_FILE_SUFFIX
+        ));
+        fs::write(&orphan, b"partial snapshot").expect("write orphaned part");
+        let telemetry = Arc::new(BrokerRaftTelemetry::default());
+
+        let original_mode = fs::metadata(&dir)
+            .expect("raft dir metadata")
+            .permissions()
+            .mode();
+        let readonly = fs::Permissions::from_mode(0o555);
+        fs::set_permissions(&dir, readonly).expect("make raft dir readonly");
+        let open_result = RaftLogStore::open_with_sync_log_and_telemetry(
+            &dir,
+            true,
+            Some(Arc::clone(&telemetry)),
+        );
+        fs::set_permissions(&dir, fs::Permissions::from_mode(original_mode))
+            .expect("restore raft dir permissions");
+
+        let _store = open_result.expect("orphaned part cleanup failure should not block open");
+        assert!(
+            orphan.exists(),
+            "undeletable orphaned part should remain for a later cleanup attempt"
+        );
+        assert_eq!(
+            telemetry
+                .snapshot_transfer_cleanups_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            telemetry
+                .snapshot_transfer_cleanup_errors_total
+                .load(Ordering::Relaxed),
+            1
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -49447,6 +49670,38 @@ mod tests {
         let telemetry = raft.telemetry_snapshot();
         assert_eq!(telemetry.snapshot_transfer_cleanups_total, 1);
         assert_eq!(telemetry.snapshot_transfer_stale_cleanups_total, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn snapshot_transfer_cleanup_failures_are_counted_and_exported() {
+        let dir = temp_dir("raft-snapshot-transfer-cleanup-failure");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let blocked = dir.join(format!(
+            "{}blocked{}",
+            SNAPSHOT_PART_FILE_PREFIX, SNAPSHOT_PART_FILE_SUFFIX
+        ));
+        fs::create_dir(&blocked).expect("create directory at staged transfer path");
+
+        assert!(
+            !raft.remove_snapshot_transfer_file(blocked.clone(), "test-cleanup-failure"),
+            "directory path must make remove_file fail"
+        );
+        assert!(
+            blocked.exists(),
+            "failed cleanup should leave path in place"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.snapshot_transfer_cleanups_total, 0);
+        assert_eq!(telemetry.snapshot_transfer_cleanup_errors_total, 1);
+
+        let metrics = raft.raft_metrics_text();
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanup_errors_total 1"),
+            "cleanup failure counter should be exported"
+        );
 
         let _ = fs::remove_dir_all(dir);
     }
