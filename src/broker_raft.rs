@@ -501,6 +501,7 @@ pub struct RaftTelemetrySnapshot {
     pub follower_append_appended_entries_total: u64,
     pub follower_append_rewritten_entries_total: u64,
     pub follower_append_truncated_entries_total: u64,
+    pub follower_append_apply_compaction_skips_total: u64,
     pub follower_append_sender_rejections_total: u64,
     pub install_snapshot_chunks_total: u64,
     pub install_snapshot_bytes_total: u64,
@@ -1517,12 +1518,22 @@ struct RetainedRequestIdentityFingerprint {
     first_index: u64,
 }
 
+#[cfg(test)]
 fn retained_request_identity_fingerprints(
     entries: &[RaftLogEntry],
 ) -> Result<BTreeMap<String, RetainedRequestIdentityFingerprint>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-retained-request-identity-cache-1");
+    retained_request_identity_fingerprints_after(entries, 0)
+}
+
+fn retained_request_identity_fingerprints_after(
+    entries: &[RaftLogEntry],
+    retained_after_index: u64,
+) -> Result<BTreeMap<String, RetainedRequestIdentityFingerprint>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-retained-request-identity-cache-1");
     let mut fingerprints = BTreeMap::new();
-    add_retained_request_identity_entries(&mut fingerprints, entries)?;
+    let retained_start = retained_entry_upper_bound(entries, retained_after_index);
+    add_retained_request_identity_entries(&mut fingerprints, &entries[retained_start..])?;
     Ok(fingerprints)
 }
 
@@ -2387,6 +2398,7 @@ struct BrokerRaftTelemetry {
     follower_append_appended_entries_total: AtomicU64,
     follower_append_rewritten_entries_total: AtomicU64,
     follower_append_truncated_entries_total: AtomicU64,
+    follower_append_apply_compaction_skips_total: AtomicU64,
     follower_append_sender_rejections_total: AtomicU64,
     install_snapshot_chunks_total: AtomicU64,
     install_snapshot_bytes_total: AtomicU64,
@@ -2868,7 +2880,12 @@ impl RaftLogStore {
             .unwrap_or((0, 0));
 
         let retained_log_entry_bytes = serialized_log_entry_lens(&entries)?;
-        let retained_request_fingerprints = retained_request_identity_fingerprints(&entries)?;
+        let retained_after_index = latest_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_included_index)
+            .unwrap_or(0);
+        let retained_request_fingerprints =
+            retained_request_identity_fingerprints_after(&entries, retained_after_index)?;
         let (term_by_index, first_index_by_term, last_index_by_term) =
             term_indexes_from_entries(&entries);
 
@@ -3847,6 +3864,45 @@ impl RaftLogStore {
         replace_retained_log_state(state, retained, retained_sizes)
     }
 
+    fn refresh_latest_snapshot_request_identity_caches(
+        &self,
+        expected: &RaftSnapshotMetadata,
+    ) -> Result<(), BrokerRaftError> {
+        crate::routine_id!("ddl-routine-broker-raft-refresh-latest-snapshot-request-cache-1");
+        let snapshot =
+            read_snapshot_file_with_payload_bytes(&self.snapshot_path)?.ok_or_else(|| {
+                BrokerRaftError::InvalidLog(format!(
+                    "latest snapshot metadata at index {} has no snapshot file",
+                    expected.last_included_index
+                ))
+            })?;
+        if snapshot.snapshot.metadata != *expected {
+            return Err(BrokerRaftError::InvalidLog(format!(
+                "latest snapshot metadata changed while refreshing request identity caches at index {}",
+                expected.last_included_index
+            )));
+        }
+        let snapshot_client_response_fingerprints = validate_snapshot_client_response_entries(
+            &client_responses_from_snapshot_payload(&snapshot.snapshot.payload)?,
+        )?;
+        let mut state = self.state.lock();
+        if state.latest_snapshot.as_ref() != Some(expected) {
+            return Err(BrokerRaftError::InvalidLog(format!(
+                "in-memory latest snapshot metadata changed while refreshing request identity caches at index {}",
+                expected.last_included_index
+            )));
+        }
+        let retained_suffix_start =
+            retained_entry_upper_bound(&state.retained_log_entries, expected.last_included_index);
+        validate_client_request_identity_entries(
+            snapshot_client_response_fingerprints.clone(),
+            &state.retained_log_entries[retained_suffix_start..],
+        )?;
+        state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
+        refresh_retained_request_identity_fingerprints_for_snapshot_boundary(&mut state)?;
+        Ok(())
+    }
+
     pub fn write_snapshot(
         &self,
         last_included_index: u64,
@@ -3887,6 +3943,9 @@ impl RaftLogStore {
                     )));
                 }
                 if existing.payload_sha256.is_some() {
+                    refresh_retained_request_identity_fingerprints_for_snapshot_boundary(
+                        &mut state,
+                    )?;
                     return Ok(existing.clone());
                 }
 
@@ -3927,6 +3986,7 @@ impl RaftLogStore {
                 )?;
                 state.latest_snapshot = Some(metadata.clone());
                 state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
+                refresh_retained_request_identity_fingerprints_for_snapshot_boundary(&mut state)?;
                 return Ok(metadata);
             }
         }
@@ -3943,9 +4003,11 @@ impl RaftLogStore {
                 state.last_index
             )));
         }
+        let retained_suffix_start =
+            retained_entry_upper_bound(&state.retained_log_entries, last_included_index);
         validate_client_request_identity_entries(
             snapshot_client_response_fingerprints.clone(),
-            &state.retained_log_entries,
+            &state.retained_log_entries[retained_suffix_start..],
         )?;
         let metadata = RaftSnapshotMetadata {
             last_included_index,
@@ -3961,6 +4023,7 @@ impl RaftLogStore {
 
         state.latest_snapshot = Some(metadata.clone());
         state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
+        refresh_retained_request_identity_fingerprints_for_snapshot_boundary(&mut state)?;
         if state.last_index <= metadata.last_included_index {
             state.last_index = metadata.last_included_index;
             state.last_term = metadata.last_included_term;
@@ -3987,15 +4050,18 @@ impl RaftLogStore {
             .as_ref()
             .filter(|snapshot| snapshot.last_included_index >= last_included_index)
         {
+            let existing = existing.clone();
             if existing.last_included_index == last_included_index {
                 validate_existing_snapshot_matches_install(
                     &self.snapshot_path,
-                    existing,
+                    &existing,
                     last_included_term,
                     &verified_payload_sha256,
                 )?;
+                state.snapshot_client_response_fingerprints = snapshot_client_response_fingerprints;
+                refresh_retained_request_identity_fingerprints_for_snapshot_boundary(&mut state)?;
             }
-            return Ok(existing.clone());
+            return Ok(existing);
         }
 
         self.repair_retained_log_entry_byte_cache_if_needed(&mut state, "install-snapshot")?;
@@ -4638,10 +4704,12 @@ impl BrokerRaft {
             )? {
                 recovered_membership = membership;
             }
-            snapshot_staged_learners = staged_learners_from_snapshot_payload_for_transport(
-                &snapshot_file.payload,
-                allow_memory_peer_addrs,
-            )?;
+            snapshot_staged_learners =
+                staged_learners_from_snapshot_payload_with_fallback_active_peers(
+                    &snapshot_file.payload,
+                    allow_memory_peer_addrs,
+                    &recovered_membership.validation_peers(),
+                )?;
             snapshot_client_responses =
                 client_responses_from_snapshot_payload(&snapshot_file.payload)?;
         }
@@ -4847,10 +4915,13 @@ impl BrokerRaft {
             )? {
                 raft.apply_membership(membership)?;
             }
-            if let Some(learners) = staged_learners_from_snapshot_payload_for_transport(
-                &snapshot_file.payload,
-                allow_memory_peer_addrs,
-            )? {
+            if let Some(learners) =
+                staged_learners_from_snapshot_payload_with_fallback_active_peers(
+                    &snapshot_file.payload,
+                    allow_memory_peer_addrs,
+                    &raft.membership().validation_peers(),
+                )?
+            {
                 raft.apply_staged_learners(learners)?;
             }
             raft.restore_client_response_cache(snapshot_client_responses)?;
@@ -5711,6 +5782,10 @@ impl BrokerRaft {
                 .telemetry
                 .follower_append_truncated_entries_total
                 .load(Ordering::Relaxed),
+            follower_append_apply_compaction_skips_total: self
+                .telemetry
+                .follower_append_apply_compaction_skips_total
+                .load(Ordering::Relaxed),
             follower_append_sender_rejections_total: self
                 .telemetry
                 .follower_append_sender_rejections_total
@@ -6454,6 +6529,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_follower_append_truncated_entries_total Local retained log entries truncated during follower-side suffix rewrite repairs.\n",
                 "# TYPE dd_rust_network_mutex_raft_follower_append_truncated_entries_total counter\n",
                 "dd_rust_network_mutex_raft_follower_append_truncated_entries_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_follower_append_apply_compaction_skips_total Successful follower-side AppendEntries responses that skipped the apply/compaction path because commitIndex was already applied.\n",
+                "# TYPE dd_rust_network_mutex_raft_follower_append_apply_compaction_skips_total counter\n",
+                "dd_rust_network_mutex_raft_follower_append_apply_compaction_skips_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_follower_append_sender_rejections_total Follower-side AppendEntries requests rejected because the leader id or term was unknown, stale, or conflicted with a known leader.\n",
                 "# TYPE dd_rust_network_mutex_raft_follower_append_sender_rejections_total counter\n",
                 "dd_rust_network_mutex_raft_follower_append_sender_rejections_total {}\n",
@@ -6641,6 +6719,7 @@ impl BrokerRaft {
             snapshot.follower_append_appended_entries_total,
             snapshot.follower_append_rewritten_entries_total,
             snapshot.follower_append_truncated_entries_total,
+            snapshot.follower_append_apply_compaction_skips_total,
             snapshot.follower_append_sender_rejections_total,
             snapshot.install_snapshot_chunks_total,
             snapshot.install_snapshot_bytes_total,
@@ -11672,7 +11751,7 @@ impl BrokerRaft {
             };
         }
 
-        {
+        let should_apply_or_compact = {
             let mut runtime = self.runtime.lock();
             if runtime.current_term != term
                 || runtime.role != RaftRole::Follower
@@ -11697,6 +11776,7 @@ impl BrokerRaft {
                     conflict_term: None,
                 };
             }
+            let mut should_apply_or_compact = runtime.commit_index > runtime.last_applied;
             let next_commit = runtime
                 .commit_index
                 .max(leader_commit.min(append_report.match_index));
@@ -11713,13 +11793,21 @@ impl BrokerRaft {
                     };
                 }
                 runtime.commit_index = next_commit;
+                should_apply_or_compact = true;
             }
-        }
-        if let Err(err) = self.apply_committed_and_maybe_compact_locked(true, false) {
-            return RaftRpcResponse::Error {
-                term: self.runtime.lock().current_term,
-                error: err.to_string(),
-            };
+            should_apply_or_compact
+        };
+        if should_apply_or_compact {
+            if let Err(err) = self.apply_committed_and_maybe_compact_locked(true, false) {
+                return RaftRpcResponse::Error {
+                    term: self.runtime.lock().current_term,
+                    error: err.to_string(),
+                };
+            }
+        } else {
+            self.telemetry
+                .follower_append_apply_compaction_skips_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         RaftRpcResponse::AppendEntries {
@@ -12328,6 +12416,31 @@ impl BrokerRaft {
                         error: err.to_string(),
                     };
                 }
+                if let Err(err) = self
+                    .log
+                    .refresh_latest_snapshot_request_identity_caches(snapshot)
+                {
+                    self.discard_snapshot_transfer(
+                        &leader_id,
+                        last_included_index,
+                        last_included_term,
+                        &expected_checksum,
+                    );
+                    warn!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        leader = %leader_id,
+                        term,
+                        snapshot_index = last_included_index,
+                        snapshot_term = last_included_term,
+                        error = %err,
+                        "raft failed to refresh same-boundary InstallSnapshot request identity caches",
+                    );
+                    return RaftRpcResponse::Error {
+                        term: self.runtime.lock().current_term,
+                        error: err.to_string(),
+                    };
+                }
             }
             self.discard_snapshot_transfer(
                 &leader_id,
@@ -12529,9 +12642,11 @@ impl BrokerRaft {
                 error: err.to_string(),
             };
         }
-        if let Err(err) = staged_learners_from_snapshot_payload_for_transport(
+        let fallback_active_peers = self.membership().validation_peers();
+        if let Err(err) = staged_learners_from_snapshot_payload_with_fallback_active_peers(
             &payload,
             self.allows_in_memory_peer_addrs(),
+            &fallback_active_peers,
         ) {
             self.remove_snapshot_transfer_file(payload_path, "invalid-staged-learners-payload");
             return RaftRpcResponse::Error {
@@ -12727,9 +12842,11 @@ impl BrokerRaft {
             payload,
             self.allows_in_memory_peer_addrs(),
         )?;
-        let snapshot_learners = staged_learners_from_snapshot_payload_for_transport(
+        let fallback_active_peers = self.membership().validation_peers();
+        let snapshot_learners = staged_learners_from_snapshot_payload_with_fallback_active_peers(
             payload,
             self.allows_in_memory_peer_addrs(),
+            &fallback_active_peers,
         )?;
         let snapshot_client_responses = client_responses_from_snapshot_payload(payload)?;
         validate_snapshot_client_response_entries(&snapshot_client_responses)?;
@@ -20529,9 +20646,23 @@ fn staged_learners_from_snapshot_payload(
     staged_learners_from_snapshot_payload_for_transport(payload, false)
 }
 
+#[cfg(test)]
 fn staged_learners_from_snapshot_payload_for_transport(
     payload: &serde_json::Value,
     allow_memory_peer_addrs: bool,
+) -> Result<Option<Vec<RaftPeerConfig>>, BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-learners-from-snapshot-1");
+    staged_learners_from_snapshot_payload_with_fallback_active_peers(
+        payload,
+        allow_memory_peer_addrs,
+        &[],
+    )
+}
+
+fn staged_learners_from_snapshot_payload_with_fallback_active_peers(
+    payload: &serde_json::Value,
+    allow_memory_peer_addrs: bool,
+    fallback_active_peers: &[RaftPeerConfig],
 ) -> Result<Option<Vec<RaftPeerConfig>>, BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-learners-from-snapshot-1");
     let Some(value) = payload.get("stagedLearners") else {
@@ -20541,7 +20672,7 @@ fn staged_learners_from_snapshot_payload_for_transport(
     let active_peers =
         match membership_from_snapshot_payload_for_transport(payload, allow_memory_peer_addrs)? {
             Some(membership) => membership.validation_peers(),
-            None => Vec::new(),
+            None => fallback_active_peers.to_vec(),
         };
     Ok(Some(validate_staged_learner_peers_for_transport(
         learners,
@@ -22707,13 +22838,35 @@ fn replace_retained_log_state(
 ) -> Result<(), BrokerRaftError> {
     crate::routine_id!("ddl-routine-broker-raft-replace-retained-log-state-1");
     validate_retained_log_entry_bytes_len(retained.len(), retained_sizes.len())?;
-    let retained_request_fingerprints = retained_request_identity_fingerprints(&retained)?;
+    let retained_after_index = state
+        .latest_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.last_included_index)
+        .unwrap_or(0);
+    let retained_request_fingerprints =
+        retained_request_identity_fingerprints_after(&retained, retained_after_index)?;
     replace_retained_log_state_with_fingerprints(
         state,
         retained,
         retained_sizes,
         retained_request_fingerprints,
     )
+}
+
+fn refresh_retained_request_identity_fingerprints_for_snapshot_boundary(
+    state: &mut RaftLogState,
+) -> Result<(), BrokerRaftError> {
+    crate::routine_id!("ddl-routine-broker-raft-refresh-retained-request-cache-1");
+    let retained_after_index = state
+        .latest_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.last_included_index)
+        .unwrap_or(0);
+    state.retained_request_fingerprints = retained_request_identity_fingerprints_after(
+        &state.retained_log_entries,
+        retained_after_index,
+    )?;
+    Ok(())
 }
 
 fn replace_retained_log_state_with_fingerprints(
@@ -30087,6 +30240,30 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_payload_without_membership_rejects_current_active_staged_learner_on_open() {
+        let dir = temp_dir("raft-snapshot-invalid-learners-current-membership");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg.clone()).expect("open raft");
+        let mut payload = idle_snapshot_payload();
+        payload["stagedLearners"] = serde_json::to_value(vec![test_peer("n2", 7981)]).unwrap();
+        raft.log
+            .write_snapshot(7, 3, payload)
+            .expect("write invalid learner snapshot without membership");
+
+        let err = match BrokerRaft::open(cfg) {
+            Ok(_) => panic!("snapshot learner must be validated against recovered membership"),
+            Err(err) => err,
+        };
+
+        assert!(
+            matches!(&err, BrokerRaftError::InvalidConfig(message) if message.contains("already an active voter") && message.contains("n2")),
+            "unexpected open error: {err:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn snapshot_payload_rejects_staged_learner_using_joint_old_address() {
         let mut payload = idle_snapshot_payload();
         payload["membership"] = serde_json::to_value(RaftMembership::Joint {
@@ -34958,6 +35135,279 @@ mod tests {
     }
 
     #[test]
+    fn retained_request_identity_cache_ignores_snapshot_covered_prefix_on_open() {
+        let dir = temp_dir("raft-retained-request-cache-open-prefix");
+        let covered_request = single_lock_request("covered-prefix-a", "covered-prefix-key-a");
+        let covered_fingerprint =
+            request_fingerprint(&covered_request).expect("covered fingerprint");
+        write_raw_snapshot(&dir, 2, 1, idle_snapshot_payload());
+        write_raw_log(
+            &dir,
+            &[
+                RaftLogEntry {
+                    index: 1,
+                    term: 1,
+                    created_at_ms: 10,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 1,
+                        request: covered_request,
+                        grant: None,
+                        request_id: "snapshot-covered-request".into(),
+                        request_fingerprint: covered_fingerprint,
+                    },
+                },
+                noop_entry(2, 1),
+                noop_entry(3, 1),
+            ],
+        );
+
+        let store = RaftLogStore::open(&dir).expect("open with snapshot-covered prefix");
+        {
+            let state = store.state.lock();
+            assert!(
+                !state
+                    .retained_request_fingerprints
+                    .contains_key("snapshot-covered-request"),
+                "request identities at or below the snapshot boundary are not retained-suffix context"
+            );
+            assert_eq!(
+                state
+                    .retained_log_entries
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "the physical prefix remains cached so log-file byte offsets still match disk"
+            );
+        }
+
+        let suffix_request = single_lock_request("covered-prefix-b", "covered-prefix-key-b");
+        let suffix_fingerprint = request_fingerprint(&suffix_request).expect("suffix fingerprint");
+        let report = store
+            .append_entries_from_leader(
+                3,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 4,
+                    term: 2,
+                    created_at_ms: 11,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: suffix_request,
+                        grant: None,
+                        request_id: "snapshot-covered-request".into(),
+                        request_fingerprint: suffix_fingerprint.clone(),
+                    },
+                }],
+            )
+            .expect("snapshot-covered prefix identity must not poison retained suffix validation");
+
+        assert!(report.success);
+        assert_eq!(report.appended_entries, 1);
+        let state = store.state.lock();
+        let cached = state
+            .retained_request_fingerprints
+            .get("snapshot-covered-request")
+            .expect("suffix request identity should now be retained");
+        assert_eq!(cached.request_fingerprint, suffix_fingerprint);
+        assert_eq!(cached.first_index, 4);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_snapshot_ignores_covered_prefix_request_identity_and_refreshes_cache() {
+        let dir = temp_dir("raft-write-snapshot-request-cache-boundary");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let covered_request = single_lock_request("snapshot-prefix-a", "snapshot-prefix-key-a");
+        let covered_fingerprint =
+            request_fingerprint(&covered_request).expect("covered fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: covered_request,
+                    grant: None,
+                    request_id: "snapshot-reused-request".into(),
+                    request_fingerprint: covered_fingerprint,
+                },
+            )
+            .expect("append snapshot-covered identity");
+        store.append(1, RaftCommand::Noop).expect("append boundary");
+
+        let suffix_request = single_lock_request("snapshot-prefix-b", "snapshot-prefix-key-b");
+        let suffix_fingerprint = request_fingerprint(&suffix_request).expect("suffix fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "snapshot-reused-request".into(),
+            request_fingerprint: suffix_fingerprint.clone(),
+            response: None,
+        }])
+        .expect("snapshot client response payload");
+
+        store
+            .write_snapshot(2, 1, payload)
+            .expect("snapshot cache should ignore old prefix identities it covers");
+
+        {
+            let state = store.state.lock();
+            assert_eq!(
+                state
+                    .snapshot_client_response_fingerprints
+                    .get("snapshot-reused-request"),
+                Some(&suffix_fingerprint)
+            );
+            assert!(
+                !state
+                    .retained_request_fingerprints
+                    .contains_key("snapshot-reused-request"),
+                "local snapshot write must remove request identities covered by its boundary"
+            );
+            assert_eq!(
+                state
+                    .retained_log_entries
+                    .iter()
+                    .map(|entry| entry.index)
+                    .collect::<Vec<_>>(),
+                vec![1, 2],
+                "local snapshot write does not need to rewrite the physical log prefix"
+            );
+        }
+
+        let report = store
+            .append_entries_from_leader(
+                2,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 12,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: suffix_request,
+                        grant: None,
+                        request_id: "snapshot-reused-request".into(),
+                        request_fingerprint: suffix_fingerprint.clone(),
+                    },
+                }],
+            )
+            .expect("post-snapshot suffix should validate against snapshot cache, not old prefix");
+
+        assert!(report.success);
+        assert_eq!(report.appended_entries, 1);
+        let cached = store
+            .state
+            .lock()
+            .retained_request_fingerprints
+            .get("snapshot-reused-request")
+            .cloned()
+            .expect("post-snapshot suffix identity should now be retained");
+        assert_eq!(cached.request_fingerprint, suffix_fingerprint);
+        assert_eq!(cached.first_index, 3);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn install_snapshot_same_boundary_refreshes_request_identity_caches() {
+        let dir = temp_dir("raft-install-snapshot-same-boundary-refreshes-request-cache");
+        let store = RaftLogStore::open(&dir).expect("open store");
+        let covered_request = single_lock_request("install-prefix-a", "install-prefix-key-a");
+        let covered_fingerprint =
+            request_fingerprint(&covered_request).expect("covered fingerprint");
+        store
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: covered_request,
+                    grant: None,
+                    request_id: "install-reused-request".into(),
+                    request_fingerprint: covered_fingerprint.clone(),
+                },
+            )
+            .expect("append snapshot-covered identity");
+        store.append(1, RaftCommand::Noop).expect("append boundary");
+
+        let suffix_request = single_lock_request("install-prefix-b", "install-prefix-key-b");
+        let suffix_fingerprint = request_fingerprint(&suffix_request).expect("suffix fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "install-reused-request".into(),
+            request_fingerprint: suffix_fingerprint.clone(),
+            response: None,
+        }])
+        .expect("snapshot client response payload");
+
+        store
+            .write_snapshot(2, 1, payload.clone())
+            .expect("write installed snapshot");
+        {
+            let mut state = store.state.lock();
+            state.snapshot_client_response_fingerprints.clear();
+            state.retained_request_fingerprints.insert(
+                "install-reused-request".into(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: covered_fingerprint,
+                    first_index: 1,
+                },
+            );
+        }
+
+        let installed = store
+            .install_snapshot_from_leader(2, 1, Some(payload_checksum(&payload)), payload)
+            .expect("same-boundary InstallSnapshot retry should refresh caches");
+        assert_eq!(installed.last_included_index, 2);
+        assert_eq!(installed.last_included_term, 1);
+        {
+            let state = store.state.lock();
+            assert_eq!(
+                state
+                    .snapshot_client_response_fingerprints
+                    .get("install-reused-request"),
+                Some(&suffix_fingerprint)
+            );
+            assert!(
+                !state
+                    .retained_request_fingerprints
+                    .contains_key("install-reused-request"),
+                "same-boundary InstallSnapshot retry must remove stale retained identities at or below the snapshot boundary"
+            );
+        }
+
+        let report = store
+            .append_entries_from_leader(
+                2,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 12,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: suffix_request,
+                        grant: None,
+                        request_id: "install-reused-request".into(),
+                        request_fingerprint: suffix_fingerprint,
+                    },
+                }],
+            )
+            .expect("post-snapshot suffix should validate after cache refresh");
+
+        assert!(report.success);
+        assert_eq!(report.appended_entries, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn follower_append_entries_repair_metrics_are_exposed() {
         let dir = temp_dir("raft-follower-repair-metrics");
         let cfg = test_raft_config(dir.clone());
@@ -36009,6 +36459,73 @@ mod tests {
             store.read_entries().is_err(),
             "full log reads should still detect the malformed appended line"
         );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn follower_idle_heartbeat_skips_apply_compaction_path() {
+        let dir = temp_dir("raft-follower-idle-heartbeat-fast-path");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.snapshot_interval = Duration::from_nanos(1);
+        cfg.snapshot_max_log_entries = 1;
+        cfg.snapshot_max_log_bytes = u64::MAX;
+        cfg.trailing_log_entries = 0;
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let entry = raft.log.append(1, RaftCommand::Noop).expect("append seed");
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 1,
+                voted_for: None,
+                commit_index: entry.index,
+            })
+            .expect("persist committed seed");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.commit_index = entry.index;
+            runtime.last_applied = entry.index;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = None;
+        }
+
+        let response = raft.handle_append_entries(
+            2,
+            "n2".into(),
+            entry.index,
+            entry.term,
+            Vec::new(),
+            entry.index,
+        );
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::AppendEntries {
+                term: 2,
+                success: true,
+                match_index,
+                ..
+            } if match_index == entry.index
+        ));
+        assert!(
+            raft.log.latest_snapshot().is_none(),
+            "idle heartbeat must not drive opportunistic compaction"
+        );
+        assert_eq!(
+            raft.log.read_entries().expect("retained entries").len(),
+            1,
+            "retained log should stay untouched until maintenance or a commit/apply path runs"
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.follower_append_apply_compaction_skips_total, 1);
+        assert_eq!(telemetry.log_compactions_total, 0);
+        assert_eq!(telemetry.log_compaction_threshold_triggers_total, 0);
+        assert_eq!(telemetry.log_compaction_cadence_triggers_total, 0);
+        assert_eq!(telemetry.apply_committed_entries_total, 0);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_follower_append_apply_compaction_skips_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_compactions_total 0"));
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -51488,6 +52005,109 @@ mod tests {
     }
 
     #[test]
+    fn already_installed_snapshot_refreshes_request_identity_caches_before_ack() {
+        let dir = temp_dir("raft-installed-snapshot-refreshes-request-cache");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let covered_request = single_lock_request("installed-prefix-a", "installed-prefix-key-a");
+        let covered_fingerprint =
+            request_fingerprint(&covered_request).expect("covered fingerprint");
+        raft.log
+            .append(
+                1,
+                RaftCommand::ClientRequestWithIdentity {
+                    client_id: 1,
+                    request: covered_request,
+                    grant: None,
+                    request_id: "installed-reused-request".into(),
+                    request_fingerprint: covered_fingerprint.clone(),
+                },
+            )
+            .expect("append snapshot-covered identity");
+        raft.log
+            .append(1, RaftCommand::Noop)
+            .expect("append boundary");
+
+        let suffix_request = single_lock_request("installed-prefix-b", "installed-prefix-key-b");
+        let suffix_fingerprint = request_fingerprint(&suffix_request).expect("suffix fingerprint");
+        let mut payload = idle_snapshot_payload();
+        payload["clientResponses"] = serde_json::to_value(vec![ClientResponseSnapshotEntry {
+            request_id: "installed-reused-request".into(),
+            request_fingerprint: suffix_fingerprint.clone(),
+            response: None,
+        }])
+        .expect("snapshot client response payload");
+        raft.log
+            .write_snapshot(2, 1, payload.clone())
+            .expect("write already-installed snapshot");
+        {
+            let mut state = raft.log.state.lock();
+            state.snapshot_client_response_fingerprints.clear();
+            state.retained_request_fingerprints.insert(
+                "installed-reused-request".into(),
+                RetainedRequestIdentityFingerprint {
+                    request_fingerprint: covered_fingerprint,
+                    first_index: 1,
+                },
+            );
+        }
+
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+        let response =
+            raft.handle_install_snapshot(2, "n2".into(), 2, 1, Some(checksum), 0, true, data);
+
+        assert!(matches!(
+            response,
+            RaftRpcResponse::InstallSnapshot {
+                term: 2,
+                success: true,
+                last_included_index: 2
+            }
+        ));
+        {
+            let state = raft.log.state.lock();
+            assert_eq!(
+                state
+                    .snapshot_client_response_fingerprints
+                    .get("installed-reused-request"),
+                Some(&suffix_fingerprint)
+            );
+            assert!(
+                !state
+                    .retained_request_fingerprints
+                    .contains_key("installed-reused-request"),
+                "already-installed InstallSnapshot ack must refresh retained request identities against the snapshot boundary"
+            );
+        }
+
+        let report = raft
+            .log
+            .append_entries_from_leader(
+                2,
+                1,
+                2,
+                0,
+                vec![RaftLogEntry {
+                    index: 3,
+                    term: 2,
+                    created_at_ms: 12,
+                    command: RaftCommand::ClientRequestWithIdentity {
+                        client_id: 2,
+                        request: suffix_request,
+                        grant: None,
+                        request_id: "installed-reused-request".into(),
+                        request_fingerprint: suffix_fingerprint,
+                    },
+                }],
+            )
+            .expect("post-snapshot suffix should validate after live cache refresh");
+        assert!(report.success);
+        assert_eq!(report.appended_entries, 1);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn already_installed_snapshot_apply_discards_same_transfer_part_file() {
         let dir = temp_dir("raft-installed-snapshot-discards-same-transfer");
         let cfg = test_raft_config(dir.clone());
@@ -51988,6 +52608,110 @@ mod tests {
         assert!(raft
             .raft_metrics_text()
             .contains("dd_rust_network_mutex_raft_snapshot_transfer_cleanups_total 1"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn handle_install_snapshot_rejects_staged_learner_active_in_current_membership_before_snapshot_write(
+    ) {
+        let dir = temp_dir("raft-install-snapshot-invalid-learners-current-membership");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+            runtime.commit_index = 0;
+            runtime.last_applied = 0;
+        }
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 0,
+            })
+            .expect("write initial hard state");
+        let mut payload = idle_snapshot_payload();
+        payload["stagedLearners"] = serde_json::to_value(vec![test_peer("n2", 7981)]).unwrap();
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+
+        let response =
+            raft.handle_install_snapshot(2, "n2".into(), 7, 2, Some(checksum), 0, true, data);
+
+        assert!(
+            matches!(response, RaftRpcResponse::Error { term: 2, ref error } if error.contains("already an active voter") && error.contains("n2")),
+            "unexpected InstallSnapshot response: {response:?}"
+        );
+        assert!(
+            raft.log.latest_snapshot().is_none(),
+            "invalid snapshot-carried learners must be rejected before durable snapshot write"
+        );
+        assert_eq!(
+            raft.log
+                .read_hard_state()
+                .expect("read hard state after rejection")
+                .commit_index,
+            0,
+            "invalid snapshot-carried learners must not advance durable commit index"
+        );
+        assert!(raft.snapshot_transfers.lock().is_empty());
+        assert!(snapshot_part_files(&dir).is_empty());
+        assert!(raft.staged_learners().is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finish_existing_install_snapshot_rejects_current_active_staged_learner_before_commit_advance(
+    ) {
+        let dir = temp_dir("raft-finish-snapshot-invalid-learners-current-membership");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+            runtime.commit_index = 0;
+            runtime.last_applied = 0;
+        }
+        raft.log
+            .write_hard_state(&RaftHardState {
+                current_term: 2,
+                voted_for: None,
+                commit_index: 0,
+            })
+            .expect("write initial hard state");
+        let mut payload = idle_snapshot_payload();
+        payload["stagedLearners"] = serde_json::to_value(vec![test_peer("n2", 7981)]).unwrap();
+        let (checksum, data) = snapshot_rpc_parts(&payload);
+        raft.log
+            .write_snapshot(7, 2, payload.clone())
+            .expect("write same-boundary invalid snapshot");
+
+        let response =
+            raft.handle_install_snapshot(2, "n2".into(), 7, 2, Some(checksum), 0, true, data);
+
+        assert!(
+            matches!(response, RaftRpcResponse::Error { term: 2, ref error } if error.contains("already an active voter") && error.contains("n2")),
+            "unexpected InstallSnapshot response: {response:?}"
+        );
+        assert_eq!(
+            raft.log
+                .read_hard_state()
+                .expect("read hard state after rejection")
+                .commit_index,
+            0,
+            "same-boundary snapshot apply rejection must happen before hard-state commit advance"
+        );
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.commit_index, 0);
+            assert_eq!(runtime.last_applied, 0);
+        }
+        assert!(raft.staged_learners().is_empty());
 
         let _ = fs::remove_dir_all(dir);
     }

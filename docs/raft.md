@@ -133,10 +133,16 @@ Implemented:
 - live `InstallSnapshot` applies durable hard-state, membership, learner, and
   response-cache side effects before installing broker state, so sidecar
   persistence failures cannot partially replace the state machine,
+- snapshot-carried staged learners are validated against snapshot membership
+  when present, and otherwise against the current/recovered membership before
+  startup accepts the snapshot, before live `InstallSnapshot` writes it, and
+  before a same-boundary snapshot retry can advance hard state,
 - live `InstallSnapshot` validates snapshot-carried idempotency cache entries
   against any retained log suffix before writing the new snapshot/rewrite, so a
   snapshot cannot install request-id state that will conflict during later
-  suffix replay,
+  suffix replay; same-boundary `InstallSnapshot` retries also refresh the
+  in-memory snapshot response cache and retained request-id cache against the
+  snapshot boundary before acknowledging,
 - committed-entry apply failures, such as membership or learner sidecar
   persistence errors, increment
   `dd_rust_network_mutex_raft_apply_committed_errors_total` and emit a
@@ -895,7 +901,11 @@ Implemented:
   path as well as the maintenance loop, while retained-suffix settings still
   block unsafe deletion. The cadence must be positive; entry-count and byte
   thresholds may be set to zero when only the cadence trigger should drive
-  snapshotting.
+  snapshotting,
+- follower heartbeats that do not advance `commitIndex` and have no unapplied
+  committed work skip the apply/compaction path entirely; the
+  `dd_rust_network_mutex_raft_follower_append_apply_compaction_skips_total`
+  counter shows this fast path during profiling.
 
 Still missing:
 
@@ -1076,7 +1086,15 @@ the log file at the retained-prefix byte offset and appends the leader suffix
 instead of rewriting the full retained log. The in-memory retained entries,
 serialized-byte cache, term indexes, and retained request-id fingerprint cache
 are truncated and extended in place after the disk write succeeds, so conflict
-repair does not clone or rescan a large retained prefix. Unit coverage also
+repair does not clone or rescan a large retained prefix. When startup reloads a
+log file that still contains entries at or below the latest snapshot boundary,
+those physical prefix entries remain available for byte-offset accounting but
+are excluded from the logical retained request-id fingerprint cache; only
+snapshot-carried response-cache entries and the post-snapshot retained suffix
+participate in future idempotency conflict checks. Local snapshot writes apply
+the same boundary rule before validating snapshot response-cache entries and
+refresh the retained request-id cache after the new snapshot boundary is stored.
+Unit coverage also
 asserts the leader-side AppendEntries log-byte counter equals only the repaired
 suffix entry bytes during conflict repair, not the full local log. If that write
 path reports an error, the retained log/index/byte/idempotency cache is reloaded
