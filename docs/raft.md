@@ -407,7 +407,8 @@ Implemented:
   before repair and counted in
   `dd_rust_network_mutex_raft_append_invalid_conflict_responses_total`; invalid
   `AppendEntries(success=true)` responses that underreport the matched boundary
-  increment `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
+  or carry contradictory conflict hints increment
+  `dd_rust_network_mutex_raft_append_invalid_success_responses_total`;
   success responses that overreport beyond the sent batch are capped and
   increment `dd_rust_network_mutex_raft_append_capped_success_responses_total`;
   lower-term `AppendEntries` responses are treated as stale and increment
@@ -480,7 +481,11 @@ Implemented:
   connection are bounded by the RPC timeout and expose
   `dd_rust_network_mutex_raft_rpc_connection_waits_total`,
   `dd_rust_network_mutex_raft_rpc_connection_wait_us_total`, and
-  `dd_rust_network_mutex_raft_rpc_connection_wait_timeouts_total`;
+  `dd_rust_network_mutex_raft_rpc_connection_wait_timeouts_total`; normal
+  consensus peer RPCs retain a small timeout floor, while follower proxy RPCs
+  use strict remaining-budget timeouts across pooled-connection wait, connect,
+  response read, and retry so short client proxy budgets are not stretched by a
+  busy pooled connection or silent peer;
   oversized snapshot chunks also increment
   `dd_rust_network_mutex_raft_install_snapshot_oversized_chunks_total`, while
   staged-transfer byte limit rejections increment
@@ -628,7 +633,10 @@ Implemented:
   prepared leader-side `InstallSnapshot` payloads are cached only while their
   checksum and snapshot boundary still match the latest local snapshot, so local
   compaction snapshots and follower-installed newer snapshots release obsolete
-  prepared payload bytes instead of retaining a stale large buffer;
+  prepared payload bytes instead of retaining a stale large buffer; if the latest
+  local snapshot advances while a chunked leader-side `InstallSnapshot` stream
+  is in progress, the stream stops before building another stale chunk and the
+  next replication pass prepares the newer snapshot;
   follower-side snapshot payloads whose idempotency cache conflicts with a
   retained suffix increment
   `dd_rust_network_mutex_raft_install_snapshot_context_invalid_request_identities_total`;
@@ -704,9 +712,12 @@ Implemented:
   is actually behind,
 - persistent Raft peer connection reuse for vote, append, snapshot, and follower
   proxy RPCs,
-- pooled peer RPC response-type validation; a mismatched response resets the
-  connection before retrying so a desynchronized stream is not reused, and
-  increments `dd_rust_network_mutex_raft_rpc_response_mismatches_total`,
+- peer RPC response-type validation for both pooled socket transport and the
+  in-memory simulation transport, with branch-level tests for each path; a
+  mismatched socket response resets the connection before retrying so a
+  desynchronized stream is not reused, while a mismatched in-memory response
+  fails the call. Both paths increment
+  `dd_rust_network_mutex_raft_rpc_response_mismatches_total`,
 - malformed vote/pre-vote requests increment
   `dd_rust_network_mutex_raft_pre_vote_malformed_requests_total` or
   `dd_rust_network_mutex_raft_request_vote_malformed_requests_total` and emit
@@ -800,9 +811,10 @@ Implemented:
   repeated `/v1/lock` or `/v1/unlock` calls with the same `requestId` or
   idempotency header and the same payload return the cached response instead of
   appending a duplicate command; in-flight duplicate retries are suppressed
-  before append, failed pre-append reservations are released, and the applied
-  cache is rebuilt from committed identity log entries and carried in Raft
-  snapshots, while mismatched payload reuse is rejected,
+  before append, failed pre-append reservations and failed pre-commit
+  proposal/batch reservations are released, and the applied cache is rebuilt
+  from committed identity log entries and carried in Raft snapshots, while
+  mismatched payload reuse is rejected,
 - public BrokerRaft client admission supports composite (multi-key) `keys`
   locking bounded to at most 3 distinct keys per request (`RAFT_MAX_COMPOSITE_KEYS`,
   below the protocol-wide `MAX_COMPOSITE_KEYS` of 5). Composite grants replicate
@@ -1161,8 +1173,11 @@ the budget expires. A non-leader proxy response can include a structured leader
 hint; the forwarding follower only accepts hints that resolve to configured
 active peers (and when both ID and address are supplied, both must match the
 same peer), then retries that peer immediately instead of walking unrelated peers
-first. Each outbound proxy RPC uses the remaining proxy budget as its timeout,
-so a silent candidate peer cannot extend a follower request beyond that
+first. Each outbound proxy RPC uses the remaining proxy budget as a strict
+timeout across connect, response read, and any one-call retry; if the budget is
+already exhausted before the retry can start, the caller gets an explicit strict
+budget-expired RPC error instead of the previous transient mismatch. A busy pooled
+connection or silent candidate peer cannot extend a follower request beyond that
 configured window. When a candidate leader successfully handles a proxied
 request in the follower's current term, the forwarding follower refreshes only
 its volatile leader hint and election deadline, so later round-robin LB writes
