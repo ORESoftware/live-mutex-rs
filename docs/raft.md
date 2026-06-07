@@ -1145,8 +1145,10 @@ Leader-side proxy responses report the current term after the proxied work
 finishes, and follower proxy responses that carry a higher Raft term force the
 forwarding follower to persist a step-down before returning the proxied client
 result, so round-robin LB traffic cannot leave the proxying node with stale term
-state. Follower proxying retries transient stale-leader, leaderless, direct
-peer-discovery, and transport failures until `proxy_retry_budget_ms` expires;
+state. Higher-term proxy responses still advance the local term when the
+responding peer was removed mid-request, but the removed peer is not retained as
+a leader hint. Follower proxying retries transient stale-leader, leaderless,
+direct peer-discovery, and transport failures until `proxy_retry_budget_ms` expires;
 terminal request-payload errors such as idempotency conflicts are not retried.
 Forwarding uses Raft peer addresses from membership rather than sending proxied
 requests back through the load balancer; if the follower has no usable leader

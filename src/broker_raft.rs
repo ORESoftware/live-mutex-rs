@@ -16222,6 +16222,19 @@ impl BrokerRaft {
             if term >= runtime.current_term {
                 let previous_term = runtime.current_term;
                 let previous_role = runtime.role;
+                let requested_leader_id = leader_id.clone();
+                let leader_id = leader_id.filter(|leader_id| {
+                    leader_id != &self.config.node_id && runtime.membership.contains_id(leader_id)
+                });
+                if requested_leader_id != leader_id {
+                    debug!(
+                        target: "lmx::raft",
+                        node_id = %self.config.node_id,
+                        requested_leader_id = ?requested_leader_id,
+                        term,
+                        "raft step-down ignored leader hint outside active membership",
+                    );
+                }
                 let new_leader_id = leader_id.clone();
                 let next_voted_for = if term > runtime.current_term {
                     None
@@ -41430,6 +41443,138 @@ mod tests {
             assert_eq!(runtime.role, RaftRole::Follower);
             assert_eq!(runtime.leader_id.as_deref(), Some("n2"));
             assert_eq!(runtime.voted_for, None);
+        }
+        assert_eq!(
+            raft.log.read_hard_state().expect("read hard state"),
+            RaftHardState {
+                current_term: 9,
+                voted_for: None,
+                commit_index: 0,
+            }
+        );
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 1);
+        assert_eq!(telemetry.proxy_requests_handled_total, 0);
+        assert_eq!(telemetry.proxy_request_errors_total, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn follower_proxy_higher_term_removed_peer_does_not_cache_leader_hint() {
+        let dir = temp_dir("raft-follower-proxy-higher-term-removed-peer");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind removed higher-term peer");
+        let removed_peer_addr = listener.local_addr().expect("removed peer addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: removed_peer_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+
+        let request_seen = Arc::new(Notify::new());
+        let membership_changed = Arc::new(Notify::new());
+        let request_seen_for_server = Arc::clone(&request_seen);
+        let membership_changed_for_server = Arc::clone(&membership_changed);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept removed peer proxy");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read proxied request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse proxied request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    auth_token: None,
+                    request_uuid,
+                    is_acquire: false,
+                    ..
+                } => assert_eq!(request_uuid, "proxy-removed-higher-term"),
+                other => panic!("unexpected proxy rpc: {other:?}"),
+            }
+            request_seen_for_server.notify_one();
+            membership_changed_for_server.notified().await;
+            let body = serde_json::to_vec(&RaftRpcResponse::ProxyResponse {
+                term: 9,
+                response: None,
+                error: None,
+                leader_id: None,
+                leader_addr: None,
+            })
+            .expect("serialize proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush proxy response");
+        });
+
+        let node = raft.clone();
+        let proxy = tokio::spawn(async move {
+            node.run_ephemeral(
+                Request::Unlock {
+                    uuid: "proxy-removed-higher-term".into(),
+                    key: Some("proxy-removed-key".into()),
+                    keys: None,
+                    lock_uuid: Some("proxy-removed-lock".into()),
+                    force: false,
+                },
+                "proxy-removed-higher-term",
+                Duration::from_millis(10),
+                false,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("proxied request should reach removed peer before membership change");
+        raft.apply_membership(RaftMembership::from_simple(vec![
+            test_peer("n1", 7980),
+            test_peer("n3", 7982),
+            test_peer("n4", 7984),
+        ]))
+        .expect("apply membership removing responding peer");
+        membership_changed.notify_one();
+
+        let response = tokio::time::timeout(Duration::from_secs(2), proxy)
+            .await
+            .expect("proxied request should finish")
+            .expect("proxy task should not panic")
+            .expect("higher-term proxy response should still succeed");
+        assert!(response.is_none());
+        server.await.expect("fake removed peer server");
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(runtime.current_term, 9);
+            assert_eq!(runtime.role, RaftRole::Follower);
+            assert_eq!(
+                runtime.leader_id, None,
+                "removed higher-term proxy responder must not be cached as leader"
+            );
+            assert!(!runtime.membership.contains_id("n2"));
         }
         assert_eq!(
             raft.log.read_hard_state().expect("read hard state"),
