@@ -58,6 +58,18 @@ enum LinearModelOp {
     Release(u16),
 }
 
+#[derive(Clone)]
+struct HistoryPhase {
+    endpoint: String,
+    key: String,
+    history: Arc<Mutex<Vec<LockHistoryOp>>>,
+    order: Arc<AtomicUsize>,
+    phase: usize,
+    workers: usize,
+    steps: usize,
+    label: String,
+}
+
 impl Drop for VersionSkewCluster {
     fn drop(&mut self) {
         for child in &mut self.children {
@@ -104,16 +116,16 @@ async fn mixed_binary_rolling_upgrade_preserves_no_wait_linearizability() {
     let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
     let order = Arc::new(AtomicUsize::new(0));
 
-    run_no_wait_history_phase(
-        endpoint.clone(),
-        key.clone(),
-        Arc::clone(&history),
-        Arc::clone(&order),
-        0,
-        3,
-        6,
-        "old-cluster",
-    )
+    run_no_wait_history_phase(HistoryPhase {
+        endpoint: endpoint.clone(),
+        key: key.clone(),
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: 0,
+        workers: 3,
+        steps: 6,
+        label: "old-cluster".to_string(),
+    })
     .await;
 
     for index in 0..cluster.nodes.len() {
@@ -123,16 +135,16 @@ async fn mixed_binary_rolling_upgrade_preserves_no_wait_linearizability() {
             .wait_for_node_http(index, Duration::from_secs(10))
             .await;
         cluster.wait_for_leader(Duration::from_secs(20)).await;
-        run_no_wait_history_phase(
-            endpoint.clone(),
-            key.clone(),
-            Arc::clone(&history),
-            Arc::clone(&order),
-            index + 1,
-            3,
-            6,
-            "rolling-upgrade",
-        )
+        run_no_wait_history_phase(HistoryPhase {
+            endpoint: endpoint.clone(),
+            key: key.clone(),
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: index + 1,
+            workers: 3,
+            steps: 6,
+            label: "rolling-upgrade".to_string(),
+        })
         .await;
     }
 
@@ -341,25 +353,18 @@ fn write_node_config(nodes: &[NodeSpec], index: usize) -> std::io::Result<()> {
     fs::write(&node.config_path, text)
 }
 
-async fn run_no_wait_history_phase(
-    endpoint: String,
-    key: String,
-    history: Arc<Mutex<Vec<LockHistoryOp>>>,
-    order: Arc<AtomicUsize>,
-    phase: usize,
-    workers: usize,
-    steps: usize,
-    label: &str,
-) {
-    let start = Arc::new(tokio::sync::Barrier::new(workers));
+async fn run_no_wait_history_phase(config: HistoryPhase) {
+    let start = Arc::new(tokio::sync::Barrier::new(config.workers));
     let mut tasks = Vec::new();
-    for worker in 0..workers {
-        let endpoint = endpoint.clone();
-        let key = key.clone();
-        let history = Arc::clone(&history);
-        let order = Arc::clone(&order);
+    for worker in 0..config.workers {
+        let endpoint = config.endpoint.clone();
+        let key = config.key.clone();
+        let history = Arc::clone(&config.history);
+        let order = Arc::clone(&config.order);
         let start = Arc::clone(&start);
-        let label = label.to_string();
+        let phase = config.phase;
+        let steps = config.steps;
+        let label = config.label.clone();
         tasks.push(tokio::spawn(async move {
             start.wait().await;
             for step in 0..steps {
@@ -719,4 +724,115 @@ fn uuid_short() -> String {
         .next()
         .unwrap()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(invoke_order: usize, response_order: usize, result: LockHistoryResult) -> LockHistoryOp {
+        LockHistoryOp {
+            key: "version-skew-key".to_string(),
+            invoke_order,
+            response_order,
+            result,
+        }
+    }
+
+    #[test]
+    fn version_skew_history_checker_accepts_serial_no_wait_lock_history() {
+        let history = vec![
+            op(
+                0,
+                1,
+                LockHistoryResult::Acquired {
+                    lock_uuid: "lock-a".to_string(),
+                },
+            ),
+            op(2, 3, LockHistoryResult::NotAcquired),
+            op(
+                4,
+                5,
+                LockHistoryResult::Released {
+                    lock_uuid: "lock-a".to_string(),
+                },
+            ),
+            op(
+                6,
+                7,
+                LockHistoryResult::Acquired {
+                    lock_uuid: "lock-b".to_string(),
+                },
+            ),
+            op(
+                8,
+                9,
+                LockHistoryResult::Released {
+                    lock_uuid: "lock-b".to_string(),
+                },
+            ),
+        ];
+
+        assert_lock_history_linearizable(&history);
+    }
+
+    #[test]
+    #[should_panic(expected = "no linearization found")]
+    fn version_skew_history_checker_rejects_overlapping_grants() {
+        let history = vec![
+            op(
+                0,
+                1,
+                LockHistoryResult::Acquired {
+                    lock_uuid: "lock-a".to_string(),
+                },
+            ),
+            op(
+                2,
+                3,
+                LockHistoryResult::Acquired {
+                    lock_uuid: "lock-b".to_string(),
+                },
+            ),
+        ];
+
+        assert_lock_history_linearizable(&history);
+    }
+
+    #[test]
+    fn version_skew_cluster_writes_three_node_incremental_raft_config() {
+        let root = unique_temp_dir("lmx-raft-version-skew-config-test");
+        let cluster = VersionSkewCluster::new(root).expect("create version-skew test cluster");
+
+        assert_eq!(cluster.nodes.len(), 3);
+        for (index, node) in cluster.nodes.iter().enumerate() {
+            let config = fs::read_to_string(&node.config_path)
+                .unwrap_or_else(|err| panic!("read config for version-skew node {index}: {err}"));
+            assert!(config.contains("[raft]\n"));
+            assert!(config.contains("enabled = true\n"));
+            assert!(config.contains("data_dir_lock = true\n"));
+            assert!(config.contains("append_entries_max_entries = 64\n"));
+            assert!(config.contains("append_entries_max_bytes = 262144\n"));
+            assert!(config.contains("append_entries_max_inline_batches = 16\n"));
+            assert!(config.contains("target_quorum_extra_fanout = 0\n"));
+            assert!(config.contains("client_batch_max_entries = 16\n"));
+            assert_eq!(
+                config.matches("[[raft.peers]]").count(),
+                3,
+                "node {index} config should include all peers: {config}"
+            );
+            for peer in &cluster.nodes {
+                assert!(
+                    config.contains(&format!("id = \"{}\"", peer.id)),
+                    "node {index} config missing peer {}: {config}",
+                    peer.id
+                );
+                assert!(
+                    config.contains(&format!("addr = \"127.0.0.1:{}\"", peer.raft_port)),
+                    "node {index} config missing peer addr {}: {config}",
+                    peer.raft_port
+                );
+            }
+        }
+    }
 }

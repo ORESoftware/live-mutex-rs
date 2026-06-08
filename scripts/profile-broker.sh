@@ -23,7 +23,7 @@ bench_keys="${BENCH_KEYS:-256}"
 bench_duration_ms="${BENCH_DURATION_MS:-10000}"
 bench_ttl_ms="${BENCH_TTL_MS:-5000}"
 bench_io_timeout_ms="${BENCH_IO_TIMEOUT_MS:-5000}"
-bench_http_keepalive="${BENCH_HTTP_KEEPALIVE:-false}"
+bench_http_keepalive="${BENCH_HTTP_KEEPALIVE:-true}"
 capture_metrics="${CAPTURE_METRICS:-true}"
 metrics_timeout_s="${METRICS_TIMEOUT_SECONDS:-2}"
 sample_seconds="${SAMPLE_SECONDS:-8}"
@@ -66,6 +66,8 @@ usage() {
   echo "env: RAFT_BENCH_ROUTE=$raft_bench_route # leader|round-robin for PROFILE_TARGET=raft" >&2
   echo "env: BENCH_WORKERS=$bench_workers BENCH_KEYS=$bench_keys BENCH_DURATION_MS=$bench_duration_ms" >&2
   echo "env: BENCH_HTTP_KEEPALIVE=$bench_http_keepalive" >&2
+  echo "env: BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=${BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH:-<optional>}" >&2
+  echo "env: BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=${BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE:-<optional>}" >&2
   echo "env: BENCH_RAFT_METRICS=$raft_metrics_default BENCH_RAFT_METRICS_ENDPOINTS=${bench_raft_metrics_endpoints:-<all-local-raft-nodes>}" >&2
   echo "env: CAPTURE_METRICS=$capture_metrics METRICS_TIMEOUT_SECONDS=$metrics_timeout_s" >&2
 }

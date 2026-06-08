@@ -174,13 +174,13 @@ BENCH_TARGET=raft BENCH_RAFT=127.0.0.1:6972,127.0.0.1:6973,127.0.0.1:6974 \
   cargo run --release --example redis_vs_raft_bench --no-default-features
 ```
 
-Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. By default the
-HTTP clients open one short-lived connection per request, which matches the
-simple LB-facing API but means the number includes connection setup cost. Set
-`BENCH_HTTP_KEEPALIVE=true` to reuse per-worker HTTP sockets per endpoint when
-you want to reduce client-side TCP churn and isolate Broker versus BrokerRaft
-server work more closely. Pass a single `BENCH_RAFT` endpoint for a real LB
-service or leader-preferred profiling. Pass a comma-separated list to
+Set `BENCH_HTTP_AUTH_TOKEN` when the HTTP API requires auth. The standalone
+benchmark opens one short-lived connection per request by default, which matches
+the simple LB-facing API but means the number includes connection setup cost.
+Set `BENCH_HTTP_KEEPALIVE=true` to reuse per-worker HTTP sockets per endpoint
+when you want to reduce client-side TCP churn and isolate Broker versus
+BrokerRaft server work more closely. Pass a single `BENCH_RAFT` endpoint for a
+real LB service or leader-preferred profiling. Pass a comma-separated list to
 round-robin benchmark traffic across node HTTP ports per HTTP request, so
 acquire and release in one cycle may hit different nodes and include follower
 proxy cost. Set `BENCH_RAFT_ROUTE=leader` with a comma-separated endpoint list
@@ -196,6 +196,9 @@ process; the default `PROFILE_TARGET=broker` profiles the regular Broker
 baseline. `scripts/profile-raft.sh` still profiles the Raft integration-test
 workload. Both scripts build with the `profiling` profile and force frame
 pointers so `perf`, `sample`, or flamegraph output has usable stacks.
+`scripts/profile-broker.sh` defaults `BENCH_HTTP_KEEPALIVE=true` for cleaner
+server-side CPU profiles; set `BENCH_HTTP_KEEPALIVE=false` there when you want
+one-shot connection behavior.
 `scripts/profile-broker.sh` also captures before/after `/metrics` and status
 artifacts in `target/profiles` by default, including every local BrokerRaft node
 when `PROFILE_TARGET=raft`; set `CAPTURE_METRICS=false` to disable that scrape.
@@ -936,10 +939,13 @@ runs can distinguish zero-RPC commits, already-committed target waits, and
 fanout rounds that returned once a quorum had replied. Cached peer `matchIndex`
 values above the leader's local log tail are ignored for target-index and commit
 quorum accounting, and already-committed fallback quorum shortcuts require the
-local log/snapshot to cover the target index. Target-index foreground
-fanout narrowing, including membership-scoped joint commits, is counted in
+local log/snapshot to cover the target index. Ordinary target-index foreground
+fanout narrowing is counted in
 `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_rounds_total` and
 `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_skipped_peers_total`.
+Membership-change entries use full foreground fanout and wait for busy pooled
+peer connections so reconfiguration does not strand old or newly promoted voters
+behind quorum-minimum optimization.
 Immediate retry rotation across ready skipped foreground candidates is counted in
 `dd_rust_network_mutex_raft_replication_quorum_limited_fanout_fast_retries_total`.
 Configured foreground spare peers beyond the minimum quorum need are counted in
@@ -1184,6 +1190,24 @@ regression gate is:
 ```bash
 scripts/raft-hardening-gate.sh
 ```
+
+The gate also scans `src/broker_raft.rs` for direct full-log read/rewrite
+primitive calls and only allows them in startup, recovery, compaction, snapshot
+install, and test helper paths. A new exception should be documented in
+`docs/raft.md`; replication and proposal hot paths should keep using retained
+caches, bounded `AppendEntries`, append-only writes, truncate+append repair, or
+`InstallSnapshot`.
+It also promotes maintenance and compaction regressions into the normal gate:
+stale snapshot-transfer cleanup cadence, snapshot-maintenance blocking/gate
+behavior, threshold/overdue compaction, and trim-failure retry observability.
+The quick gate also covers the current BrokerRaft unit-test inventory through
+broad prefix slices plus an explicit singleton tail, and self-audits those
+filters against `cargo test --lib -- --list` so new BrokerRaft unit tests cannot
+silently miss quick mode. Full mode still adds the complete no-default-features
+library suite.
+It also runs all-targets Clippy by default so test helpers, examples, and live
+smoke harnesses are linted along with the library. Set `CLIPPY_SCOPE=lib` for a
+shorter library-only diagnostic run.
 
 To collect repeatable local or staging soak evidence with per-iteration logs,
 a per-run TSV summary, an aggregate summary index, a run manifest, and captured

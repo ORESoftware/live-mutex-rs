@@ -3077,6 +3077,11 @@ fn validate_broker_raft_waiter_snapshot(
                     "broker snapshot lock `{lock_key}` has a composite waiter with no remaining keys"
                 ));
             }
+            if remaining_keys.first().is_some_and(|key| key != lock_key) {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` has composite waiter queued on the wrong key"
+                ));
+            }
             let mut all = std::collections::BTreeSet::new();
             for key in all_keys {
                 if key.is_empty() {
@@ -3090,10 +3095,34 @@ fn validate_broker_raft_waiter_snapshot(
                     ));
                 }
             }
-            for key in remaining_keys.iter().chain(granted_keys.iter()) {
+            let mut remaining = std::collections::BTreeSet::new();
+            for key in remaining_keys {
                 if !all.contains(key) {
                     return Err(format!(
                         "broker snapshot lock `{lock_key}` has composite sub-key `{key}` outside allKeys"
+                    ));
+                }
+                if !remaining.insert(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` repeats remaining composite key `{key}`"
+                    ));
+                }
+            }
+            let mut granted = std::collections::BTreeSet::new();
+            for key in granted_keys {
+                if !all.contains(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` has composite sub-key `{key}` outside allKeys"
+                    ));
+                }
+                if !granted.insert(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` repeats granted composite key `{key}`"
+                    ));
+                }
+                if remaining.contains(key) {
+                    return Err(format!(
+                        "broker snapshot lock `{lock_key}` has composite key `{key}` in both remainingKeys and grantedKeys"
                     ));
                 }
             }
@@ -3103,6 +3132,24 @@ fn validate_broker_raft_waiter_snapshot(
                         "broker snapshot lock `{lock_key}` has granted token for unknown key `{key}`"
                     ));
                 }
+            }
+            if remaining
+                .union(&granted)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                != all
+            {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` composite waiter does not partition allKeys"
+                ));
+            }
+            let token_keys = granted_tokens
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>();
+            if token_keys != granted {
+                return Err(format!(
+                    "broker snapshot lock `{lock_key}` composite granted token keys do not match grantedKeys"
+                ));
             }
             Ok(())
         }
@@ -3212,6 +3259,77 @@ mod tests {
             out.push(msg);
         }
         out
+    }
+
+    fn partial_composite_snapshot_payload() -> serde_json::Value {
+        let broker = Broker::new(BrokerConfig::default());
+        let (holder, mut holder_rx) = broker.register_client();
+        let (waiter, mut waiter_rx) = broker.register_client();
+        broker.handle_request(
+            holder,
+            Request::Lock {
+                uuid: "snapshot-partial-holder".into(),
+                key: Some("snapshot-partial-b".into()),
+                keys: None,
+                pid: None,
+                ttl: None,
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert!(drain(&mut holder_rx)
+            .iter()
+            .any(|response| matches!(response, Response::Lock { acquired: true, .. })));
+        broker.handle_request(
+            waiter,
+            Request::Lock {
+                uuid: "snapshot-partial-composite".into(),
+                key: None,
+                keys: Some(vec![
+                    "snapshot-partial-b".into(),
+                    "snapshot-partial-a".into(),
+                ]),
+                pid: None,
+                ttl: None,
+                max: None,
+                force: false,
+                retry_count: 0,
+                keep_locks_after_death: false,
+                wait: None,
+            },
+        );
+        assert!(drain(&mut waiter_rx).iter().any(|response| matches!(
+            response,
+            Response::CompositeLock {
+                acquired: false,
+                ..
+            }
+        )));
+        assert_eq!(broker.metrics().holders, 2);
+        assert_eq!(broker.metrics().waiters, 1);
+        serde_json::json!({
+            "broker": broker.snapshot_for_raft().expect("partial composite snapshot"),
+        })
+    }
+
+    fn partial_composite_waiter_kind_mut(
+        payload: &mut serde_json::Value,
+    ) -> &mut serde_json::Value {
+        payload["broker"]["locks"]
+            .as_array_mut()
+            .expect("snapshot locks")
+            .iter_mut()
+            .find(|lock| lock["key"] == "snapshot-partial-b")
+            .expect("lock with queued composite waiter")["queue"]
+            .as_array_mut()
+            .expect("queued waiter")
+            .first_mut()
+            .expect("composite waiter")
+            .get_mut("kind")
+            .expect("composite kind")
     }
 
     #[test]
@@ -3507,6 +3625,111 @@ mod tests {
         let metrics = restored.metrics();
         assert_eq!(metrics.holders, 1);
         assert_eq!(metrics.waiters, 0);
+    }
+
+    #[test]
+    fn raft_snapshot_validation_accepts_partial_composite_waiter_partition() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-partial-composite-valid-1");
+        let payload = partial_composite_snapshot_payload();
+
+        Broker::validate_raft_snapshot_payload(&payload)
+            .expect("partial composite snapshot should validate");
+
+        let restored = Broker::new(BrokerConfig::default());
+        restored
+            .install_raft_snapshot(&payload)
+            .expect("partial composite snapshot should install");
+        let metrics = restored.metrics();
+        assert_eq!(metrics.holders, 2);
+        assert_eq!(metrics.waiters, 1);
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_composite_waiter_on_wrong_queue_key() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-composite-wrong-queue-key-1");
+        let mut payload = partial_composite_snapshot_payload();
+        let kind = partial_composite_waiter_kind_mut(&mut payload);
+        kind["remainingKeys"] = serde_json::json!(["snapshot-partial-a", "snapshot-partial-b"]);
+        kind["grantedKeys"] = serde_json::json!([]);
+        kind["grantedTokens"] = serde_json::json!({});
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("wrong queued key must be rejected");
+
+        assert!(
+            err.contains("queued on the wrong key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_composite_waiter_duplicate_remaining_key() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-composite-duplicate-remaining-1");
+        let mut payload = partial_composite_snapshot_payload();
+        let kind = partial_composite_waiter_kind_mut(&mut payload);
+        kind["remainingKeys"] = serde_json::json!(["snapshot-partial-b", "snapshot-partial-b"]);
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("duplicate remaining key must be rejected");
+
+        assert!(
+            err.contains("repeats remaining composite key"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_composite_waiter_overlapping_partition() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-composite-overlap-1");
+        let mut payload = partial_composite_snapshot_payload();
+        let kind = partial_composite_waiter_kind_mut(&mut payload);
+        kind["grantedKeys"] = serde_json::json!(["snapshot-partial-a", "snapshot-partial-b"]);
+        kind["grantedTokens"] = serde_json::json!({
+            "snapshot-partial-a": 1,
+            "snapshot-partial-b": 2,
+        });
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("overlapping remaining/granted key must be rejected");
+
+        assert!(
+            err.contains("in both remainingKeys and grantedKeys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_composite_waiter_incomplete_partition() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-composite-incomplete-partition-1");
+        let mut payload = partial_composite_snapshot_payload();
+        let kind = partial_composite_waiter_kind_mut(&mut payload);
+        kind["remainingKeys"] = serde_json::json!(["snapshot-partial-b"]);
+        kind["grantedKeys"] = serde_json::json!([]);
+        kind["grantedTokens"] = serde_json::json!({});
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("incomplete composite partition must be rejected");
+
+        assert!(
+            err.contains("does not partition allKeys"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn raft_snapshot_validation_rejects_composite_waiter_token_key_mismatch() {
+        crate::routine_id!("ddl-routine-broker-test-snapshot-composite-token-mismatch-1");
+        let mut payload = partial_composite_snapshot_payload();
+        let kind = partial_composite_waiter_kind_mut(&mut payload);
+        kind["grantedTokens"] = serde_json::json!({});
+
+        let err = Broker::validate_raft_snapshot_payload(&payload)
+            .expect_err("missing granted token must be rejected");
+
+        assert!(
+            err.contains("granted token keys do not match grantedKeys"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

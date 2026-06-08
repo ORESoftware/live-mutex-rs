@@ -48,7 +48,13 @@ enum LiveHttpLinearModelOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LiveFullLogMetrics {
     reads_total: u64,
+    read_failures_total: u64,
+    read_bytes_total: u64,
+    read_entries_total: u64,
     rewrites_total: u64,
+    rewrite_failures_total: u64,
+    rewrite_entries_total: u64,
+    rewrite_bytes_total: u64,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -151,16 +157,16 @@ async fn live_raft_http_survives_kubectl_leader_delete_when_enabled() {
         );
         None
     };
-    run_live_http_no_wait_history_phase(
-        endpoint.clone(),
-        vec![history_key.clone()],
-        Arc::clone(&history),
-        Arc::clone(&order),
-        0,
-        2,
-        3,
-        "live-k8s-before-failover",
-    )
+    run_live_http_no_wait_history_phase(LiveHttpNoWaitHistoryPhase {
+        endpoint: endpoint.clone(),
+        keys: vec![history_key.clone()],
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: 0,
+        workers: 2,
+        steps: 3,
+        label: "live-k8s-before-failover".to_string(),
+    })
     .await;
     if let (Some(endpoints), Some(before_phase_full_log)) =
         (&metrics_endpoints, &before_phase_full_log)
@@ -182,14 +188,16 @@ async fn live_raft_http_survives_kubectl_leader_delete_when_enabled() {
     .expect("pre-failover acquire/release through BrokerRaft service");
 
     let during_history = tokio::spawn(run_live_http_no_wait_history_phase(
-        endpoint.clone(),
-        vec![history_key],
-        Arc::clone(&history),
-        Arc::clone(&order),
-        1,
-        4,
-        10,
-        "live-k8s-during-failover",
+        LiveHttpNoWaitHistoryPhase {
+            endpoint: endpoint.clone(),
+            keys: vec![history_key],
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: 1,
+            workers: 4,
+            steps: 10,
+            label: "live-k8s-during-failover".to_string(),
+        },
     ));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -252,7 +260,7 @@ async fn live_raft_http_survives_kubectl_leader_delete_when_enabled() {
     ]);
 }
 
-async fn run_live_http_no_wait_history_phase(
+struct LiveHttpNoWaitHistoryPhase {
     endpoint: String,
     keys: Vec<String>,
     history: Arc<Mutex<Vec<LiveHttpLockHistoryOp>>>,
@@ -260,12 +268,23 @@ async fn run_live_http_no_wait_history_phase(
     phase: usize,
     workers: usize,
     steps: usize,
-    label: &str,
-) {
+    label: String,
+}
+
+async fn run_live_http_no_wait_history_phase(phase_spec: LiveHttpNoWaitHistoryPhase) {
+    let LiveHttpNoWaitHistoryPhase {
+        endpoint,
+        keys,
+        history,
+        order,
+        phase,
+        workers,
+        steps,
+        label,
+    } = phase_spec;
     assert!(!keys.is_empty(), "live history phase needs lock keys");
     assert!(workers > 0, "live history phase needs workers");
     let start = Arc::new(tokio::sync::Barrier::new(workers));
-    let label = label.to_string();
     let mut tasks = Vec::new();
 
     for worker in 0..workers {
@@ -525,11 +544,41 @@ async fn current_live_full_log_metric(endpoint: &str) -> LiveFullLogMetrics {
             "dd_rust_network_mutex_raft_log_full_reads_total",
         )
         .unwrap_or_else(|| panic!("full-log read metric missing at {endpoint}")),
+        read_failures_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_read_failures_total",
+        )
+        .unwrap_or_else(|| panic!("full-log read-failure metric missing at {endpoint}")),
+        read_bytes_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+        )
+        .unwrap_or_else(|| panic!("full-log read-bytes metric missing at {endpoint}")),
+        read_entries_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_read_entries_total",
+        )
+        .unwrap_or_else(|| panic!("full-log read-entries metric missing at {endpoint}")),
         rewrites_total: prometheus_metric_value(
             &metrics,
             "dd_rust_network_mutex_raft_log_full_rewrites_total",
         )
         .unwrap_or_else(|| panic!("full-log rewrite metric missing at {endpoint}")),
+        rewrite_failures_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+        )
+        .unwrap_or_else(|| panic!("full-log rewrite-failure metric missing at {endpoint}")),
+        rewrite_entries_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
+        )
+        .unwrap_or_else(|| panic!("full-log rewrite-entries metric missing at {endpoint}")),
+        rewrite_bytes_total: prometheus_metric_value(
+            &metrics,
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
+        )
+        .unwrap_or_else(|| panic!("full-log rewrite-bytes metric missing at {endpoint}")),
     }
 }
 
@@ -541,7 +590,7 @@ async fn assert_live_full_log_metrics_unchanged(
     let after = current_live_full_log_metrics(endpoints).await;
     assert_eq!(
         &after, before,
-        "{label} should not use full-log scans or rewrites; before={before:?} after={after:?}"
+        "{label} should not use full-log scans, read-failure, rewrite, or rewrite-failure paths; before={before:?} after={after:?}"
     );
 }
 
@@ -1058,7 +1107,13 @@ mod tests {
 dd_rust_network_mutex_raft_log_full_reads_total{node=\"a\"} 1\n\
 dd_rust_network_mutex_raft_log_full_reads_total{node=\"b\"} 2\n\
 dd_rust_network_mutex_raft_log_full_reads_total NaN\n\
+dd_rust_network_mutex_raft_log_full_read_failures_total 0\n\
+dd_rust_network_mutex_raft_log_full_read_bytes_total 10\n\
+dd_rust_network_mutex_raft_log_full_read_entries_total 4\n\
 dd_rust_network_mutex_raft_log_full_rewrites_total 0\n\
+dd_rust_network_mutex_raft_log_full_rewrite_failures_total 0\n\
+dd_rust_network_mutex_raft_log_full_rewrite_entries_total 0\n\
+dd_rust_network_mutex_raft_log_full_rewrite_bytes_total 0\n\
 bad_line\n";
 
         assert_eq!(
@@ -1069,6 +1124,27 @@ bad_line\n";
             prometheus_metric_value(
                 metrics,
                 "dd_rust_network_mutex_raft_log_full_rewrites_total"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            prometheus_metric_value(
+                metrics,
+                "dd_rust_network_mutex_raft_log_full_read_bytes_total"
+            ),
+            Some(10)
+        );
+        assert_eq!(
+            prometheus_metric_value(
+                metrics,
+                "dd_rust_network_mutex_raft_log_full_read_failures_total"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            prometheus_metric_value(
+                metrics,
+                "dd_rust_network_mutex_raft_log_full_rewrite_failures_total"
             ),
             Some(0)
         );

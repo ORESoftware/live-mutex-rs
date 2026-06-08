@@ -665,7 +665,13 @@ async fn current_metric_sum_for_nodes(cluster: &RaftCluster, nodes: &[usize], na
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FullLogMetrics {
     reads_total: u64,
+    read_failures_total: u64,
+    read_bytes_total: u64,
+    read_entries_total: u64,
     rewrites_total: u64,
+    rewrite_failures_total: u64,
+    rewrite_entries_total: u64,
+    rewrite_bytes_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -693,8 +699,38 @@ enum HttpLinearModelOp {
 async fn current_full_log_metrics(port: u16) -> FullLogMetrics {
     FullLogMetrics {
         reads_total: current_metric(port, "dd_rust_network_mutex_raft_log_full_reads_total").await,
+        read_failures_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_read_failures_total",
+        )
+        .await,
+        read_bytes_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+        )
+        .await,
+        read_entries_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_read_entries_total",
+        )
+        .await,
         rewrites_total: current_metric(port, "dd_rust_network_mutex_raft_log_full_rewrites_total")
             .await,
+        rewrite_failures_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+        )
+        .await,
+        rewrite_entries_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
+        )
+        .await,
+        rewrite_bytes_total: current_metric(
+            port,
+            "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
+        )
+        .await,
     }
 }
 
@@ -721,7 +757,7 @@ async fn assert_full_log_metrics_unchanged(
     let after = current_full_log_metrics_for_nodes(cluster, nodes).await;
     assert_eq!(
         &after, before,
-        "{label} should not use full-log scans or rewrites; before={before:?} after={after:?}"
+        "{label} should not use full-log scans, read-failure, rewrite, or rewrite-failure paths; before={before:?} after={after:?}"
     );
 }
 
@@ -960,7 +996,7 @@ fn apply_http_linear_model_op(holder: u16, op: HttpLinearModelOp) -> Option<u16>
     }
 }
 
-async fn run_http_no_wait_history_phase(
+struct HttpNoWaitHistoryPhase {
     port: u16,
     keys: Vec<String>,
     history: Arc<Mutex<Vec<HttpLockHistoryOp>>>,
@@ -968,12 +1004,23 @@ async fn run_http_no_wait_history_phase(
     phase: usize,
     workers: usize,
     steps: usize,
-    label: &str,
-) {
+    label: String,
+}
+
+async fn run_http_no_wait_history_phase(phase_spec: HttpNoWaitHistoryPhase) {
+    let HttpNoWaitHistoryPhase {
+        port,
+        keys,
+        history,
+        order,
+        phase,
+        workers,
+        steps,
+        label,
+    } = phase_spec;
     assert!(!keys.is_empty(), "history phase needs lock keys");
     assert!(workers > 0, "history phase needs workers");
     let start = Arc::new(tokio::sync::Barrier::new(workers));
-    let label = label.to_string();
     let mut tasks = Vec::new();
 
     for worker in 0..workers {
@@ -1090,17 +1137,30 @@ async fn run_http_no_wait_history_phase(
     }
 }
 
-async fn run_lb_membership_churn_history_step(
-    cluster: &RaftCluster,
-    active_nodes: &[usize],
-    target_nodes: &[usize],
+struct LbMembershipChurnHistoryStep<'a> {
+    cluster: &'a RaftCluster,
+    active_nodes: &'a [usize],
+    target_nodes: &'a [usize],
     expected_size: u64,
     expected_quorum: u64,
     phase: usize,
     history: Arc<Mutex<Vec<HttpLockHistoryOp>>>,
     order: Arc<AtomicUsize>,
-    label: &str,
-) {
+    label: &'a str,
+}
+
+async fn run_lb_membership_churn_history_step(step: LbMembershipChurnHistoryStep<'_>) {
+    let LbMembershipChurnHistoryStep {
+        cluster,
+        active_nodes,
+        target_nodes,
+        expected_size,
+        expected_quorum,
+        phase,
+        history,
+        order,
+        label,
+    } = step;
     let lb = start_round_robin_lb(
         active_nodes
             .iter()
@@ -1131,16 +1191,16 @@ async fn run_lb_membership_churn_history_step(
         let label = label.to_string();
         tokio::spawn(async move {
             let _lb = lb;
-            run_http_no_wait_history_phase(
-                lb_port,
+            run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+                port: lb_port,
                 keys,
                 history,
                 order,
                 phase,
-                4,
-                12,
-                &format!("lb-membership-churn-{label}"),
-            )
+                workers: 4,
+                steps: 12,
+                label: format!("lb-membership-churn-{label}"),
+            })
             .await;
         })
     };
@@ -1859,16 +1919,16 @@ async fn raft_lb_failover_no_wait_history_is_linearizable() {
     let order = Arc::new(AtomicUsize::new(0));
 
     let before_phase0_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
-    run_http_no_wait_history_phase(
-        lb.port,
-        keys.clone(),
-        Arc::clone(&history),
-        Arc::clone(&order),
-        0,
-        3,
-        6,
-        "lb-before-failover",
-    )
+    run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+        port: lb.port,
+        keys: keys.clone(),
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: 0,
+        workers: 3,
+        steps: 6,
+        label: "lb-before-failover".to_string(),
+    })
     .await;
     wait_for_zero_holders_and_waiters(&cluster).await;
     assert_full_log_metrics_unchanged(
@@ -1911,16 +1971,16 @@ async fn raft_lb_failover_no_wait_history_is_linearizable() {
     .await;
 
     let before_phase1_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
-    run_http_no_wait_history_phase(
-        lb.port,
+    run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+        port: lb.port,
         keys,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        1,
-        3,
-        6,
-        "lb-after-failover",
-    )
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: 1,
+        workers: 3,
+        steps: 6,
+        label: "lb-after-failover".to_string(),
+    })
     .await;
     wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
     assert_full_log_metrics_unchanged(
@@ -1951,16 +2011,16 @@ async fn raft_lb_rolling_restart_no_wait_history_is_linearizable() {
     for (phase, restart_index) in all_nodes.iter().copied().enumerate() {
         wait_for_leader(&cluster).await;
         let before_phase_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
-        run_http_no_wait_history_phase(
-            lb.port,
-            keys.clone(),
-            Arc::clone(&history),
-            Arc::clone(&order),
+        run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+            port: lb.port,
+            keys: keys.clone(),
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
             phase,
-            3,
-            5,
-            "lb-rolling-restart",
-        )
+            workers: 3,
+            steps: 5,
+            label: "lb-rolling-restart".to_string(),
+        })
         .await;
         wait_for_zero_holders_and_waiters(&cluster).await;
         let leader = wait_for_leader(&cluster).await;
@@ -2013,16 +2073,16 @@ async fn raft_lb_rolling_restart_no_wait_history_is_linearizable() {
     }
 
     let before_final_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
-    run_http_no_wait_history_phase(
-        lb.port,
+    run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+        port: lb.port,
         keys,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        all_nodes.len(),
-        3,
-        5,
-        "lb-rolling-restart-final",
-    )
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: all_nodes.len(),
+        workers: 3,
+        steps: 5,
+        label: "lb-rolling-restart-final".to_string(),
+    })
     .await;
     wait_for_zero_holders_and_waiters(&cluster).await;
     let leader = wait_for_leader(&cluster).await;
@@ -2099,16 +2159,16 @@ async fn raft_lb_rolling_config_skew_restart_no_wait_history_is_linearizable() {
             let history = Arc::clone(&history);
             let order = Arc::clone(&order);
             tokio::spawn(async move {
-                run_http_no_wait_history_phase(
-                    lb_port,
+                run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+                    port: lb_port,
                     keys,
                     history,
                     order,
                     phase,
-                    3,
-                    4,
-                    "lb-rolling-config-skew",
-                )
+                    workers: 3,
+                    steps: 4,
+                    label: "lb-rolling-config-skew".to_string(),
+                })
                 .await;
             })
         };
@@ -2140,16 +2200,16 @@ async fn raft_lb_rolling_config_skew_restart_no_wait_history_is_linearizable() {
     }
 
     let before_final_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
-    run_http_no_wait_history_phase(
-        lb.port,
+    run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+        port: lb.port,
         keys,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        all_nodes.len(),
-        3,
-        4,
-        "lb-rolling-config-skew-final",
-    )
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        phase: all_nodes.len(),
+        workers: 3,
+        steps: 4,
+        label: "lb-rolling-config-skew-final".to_string(),
+    })
     .await;
     wait_for_zero_holders_and_waiters(&cluster).await;
     let leader = wait_for_leader(&cluster).await;
@@ -2209,16 +2269,16 @@ async fn raft_lb_live_leader_kill_restart_history_is_linearizable() {
         let order = Arc::clone(&order);
         let keys = keys.clone();
         tokio::spawn(async move {
-            run_http_no_wait_history_phase(
-                lb.port,
+            run_http_no_wait_history_phase(HttpNoWaitHistoryPhase {
+                port: lb.port,
                 keys,
                 history,
                 order,
-                0,
-                3,
-                4,
-                "lb-live-leader-kill",
-            )
+                phase: 0,
+                workers: 3,
+                steps: 4,
+                label: "lb-live-leader-kill".to_string(),
+            })
             .await;
         })
     };
@@ -2833,6 +2893,10 @@ async fn raft_follower_proxy_survives_leaderless_failover_window() {
     wait_for_status_indexes_at_least_among(&cluster, &all_nodes, acquired_index, acquired_index)
         .await;
 
+    let survivors: Vec<usize> = (0..cluster.http_ports.len())
+        .filter(|idx| *idx != old_leader)
+        .collect();
+    let before_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
     cluster.abort_node(old_leader).await;
     let target_port = cluster.http_ports[target_follower];
     let (status, release) = http_post_json(
@@ -2867,9 +2931,6 @@ async fn raft_follower_proxy_survives_leaderless_failover_window() {
         "failover release should either be proxied by the target follower or handled after it became leader; forwarded={forwarded}, retries={retries}, status={target_status:?}, release={release:?}"
     );
 
-    let survivors: Vec<usize> = (0..cluster.http_ports.len())
-        .filter(|idx| *idx != old_leader)
-        .collect();
     let new_leader = wait_for_leader_among(&cluster, &survivors).await;
     assert_ne!(new_leader, old_leader);
     let release_status = wait_for_status_index_at_least(
@@ -2884,6 +2945,13 @@ async fn raft_follower_proxy_survives_leaderless_failover_window() {
     wait_for_status_indexes_at_least_among(&cluster, &survivors, release_index, release_index)
         .await;
     wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_full_log,
+        "leaderless follower-proxy failover release",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2994,7 +3062,14 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
 
     cluster.abort_node(old_leader).await;
     cluster.abort_node(second_old_voter).await;
-    let _new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    let new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    let before_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+    let baseline_status = http_get_json(cluster.http_ports[new_leader], "/raft/status")
+        .await
+        .expect("survivor leader status before membership failover traffic");
+    let baseline_commit_index = baseline_status["commitIndex"]
+        .as_u64()
+        .expect("survivor leader commitIndex before membership failover traffic");
     let survivor_ports = survivors
         .iter()
         .map(|idx| cluster.http_ports[*idx])
@@ -3027,6 +3102,25 @@ async fn raft_membership_promotes_new_voters_and_survives_old_majority_loss() {
         reacquire["acquired"], true,
         "reacquire after membership failover response: {reacquire:?}"
     );
+    let leader_after_reacquire = wait_for_leader_among(&cluster, &survivors).await;
+    let status = http_get_json(cluster.http_ports[leader_after_reacquire], "/raft/status")
+        .await
+        .expect("leader status after membership failover reacquire");
+    let commit_index = status["commitIndex"]
+        .as_u64()
+        .expect("leader commitIndex after membership failover reacquire");
+    assert!(
+        commit_index >= baseline_commit_index.saturating_add(2),
+        "membership failover should commit the release and reacquire after survivor-only baseline; baseline={baseline_commit_index} status={status:?}"
+    );
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, commit_index, commit_index).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_full_log,
+        "post-membership old-majority-loss failover traffic",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3167,30 +3261,30 @@ async fn raft_lb_membership_churn_no_wait_history_is_linearizable() {
     let v5 = vec![0, 1, 2, 3, 4];
 
     wait_for_leader_among(&cluster, &v3).await;
-    run_lb_membership_churn_history_step(
-        &cluster,
-        &v3,
-        &v4,
-        4,
-        3,
-        0,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        "grow-3-to-4",
-    )
+    run_lb_membership_churn_history_step(LbMembershipChurnHistoryStep {
+        cluster: &cluster,
+        active_nodes: &v3,
+        target_nodes: &v4,
+        expected_size: 4,
+        expected_quorum: 3,
+        phase: 0,
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        label: "grow-3-to-4",
+    })
     .await;
 
-    run_lb_membership_churn_history_step(
-        &cluster,
-        &v4,
-        &v5,
-        5,
-        3,
-        1,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        "grow-4-to-5",
-    )
+    run_lb_membership_churn_history_step(LbMembershipChurnHistoryStep {
+        cluster: &cluster,
+        active_nodes: &v4,
+        target_nodes: &v5,
+        expected_size: 5,
+        expected_quorum: 3,
+        phase: 1,
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        label: "grow-4-to-5",
+    })
     .await;
 
     let leader = wait_for_leader_among(&cluster, &v5).await;
@@ -3216,30 +3310,30 @@ async fn raft_lb_membership_churn_no_wait_history_is_linearizable() {
         .filter(|idx| *idx != shrink_victims[1])
         .collect::<Vec<_>>();
 
-    run_lb_membership_churn_history_step(
-        &cluster,
-        &v5,
-        &s4,
-        4,
-        3,
-        2,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        "shrink-5-to-4",
-    )
+    run_lb_membership_churn_history_step(LbMembershipChurnHistoryStep {
+        cluster: &cluster,
+        active_nodes: &v5,
+        target_nodes: &s4,
+        expected_size: 4,
+        expected_quorum: 3,
+        phase: 2,
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        label: "shrink-5-to-4",
+    })
     .await;
 
-    run_lb_membership_churn_history_step(
-        &cluster,
-        &s4,
-        &s3,
-        3,
-        2,
-        3,
-        Arc::clone(&history),
-        Arc::clone(&order),
-        "shrink-4-to-3",
-    )
+    run_lb_membership_churn_history_step(LbMembershipChurnHistoryStep {
+        cluster: &cluster,
+        active_nodes: &s4,
+        target_nodes: &s3,
+        expected_size: 3,
+        expected_quorum: 2,
+        phase: 3,
+        history: Arc::clone(&history),
+        order: Arc::clone(&order),
+        label: "shrink-4-to-3",
+    })
     .await;
 
     let history = history.lock().expect("history").clone();
@@ -3731,8 +3825,17 @@ async fn broker_and_raft_http_contract_match() {
     let cluster = start_cluster().await;
     let _leader = wait_for_leader(&cluster).await;
     let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let before_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
     assert_http_lock_contract(lb.port, "raft").await;
     wait_for_zero_holders_and_waiters(&cluster).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &all_nodes,
+        &before_full_log,
+        "BrokerRaft public HTTP contract including composite union keys",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

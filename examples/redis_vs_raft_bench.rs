@@ -15,9 +15,12 @@
 //! defaults to BENCH_RAFT, so leader-routed traffic can still guard every local
 //! node when the endpoint list includes the full cluster. When metrics capture
 //! is on, BENCH_RAFT_FAIL_ON_FULL_LOG=true fails the benchmark if steady-state
-//! full-log reads or rewrites are observed.
+//! full-log guard counters move.
 //! Optional BENCH_MIN_*_OPS_PER_SEC and BENCH_MAX_*_P99_MS thresholds fail the
 //! benchmark when a target falls below the configured performance floor.
+//! Optional BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH and
+//! BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE thresholds fail Raft metric runs
+//! when batching efficiency regresses.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -86,6 +89,8 @@ struct PerfThresholds {
     max_redis_p99_ms: Option<f64>,
     max_broker_p99_ms: Option<f64>,
     max_raft_p99_ms: Option<f64>,
+    min_raft_client_batch_entries_per_batch: Option<f64>,
+    max_raft_commit_slot_writes_per_cycle: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -320,6 +325,12 @@ impl PerfThresholds {
             max_redis_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_REDIS_P99_MS"),
             max_broker_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_BROKER_P99_MS"),
             max_raft_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_RAFT_P99_MS"),
+            min_raft_client_batch_entries_per_batch: env_parse_optional_non_negative_f64(
+                "BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH",
+            ),
+            max_raft_commit_slot_writes_per_cycle: env_parse_optional_non_negative_f64(
+                "BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE",
+            ),
         }
     }
 
@@ -339,6 +350,66 @@ impl PerfThresholds {
             "raft" => self.max_raft_p99_ms,
             _ => None,
         }
+    }
+
+    fn raft_metric_guard_failures(
+        &self,
+        before: &MetricSnapshot,
+        after: &MetricSnapshot,
+        successful_cycles: u64,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        if let Some(min_entries_per_batch) = self.min_raft_client_batch_entries_per_batch {
+            let client_batches = metric_delta(
+                before,
+                after,
+                "dd_rust_network_mutex_raft_client_batches_total",
+            );
+            let client_entries = metric_delta(
+                before,
+                after,
+                "dd_rust_network_mutex_raft_client_batch_entries_total",
+            );
+            if client_batches <= 0.0 {
+                failures.push(format!(
+                    "[raft-metrics-guard] client batch efficiency unavailable because client_batches={} while BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH={:.3}",
+                    format_metric_rate(client_batches),
+                    min_entries_per_batch
+                ));
+            } else {
+                let actual = client_entries / client_batches;
+                if actual < min_entries_per_batch {
+                    failures.push(format!(
+                        "[raft-metrics-guard] client batch entries per batch {:.3} below BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH {:.3}",
+                        actual,
+                        min_entries_per_batch
+                    ));
+                }
+            }
+        }
+        if let Some(max_commit_writes_per_cycle) = self.max_raft_commit_slot_writes_per_cycle {
+            if successful_cycles == 0 {
+                failures.push(format!(
+                    "[raft-metrics-guard] commit-slot writes per cycle unavailable because raft completed 0 successful cycles while BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE={:.3}",
+                    max_commit_writes_per_cycle
+                ));
+            } else {
+                let commit_slot_writes = metric_delta(
+                    before,
+                    after,
+                    "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total",
+                );
+                let actual = commit_slot_writes / successful_cycles as f64;
+                if actual > max_commit_writes_per_cycle {
+                    failures.push(format!(
+                        "[raft-metrics-guard] commit-slot writes per cycle {:.3} above BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE {:.3}",
+                        actual,
+                        max_commit_writes_per_cycle
+                    ));
+                }
+            }
+        }
+        failures
     }
 }
 
@@ -471,6 +542,13 @@ async fn run_raft(config: Config) -> Summary {
         summary
             .metric_lines
             .extend(raft_metric_per_cycle_lines(&before, &after, summary.ok));
+        let failures = config
+            .perf_thresholds
+            .raft_metric_guard_failures(&before, &after, summary.ok);
+        for failure in failures {
+            summary.metric_lines.push(failure.clone());
+            summary.fatal_errors.push(failure);
+        }
         if config.fail_on_raft_full_log {
             let failures = raft_full_log_guard_failures(&before, &after);
             for failure in failures {
@@ -860,6 +938,46 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total",
     ),
     (
+        "client_batches",
+        "dd_rust_network_mutex_raft_client_batches_total",
+    ),
+    (
+        "client_batch_entries",
+        "dd_rust_network_mutex_raft_client_batch_entries_total",
+    ),
+    (
+        "client_pipeline_batches",
+        "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total",
+    ),
+    (
+        "client_queue_wait_us",
+        "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total",
+    ),
+    (
+        "client_refill_rounds",
+        "dd_rust_network_mutex_raft_client_batch_refill_rounds_total",
+    ),
+    (
+        "client_refilled_entries",
+        "dd_rust_network_mutex_raft_client_batch_refilled_entries_total",
+    ),
+    (
+        "client_commit_waits",
+        "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total",
+    ),
+    (
+        "client_commit_wait_us",
+        "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total",
+    ),
+    (
+        "client_cancelled",
+        "dd_rust_network_mutex_raft_client_batch_cancelled_requests_total",
+    ),
+    (
+        "client_batch_errors",
+        "dd_rust_network_mutex_raft_client_batch_errors_total",
+    ),
+    (
         "follower_conflicts",
         "dd_rust_network_mutex_raft_follower_append_conflicts_total",
     ),
@@ -946,6 +1064,10 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
     (
         "full_log_reads",
         "dd_rust_network_mutex_raft_log_full_reads_total",
+    ),
+    (
+        "full_log_read_failures",
+        "dd_rust_network_mutex_raft_log_full_read_failures_total",
     ),
     (
         "full_log_read_bytes",
@@ -1131,6 +1253,38 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total",
     ),
     (
+        "client_batches",
+        "dd_rust_network_mutex_raft_client_batches_total",
+    ),
+    (
+        "client_batch_entries",
+        "dd_rust_network_mutex_raft_client_batch_entries_total",
+    ),
+    (
+        "client_pipeline_batches",
+        "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total",
+    ),
+    (
+        "client_queue_wait_us",
+        "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total",
+    ),
+    (
+        "client_refill_rounds",
+        "dd_rust_network_mutex_raft_client_batch_refill_rounds_total",
+    ),
+    (
+        "client_refilled_entries",
+        "dd_rust_network_mutex_raft_client_batch_refilled_entries_total",
+    ),
+    (
+        "client_commit_waits",
+        "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total",
+    ),
+    (
+        "client_commit_wait_us",
+        "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total",
+    ),
+    (
         "follower_appended",
         "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
     ),
@@ -1167,8 +1321,16 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_log_full_reads_total",
     ),
     (
+        "full_log_read_failures",
+        "dd_rust_network_mutex_raft_log_full_read_failures_total",
+    ),
+    (
         "full_log_read_bytes",
         "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+    ),
+    (
+        "full_log_read_entries",
+        "dd_rust_network_mutex_raft_log_full_read_entries_total",
     ),
     (
         "full_log_rewrites",
@@ -1182,12 +1344,20 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
         "full_log_rewrite_bytes",
         "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
     ),
+    (
+        "full_log_rewrite_entries",
+        "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
+    ),
 ];
 
 const RAFT_FULL_LOG_GUARD_METRICS: &[(&str, &str)] = &[
     (
         "full_log_reads",
         "dd_rust_network_mutex_raft_log_full_reads_total",
+    ),
+    (
+        "full_log_read_failures",
+        "dd_rust_network_mutex_raft_log_full_read_failures_total",
     ),
     (
         "full_log_read_bytes",
@@ -1392,6 +1562,8 @@ Configuration is environment driven:\n\
   BENCH_MAX_REDIS_P99_MS=<optional ceiling>\n\
   BENCH_MAX_BROKER_P99_MS=<optional ceiling>\n\
   BENCH_MAX_RAFT_P99_MS=<optional ceiling>\n\
+  BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=<optional floor; requires BENCH_RAFT_METRICS=true>\n\
+  BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=<optional ceiling; requires BENCH_RAFT_METRICS=true>\n\
 \n\
 Example:\n\
   BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
@@ -1951,6 +2123,39 @@ mod tests {
     }
 
     #[test]
+    fn raft_metric_guard_reports_batch_efficiency_failures() {
+        let thresholds = PerfThresholds {
+            min_raft_client_batch_entries_per_batch: Some(4.0),
+            max_raft_commit_slot_writes_per_cycle: Some(0.5),
+            ..PerfThresholds::default()
+        };
+        let before = MetricSnapshot::default();
+        let mut after = MetricSnapshot::default();
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batches_total".into(),
+            10.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_entries_total".into(),
+            20.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
+            8.0,
+        );
+
+        let failures = thresholds.raft_metric_guard_failures(&before, &after, 4);
+
+        assert_eq!(failures.len(), 2);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE")));
+    }
+
+    #[test]
     fn perf_guard_rejects_zero_success_by_default_but_can_report_only() {
         let mut config = Config {
             redis_addr: DEFAULT_REDIS_ADDR.to_string(),
@@ -2126,6 +2331,46 @@ nan_value NaN\n",
             1000.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_client_batches_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_entries_total".into(),
+            8.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total".into(),
+            3.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total".into(),
+            100.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refill_rounds_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refilled_entries_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total".into(),
+            200.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_cancelled_requests_total".into(),
+            0.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_errors_total".into(),
+            0.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
             3.0,
         );
@@ -2156,6 +2401,10 @@ nan_value NaN\n",
         before.values.insert(
             "dd_rust_network_mutex_raft_log_full_reads_total".into(),
             2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            0.0,
         );
         before.values.insert(
             "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
@@ -2226,6 +2475,46 @@ nan_value NaN\n",
             3500.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_client_batches_total".into(),
+            7.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_entries_total".into(),
+            38.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total".into(),
+            10.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total".into(),
+            1900.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refill_rounds_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refilled_entries_total".into(),
+            11.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total".into(),
+            7.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total".into(),
+            2900.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_cancelled_requests_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_errors_total".into(),
+            2.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
             7.0,
         );
@@ -2256,6 +2545,10 @@ nan_value NaN\n",
         after.values.insert(
             "dd_rust_network_mutex_raft_log_full_reads_total".into(),
             3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            1.0,
         );
         after.values.insert(
             "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
@@ -2300,6 +2593,16 @@ nan_value NaN\n",
         assert!(joined.contains("admission_probe_fail=+1"));
         assert!(joined.contains("admission_probe_acks=+20"));
         assert!(joined.contains("admission_probe_us=+2500"));
+        assert!(joined.contains("client_batches=+5"));
+        assert!(joined.contains("client_batch_entries=+30"));
+        assert!(joined.contains("client_pipeline_batches=+7"));
+        assert!(joined.contains("client_queue_wait_us=+1800"));
+        assert!(joined.contains("client_refill_rounds=+2"));
+        assert!(joined.contains("client_refilled_entries=+9"));
+        assert!(joined.contains("client_commit_waits=+5"));
+        assert!(joined.contains("client_commit_wait_us=+2700"));
+        assert!(joined.contains("client_cancelled=+1"));
+        assert!(joined.contains("client_batch_errors=+2"));
         assert!(joined.contains("follower_conflicts=+4"));
         assert!(joined.contains("follower_rewrites=+1"));
         assert!(joined.contains("follower_appended=+18"));
@@ -2309,6 +2612,7 @@ nan_value NaN\n",
         assert!(joined.contains("compaction_failures=+2"));
         assert!(joined.contains("compaction_trim_failures=+1"));
         assert!(joined.contains("full_log_reads=+1"));
+        assert!(joined.contains("full_log_read_failures=+1"));
         assert!(joined.contains("full_log_read_bytes=+2048"));
         assert!(joined.contains("full_log_read_entries=+5"));
         assert!(joined.contains("full_log_rewrites=+2"));
@@ -2342,6 +2646,38 @@ nan_value NaN\n",
             1200.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_client_batches_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_entries_total".into(),
+            8.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total".into(),
+            3.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total".into(),
+            400.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refill_rounds_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refilled_entries_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total".into(),
+            800.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
             12.0,
         );
@@ -2366,8 +2702,16 @@ nan_value NaN\n",
             1.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            0.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
             2048.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_entries_total".into(),
+            5.0,
         );
         before.values.insert(
             "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
@@ -2380,6 +2724,10 @@ nan_value NaN\n",
         before.values.insert(
             "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
             1024.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            2.0,
         );
 
         let mut after = MetricSnapshot::default();
@@ -2402,6 +2750,38 @@ nan_value NaN\n",
         after.values.insert(
             "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total".into(),
             2200.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batches_total".into(),
+            10.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_entries_total".into(),
+            32.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_pipeline_batches_total".into(),
+            11.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_queue_wait_us_total".into(),
+            2400.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refill_rounds_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_refilled_entries_total".into(),
+            10.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_waits_total".into(),
+            10.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_batch_commit_lock_wait_us_total".into(),
+            2800.0,
         );
         after.values.insert(
             "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
@@ -2428,8 +2808,16 @@ nan_value NaN\n",
             1.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            0.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
             2048.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_entries_total".into(),
+            5.0,
         );
         after.values.insert(
             "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
@@ -2443,6 +2831,10 @@ nan_value NaN\n",
             "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total".into(),
             1024.0,
         );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            2.0,
+        );
 
         let joined = raft_metric_per_cycle_lines(&before, &after, 4).join("\n");
 
@@ -2452,16 +2844,27 @@ nan_value NaN\n",
         assert!(joined.contains("append_log_bytes=100.500"));
         assert!(joined.contains("admission_probe=2"));
         assert!(joined.contains("admission_probe_us=250"));
+        assert!(joined.contains("client_batches=2"));
+        assert!(joined.contains("client_batch_entries=6"));
+        assert!(joined.contains("client_pipeline_batches=2"));
+        assert!(joined.contains("client_queue_wait_us=500"));
+        assert!(joined.contains("client_refill_rounds=0.500"));
+        assert!(joined.contains("client_refilled_entries=2"));
+        assert!(joined.contains("client_commit_waits=2"));
+        assert!(joined.contains("client_commit_wait_us=500"));
         assert!(joined.contains("follower_appended=5"));
         assert!(joined.contains("follower_rewrites=1"));
         assert!(joined.contains("proxy_forwarded=1.500"));
         assert!(joined.contains("commit_slot_writes=2"));
         assert!(joined.contains("commit_slot_bytes=2048"));
         assert!(joined.contains("full_log_reads=0"));
+        assert!(joined.contains("full_log_read_failures=0"));
         assert!(joined.contains("full_log_read_bytes=0"));
+        assert!(joined.contains("full_log_read_entries=0"));
         assert!(joined.contains("full_log_rewrites=0"));
         assert!(joined.contains("full_log_rewrite_failures=0"));
         assert!(joined.contains("full_log_rewrite_bytes=0"));
+        assert!(joined.contains("full_log_rewrite_entries=0"));
     }
 
     #[test]
@@ -2504,6 +2907,10 @@ nan_value NaN\n",
             1024.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            0.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
             1.0,
         );
@@ -2522,6 +2929,10 @@ nan_value NaN\n",
             4096.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_failures_total".into(),
+            1.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
             1.0,
         );
@@ -2534,6 +2945,7 @@ nan_value NaN\n",
 
         assert!(joined.contains("full-log activity observed"));
         assert!(joined.contains("full_log_reads=+1"));
+        assert!(joined.contains("full_log_read_failures=+1"));
         assert!(joined.contains("full_log_read_bytes=+3072"));
         assert!(joined.contains("full_log_rewrite_entries=+2"));
         assert!(!joined.contains("full_log_rewrites="));

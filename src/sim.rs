@@ -787,6 +787,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut held = BTreeMap::<String, RaftSimLock>::new();
 
+        let healthy_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
         let pre_partition_index =
             run_seeded_lock_model_steps(&sim, &node_ids, &keys, &mut held, &mut rng, 12, "healthy")
                 .await
@@ -794,6 +795,11 @@ mod tests {
         wait_for_all_applied(&sim, pre_partition_index, Duration::from_secs(5))
             .await
             .expect("healthy operations should apply everywhere before partition");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &healthy_full_log_before,
+            "healthy seeded chaos traffic",
+        );
 
         let old_leader = sim
             .wait_for_leader(Duration::from_secs(5))
@@ -812,6 +818,8 @@ mod tests {
             &[majority[0].as_str(), majority[1].as_str()],
         );
 
+        let stale_leader_full_log_before =
+            full_log_metrics_for_nodes(&sim, std::slice::from_ref(&old_leader_id));
         let stale_commit_before = old_leader.commit_index();
         let stale_apply_before = old_leader.progress_snapshot().last_applied;
         let stale_result = acquire_key_on_node(
@@ -834,10 +842,16 @@ mod tests {
             stale_progress.last_applied, stale_apply_before,
             "isolated stale leader must not apply during minority partition"
         );
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &stale_leader_full_log_before,
+            "seeded chaos stale-leader minority write attempt",
+        );
 
         wait_for_ready_leader_in(&sim, &majority, Duration::from_secs(5))
             .await
             .expect("majority partition should elect a ready leader");
+        let partition_full_log_before = full_log_metrics_for_nodes(&sim, &majority);
         let partition_index = run_seeded_lock_model_steps(
             &sim,
             &majority,
@@ -853,25 +867,48 @@ mod tests {
         wait_for_applied_on(&sim, &majority_ids, partition_index, Duration::from_secs(5))
             .await
             .expect("majority-side operations should apply on the majority partition");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &partition_full_log_before,
+            "seeded chaos majority-partition traffic",
+        );
 
         sim.restart_node(&old_leader_id)
             .expect("restart isolated old leader with durable local state");
+        let repair_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
         sim.heal();
         wait_for_all_applied(&sim, partition_index, Duration::from_secs(5))
             .await
             .expect("healed cluster should repair and apply majority partition writes");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &repair_full_log_before,
+            "seeded chaos stale-leader restart repair",
+        );
 
         for node_id in &node_ids {
+            let survivors = node_ids
+                .iter()
+                .filter(|candidate| *candidate != node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let survivor_full_log_before = full_log_metrics_for_nodes(&sim, &survivors);
             sim.restart_node(node_id)
                 .expect("restart healed raft node during chaos test");
             sim.wait_for_leader(Duration::from_secs(5))
                 .await
                 .expect("cluster should keep electing after rolling restart");
+            assert_full_log_metrics_unchanged(
+                &sim,
+                &survivor_full_log_before,
+                "seeded chaos survivor convergence during rolling restart",
+            );
         }
         wait_for_all_applied(&sim, partition_index, Duration::from_secs(5))
             .await
             .expect("rolling restarts should preserve applied state");
 
+        let cleanup_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
         release_all_held_on_seeded_nodes(&sim, &node_ids, &mut held, &mut rng, "cleanup")
             .await
             .expect("cleanup releases should complete after restarts");
@@ -883,7 +920,13 @@ mod tests {
         wait_for_all_applied(&sim, cleanup_index, Duration::from_secs(5))
             .await
             .expect("cleanup releases should apply on every node");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &cleanup_full_log_before,
+            "seeded chaos cleanup releases",
+        );
 
+        let post_cleanup_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
         for (idx, key) in keys.iter().enumerate() {
             let node_id = &node_ids[idx % node_ids.len()];
             let lock = acquire_key_on_node(&sim, node_id, key.clone(), "post-cleanup")
@@ -894,6 +937,19 @@ mod tests {
                 .await
                 .expect("post-cleanup release should succeed");
         }
+        let post_cleanup_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after post-cleanup seeded chaos traffic")
+            .commit_index();
+        wait_for_all_applied(&sim, post_cleanup_index, Duration::from_secs(5))
+            .await
+            .expect("post-cleanup seeded chaos traffic should apply on every node");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &post_cleanup_full_log_before,
+            "seeded chaos post-cleanup traffic",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1231,17 +1287,17 @@ mod tests {
         let order = Arc::new(AtomicUsize::new(1));
         let partition_full_log_before = full_log_metrics_for_nodes(&sim, &majority);
         let sim_phase = Arc::new(sim);
-        run_no_wait_history_phase(
-            Arc::clone(&sim_phase),
-            majority.clone(),
-            keys.clone(),
-            Arc::clone(&history),
-            Arc::clone(&order),
-            0,
-            3,
-            5,
-            "stale-restart-history",
-        )
+        run_no_wait_history_phase(NoWaitHistoryPhase {
+            sim: Arc::clone(&sim_phase),
+            node_ids: majority.clone(),
+            keys: keys.clone(),
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: 0,
+            workers: 3,
+            steps: 5,
+            label: "stale-restart-history",
+        })
         .await;
         let partition_index =
             wait_for_ready_leader_in(&sim_phase, &majority, Duration::from_secs(5))
@@ -1282,17 +1338,17 @@ mod tests {
 
         let sim = Arc::new(sim);
         let post_heal_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
-        run_no_wait_history_phase(
-            Arc::clone(&sim),
+        run_no_wait_history_phase(NoWaitHistoryPhase {
+            sim: Arc::clone(&sim),
             node_ids,
             keys,
-            Arc::clone(&history),
-            Arc::clone(&order),
-            1,
-            3,
-            5,
-            "stale-restart-history",
-        )
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: 1,
+            workers: 3,
+            steps: 5,
+            label: "stale-restart-history",
+        })
         .await;
         let final_index = sim
             .wait_for_leader(Duration::from_secs(5))
@@ -1334,17 +1390,17 @@ mod tests {
                 .expect("leader before rolling-restart history phase");
             let phase_full_log_before = full_log_metrics_for_nodes(&sim, &restart_order);
             let sim_phase = Arc::new(sim);
-            run_no_wait_history_phase(
-                Arc::clone(&sim_phase),
-                sim_phase.node_ids(),
-                keys.clone(),
-                Arc::clone(&history),
-                Arc::clone(&order),
+            run_no_wait_history_phase(NoWaitHistoryPhase {
+                sim: Arc::clone(&sim_phase),
+                node_ids: sim_phase.node_ids(),
+                keys: keys.clone(),
+                history: Arc::clone(&history),
+                order: Arc::clone(&order),
                 phase,
-                3,
-                5,
-                "rolling-history",
-            )
+                workers: 3,
+                steps: 5,
+                label: "rolling-history",
+            })
             .await;
             let phase_index = sim_phase
                 .wait_for_leader(Duration::from_secs(5))
@@ -1384,17 +1440,17 @@ mod tests {
 
         let sim = Arc::new(sim);
         let final_phase_full_log_before = full_log_metrics_for_nodes(&sim, &restart_order);
-        run_no_wait_history_phase(
-            Arc::clone(&sim),
-            sim.node_ids(),
+        run_no_wait_history_phase(NoWaitHistoryPhase {
+            sim: Arc::clone(&sim),
+            node_ids: sim.node_ids(),
             keys,
-            Arc::clone(&history),
-            Arc::clone(&order),
-            restart_order.len(),
-            3,
-            5,
-            "rolling-history",
-        )
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: restart_order.len(),
+            workers: 3,
+            steps: 5,
+            label: "rolling-history",
+        })
         .await;
         let final_index = sim
             .wait_for_leader(Duration::from_secs(5))
@@ -2919,20 +2975,20 @@ mod tests {
         let sim = Arc::new(sim);
         let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
         let order = Arc::new(AtomicUsize::new(1));
-        run_no_wait_history_phase(
-            Arc::clone(&sim),
-            final_node_ids.clone(),
-            vec![format!(
+        run_no_wait_history_phase(NoWaitHistoryPhase {
+            sim: Arc::clone(&sim),
+            node_ids: final_node_ids.clone(),
+            keys: vec![format!(
                 "sim-shrink-failover-history-key-{}",
                 Uuid::new_v4()
             )],
-            Arc::clone(&history),
-            Arc::clone(&order),
-            0,
-            3,
-            5,
-            "shrink-failover-history",
-        )
+            history: Arc::clone(&history),
+            order: Arc::clone(&order),
+            phase: 0,
+            workers: 3,
+            steps: 5,
+            label: "shrink-failover-history",
+        })
         .await;
         let final_commit_index =
             wait_for_ready_leader_in(&sim, &final_node_ids, Duration::from_secs(5))
@@ -2986,6 +3042,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FullLogMetricSnapshot {
         reads_total: u64,
+        read_failures_total: u64,
         read_bytes_total: u64,
         read_entries_total: u64,
         rewrites_total: u64,
@@ -3051,6 +3108,10 @@ mod tests {
         let metrics = node.raft_metrics_text();
         FullLogMetricSnapshot {
             reads_total: metric_value(&metrics, "dd_rust_network_mutex_raft_log_full_reads_total"),
+            read_failures_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_read_failures_total",
+            ),
             read_bytes_total: metric_value(
                 &metrics,
                 "dd_rust_network_mutex_raft_log_full_read_bytes_total",
@@ -3088,7 +3149,7 @@ mod tests {
         let after = full_log_metrics_for_nodes(sim, &node_ids);
         assert_eq!(
             &after, before,
-            "{label} should not use full-log scans or rewrites; before={before:?} after={after:?}"
+            "{label} should not use full-log scans, read failures, rewrites, or rewrite failures; before={before:?} after={after:?}"
         );
     }
 
@@ -3233,7 +3294,7 @@ mod tests {
         }
     }
 
-    async fn run_no_wait_history_phase(
+    struct NoWaitHistoryPhase {
         sim: Arc<RaftSim>,
         node_ids: Vec<String>,
         keys: Vec<String>,
@@ -3242,9 +3303,22 @@ mod tests {
         phase: usize,
         workers: usize,
         steps: usize,
-        label: &str,
-    ) {
+        label: &'static str,
+    }
+
+    async fn run_no_wait_history_phase(phase_spec: NoWaitHistoryPhase) {
         crate::routine_id!("ddl-routine-raft-sim-test-no-wait-history-phase-1");
+        let NoWaitHistoryPhase {
+            sim,
+            node_ids,
+            keys,
+            history,
+            order,
+            phase,
+            workers,
+            steps,
+            label,
+        } = phase_spec;
         assert!(!node_ids.is_empty(), "history phase needs node candidates");
         assert!(!keys.is_empty(), "history phase needs lock keys");
         assert!(workers > 0, "history phase needs workers");
