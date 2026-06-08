@@ -14,12 +14,13 @@
 //! process-global and would race with the other tests in this
 //! binary.
 
-use std::sync::{Mutex, Once};
+use std::sync::Once;
 use std::time::Duration;
 
 use dd_rust_network_mutex::{server, BrokerConfig, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 
 const ADMIN_TOKEN: &str = "all-dogs-go-to-heaven";
 
@@ -143,7 +144,7 @@ fn auth_header() -> [(&'static str, &'static str); 1] {
 
 #[tokio::test]
 async fn admin_log_level_round_trip() {
-    let _g = log_level_lock().lock().unwrap();
+    let _g = log_level_lock().lock().await;
     let (_tcp, http) = start_broker().await;
 
     // GET without a token: 401.
@@ -215,7 +216,7 @@ async fn admin_log_level_round_trip() {
 
 #[tokio::test]
 async fn admin_log_level_returns_html_for_htmx_request() {
-    let _g = log_level_lock().lock().unwrap();
+    let _g = log_level_lock().lock().await;
     let (_tcp, http) = start_broker().await;
     let (status, head, body) = http_request(
         "POST",
@@ -241,7 +242,7 @@ async fn admin_log_level_returns_html_for_htmx_request() {
 
 #[tokio::test]
 async fn admin_log_level_still_returns_json_without_htmx() {
-    let _g = log_level_lock().lock().unwrap();
+    let _g = log_level_lock().lock().await;
     let (_tcp, http) = start_broker().await;
     let (status, head, body) = http_request(
         "POST",

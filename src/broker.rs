@@ -247,6 +247,17 @@ impl GrantOverrides {
 }
 
 #[derive(Debug, Clone)]
+struct CompositeLockRequest {
+    client: ClientId,
+    uuid: String,
+    keys: Vec<String>,
+    pid: Option<i64>,
+    ttl: Option<Duration>,
+    wait: bool,
+    grant_overrides: GrantOverrides,
+}
+
+#[derive(Debug, Clone)]
 enum PendingKind {
     Exclusive,
     Reader,
@@ -966,13 +977,15 @@ impl Broker {
                     (None, Some(ks)) => {
                         self.handle_composite_lock(
                             &mut state,
-                            client,
-                            uuid,
-                            ks,
-                            pid,
-                            ttl,
-                            wait,
-                            grant_overrides,
+                            CompositeLockRequest {
+                                client,
+                                uuid,
+                                keys: ks,
+                                pid,
+                                ttl,
+                                wait,
+                                grant_overrides,
+                            },
                         );
                     }
                     (Some(_), Some(_)) => {
@@ -1239,17 +1252,16 @@ impl Broker {
 
     // ---- composite --------------------------------------------------------
 
-    fn handle_composite_lock(
-        &self,
-        state: &mut BrokerState,
-        client: ClientId,
-        uuid: String,
-        mut keys: Vec<String>,
-        pid: Option<i64>,
-        ttl: Option<Duration>,
-        wait: bool,
-        grant_overrides: GrantOverrides,
-    ) {
+    fn handle_composite_lock(&self, state: &mut BrokerState, request: CompositeLockRequest) {
+        let CompositeLockRequest {
+            client,
+            uuid,
+            mut keys,
+            pid,
+            ttl,
+            wait,
+            grant_overrides,
+        } = request;
         crate::routine_id!("ddl-routine-UD_1TQ6n72nYb_GRcW");
         if keys.is_empty() || keys.len() > MAX_COMPOSITE_KEYS {
             self.send(
@@ -2261,6 +2273,51 @@ impl Broker {
         let mut state = self.state.lock();
         if let Some(handle) = state.clients.get_mut(&client) {
             handle.held_lock_uuids.remove(lock_uuid);
+        }
+    }
+
+    /// Convert a holder to a detached bearer-token holder by lock UUID.
+    ///
+    /// This is used when BrokerRaft replays a cached HTTP acquire response:
+    /// the original ephemeral client may still be registered if its task was
+    /// interrupted between observing the broker response and running the normal
+    /// detach/drop cleanup. A replayed successful acquire must still be
+    /// unlockable by lock UUID from a later HTTP request.
+    pub fn detach_lock_owner(&self, lock_uuid: &str) {
+        crate::routine_id!("ddl-routine-broker-detach-lock-owner-1");
+        let mut state = self.state.lock();
+        let mut touched_clients = std::collections::HashSet::<ClientId>::new();
+        for lock in state.locks.values_mut() {
+            if let Some(holder) = lock.exclusive_holders.get_mut(lock_uuid) {
+                touched_clients.insert(holder.client);
+                holder.client = SNAPSHOT_DETACHED_CLIENT;
+            }
+            if let Some(holder) = lock.readers.get_mut(lock_uuid) {
+                touched_clients.insert(holder.client);
+                holder.client = SNAPSHOT_DETACHED_CLIENT;
+            }
+            if let Some(writer) = lock
+                .writer
+                .as_mut()
+                .filter(|writer| writer.lock_uuid == lock_uuid)
+            {
+                touched_clients.insert(writer.client);
+                writer.client = SNAPSHOT_DETACHED_CLIENT;
+            }
+        }
+        for client in touched_clients {
+            if client == SNAPSHOT_DETACHED_CLIENT {
+                continue;
+            }
+            let should_remove = if let Some(handle) = state.clients.get_mut(&client) {
+                handle.held_lock_uuids.remove(lock_uuid);
+                handle.held_lock_uuids.is_empty() && handle.pending_request_uuids.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                state.clients.remove(&client);
+            }
         }
     }
 

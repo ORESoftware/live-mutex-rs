@@ -465,6 +465,30 @@ With this layout:
 
 ```bash
 LMX_LIVE_RAFT_HTTP=live-mutex-rs-raft.default.svc.cluster.local:6971 \
+LMX_LIVE_RAFT_METRICS_ENDPOINTS=live-mutex-rs-raft-0.live-mutex-rs-raft.default.svc.cluster.local:6971,live-mutex-rs-raft-1.live-mutex-rs-raft.default.svc.cluster.local:6971,live-mutex-rs-raft-2.live-mutex-rs-raft.default.svc.cluster.local:6971 \
+  cargo test --test k8s_raft_live_smoke -- --ignored --nocapture
+```
+
+The metrics endpoint list should contain one unique stable pod or per-pod
+Service HTTP endpoint per Raft node. The hardening gate and soak wrapper require
+that list by default when `RUN_K8S_RAFT_LIVE=true`; direct cargo smoke runs can
+omit it for behavior-only evidence.
+
+The ignored Raft live smoke also has an opt-in failover path. It observes the
+leader through `/raft/status`, records a bounded no-wait acquire/release
+history through the Service, deletes that leader pod with `kubectl` while more
+no-wait traffic is in flight, waits for the pod UID to change so the test cannot
+pass before Kubernetes actually replaces the pod, waits for the Service to
+expose a leader again, checks the recorded single-key history for
+linearizability, proves acquire/release still works through the Service, and
+then waits for the StatefulSet rollout to settle:
+
+```bash
+LMX_LIVE_RAFT_HTTP=live-mutex-rs-raft.default.svc.cluster.local:6971 \
+LMX_LIVE_RAFT_METRICS_ENDPOINTS=live-mutex-rs-raft-0.live-mutex-rs-raft.default.svc.cluster.local:6971,live-mutex-rs-raft-1.live-mutex-rs-raft.default.svc.cluster.local:6971,live-mutex-rs-raft-2.live-mutex-rs-raft.default.svc.cluster.local:6971 \
+LMX_LIVE_RAFT_NAMESPACE=default \
+LMX_LIVE_RAFT_STATEFULSET=live-mutex-rs-raft \
+LMX_LIVE_RAFT_KUBECTL_FAILOVER=true \
   cargo test --test k8s_raft_live_smoke -- --ignored --nocapture
 ```
 

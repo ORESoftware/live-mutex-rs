@@ -52,6 +52,9 @@ election_timeout_max_ms = 300
 snapshot_interval_ms = 1800000
 snapshot_max_log_entries = 100000
 snapshot_max_log_bytes = 67108864
+# Also snapshot/compact committed retained-log prefixes older than 30 minutes.
+# Set to 0 to disable the age trigger.
+snapshot_max_log_age_ms = 1800000
 trailing_log_entries = 10000
 
 # Bound AppendEntries catch-up so lagging followers receive incremental JSON
@@ -59,6 +62,9 @@ trailing_log_entries = 10000
 append_entries_max_entries = 256
 append_entries_max_bytes = 1048576
 append_entries_max_inline_batches = 64
+# Keep foreground writes quorum-minimal by default. Raise this to hedge with
+# extra ready followers when tail latency matters more than extra peer traffic.
+target_quorum_extra_fanout = 0
 install_snapshot_chunk_bytes = 1048576
 install_snapshot_max_staged_bytes = 134217728
 install_snapshot_max_staged_transfers = 4

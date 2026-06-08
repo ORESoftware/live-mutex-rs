@@ -962,7 +962,7 @@ mod tests {
     async fn response_frame_reader_rejects_oversized_unterminated_frame() {
         let (mut tx, rx) = tokio::io::duplex(16);
         let writer = tokio::spawn(async move {
-            let _ = tx.write_all(&vec![b'x'; 128]).await;
+            let _ = tx.write_all(&[b'x'; 128]).await;
         });
 
         let mut reader = BufReader::new(rx);

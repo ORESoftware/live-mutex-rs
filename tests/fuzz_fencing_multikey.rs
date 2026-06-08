@@ -6,12 +6,12 @@
 //! acquired:false on the spot. That lets us drive thousands of randomized ops
 //! against a shadow model and assert, after every single op:
 //!
-//!   * mutual exclusion   — a key is held by at most one lock at a time;
-//!   * composite atomicity — a composite grant locks ALL its keys or none;
-//!   * fencing monotonic   — each grant's per-key token is strictly greater
-//!                           than any token previously issued for that key;
-//!   * no-wait correctness — acquired matches the model's free/held view, and
-//!                           a contended no-wait acquire mutates nothing.
+//! * mutual exclusion   — a key is held by at most one lock at a time;
+//! * composite atomicity — a composite grant locks ALL its keys or none;
+//! * fencing monotonic   — each grant's per-key token is strictly greater
+//!   than any token previously issued for that key;
+//! * no-wait correctness — acquired matches the model's free/held view, and
+//!   a contended no-wait acquire mutates nothing.
 //!
 //! A second, scenario-style test exercises the *wait* (queue → grant) path and
 //! checks fencing monotonicity through the cascade of FIFO grants.
@@ -302,7 +302,11 @@ fn run_fuzz_seed(seed: u64, ops: usize) {
         // Release it again so repeated probes stay clean.
         broker.handle_request(
             cids[0],
-            unlock_req(&format!("finalu{req_seq}"), &[k.clone()], &lu.unwrap()),
+            unlock_req(
+                &format!("finalu{req_seq}"),
+                std::slice::from_ref(k),
+                &lu.unwrap(),
+            ),
         );
         let _ = drain(&mut rxs[0]);
     }

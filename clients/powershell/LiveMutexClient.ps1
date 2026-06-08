@@ -9,7 +9,10 @@
 # Dot-source this file and use [LiveMutexClient]::Connect(host, port); see
 # smoke.ps1 for an end-to-end example.
 
-Set-StrictMode -Version Latest
+# StrictMode 1.0 still catches uninitialized variables but lets an absent JSON
+# field read back as $null (broker frames legitimately omit optional fields such
+# as fencingToken, or `type` on a bare error frame) instead of throwing.
+Set-StrictMode -Version 1.0
 
 # Request `type` values (src/protocol.rs `enum Request`)
 $script:LmxReq = @{
@@ -95,7 +98,7 @@ class LiveMutexClient {
     hidden [object] ReadGrant([string] $want) {
         while ($true) {
             $obj = $this.ReadReply($want)
-            if ($obj.PSObject.Properties.Name -contains 'error' -and $null -ne $obj.error) { return $obj }
+            if ($null -ne $obj.error) { return $obj }
             if ($obj.acquired -eq $true) { return $obj }
             if ($obj.acquired -eq $false) { continue }
             return $obj
@@ -107,9 +110,7 @@ class LiveMutexClient {
         while ($true) {
             $obj = $this.ReadReply($want)
             if ($obj.granted -eq $true) { return $obj }
-            if ($obj.PSObject.Properties.Name -contains 'error' -and $null -ne $obj.error) {
-                throw "rw acquire failed: $($obj.error)"
-            }
+            if ($null -ne $obj.error) { throw "rw acquire failed: $($obj.error)" }
         }
         throw 'unreachable'
     }

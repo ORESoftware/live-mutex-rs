@@ -33,6 +33,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+type FencingTokenStream = HashMap<String, Vec<(std::time::Instant, u64)>>;
+
 // =========================================================================
 // PRNG + seed helpers
 // =========================================================================
@@ -451,7 +453,7 @@ async fn fuzz_exclusive_no_double_grant() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fuzz_semaphore_cap_invariant() {
-    let seed = seed_for("fuzz_semaphore_cap_invariant", 0xBADC_AFE);
+    let seed = seed_for("fuzz_semaphore_cap_invariant", 0x0BAD_CAFE);
     let port = start_broker(BrokerConfig::default()).await;
     let oracle = Arc::new(Mutex::new(Oracle::new()));
 
@@ -765,8 +767,7 @@ async fn fuzz_fencing_strictly_monotonic_per_key() {
     let client_count = 12;
     let cycles_per_client = 30;
     // Per-key collected token streams — flatten and assert strict mono.
-    let collected: Arc<Mutex<HashMap<String, Vec<(std::time::Instant, u64)>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let collected: Arc<Mutex<FencingTokenStream>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut joinset = JoinSet::new();
     for client_idx in 0..client_count {

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dd_rust_network_mutex::{server, BrokerConfig, BrokerRaftConfig, RaftPeerConfig, ServerConfig};
@@ -20,10 +20,13 @@ use tokio::task::JoinHandle;
 static RAFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct RaftCluster {
+    raft_ports: Vec<u16>,
     http_ports: Vec<u16>,
     peers: Vec<RaftPeerConfig>,
+    initial_peers: Vec<RaftPeerConfig>,
     data_dir: PathBuf,
-    handles: Vec<Option<JoinHandle<()>>>,
+    tuning: RaftClusterTuning,
+    handles: Vec<Option<JoinHandle<Result<(), String>>>>,
 }
 
 impl RaftCluster {
@@ -34,14 +37,55 @@ impl RaftCluster {
         }
         wait_for_http_unavailable(self.http_ports[index], "/raft/status").await;
     }
+
+    async fn restart_node(&mut self, index: usize) {
+        self.abort_node(index).await;
+        self.spawn_node_until_ready(index, self.tuning.clone())
+            .await;
+    }
+
+    async fn restart_node_with_tuning(&mut self, index: usize, tuning: RaftClusterTuning) {
+        self.abort_node(index).await;
+        self.spawn_node_until_ready(index, tuning).await;
+    }
+
+    async fn spawn_node_until_ready(&mut self, index: usize, tuning: RaftClusterTuning) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            self.handles[index] = Some(spawn_raft_node(
+                index,
+                &self.raft_ports,
+                &self.http_ports,
+                &self.data_dir,
+                &self.initial_peers,
+                &tuning,
+            ));
+            match wait_for_http_port_or_node_exit(
+                &mut self.handles[index],
+                self.http_ports[index],
+                index,
+                deadline,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(err)
+                    if err.contains("already locked by this process")
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                Err(err) => panic!("{err}"),
+            }
+        }
+    }
 }
 
 impl Drop for RaftCluster {
     fn drop(&mut self) {
-        for handle in &self.handles {
-            if let Some(handle) = handle {
-                handle.abort();
-            }
+        for handle in self.handles.iter().flatten() {
+            handle.abort();
         }
         let _ = fs::remove_dir_all(&self.data_dir);
     }
@@ -58,7 +102,14 @@ struct RaftClusterTuning {
     trailing_log_entries: u64,
     append_entries_max_entries: usize,
     append_entries_max_bytes: usize,
+    append_entries_max_inline_batches: usize,
+    target_quorum_extra_fanout: usize,
     install_snapshot_chunk_bytes: usize,
+    client_batch_max_entries: usize,
+    client_pipeline_max_batches: usize,
+    client_batch_max_pending: usize,
+    client_batch_max_delay: Duration,
+    client_response_cache_max_entries: usize,
     proxy_retry_budget: Duration,
     peer_token: Option<String>,
 }
@@ -76,7 +127,14 @@ impl Default for RaftClusterTuning {
             trailing_log_entries: defaults.trailing_log_entries,
             append_entries_max_entries: defaults.append_entries_max_entries,
             append_entries_max_bytes: defaults.append_entries_max_bytes,
+            append_entries_max_inline_batches: defaults.append_entries_max_inline_batches,
+            target_quorum_extra_fanout: defaults.target_quorum_extra_fanout,
             install_snapshot_chunk_bytes: defaults.install_snapshot_chunk_bytes,
+            client_batch_max_entries: defaults.client_batch_max_entries,
+            client_pipeline_max_batches: defaults.client_pipeline_max_batches,
+            client_batch_max_pending: defaults.client_batch_max_pending,
+            client_batch_max_delay: defaults.client_batch_max_delay,
+            client_response_cache_max_entries: defaults.client_response_cache_max_entries,
             proxy_retry_budget: defaults.proxy_retry_budget,
             peer_token: None,
         }
@@ -184,9 +242,12 @@ async fn start_cluster_with_tuning(
     }
 
     let cluster = RaftCluster {
+        raft_ports,
         http_ports,
         peers,
+        initial_peers,
         data_dir,
+        tuning,
         handles,
     };
     wait_for_http(&cluster).await;
@@ -200,28 +261,37 @@ fn spawn_raft_node(
     data_dir: &std::path::Path,
     initial_peers: &[RaftPeerConfig],
     tuning: &RaftClusterTuning,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<(), String>> {
     let node_id = format!("node-{}", index + 1);
-    let mut raft = BrokerRaftConfig::default();
-    raft.enabled = true;
-    raft.node_id = node_id.clone();
-    raft.bind_addr = Some(format!("127.0.0.1:{}", raft_ports[index]).parse().unwrap());
-    raft.advertise_addr = Some(format!("127.0.0.1:{}", raft_ports[index]));
-    raft.data_dir = data_dir.join(&node_id);
-    raft.heartbeat_interval = tuning.heartbeat_interval;
-    raft.election_timeout_min = tuning.election_timeout_min;
-    raft.election_timeout_max = tuning.election_timeout_max;
-    raft.snapshot_interval = tuning.snapshot_interval;
-    raft.snapshot_max_log_entries = tuning.snapshot_max_log_entries;
-    raft.snapshot_max_log_bytes = tuning.snapshot_max_log_bytes;
-    raft.trailing_log_entries = tuning.trailing_log_entries;
-    raft.append_entries_max_entries = tuning.append_entries_max_entries;
-    raft.append_entries_max_bytes = tuning.append_entries_max_bytes;
-    raft.install_snapshot_chunk_bytes = tuning.install_snapshot_chunk_bytes;
-    raft.proxy_retry_budget = tuning.proxy_retry_budget;
-    raft.peer_token = tuning.peer_token.clone();
-    raft.peers = initial_peers.to_vec();
-    raft.broker = BrokerConfig::default();
+    let raft = BrokerRaftConfig {
+        enabled: true,
+        node_id: node_id.clone(),
+        bind_addr: Some(format!("127.0.0.1:{}", raft_ports[index]).parse().unwrap()),
+        advertise_addr: Some(format!("127.0.0.1:{}", raft_ports[index])),
+        data_dir: data_dir.join(&node_id),
+        heartbeat_interval: tuning.heartbeat_interval,
+        election_timeout_min: tuning.election_timeout_min,
+        election_timeout_max: tuning.election_timeout_max,
+        snapshot_interval: tuning.snapshot_interval,
+        snapshot_max_log_entries: tuning.snapshot_max_log_entries,
+        snapshot_max_log_bytes: tuning.snapshot_max_log_bytes,
+        trailing_log_entries: tuning.trailing_log_entries,
+        append_entries_max_entries: tuning.append_entries_max_entries,
+        append_entries_max_bytes: tuning.append_entries_max_bytes,
+        append_entries_max_inline_batches: tuning.append_entries_max_inline_batches,
+        target_quorum_extra_fanout: tuning.target_quorum_extra_fanout,
+        install_snapshot_chunk_bytes: tuning.install_snapshot_chunk_bytes,
+        client_batch_max_entries: tuning.client_batch_max_entries,
+        client_pipeline_max_batches: tuning.client_pipeline_max_batches,
+        client_batch_max_pending: tuning.client_batch_max_pending,
+        client_batch_max_delay: tuning.client_batch_max_delay,
+        client_response_cache_max_entries: tuning.client_response_cache_max_entries,
+        proxy_retry_budget: tuning.proxy_retry_budget,
+        peer_token: tuning.peer_token.clone(),
+        peers: initial_peers.to_vec(),
+        broker: BrokerConfig::default(),
+        ..BrokerRaftConfig::default()
+    };
 
     let config = ServerConfig {
         tcp_bind: None,
@@ -237,7 +307,10 @@ fn spawn_raft_node(
     };
 
     tokio::spawn(async move {
-        let _ = server::run_raft(config, raft).await;
+        match server::run_raft(config, raft).await {
+            Ok(()) => Err(format!("raft node {node_id} exited unexpectedly")),
+            Err(err) => Err(format!("raft node {node_id} failed: {err}")),
+        }
     })
 }
 
@@ -271,6 +344,39 @@ async fn wait_for_http_port(port: u16, path: &str) {
             tokio::time::Instant::now() < deadline,
             "timed out waiting for HTTP listener on port {port}"
         );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_http_port_or_node_exit(
+    handle: &mut Option<JoinHandle<Result<(), String>>>,
+    port: u16,
+    index: usize,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    loop {
+        if http_get_json(port, "/raft/status").await.is_some() {
+            return Ok(());
+        }
+        if handle.as_ref().is_some_and(|handle| handle.is_finished()) {
+            let result = handle
+                .take()
+                .expect("finished node handle should exist")
+                .await;
+            let exit = match result {
+                Ok(Ok(())) => "raft node task returned successfully".to_string(),
+                Ok(Err(err)) => err,
+                Err(err) => format!("raft node task join failed: {err}"),
+            };
+            return Err(format!(
+                "raft node {index} exited before HTTP listener on port {port} became ready: {exit}"
+            ));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for HTTP listener on port {port}"
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -548,6 +654,156 @@ async fn current_metric(port: u16, name: &str) -> u64 {
     metric_value(&metrics, name).unwrap_or_else(|| panic!("metric {name} missing on port {port}"))
 }
 
+async fn current_metric_sum_for_nodes(cluster: &RaftCluster, nodes: &[usize], name: &str) -> u64 {
+    let mut total = 0_u64;
+    for index in nodes {
+        total = total.saturating_add(current_metric(cluster.http_ports[*index], name).await);
+    }
+    total
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FullLogMetrics {
+    reads_total: u64,
+    rewrites_total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct HttpLockHistoryOp {
+    key: String,
+    invoke_order: usize,
+    response_order: usize,
+    result: HttpLockHistoryResult,
+}
+
+#[derive(Debug, Clone)]
+enum HttpLockHistoryResult {
+    Acquired { lock_uuid: String },
+    NotAcquired,
+    Released { lock_uuid: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpLinearModelOp {
+    AcquireGranted(u16),
+    AcquireRejected,
+    Release(u16),
+}
+
+async fn current_full_log_metrics(port: u16) -> FullLogMetrics {
+    FullLogMetrics {
+        reads_total: current_metric(port, "dd_rust_network_mutex_raft_log_full_reads_total").await,
+        rewrites_total: current_metric(port, "dd_rust_network_mutex_raft_log_full_rewrites_total")
+            .await,
+    }
+}
+
+async fn current_full_log_metrics_for_nodes(
+    cluster: &RaftCluster,
+    nodes: &[usize],
+) -> BTreeMap<usize, FullLogMetrics> {
+    let mut metrics = BTreeMap::new();
+    for index in nodes {
+        metrics.insert(
+            *index,
+            current_full_log_metrics(cluster.http_ports[*index]).await,
+        );
+    }
+    metrics
+}
+
+async fn assert_full_log_metrics_unchanged(
+    cluster: &RaftCluster,
+    nodes: &[usize],
+    before: &BTreeMap<usize, FullLogMetrics>,
+    label: &str,
+) {
+    let after = current_full_log_metrics_for_nodes(cluster, nodes).await;
+    assert_eq!(
+        &after, before,
+        "{label} should not use full-log scans or rewrites; before={before:?} after={after:?}"
+    );
+}
+
+async fn change_membership_retrying(
+    cluster: &RaftCluster,
+    current_nodes: &[usize],
+    target: &[RaftPeerConfig],
+    expected_size: u64,
+    expected_quorum: u64,
+    label: &str,
+) -> Value {
+    assert!(
+        !current_nodes.is_empty(),
+        "{label}: current membership node set must not be empty"
+    );
+    let body = json!({ "peers": target });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut attempts = 0usize;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let leader = wait_for_leader_among(cluster, current_nodes).await;
+        match http_request(
+            "POST",
+            cluster.http_ports[leader],
+            "/raft/membership",
+            Some(body.clone()),
+        )
+        .await
+        {
+            Ok((status, raw_body)) => match serde_json::from_str::<Value>(&raw_body) {
+                Ok(membership) => {
+                    if status == 200 {
+                        assert_eq!(
+                            membership["clusterSize"].as_u64(),
+                            Some(expected_size),
+                            "{label} clusterSize: {membership:?}"
+                        );
+                        assert_eq!(
+                            membership["quorumSize"].as_u64(),
+                            Some(expected_quorum),
+                            "{label} quorumSize: {membership:?}"
+                        );
+                        return membership;
+                    }
+                    let latest = format!(
+                        "status={status} body={membership:?} leader={leader} attempts={attempts}"
+                    );
+                    if status == 503 && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    panic!(
+                        "{label}: membership change failed after {attempts} attempt(s): {latest}"
+                    );
+                }
+                Err(err) => {
+                    let latest = format!(
+                            "status={status} parse_error={err} raw_body={raw_body:?} leader={leader} attempts={attempts}"
+                        );
+                    if (status == 0 || status == 503 || raw_body.is_empty())
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    panic!(
+                            "{label}: membership response was not JSON after {attempts} attempt(s): {latest}"
+                        );
+                }
+            },
+            Err(err) => {
+                let latest = format!("io_error={err} leader={leader} attempts={attempts}");
+                if tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                panic!("{label}: membership request failed after {attempts} attempt(s): {latest}");
+            }
+        }
+    }
+}
+
 async fn assert_no_raft_auth_rejections(cluster: &RaftCluster, nodes: &[usize], label: &str) {
     for index in nodes {
         let port = cluster.http_ports[*index];
@@ -576,6 +832,356 @@ async fn start_round_robin_lb(backends: Vec<u16>) -> TestLb {
         }
     });
     TestLb { port, handle }
+}
+
+fn assert_http_lock_history_linearizable(history: &[HttpLockHistoryOp]) {
+    assert!(
+        !history.is_empty(),
+        "HTTP linearizability history should contain operations"
+    );
+    let mut by_key = BTreeMap::<String, Vec<HttpLockHistoryOp>>::new();
+    for op in history {
+        by_key.entry(op.key.clone()).or_default().push(op.clone());
+    }
+    for (key, ops) in by_key {
+        assert_http_linearizable_key_history(&key, &ops);
+    }
+}
+
+fn assert_http_linearizable_key_history(key: &str, ops: &[HttpLockHistoryOp]) {
+    assert!(
+        ops.len() < 128,
+        "linearizability checker supports fewer than 128 operations per key; key={key} ops={}",
+        ops.len()
+    );
+    let mut lock_ids = BTreeMap::<String, u16>::new();
+    let mut granted_ids = BTreeSet::<u16>::new();
+    for op in ops {
+        let lock_uuid = match &op.result {
+            HttpLockHistoryResult::Acquired { lock_uuid }
+            | HttpLockHistoryResult::Released { lock_uuid } => lock_uuid,
+            HttpLockHistoryResult::NotAcquired => continue,
+        };
+        if !lock_ids.contains_key(lock_uuid) {
+            let next_id = u16::try_from(lock_ids.len().saturating_add(1))
+                .expect("linearizable history lock id should fit in u16");
+            lock_ids.insert(lock_uuid.clone(), next_id);
+        }
+    }
+
+    let model_ops = ops
+        .iter()
+        .map(|op| match &op.result {
+            HttpLockHistoryResult::Acquired { lock_uuid } => {
+                let id = *lock_ids
+                    .get(lock_uuid)
+                    .expect("granted lock uuid should be indexed");
+                assert!(
+                    granted_ids.insert(id),
+                    "lock uuid {lock_uuid} was granted more than once for key {key}"
+                );
+                HttpLinearModelOp::AcquireGranted(id)
+            }
+            HttpLockHistoryResult::NotAcquired => HttpLinearModelOp::AcquireRejected,
+            HttpLockHistoryResult::Released { lock_uuid } => HttpLinearModelOp::Release(
+                *lock_ids
+                    .get(lock_uuid)
+                    .expect("released lock uuid should be indexed"),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let predecessors = ops
+        .iter()
+        .map(|candidate| {
+            ops.iter()
+                .enumerate()
+                .filter_map(|(idx, predecessor)| {
+                    (predecessor.response_order < candidate.invoke_order).then_some(1u128 << idx)
+                })
+                .fold(0u128, |acc, bit| acc | bit)
+        })
+        .collect::<Vec<_>>();
+    let all_done = if model_ops.is_empty() {
+        0
+    } else {
+        (1u128 << model_ops.len()) - 1
+    };
+    let mut memo = BTreeSet::<(u128, u16)>::new();
+    assert!(
+        search_http_linearized_history(0, 0, all_done, &model_ops, &predecessors, &mut memo),
+        "no linearization found for key {key}; ops={ops:?}"
+    );
+}
+
+fn search_http_linearized_history(
+    done: u128,
+    holder: u16,
+    all_done: u128,
+    ops: &[HttpLinearModelOp],
+    predecessors: &[u128],
+    memo: &mut BTreeSet<(u128, u16)>,
+) -> bool {
+    if done == all_done {
+        return true;
+    }
+    if !memo.insert((done, holder)) {
+        return false;
+    }
+    for (idx, op) in ops.iter().enumerate() {
+        let bit = 1u128 << idx;
+        if done & bit != 0 || predecessors[idx] & !done != 0 {
+            continue;
+        }
+        let Some(next_holder) = apply_http_linear_model_op(holder, *op) else {
+            continue;
+        };
+        if search_http_linearized_history(
+            done | bit,
+            next_holder,
+            all_done,
+            ops,
+            predecessors,
+            memo,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn apply_http_linear_model_op(holder: u16, op: HttpLinearModelOp) -> Option<u16> {
+    match op {
+        HttpLinearModelOp::AcquireGranted(lock_id) if holder == 0 => Some(lock_id),
+        HttpLinearModelOp::AcquireGranted(_) => None,
+        HttpLinearModelOp::AcquireRejected if holder != 0 => Some(holder),
+        HttpLinearModelOp::AcquireRejected => None,
+        HttpLinearModelOp::Release(lock_id) if holder == lock_id => Some(0),
+        HttpLinearModelOp::Release(_) => None,
+    }
+}
+
+async fn run_http_no_wait_history_phase(
+    port: u16,
+    keys: Vec<String>,
+    history: Arc<Mutex<Vec<HttpLockHistoryOp>>>,
+    order: Arc<AtomicUsize>,
+    phase: usize,
+    workers: usize,
+    steps: usize,
+    label: &str,
+) {
+    assert!(!keys.is_empty(), "history phase needs lock keys");
+    assert!(workers > 0, "history phase needs workers");
+    let start = Arc::new(tokio::sync::Barrier::new(workers));
+    let label = label.to_string();
+    let mut tasks = Vec::new();
+
+    for worker in 0..workers {
+        let keys = keys.clone();
+        let history = Arc::clone(&history);
+        let order = Arc::clone(&order);
+        let start = Arc::clone(&start);
+        let label = label.clone();
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            let mut state =
+                0xC011_EC7E_D15C_A11Du64 ^ ((phase as u64).wrapping_shl(17)) ^ worker as u64;
+            for step in 0..steps {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let key = keys[(state as usize) % keys.len()].clone();
+                let acquire_request_id = format!(
+                    "{label}-acquire-{phase}-{worker}-{step}-{}",
+                    uuid::Uuid::new_v4()
+                );
+                let acquire_invoke = order.fetch_add(1, Ordering::SeqCst);
+                let (status, acquire) = http_post_json_retrying_unavailable(
+                    port,
+                    "/v1/lock",
+                    json!({
+                        "key": key.clone(),
+                        "ttlMs": 5000,
+                        "waitMs": 0,
+                        "requestId": acquire_request_id,
+                    }),
+                    &format!("{label} acquire phase={phase} worker={worker} step={step}"),
+                )
+                .await;
+                let acquire_response = order.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(
+                    status, 200,
+                    "{label} acquire phase={phase} worker={worker} step={step} response: {acquire:?}"
+                );
+                if acquire["acquired"].as_bool() == Some(true) {
+                    let lock_uuid = acquire["lockUuid"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{label} acquire phase={phase} worker={worker} step={step} missing lockUuid: {acquire:?}"
+                            )
+                        })
+                        .to_string();
+                    history.lock().expect("history").push(HttpLockHistoryOp {
+                        key: key.clone(),
+                        invoke_order: acquire_invoke,
+                        response_order: acquire_response,
+                        result: HttpLockHistoryResult::Acquired {
+                            lock_uuid: lock_uuid.clone(),
+                        },
+                    });
+                    tokio::time::sleep(Duration::from_millis(
+                        2 + ((worker + step) % 3) as u64,
+                    ))
+                    .await;
+                    let release_request_id = format!(
+                        "{label}-release-{phase}-{worker}-{step}-{}",
+                        uuid::Uuid::new_v4()
+                    );
+                    let release_invoke = order.fetch_add(1, Ordering::SeqCst);
+                    let (status, release) = http_post_json_retrying_unavailable(
+                        port,
+                        "/v1/unlock",
+                        json!({
+                            "key": key.clone(),
+                            "lockUuid": lock_uuid.clone(),
+                            "requestId": release_request_id,
+                        }),
+                        &format!("{label} release phase={phase} worker={worker} step={step}"),
+                    )
+                    .await;
+                    let release_response = order.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        status, 200,
+                        "{label} release phase={phase} worker={worker} step={step} response: {release:?}"
+                    );
+                    assert_eq!(
+                        release["unlocked"],
+                        true,
+                        "{label} release phase={phase} worker={worker} step={step} response: {release:?}"
+                    );
+                    history.lock().expect("history").push(HttpLockHistoryOp {
+                        key,
+                        invoke_order: release_invoke,
+                        response_order: release_response,
+                        result: HttpLockHistoryResult::Released { lock_uuid },
+                    });
+                } else {
+                    assert_eq!(
+                        acquire["acquired"],
+                        false,
+                        "{label} acquire phase={phase} worker={worker} step={step} should return a boolean acquired field: {acquire:?}"
+                    );
+                    history.lock().expect("history").push(HttpLockHistoryOp {
+                        key,
+                        invoke_order: acquire_invoke,
+                        response_order: acquire_response,
+                        result: HttpLockHistoryResult::NotAcquired,
+                    });
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .expect("HTTP history phase worker should not panic");
+    }
+}
+
+async fn run_lb_membership_churn_history_step(
+    cluster: &RaftCluster,
+    active_nodes: &[usize],
+    target_nodes: &[usize],
+    expected_size: u64,
+    expected_quorum: u64,
+    phase: usize,
+    history: Arc<Mutex<Vec<HttpLockHistoryOp>>>,
+    order: Arc<AtomicUsize>,
+    label: &str,
+) {
+    let lb = start_round_robin_lb(
+        active_nodes
+            .iter()
+            .map(|idx| cluster.http_ports[*idx])
+            .collect(),
+    )
+    .await;
+    let key = format!(
+        "raft-http-linearizable-membership-{label}-{phase}-{}",
+        uuid::Uuid::new_v4()
+    );
+    let all_nodes = (0..cluster.http_ports.len()).collect::<Vec<_>>();
+    let before_full_log = current_full_log_metrics_for_nodes(cluster, &all_nodes).await;
+    let target_peers = target_nodes
+        .iter()
+        .map(|idx| cluster.peers[*idx].clone())
+        .collect::<Vec<_>>();
+    let expected_ids = target_nodes
+        .iter()
+        .map(|idx| cluster.peers[*idx].id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let traffic = {
+        let lb_port = lb.port;
+        let history = Arc::clone(&history);
+        let order = Arc::clone(&order);
+        let keys = vec![key];
+        let label = label.to_string();
+        tokio::spawn(async move {
+            let _lb = lb;
+            run_http_no_wait_history_phase(
+                lb_port,
+                keys,
+                history,
+                order,
+                phase,
+                4,
+                12,
+                &format!("lb-membership-churn-{label}"),
+            )
+            .await;
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(8)).await;
+    change_membership_retrying(
+        cluster,
+        active_nodes,
+        &target_peers,
+        expected_size,
+        expected_quorum,
+        label,
+    )
+    .await;
+    wait_for_simple_membership(
+        cluster,
+        target_nodes,
+        &expected_ids,
+        expected_size,
+        expected_quorum,
+    )
+    .await;
+    traffic
+        .await
+        .expect("membership churn traffic worker should not panic");
+    wait_for_zero_holders_and_waiters_among(cluster, target_nodes).await;
+    let leader = wait_for_leader_among(cluster, target_nodes).await;
+    let status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status after membership churn phase");
+    let commit_index = status["commitIndex"]
+        .as_u64()
+        .expect("leader commitIndex after membership churn phase");
+    wait_for_status_indexes_at_least_among(cluster, target_nodes, commit_index, commit_index).await;
+    assert_full_log_metrics_unchanged(
+        cluster,
+        &all_nodes,
+        &before_full_log,
+        "membership churn HTTP LB traffic and catch-up",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -946,6 +1552,927 @@ async fn raft_lb_round_robin_survives_leader_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_five_voter_cluster_commits_with_three_node_quorum() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster_with_nodes(5, 5).await;
+    let all_nodes = vec![0, 1, 2, 3, 4];
+    let expected_ids = cluster
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_simple_membership(&cluster, &all_nodes, &expected_ids, 5, 3).await;
+
+    let initial_leader = wait_for_leader(&cluster).await;
+    let victims = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| *idx != initial_leader)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        victims.len(),
+        2,
+        "test should have two non-leader voters to take down"
+    );
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| !victims.contains(idx))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        survivors.len(),
+        3,
+        "test should leave exactly a 3-of-5 quorum online"
+    );
+
+    for victim in &victims {
+        cluster.abort_node(*victim).await;
+    }
+    let active_leader = wait_for_leader_among(&cluster, &survivors).await;
+    let survivor_statuses =
+        wait_for_status_indexes_at_least_among(&cluster, &survivors, 0, 0).await;
+    for status in &survivor_statuses {
+        assert_eq!(
+            status["clusterSize"].as_u64(),
+            Some(5),
+            "survivors should retain five-voter membership: {status:?}"
+        );
+        assert_eq!(
+            status["quorumSize"].as_u64(),
+            Some(3),
+            "survivors should use strict-majority 3-of-5 quorum: {status:?}"
+        );
+    }
+
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    let before_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+    let key = format!("raft-five-voter-quorum-{}", uuid::Uuid::new_v4());
+    let (status, acquire) =
+        http_post_json(lb.port, "/v1/lock", json!({"key": key, "ttlMs": 5000})).await;
+    assert_eq!(status, 200, "3-of-5 acquire response: {acquire:?}");
+    assert_eq!(
+        acquire["acquired"], true,
+        "3-of-5 acquire response: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"]
+        .as_str()
+        .expect("3-of-5 acquire should return a lockUuid")
+        .to_string();
+    let acquire_status =
+        wait_for_status_index_at_least(cluster.http_ports[active_leader], "lastApplied", 1).await;
+    let acquire_index = acquire_status["lastApplied"]
+        .as_u64()
+        .expect("active leader lastApplied after 3-of-5 acquire");
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, acquire_index, acquire_index)
+        .await;
+
+    let (status, release) = http_post_json(
+        lb.port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(status, 200, "3-of-5 release response: {release:?}");
+    assert_eq!(
+        release["unlocked"], true,
+        "3-of-5 release response: {release:?}"
+    );
+    let release_status = wait_for_status_index_at_least(
+        cluster.http_ports[active_leader],
+        "lastApplied",
+        acquire_index.saturating_add(1),
+    )
+    .await;
+    let release_index = release_status["lastApplied"]
+        .as_u64()
+        .expect("active leader lastApplied after 3-of-5 release");
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, release_index, release_index)
+        .await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_full_log,
+        "steady 3-of-5 quorum traffic",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_five_voter_minority_rejects_public_write_without_phantom_lock() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster_with_nodes(5, 5).await;
+    let all_nodes = vec![0, 1, 2, 3, 4];
+    let expected_ids = cluster
+        .peers
+        .iter()
+        .map(|peer| peer.id.clone())
+        .collect::<BTreeSet<_>>();
+    wait_for_simple_membership(&cluster, &all_nodes, &expected_ids, 5, 3).await;
+
+    let old_leader = wait_for_leader(&cluster).await;
+    let baseline_status =
+        wait_for_status_index_at_least(cluster.http_ports[old_leader], "lastApplied", 0).await;
+    let baseline_applied = baseline_status["lastApplied"]
+        .as_u64()
+        .expect("old leader baseline lastApplied");
+    wait_for_status_indexes_at_least_among(
+        &cluster,
+        &all_nodes,
+        baseline_applied,
+        baseline_applied,
+    )
+    .await;
+
+    let victims = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| *idx != old_leader)
+        .take(3)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        victims.len(),
+        3,
+        "test should have three non-leader voters to take down"
+    );
+    let minority = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| !victims.contains(idx))
+        .collect::<Vec<_>>();
+    assert!(
+        minority.contains(&old_leader),
+        "old leader should be left in the two-node minority"
+    );
+    assert_eq!(
+        minority.len(),
+        2,
+        "test should leave exactly a 2-of-5 minority online"
+    );
+
+    for victim in &victims {
+        cluster.abort_node(*victim).await;
+    }
+
+    let key = format!("raft-five-voter-minority-{}", uuid::Uuid::new_v4());
+    let rejected_request_id = format!("raft-five-voter-minority-{}", uuid::Uuid::new_v4());
+    let (status, rejected_headers, rejected) = http_post_json_with_headers(
+        cluster.http_ports[old_leader],
+        "/v1/lock",
+        json!({
+            "key": key.clone(),
+            "ttlMs": 5000,
+            "waitMs": 0,
+            "requestId": rejected_request_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "2-of-5 minority write should be rejected: {rejected:?}"
+    );
+    assert_eq!(
+        rejected_headers.get("x-lmx-request-id"),
+        Some(&rejected_request_id),
+        "minority rejection should echo the retry handle request id"
+    );
+    assert_ne!(
+        rejected["acquired"], true,
+        "2-of-5 minority must not report a granted lock: {rejected:?}"
+    );
+    assert_ne!(
+        rejected["outcomeUnknown"], true,
+        "active-quorum admission failure happens before append, so the response should not claim an unknown committed outcome: {rejected:?}"
+    );
+    wait_for_zero_holders_and_waiters_among(&cluster, &minority).await;
+    let minority_statuses = wait_for_status_indexes_at_least_among(
+        &cluster,
+        &minority,
+        baseline_applied,
+        baseline_applied,
+    )
+    .await;
+    for status in &minority_statuses {
+        assert_eq!(
+            status["lastApplied"].as_u64(),
+            Some(baseline_applied),
+            "minority rejection must not apply a client entry: {status:?}"
+        );
+        assert_eq!(
+            status["clusterSize"].as_u64(),
+            Some(5),
+            "minority survivors should retain five-voter membership: {status:?}"
+        );
+        assert_eq!(
+            status["quorumSize"].as_u64(),
+            Some(3),
+            "minority survivors should still require 3-of-5 quorum: {status:?}"
+        );
+    }
+
+    cluster.restart_node(victims[0]).await;
+    let restored = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| !victims[1..].contains(idx))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored.len(),
+        3,
+        "restoring one voter should create exactly a 3-of-5 quorum"
+    );
+    let restored_leader = wait_for_leader_among(&cluster, &restored).await;
+    wait_for_status_indexes_at_least_among(&cluster, &restored, baseline_applied, baseline_applied)
+        .await;
+
+    let restored_ports = restored
+        .iter()
+        .map(|idx| cluster.http_ports[*idx])
+        .collect::<Vec<_>>();
+    let lb = start_round_robin_lb(restored_ports).await;
+    let (status, acquire) =
+        http_post_json(lb.port, "/v1/lock", json!({"key": key, "ttlMs": 5000})).await;
+    assert_eq!(
+        status, 200,
+        "restored 3-of-5 acquire after minority rejection: {acquire:?}"
+    );
+    assert_eq!(
+        acquire["acquired"], true,
+        "minority rejection must not leave a phantom held lock: {acquire:?}"
+    );
+    let lock_uuid = acquire["lockUuid"]
+        .as_str()
+        .expect("restored quorum acquire should return a lockUuid")
+        .to_string();
+    let acquire_status = wait_for_status_index_at_least(
+        cluster.http_ports[restored_leader],
+        "lastApplied",
+        baseline_applied.saturating_add(1),
+    )
+    .await;
+    let acquire_index = acquire_status["lastApplied"]
+        .as_u64()
+        .expect("restored leader lastApplied after post-minority acquire");
+    wait_for_status_indexes_at_least_among(&cluster, &restored, acquire_index, acquire_index).await;
+
+    let (status, release) = http_post_json(
+        lb.port,
+        "/v1/unlock",
+        json!({"key": key, "lockUuid": lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "restored 3-of-5 release after minority rejection: {release:?}"
+    );
+    assert_eq!(
+        release["unlocked"], true,
+        "restored 3-of-5 release after minority rejection: {release:?}"
+    );
+    let release_status = wait_for_status_index_at_least(
+        cluster.http_ports[restored_leader],
+        "lastApplied",
+        acquire_index.saturating_add(1),
+    )
+    .await;
+    let release_index = release_status["lastApplied"]
+        .as_u64()
+        .expect("restored leader lastApplied after post-minority release");
+    wait_for_status_indexes_at_least_among(&cluster, &restored, release_index, release_index).await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &restored).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_failover_no_wait_history_is_linearizable() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster().await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    wait_for_leader(&cluster).await;
+
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let keys = vec![format!(
+        "raft-http-linearizable-failover-key-{}",
+        uuid::Uuid::new_v4()
+    )];
+    let history = Arc::new(Mutex::new(Vec::<HttpLockHistoryOp>::new()));
+    let order = Arc::new(AtomicUsize::new(0));
+
+    let before_phase0_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
+    run_http_no_wait_history_phase(
+        lb.port,
+        keys.clone(),
+        Arc::clone(&history),
+        Arc::clone(&order),
+        0,
+        3,
+        6,
+        "lb-before-failover",
+    )
+    .await;
+    wait_for_zero_holders_and_waiters(&cluster).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &all_nodes,
+        &before_phase0_full_log,
+        "pre-failover HTTP LB no-wait traffic",
+    )
+    .await;
+
+    let old_leader = wait_for_leader(&cluster).await;
+    let old_leader_status =
+        wait_for_status_index_at_least(cluster.http_ports[old_leader], "lastApplied", 1).await;
+    let pre_failover_applied = old_leader_status["lastApplied"]
+        .as_u64()
+        .expect("old leader lastApplied before failover");
+    let survivors: Vec<usize> = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| *idx != old_leader)
+        .collect();
+    let before_failover_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+
+    cluster.abort_node(old_leader).await;
+    let new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    assert_ne!(new_leader, old_leader);
+    wait_for_status_indexes_at_least_among(
+        &cluster,
+        &survivors,
+        pre_failover_applied,
+        pre_failover_applied,
+    )
+    .await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_failover_full_log,
+        "leader failover and survivor convergence",
+    )
+    .await;
+
+    let before_phase1_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+    run_http_no_wait_history_phase(
+        lb.port,
+        keys,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        1,
+        3,
+        6,
+        "lb-after-failover",
+    )
+    .await;
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_phase1_full_log,
+        "post-failover HTTP LB no-wait traffic",
+    )
+    .await;
+
+    let history = history.lock().expect("history").clone();
+    assert_http_lock_history_linearizable(&history);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_rolling_restart_no_wait_history_is_linearizable() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster().await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let keys = vec![format!(
+        "raft-http-linearizable-rolling-key-{}",
+        uuid::Uuid::new_v4()
+    )];
+    let history = Arc::new(Mutex::new(Vec::<HttpLockHistoryOp>::new()));
+    let order = Arc::new(AtomicUsize::new(0));
+
+    for (phase, restart_index) in all_nodes.iter().copied().enumerate() {
+        wait_for_leader(&cluster).await;
+        let before_phase_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
+        run_http_no_wait_history_phase(
+            lb.port,
+            keys.clone(),
+            Arc::clone(&history),
+            Arc::clone(&order),
+            phase,
+            3,
+            5,
+            "lb-rolling-restart",
+        )
+        .await;
+        wait_for_zero_holders_and_waiters(&cluster).await;
+        let leader = wait_for_leader(&cluster).await;
+        let phase_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+            .await
+            .expect("leader status after rolling-restart traffic phase");
+        let phase_commit = phase_status["commitIndex"]
+            .as_u64()
+            .expect("leader commitIndex after rolling-restart traffic phase");
+        wait_for_status_indexes_at_least_among(&cluster, &all_nodes, phase_commit, phase_commit)
+            .await;
+        assert_full_log_metrics_unchanged(
+            &cluster,
+            &all_nodes,
+            &before_phase_full_log,
+            "rolling-restart HTTP LB traffic phase",
+        )
+        .await;
+
+        let survivors = all_nodes
+            .iter()
+            .copied()
+            .filter(|idx| *idx != restart_index)
+            .collect::<Vec<_>>();
+        let before_restart_survivor_full_log =
+            current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+        cluster.restart_node(restart_index).await;
+        let leader = wait_for_leader(&cluster).await;
+        let restart_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+            .await
+            .expect("leader status after rolling restart");
+        let restart_commit = restart_status["commitIndex"]
+            .as_u64()
+            .expect("leader commitIndex after rolling restart");
+        wait_for_status_indexes_at_least_among(
+            &cluster,
+            &all_nodes,
+            restart_commit,
+            restart_commit,
+        )
+        .await;
+        wait_for_zero_holders_and_waiters(&cluster).await;
+        assert_full_log_metrics_unchanged(
+            &cluster,
+            &survivors,
+            &before_restart_survivor_full_log,
+            "rolling-restart survivor convergence",
+        )
+        .await;
+    }
+
+    let before_final_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
+    run_http_no_wait_history_phase(
+        lb.port,
+        keys,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        all_nodes.len(),
+        3,
+        5,
+        "lb-rolling-restart-final",
+    )
+    .await;
+    wait_for_zero_holders_and_waiters(&cluster).await;
+    let leader = wait_for_leader(&cluster).await;
+    let final_status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status after final rolling-restart traffic phase");
+    let final_commit = final_status["commitIndex"]
+        .as_u64()
+        .expect("leader commitIndex after final rolling-restart traffic phase");
+    wait_for_status_indexes_at_least_among(&cluster, &all_nodes, final_commit, final_commit).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &all_nodes,
+        &before_final_full_log,
+        "final rolling-restart HTTP LB traffic phase",
+    )
+    .await;
+
+    let history = history.lock().expect("history").clone();
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::Acquired { .. })),
+        "rolling-restart HTTP history should record successful acquires"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::NotAcquired)),
+        "rolling-restart HTTP history should record contended no-wait acquires"
+    );
+    assert_http_lock_history_linearizable(&history);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_rolling_config_skew_restart_no_wait_history_is_linearizable() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster().await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let upgraded_tuning = RaftClusterTuning {
+        append_entries_max_entries: 1,
+        append_entries_max_bytes: 384,
+        append_entries_max_inline_batches: 1,
+        target_quorum_extra_fanout: 1,
+        install_snapshot_chunk_bytes: 256,
+        client_batch_max_entries: 1,
+        client_pipeline_max_batches: 1,
+        client_batch_max_delay: Duration::from_millis(3),
+        client_response_cache_max_entries: 64,
+        proxy_retry_budget: Duration::from_secs(3),
+        ..RaftClusterTuning::default()
+    };
+    let keys = vec![format!(
+        "raft-http-linearizable-config-skew-key-{}",
+        uuid::Uuid::new_v4()
+    )];
+    let history = Arc::new(Mutex::new(Vec::<HttpLockHistoryOp>::new()));
+    let order = Arc::new(AtomicUsize::new(0));
+
+    for (phase, restart_index) in all_nodes.iter().copied().enumerate() {
+        wait_for_leader(&cluster).await;
+        let survivors = all_nodes
+            .iter()
+            .copied()
+            .filter(|idx| *idx != restart_index)
+            .collect::<Vec<_>>();
+        let before_survivor_full_log =
+            current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+
+        let traffic = {
+            let lb_port = lb.port;
+            let keys = keys.clone();
+            let history = Arc::clone(&history);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                run_http_no_wait_history_phase(
+                    lb_port,
+                    keys,
+                    history,
+                    order,
+                    phase,
+                    3,
+                    4,
+                    "lb-rolling-config-skew",
+                )
+                .await;
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(8)).await;
+        cluster
+            .restart_node_with_tuning(restart_index, upgraded_tuning.clone())
+            .await;
+        traffic
+            .await
+            .expect("rolling config-skew traffic worker should not panic");
+        wait_for_zero_holders_and_waiters(&cluster).await;
+        let leader = wait_for_leader(&cluster).await;
+        let status = http_get_json(cluster.http_ports[leader], "/raft/status")
+            .await
+            .expect("leader status after rolling config-skew restart");
+        let commit_index = status["commitIndex"]
+            .as_u64()
+            .expect("leader commitIndex after rolling config-skew restart");
+        wait_for_status_indexes_at_least_among(&cluster, &all_nodes, commit_index, commit_index)
+            .await;
+        assert_full_log_metrics_unchanged(
+            &cluster,
+            &survivors,
+            &before_survivor_full_log,
+            "survivors during rolling config-skew restart",
+        )
+        .await;
+    }
+
+    let before_final_full_log = current_full_log_metrics_for_nodes(&cluster, &all_nodes).await;
+    run_http_no_wait_history_phase(
+        lb.port,
+        keys,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        all_nodes.len(),
+        3,
+        4,
+        "lb-rolling-config-skew-final",
+    )
+    .await;
+    wait_for_zero_holders_and_waiters(&cluster).await;
+    let leader = wait_for_leader(&cluster).await;
+    let status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status after final config-skew traffic phase");
+    let commit_index = status["commitIndex"]
+        .as_u64()
+        .expect("leader commitIndex after final config-skew traffic phase");
+    wait_for_status_indexes_at_least_among(&cluster, &all_nodes, commit_index, commit_index).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &all_nodes,
+        &before_final_full_log,
+        "final all-upgraded config-skew HTTP LB traffic phase",
+    )
+    .await;
+
+    let history = history.lock().expect("history").clone();
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::Acquired { .. })),
+        "rolling config-skew HTTP history should record successful acquires"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::NotAcquired)),
+        "rolling config-skew HTTP history should record contended no-wait acquires"
+    );
+    assert_http_lock_history_linearizable(&history);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_live_leader_kill_restart_history_is_linearizable() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster().await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    let old_leader = wait_for_leader(&cluster).await;
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| *idx != old_leader)
+        .collect::<Vec<_>>();
+    let keys = vec![format!(
+        "raft-http-linearizable-live-kill-key-{}",
+        uuid::Uuid::new_v4()
+    )];
+    let history = Arc::new(Mutex::new(Vec::<HttpLockHistoryOp>::new()));
+    let order = Arc::new(AtomicUsize::new(0));
+    let before_survivor_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+
+    let traffic = {
+        let history = Arc::clone(&history);
+        let order = Arc::clone(&order);
+        let keys = keys.clone();
+        tokio::spawn(async move {
+            run_http_no_wait_history_phase(
+                lb.port,
+                keys,
+                history,
+                order,
+                0,
+                3,
+                4,
+                "lb-live-leader-kill",
+            )
+            .await;
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(8)).await;
+    cluster.abort_node(old_leader).await;
+    let new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    assert_ne!(new_leader, old_leader);
+
+    tokio::time::sleep(Duration::from_millis(8)).await;
+    cluster.restart_node(old_leader).await;
+
+    traffic
+        .await
+        .expect("live leader kill/restart traffic worker should not panic");
+    wait_for_zero_holders_and_waiters(&cluster).await;
+    let leader = wait_for_leader(&cluster).await;
+    let status = http_get_json(cluster.http_ports[leader], "/raft/status")
+        .await
+        .expect("leader status after live kill/restart history");
+    let commit_index = status["commitIndex"]
+        .as_u64()
+        .expect("leader commitIndex after live kill/restart history");
+    wait_for_status_indexes_at_least_among(&cluster, &all_nodes, commit_index, commit_index).await;
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_survivor_full_log,
+        "surviving nodes during live leader kill/restart HTTP LB traffic",
+    )
+    .await;
+
+    let history = history.lock().expect("history").clone();
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::Acquired { .. })),
+        "live leader kill/restart HTTP history should record successful acquires"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::NotAcquired)),
+        "live leader kill/restart HTTP history should record contended no-wait acquires"
+    );
+    assert_http_lock_history_linearizable(&history);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_request_id_retry_after_failover_uses_replicated_cache_without_append() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let mut cluster = start_cluster().await;
+    let lb = start_round_robin_lb(cluster.http_ports.clone()).await;
+    wait_for_leader(&cluster).await;
+    let all_nodes: Vec<usize> = (0..cluster.http_ports.len()).collect();
+    let key = format!("raft-http-idempotent-failover-key-{}", uuid::Uuid::new_v4());
+    let request_id = format!("raft-http-idempotent-failover-{}", uuid::Uuid::new_v4());
+    let acquire_body = json!({
+        "key": key.clone(),
+        "ttlMs": 5000,
+        "waitMs": 0,
+        "requestId": request_id,
+    });
+
+    let (status, first) = http_post_json_retrying_unavailable(
+        lb.port,
+        "/v1/lock",
+        acquire_body.clone(),
+        "idempotent first acquire before failover",
+    )
+    .await;
+    assert_eq!(status, 200, "first acquire response: {first:?}");
+    assert_eq!(first["acquired"], true, "first acquire response: {first:?}");
+    let lock_uuid = first["lockUuid"]
+        .as_str()
+        .expect("first acquire lockUuid")
+        .to_string();
+
+    let old_leader = wait_for_leader(&cluster).await;
+    let old_leader_status = http_get_json(cluster.http_ports[old_leader], "/raft/status")
+        .await
+        .expect("old leader status after first acquire");
+    let first_commit = old_leader_status["commitIndex"]
+        .as_u64()
+        .expect("old leader commitIndex after first acquire");
+    wait_for_status_indexes_at_least_among(&cluster, &all_nodes, first_commit, first_commit).await;
+
+    cluster.abort_node(old_leader).await;
+    let survivors = all_nodes
+        .iter()
+        .copied()
+        .filter(|idx| *idx != old_leader)
+        .collect::<Vec<_>>();
+    let new_leader = wait_for_leader_among(&cluster, &survivors).await;
+    assert_ne!(new_leader, old_leader);
+    wait_for_status_indexes_at_least_among(&cluster, &survivors, first_commit, first_commit).await;
+
+    let before_full_log = current_full_log_metrics_for_nodes(&cluster, &survivors).await;
+    let before_proposals = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_proposals_total",
+    )
+    .await;
+    let before_batches = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_batches_total",
+    )
+    .await;
+    let before_batch_entries = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_batch_entries_total",
+    )
+    .await;
+    let before_cache_hits = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_cache_completed_hits_total",
+    )
+    .await;
+
+    let (status, duplicate) = http_post_json_retrying_unavailable(
+        lb.port,
+        "/v1/lock",
+        acquire_body.clone(),
+        "idempotent duplicate acquire after failover",
+    )
+    .await;
+    assert_eq!(status, 200, "duplicate acquire response: {duplicate:?}");
+    assert_eq!(
+        duplicate["acquired"], true,
+        "duplicate acquire should replay the original granted response: {duplicate:?}"
+    );
+    assert_eq!(
+        duplicate["lockUuid"].as_str(),
+        Some(lock_uuid.as_str()),
+        "duplicate acquire should replay the original lock UUID: first={first:?} duplicate={duplicate:?}"
+    );
+    assert_eq!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_proposals_total"
+        )
+        .await,
+        before_proposals,
+        "duplicate idempotent retry after failover must not enqueue a new proposal"
+    );
+    assert_eq!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_batches_total"
+        )
+        .await,
+        before_batches,
+        "duplicate idempotent retry after failover must not submit a new batch"
+    );
+    assert_eq!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_batch_entries_total"
+        )
+        .await,
+        before_batch_entries,
+        "duplicate idempotent retry after failover must not append another client entry"
+    );
+    assert!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_cache_completed_hits_total"
+        )
+        .await
+            > before_cache_hits,
+        "duplicate idempotent retry after failover should be served from the completed response cache"
+    );
+    assert_full_log_metrics_unchanged(
+        &cluster,
+        &survivors,
+        &before_full_log,
+        "idempotent retry after leader failover",
+    )
+    .await;
+
+    let before_conflicts = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_cache_conflicts_total",
+    )
+    .await;
+    let before_conflict_proposals = current_metric_sum_for_nodes(
+        &cluster,
+        &survivors,
+        "dd_rust_network_mutex_raft_client_proposals_total",
+    )
+    .await;
+    let (status, conflict) = http_post_json_retrying_unavailable(
+        lb.port,
+        "/v1/lock",
+        json!({
+            "key": format!("{key}-different"),
+            "ttlMs": 5000,
+            "waitMs": 0,
+            "requestId": acquire_body["requestId"].clone(),
+        }),
+        "conflicting idempotent acquire after failover",
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "conflicting idempotency payload should return conflict: {conflict:?}"
+    );
+    assert_eq!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_proposals_total"
+        )
+        .await,
+        before_conflict_proposals,
+        "conflicting idempotency retry must be rejected before proposal"
+    );
+    assert!(
+        current_metric_sum_for_nodes(
+            &cluster,
+            &survivors,
+            "dd_rust_network_mutex_raft_client_cache_conflicts_total"
+        )
+        .await
+            > before_conflicts,
+        "conflicting idempotency retry should increment the conflict counter"
+    );
+
+    let (status, release) = http_post_json_retrying_unavailable(
+        lb.port,
+        "/v1/unlock",
+        json!({
+            "key": key,
+            "lockUuid": lock_uuid,
+            "requestId": format!("raft-http-idempotent-release-{}", uuid::Uuid::new_v4()),
+        }),
+        "release after idempotent failover retry",
+    )
+    .await;
+    assert_eq!(status, 200, "release response: {release:?}");
+    assert_eq!(release["unlocked"], true, "release response: {release:?}");
+    wait_for_zero_holders_and_waiters_among(&cluster, &survivors).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raft_http_responses_carry_leader_role_headers() {
     // Every HTTP response stamps the node's Raft role and last-known leader so a
     // load balancer can learn the leader from any response (not just a probe).
@@ -1178,6 +2705,100 @@ async fn raft_http_responses_carry_leader_role_headers() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_http_acquire_release_echo_request_id_headers() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let cluster = start_cluster().await;
+    let leader = wait_for_leader(&cluster).await;
+    let port = cluster.http_ports[leader];
+    let key = format!("raft-request-id-header-key-{}", uuid::Uuid::new_v4());
+    let acquire_request_id = format!("raft-request-id-acquire-{}", uuid::Uuid::new_v4());
+
+    let (status, headers, acquire) = http_post_json_with_headers(
+        port,
+        "/v1/lock",
+        json!({
+            "key": key.clone(),
+            "ttlMs": 5000,
+            "requestId": acquire_request_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "acquire response: {acquire:?}");
+    assert_eq!(acquire["acquired"], true, "acquire response: {acquire:?}");
+    assert_eq!(
+        headers.get("x-lmx-request-id"),
+        Some(&acquire_request_id),
+        "acquire response should echo supplied request id"
+    );
+    let lock_uuid = acquire["lockUuid"]
+        .as_str()
+        .expect("acquire lockUuid")
+        .to_string();
+
+    let generated_key = format!("raft-generated-request-id-key-{}", uuid::Uuid::new_v4());
+    let (status, generated_headers, generated) = http_post_json_with_headers(
+        port,
+        "/v1/lock",
+        json!({"key": generated_key.clone(), "ttlMs": 5000}),
+    )
+    .await;
+    assert_eq!(status, 200, "generated-id acquire response: {generated:?}");
+    assert_eq!(
+        generated["acquired"], true,
+        "generated-id acquire response: {generated:?}"
+    );
+    let generated_request_id = generated_headers
+        .get("x-lmx-request-id")
+        .expect("generated-id acquire should expose generated request id");
+    uuid::Uuid::parse_str(generated_request_id)
+        .expect("generated request id header should be a UUID");
+    let generated_lock_uuid = generated["lockUuid"]
+        .as_str()
+        .expect("generated acquire lockUuid")
+        .to_string();
+
+    let release_request_id = format!("raft-request-id-release-{}", uuid::Uuid::new_v4());
+    let (status, release_headers, release) = http_post_json_with_headers(
+        port,
+        "/v1/unlock",
+        json!({
+            "key": key,
+            "lockUuid": lock_uuid,
+            "requestId": release_request_id,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "release response: {release:?}");
+    assert_eq!(release["unlocked"], true, "release response: {release:?}");
+    assert_eq!(
+        release_headers.get("x-lmx-request-id"),
+        Some(&release_request_id),
+        "release response should echo supplied request id"
+    );
+
+    let (status, generated_release_headers, generated_release) = http_post_json_with_headers(
+        port,
+        "/v1/unlock",
+        json!({"key": generated_key, "lockUuid": generated_lock_uuid}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "generated-id cleanup release response: {generated_release:?}"
+    );
+    assert_eq!(
+        generated_release["unlocked"], true,
+        "generated-id cleanup release response: {generated_release:?}"
+    );
+    let generated_release_request_id = generated_release_headers
+        .get("x-lmx-request-id")
+        .expect("generated-id release should expose generated request id");
+    uuid::Uuid::parse_str(generated_release_request_id)
+        .expect("generated release request id header should be a UUID");
+    wait_for_zero_holders_and_waiters(&cluster).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1536,6 +3157,108 @@ async fn raft_membership_grows_and_shrinks_through_even_size() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_lb_membership_churn_no_wait_history_is_linearizable() {
+    let _guard = RAFT_TEST_LOCK.lock().await;
+    let cluster = start_cluster_with_nodes(5, 3).await;
+    let history = Arc::new(Mutex::new(Vec::<HttpLockHistoryOp>::new()));
+    let order = Arc::new(AtomicUsize::new(0));
+    let v3 = vec![0, 1, 2];
+    let v4 = vec![0, 1, 2, 3];
+    let v5 = vec![0, 1, 2, 3, 4];
+
+    wait_for_leader_among(&cluster, &v3).await;
+    run_lb_membership_churn_history_step(
+        &cluster,
+        &v3,
+        &v4,
+        4,
+        3,
+        0,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        "grow-3-to-4",
+    )
+    .await;
+
+    run_lb_membership_churn_history_step(
+        &cluster,
+        &v4,
+        &v5,
+        5,
+        3,
+        1,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        "grow-4-to-5",
+    )
+    .await;
+
+    let leader = wait_for_leader_among(&cluster, &v5).await;
+    let shrink_victims = v5
+        .iter()
+        .copied()
+        .filter(|idx| *idx != leader)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shrink_victims.len(),
+        2,
+        "5-node cluster should have two non-leaders available to remove"
+    );
+    let s4 = v5
+        .iter()
+        .copied()
+        .filter(|idx| *idx != shrink_victims[0])
+        .collect::<Vec<_>>();
+    let s3 = s4
+        .iter()
+        .copied()
+        .filter(|idx| *idx != shrink_victims[1])
+        .collect::<Vec<_>>();
+
+    run_lb_membership_churn_history_step(
+        &cluster,
+        &v5,
+        &s4,
+        4,
+        3,
+        2,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        "shrink-5-to-4",
+    )
+    .await;
+
+    run_lb_membership_churn_history_step(
+        &cluster,
+        &s4,
+        &s3,
+        3,
+        2,
+        3,
+        Arc::clone(&history),
+        Arc::clone(&order),
+        "shrink-4-to-3",
+    )
+    .await;
+
+    let history = history.lock().expect("history").clone();
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::Acquired { .. })),
+        "membership churn HTTP history should record successful acquires"
+    );
+    assert!(
+        history
+            .iter()
+            .any(|op| matches!(op.result, HttpLockHistoryResult::NotAcquired)),
+        "membership churn HTTP history should record contended no-wait acquires"
+    );
+    assert_http_lock_history_linearizable(&history);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction() {
     let _guard = RAFT_TEST_LOCK.lock().await;
     let tuning = RaftClusterTuning {
@@ -1629,6 +3352,13 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
         "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
     )
     .await;
+    let before_leader_compactions = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_log_compactions_total",
+    )
+    .await;
+    let before_leader_full_log = current_full_log_metrics(cluster.http_ports[leader]).await;
+    let before_learner_full_log = current_full_log_metrics(cluster.http_ports[3]).await;
 
     let (status, staged) = http_post_json(
         cluster.http_ports[leader],
@@ -1674,11 +3404,35 @@ async fn raft_staged_learner_catches_up_with_install_snapshot_after_compaction()
         "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
     )
     .await;
+    let after_leader_compactions = current_metric(
+        cluster.http_ports[leader],
+        "dd_rust_network_mutex_raft_log_compactions_total",
+    )
+    .await;
+    let after_leader_full_log = current_full_log_metrics(cluster.http_ports[leader]).await;
+    let after_learner_full_log = current_full_log_metrics(cluster.http_ports[3]).await;
     let learner_snapshot_index = current_metric(
         cluster.http_ports[3],
         "dd_rust_network_mutex_raft_latest_snapshot_index",
     )
     .await;
+    assert_eq!(
+        after_leader_full_log.reads_total, before_leader_full_log.reads_total,
+        "snapshot learner catch-up should not make the leader perform a full retained-log scan"
+    );
+    let leader_full_rewrite_delta = after_leader_full_log
+        .rewrites_total
+        .saturating_sub(before_leader_full_log.rewrites_total);
+    let leader_compaction_delta =
+        after_leader_compactions.saturating_sub(before_leader_compactions);
+    assert!(
+        leader_full_rewrite_delta <= leader_compaction_delta,
+        "snapshot learner catch-up should not make the leader rewrite the retained log except for real compaction; full_rewrite_delta={leader_full_rewrite_delta} compaction_delta={leader_compaction_delta}"
+    );
+    assert_eq!(
+        after_learner_full_log, before_learner_full_log,
+        "empty learner catch-up should install the snapshot and append the retained suffix without full-log scan/rewrite"
+    );
     let appended_delta = after_learner_appended.saturating_sub(before_learner_appended);
     let sent_delta = after_leader_sent.saturating_sub(before_leader_sent);
     if learner_snapshot_index < stage_target {
@@ -1857,6 +3611,8 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
         "dd_rust_network_mutex_raft_append_snapshot_fallbacks_total",
     )
     .await;
+    let before_leader_full_log = current_full_log_metrics(cluster.http_ports[leader]).await;
+    let before_learner_full_log = current_full_log_metrics(cluster.http_ports[3]).await;
 
     let (status, staged) = http_post_json(
         cluster.http_ports[leader],
@@ -1893,9 +3649,19 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
         "dd_rust_network_mutex_raft_append_snapshot_fallbacks_total",
     )
     .await;
+    let after_leader_full_log = current_full_log_metrics(cluster.http_ports[leader]).await;
+    let after_learner_full_log = current_full_log_metrics(cluster.http_ports[3]).await;
     assert_eq!(
         after_fallbacks, before_fallbacks,
         "append-only learner catch-up should not fall back to InstallSnapshot"
+    );
+    assert_eq!(
+        after_leader_full_log, before_leader_full_log,
+        "append-only learner catch-up should not make the leader scan or rewrite the retained log"
+    );
+    assert_eq!(
+        after_learner_full_log, before_learner_full_log,
+        "append-only learner catch-up should append bounded suffixes without full-log scan/rewrite"
     );
     assert_eq!(
         current_metric(
@@ -1915,7 +3681,7 @@ async fn raft_staged_learner_catches_up_over_bounded_append_entries_without_snap
         0,
         "append-only learner should not install a snapshot"
     );
-    let minimum_catchup_batches = (stage_target + 1) / 2;
+    let minimum_catchup_batches = stage_target.div_ceil(2);
     assert!(
         after_batches.saturating_sub(before_batches) >= minimum_catchup_batches,
         "bounded catch-up should require multiple AppendEntries batches; before={before_batches} after={after_batches} target={stage_target}"
@@ -2331,12 +4097,87 @@ async fn http_post_json(port: u16, path: &str, body: Value) -> (u16, Value) {
     (status, parsed)
 }
 
+async fn http_post_json_with_headers(
+    port: u16,
+    path: &str,
+    body: Value,
+) -> (u16, BTreeMap<String, String>, Value) {
+    let raw = http_request_raw("POST", port, path, Some(body))
+        .await
+        .expect("HTTP request failed");
+    let (status, headers, body) = parse_http_response(&raw);
+    let parsed = serde_json::from_str(&body)
+        .unwrap_or_else(|err| panic!("failed to parse JSON body: {err}; body={body:?}"));
+    (status, headers, parsed)
+}
+
+async fn http_post_json_retrying_unavailable(
+    port: u16,
+    path: &str,
+    body: Value,
+    label: &str,
+) -> (u16, Value) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut attempts = 0usize;
+    let mut latest = String::new();
+    loop {
+        attempts = attempts.saturating_add(1);
+        match http_request("POST", port, path, Some(body.clone())).await {
+            Ok((status, raw_body)) => match serde_json::from_str::<Value>(&raw_body) {
+                Ok(parsed) => {
+                    if status == 503 && tokio::time::Instant::now() < deadline {
+                        latest = format!("status={status} body={parsed:?} attempts={attempts}");
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    return (status, parsed);
+                }
+                Err(err) => {
+                    if (status == 0 || status == 503 || raw_body.is_empty())
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        latest = format!(
+                            "status={status} parse_error={err} raw_body={raw_body:?} attempts={attempts}"
+                        );
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    panic!(
+                        "{label}: failed to parse JSON body after {attempts} attempt(s): {err}; body={raw_body:?}; latest={latest}"
+                    );
+                }
+            },
+            Err(err) => {
+                if tokio::time::Instant::now() < deadline {
+                    latest = format!("io_error={err} attempts={attempts}");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    continue;
+                }
+                panic!(
+                    "{label}: HTTP request failed after {attempts} attempt(s): {err}; latest={latest}"
+                );
+            }
+        }
+    }
+}
+
 async fn http_request(
     method: &str,
     port: u16,
     path: &str,
     body: Option<Value>,
 ) -> std::io::Result<(u16, String)> {
+    let raw = http_request_raw(method, port, path, body).await?;
+    let (status, _, body) = parse_http_response(&raw);
+    Ok((status, body))
+}
+
+async fn http_request_raw(
+    method: &str,
+    port: u16,
+    path: &str,
+    body: Option<Value>,
+) -> std::io::Result<String> {
     let body = body
         .map(|value| serde_json::to_vec(&value).unwrap())
         .unwrap_or_default();
@@ -2356,34 +4197,33 @@ async fn http_request(
 
     let mut raw = String::new();
     stream.read_to_string(&mut raw).await?;
-    let status = raw
+    Ok(raw)
+}
+
+fn parse_http_response(raw: &str) -> (u16, BTreeMap<String, String>, String) {
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw, ""));
+    let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .unwrap_or(0);
-    let body = raw
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default();
-    Ok((status, body))
+    let mut headers = BTreeMap::new();
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    (status, headers, body.to_string())
 }
 
 /// Issue a GET and return the value of a single response header (case-insensitive
 /// name match, trimmed value), or `None` if the header is absent.
 async fn http_response_header(port: u16, path: &str, header: &str) -> Option<String> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
-    stream.write_all(request.as_bytes()).await.ok()?;
-    stream.flush().await.ok()?;
-    let mut raw = String::new();
-    stream.read_to_string(&mut raw).await.ok()?;
-    let head = raw.split_once("\r\n\r\n").map(|(h, _)| h).unwrap_or(&raw);
-    let needle = format!("{}:", header.to_ascii_lowercase());
-    head.lines()
-        .find(|line| line.to_ascii_lowercase().starts_with(&needle))
-        .map(|line| line.split_once(':').map(|(_, v)| v.trim().to_string()))
-        .flatten()
+    let raw = http_request_raw("GET", port, path, None).await.ok()?;
+    let (_, headers, _) = parse_http_response(&raw);
+    headers.get(&header.to_ascii_lowercase()).cloned()
 }
 
 async fn proxy_http_once(

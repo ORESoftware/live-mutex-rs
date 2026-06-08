@@ -4,10 +4,10 @@
 //! composite (multi-key) blocking acquires.
 //!
 //! Invariants enforced against a shared shadow model under every grant/release:
-//!   * mutual exclusion  — no two live holders ever overlap on a key;
-//!   * fencing monotonic — each grant's per-key token strictly exceeds the last
-//!                         token observed for that key, across all tasks;
-//!   * composite atomicity — a composite guard carries a token for every key.
+//! * mutual exclusion  — no two live holders ever overlap on a key;
+//! * fencing monotonic — each grant's per-key token strictly exceeds the last
+//!   token observed for that key, across all tasks;
+//! * composite atomicity — a composite guard carries a token for every key.
 //!
 //! Ordering rule that makes the model race-free: we mark a key FREE in the
 //! model *before* releasing it on the broker, so the broker can't hand the key

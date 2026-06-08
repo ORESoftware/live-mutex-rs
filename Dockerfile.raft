@@ -19,7 +19,8 @@ ARG CARGO_BUILD_FLAGS=""
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY vendor ./vendor
 RUN mkdir -p src \
   && echo "fn main() {}" > src/main.rs \
   && printf 'pub fn __stub() {}\n' > src/lib.rs \
@@ -54,6 +55,7 @@ RUN apt-get update \
 
 COPY --from=build /app/target/release/dd-rust-network-mutex /usr/local/bin/dd-rust-network-mutex
 COPY lmx-raft.toml /etc/dd-rust-network-mutex/lmx.toml
+COPY .cli-flags.toml /etc/dd-rust-network-mutex/.cli-flags.toml
 
 ENV LMX_CONFIG=/etc/dd-rust-network-mutex/lmx.toml \
     LMX_RAFT_ENABLED=true \

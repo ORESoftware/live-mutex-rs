@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use dd_rust_network_mutex::{
+    cli_flags::{self, BrokerCliConfig},
     config, routine_id,
     server::{self, ServerConfig},
     BrokerRaftConfig,
@@ -19,6 +20,17 @@ use tracing::info;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let cli_config = cli_flags::load_broker_cli_config()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
+    let cli_env = match cli_config {
+        BrokerCliConfig::Run(cli_env) => cli_env,
+        BrokerCliConfig::Help(help) => {
+            print!("{}", help.table());
+            return Ok(());
+        }
+    };
+    cli_env.apply_cli_overrides_to_process_env();
+
     // Initialise tracing/OTel BEFORE we touch the macro, so the very first
     // `info!("enter")` line lands on a real subscriber. The init helper is
     // idempotent.

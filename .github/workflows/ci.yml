@@ -61,6 +61,31 @@ jobs:
       - name: Run tests without default features
         run: cargo test --locked --no-default-features
 
+      - name: Verify broker CLI FFI packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_files="$(cargo package --locked --list)"
+          for file in \
+            .cli-flags.toml \
+            build.rs \
+            vendor/flags2env/LICENSE \
+            vendor/flags2env/parser.c \
+            vendor/flags2env/parser.h
+          do
+            grep -qx "$file" <<< "$package_files"
+          done
+
+          install_root="$(mktemp -d)"
+          cargo install --path . --root "$install_root" --locked --debug --force
+          "$install_root/bin/dd-rust-network-mutex" --help | grep -q -- "--tcp-port"
+          if "$install_root/bin/dd-rust-network-mutex" --tcp-port nope 2>"$install_root/invalid-cli.log"; then
+            echo "expected invalid typed CLI flag to fail" >&2
+            exit 1
+          fi
+          grep -q "not a valid integer" "$install_root/invalid-cli.log"
+
   clients:
     name: Client protocol checks
     runs-on: ubuntu-latest

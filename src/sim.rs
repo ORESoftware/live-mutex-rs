@@ -104,7 +104,7 @@ pub enum RaftSimError {
     #[error("raft simulation request `{request_id}` returned unexpected response: {response:?}")]
     UnexpectedResponse {
         request_id: String,
-        response: Response,
+        response: Box<Response>,
     },
 }
 
@@ -140,29 +140,30 @@ impl RaftSim {
         let mut nodes = BTreeMap::new();
 
         for peer in &peers {
-            let mut raft_config = BrokerRaftConfig::default();
-            raft_config.enabled = true;
-            raft_config.node_id = peer.id.clone();
-            raft_config.bind_addr = Some("127.0.0.1:0".parse().expect("valid sim bind addr"));
-            raft_config.advertise_addr = Some(peer.addr.clone());
-            raft_config.data_dir = config.data_dir.join(&peer.id);
-            raft_config.data_dir_lock = false;
-            raft_config.broker = config.broker.clone();
-            raft_config.heartbeat_interval = config.heartbeat_interval;
-            raft_config.election_timeout_min = config.election_timeout_min;
-            raft_config.election_timeout_max = config.election_timeout_max;
-            raft_config.snapshot_interval = config.snapshot_interval;
-            raft_config.snapshot_max_log_entries = config.snapshot_max_log_entries;
-            raft_config.snapshot_max_log_bytes = config.snapshot_max_log_bytes;
-            raft_config.trailing_log_entries = config.trailing_log_entries;
-            raft_config.append_entries_max_entries = config.append_entries_max_entries;
-            raft_config.append_entries_max_bytes = config.append_entries_max_bytes;
-            raft_config.append_entries_max_inline_batches =
-                config.append_entries_max_inline_batches;
-            raft_config.sync_log = config.sync_log;
-            raft_config.sync_commit = config.sync_commit;
-            raft_config.peer_token = config.peer_token.clone();
-            raft_config.peers = peers.clone();
+            let raft_config = BrokerRaftConfig {
+                enabled: true,
+                node_id: peer.id.clone(),
+                bind_addr: Some("127.0.0.1:0".parse().expect("valid sim bind addr")),
+                advertise_addr: Some(peer.addr.clone()),
+                data_dir: config.data_dir.join(&peer.id),
+                data_dir_lock: false,
+                broker: config.broker.clone(),
+                heartbeat_interval: config.heartbeat_interval,
+                election_timeout_min: config.election_timeout_min,
+                election_timeout_max: config.election_timeout_max,
+                snapshot_interval: config.snapshot_interval,
+                snapshot_max_log_entries: config.snapshot_max_log_entries,
+                snapshot_max_log_bytes: config.snapshot_max_log_bytes,
+                trailing_log_entries: config.trailing_log_entries,
+                append_entries_max_entries: config.append_entries_max_entries,
+                append_entries_max_bytes: config.append_entries_max_bytes,
+                append_entries_max_inline_batches: config.append_entries_max_inline_batches,
+                sync_log: config.sync_log,
+                sync_commit: config.sync_commit,
+                peer_token: config.peer_token.clone(),
+                peers: peers.clone(),
+                ..BrokerRaftConfig::default()
+            };
 
             let node = BrokerRaft::open_in_memory(raft_config, Arc::clone(&network))?;
             network.register(node.clone());
@@ -382,15 +383,7 @@ impl RaftSim {
                         .map_err(Into::into)
                 }
             },
-            |err| {
-                matches!(
-                    err,
-                    RaftSimError::Raft(
-                        BrokerRaftError::NotLeader { .. }
-                            | BrokerRaftError::QuorumUnavailable { .. }
-                    )
-                )
-            },
+            retryable_sim_leader_error,
         )
         .await
     }
@@ -472,7 +465,7 @@ impl RaftSim {
             }),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
-                response,
+                response: Box::new(response),
             }),
         }
     }
@@ -505,7 +498,7 @@ impl RaftSim {
             false,
         )
         .await?
-        .ok_or_else(|| RaftSimError::NoResponse {
+        .ok_or(RaftSimError::NoResponse {
             request_id: request_uuid,
         })
     }
@@ -618,6 +611,18 @@ where
     }
 }
 
+fn retryable_sim_leader_error(err: &RaftSimError) -> bool {
+    crate::routine_id!("ddl-routine-raft-sim-retryable-leader-error-1");
+    matches!(
+        err,
+        RaftSimError::Raft(
+            BrokerRaftError::NotLeader { .. }
+                | BrokerRaftError::QuorumUnavailable { .. }
+                | BrokerRaftError::ClientProposalUncertain { .. }
+        )
+    )
+}
+
 fn duration_ms_u64(duration: Duration) -> u64 {
     crate::routine_id!("ddl-routine-raft-sim-duration-ms-1");
     duration.as_millis().min(u64::MAX as u128) as u64
@@ -629,7 +634,7 @@ mod tests {
     use crate::RaftMembership;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -891,6 +896,536 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_concurrent_partition_heal_preserves_single_key_linearizability() {
+        #[derive(Debug, Clone)]
+        struct GrantInterval {
+            key: String,
+            lock_uuid: String,
+            acquire_order: usize,
+            release_invocation_order: usize,
+        }
+
+        let sim = Arc::new(RaftSim::new(3).await.expect("start in-memory raft sim"));
+        let node_ids = sim.node_ids();
+        let leader = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader before concurrent partition");
+        let old_leader_id = leader.config().node_id.clone();
+        let majority = node_ids
+            .iter()
+            .filter(|node_id| *node_id != &old_leader_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(majority.len(), 2);
+        sim.partition(
+            &[old_leader_id.as_str()],
+            &[majority[0].as_str(), majority[1].as_str()],
+        );
+        wait_for_ready_leader_in(&sim, &majority, Duration::from_secs(5))
+            .await
+            .expect("majority partition should elect a ready leader");
+
+        let keys = (0..3)
+            .map(|idx| format!("sim-linear-key-{idx}-{}", Uuid::new_v4()))
+            .collect::<Vec<_>>();
+        let unreleased = Arc::new(Mutex::new(BTreeMap::<String, String>::new()));
+        let history = Arc::new(Mutex::new(Vec::<GrantInterval>::new()));
+        let order = Arc::new(AtomicUsize::new(1));
+        let healed = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for worker in 0..8 {
+            let sim = Arc::clone(&sim);
+            let majority = majority.clone();
+            let all_nodes = node_ids.clone();
+            let keys = keys.clone();
+            let unreleased = Arc::clone(&unreleased);
+            let history = Arc::clone(&history);
+            let order = Arc::clone(&order);
+            let healed = Arc::clone(&healed);
+            tasks.push(tokio::spawn(async move {
+                let mut state = 0xA11C_E000_u64 + worker as u64;
+                for step in 0..24 {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let key = keys[(state as usize) % keys.len()].clone();
+                    let candidate_nodes = if healed.load(Ordering::SeqCst) == 0 {
+                        &majority
+                    } else {
+                        &all_nodes
+                    };
+                    let node_id = &candidate_nodes
+                        [(state.rotate_left(17) as usize + step) % candidate_nodes.len()];
+                    let lock =
+                        match acquire_key_on_node(&sim, node_id, key.clone(), "linear-partition")
+                            .await
+                        {
+                            Ok(Some(lock)) => lock,
+                            Ok(None) => {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                                continue;
+                            }
+                            Err(err) if retryable_sim_leader_error(&err) => {
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                                continue;
+                            }
+                            Err(err) => panic!("linearizability acquire failed: {err:?}"),
+                        };
+                    let acquire_order = order.fetch_add(1, Ordering::SeqCst);
+                    {
+                        let mut held = unreleased.lock().expect("unreleased lock map");
+                        assert!(
+                            held.insert(lock.key.clone(), lock.lock_uuid.clone())
+                                .is_none(),
+                            "two successful Raft lock grants overlapped before any release was invoked for key {}",
+                            lock.key
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(1 + ((worker + step) % 4) as u64))
+                        .await;
+                    let release_invocation_order = order.fetch_add(1, Ordering::SeqCst);
+                    {
+                        let mut held = unreleased.lock().expect("unreleased lock map");
+                        assert_eq!(
+                            held.remove(&lock.key).as_deref(),
+                            Some(lock.lock_uuid.as_str()),
+                            "release observed a different unreleased holder for {}",
+                            lock.key
+                        );
+                    }
+                    release_lock_on_node(&sim, node_id, &lock, "linear-partition")
+                        .await
+                        .expect("linearizability release should succeed");
+                    history.lock().expect("history").push(GrantInterval {
+                        key: lock.key,
+                        lock_uuid: lock.lock_uuid,
+                        acquire_order,
+                        release_invocation_order,
+                    });
+                }
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        sim.heal();
+        healed.store(1, Ordering::SeqCst);
+
+        for task in tasks {
+            task.await
+                .expect("concurrent linearizability worker should not panic");
+        }
+        assert!(
+            unreleased.lock().expect("unreleased lock map").is_empty(),
+            "all successful grants should have been released"
+        );
+        let final_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after concurrent partition heal")
+            .commit_index();
+        wait_for_all_applied(&sim, final_index, Duration::from_secs(5))
+            .await
+            .expect("concurrent partition/heal history should apply on all nodes");
+
+        let history = history.lock().expect("history").clone();
+        assert!(
+            !history.is_empty(),
+            "concurrent partition/heal test should record successful grants"
+        );
+        for (left_idx, left) in history.iter().enumerate() {
+            for right in history.iter().skip(left_idx + 1) {
+                if left.key == right.key {
+                    assert!(
+                        left.release_invocation_order < right.acquire_order
+                            || right.release_invocation_order < left.acquire_order,
+                        "successful grants for {} overlapped before a release invocation: left={left:?} right={right:?}",
+                        left.key
+                    );
+                    assert_ne!(
+                        left.lock_uuid, right.lock_uuid,
+                        "distinct grants for {} should not reuse lock UUIDs",
+                        left.key
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_partition_heal_no_wait_history_is_linearizable() {
+        let sim = Arc::new(RaftSim::new(3).await.expect("start in-memory raft sim"));
+        let node_ids = sim.node_ids();
+        let leader = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader before no-wait history partition");
+        let old_leader_id = leader.config().node_id.clone();
+        let majority = node_ids
+            .iter()
+            .filter(|node_id| *node_id != &old_leader_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(majority.len(), 2);
+        sim.partition(
+            &[old_leader_id.as_str()],
+            &[majority[0].as_str(), majority[1].as_str()],
+        );
+        wait_for_ready_leader_in(&sim, &majority, Duration::from_secs(5))
+            .await
+            .expect("majority partition should elect a ready leader");
+
+        let keys = (0..2)
+            .map(|idx| format!("sim-linear-history-key-{idx}-{}", Uuid::new_v4()))
+            .collect::<Vec<_>>();
+        let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
+        let order = Arc::new(AtomicUsize::new(1));
+        let healed = Arc::new(AtomicUsize::new(0));
+        let full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
+        let mut tasks = Vec::new();
+
+        for worker in 0..4 {
+            let sim = Arc::clone(&sim);
+            let majority = majority.clone();
+            let all_nodes = node_ids.clone();
+            let keys = keys.clone();
+            let history = Arc::clone(&history);
+            let order = Arc::clone(&order);
+            let healed = Arc::clone(&healed);
+            tasks.push(tokio::spawn(async move {
+                let mut state = 0x1EAF_5EED_u64 + worker as u64;
+                for step in 0..10 {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let key = keys[(state as usize) % keys.len()].clone();
+                    let candidate_nodes = if healed.load(Ordering::SeqCst) == 0 {
+                        &majority
+                    } else {
+                        &all_nodes
+                    };
+                    let node_id = &candidate_nodes
+                        [(state.rotate_left(11) as usize + step) % candidate_nodes.len()];
+                    let acquire_invoke = order.fetch_add(1, Ordering::SeqCst);
+                    let acquire =
+                        acquire_key_on_node(&sim, node_id, key.clone(), "linear-history").await;
+                    let acquire_response = order.fetch_add(1, Ordering::SeqCst);
+                    let lock = match acquire {
+                        Ok(Some(lock)) => {
+                            history.lock().expect("history").push(LockHistoryOp {
+                                key: key.clone(),
+                                invoke_order: acquire_invoke,
+                                response_order: acquire_response,
+                                result: LockHistoryResult::Acquired {
+                                    lock_uuid: lock.lock_uuid.clone(),
+                                },
+                            });
+                            Some(lock)
+                        }
+                        Ok(None) => {
+                            history.lock().expect("history").push(LockHistoryOp {
+                                key,
+                                invoke_order: acquire_invoke,
+                                response_order: acquire_response,
+                                result: LockHistoryResult::NotAcquired,
+                            });
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            None
+                        }
+                        Err(err) if retryable_sim_leader_error(&err) => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            None
+                        }
+                        Err(err) => panic!("linearizable history acquire failed: {err:?}"),
+                    };
+                    let Some(lock) = lock else {
+                        continue;
+                    };
+                    tokio::time::sleep(Duration::from_millis(1 + ((worker + step) % 3) as u64))
+                        .await;
+                    let release_invoke = order.fetch_add(1, Ordering::SeqCst);
+                    release_lock_on_node(&sim, node_id, &lock, "linear-history")
+                        .await
+                        .expect("linearizable history release should succeed");
+                    let release_response = order.fetch_add(1, Ordering::SeqCst);
+                    history.lock().expect("history").push(LockHistoryOp {
+                        key: lock.key,
+                        invoke_order: release_invoke,
+                        response_order: release_response,
+                        result: LockHistoryResult::Released {
+                            lock_uuid: lock.lock_uuid,
+                        },
+                    });
+                }
+            }));
+        }
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        sim.heal();
+        healed.store(1, Ordering::SeqCst);
+
+        for task in tasks {
+            task.await
+                .expect("linearizable history worker should not panic");
+        }
+        let final_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after linearizable history heal")
+            .commit_index();
+        wait_for_all_applied(&sim, final_index, Duration::from_secs(5))
+            .await
+            .expect("linearizable history should apply on all nodes");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &full_log_before,
+            "partition/heal no-wait history traffic",
+        );
+
+        let history = history.lock().expect("history").clone();
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::Acquired { .. })),
+            "linearizable history test should record successful acquires"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::NotAcquired)),
+            "linearizable history test should record contended no-wait acquires"
+        );
+        assert_lock_history_linearizable(&history);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_stale_leader_restart_no_wait_history_is_linearizable() {
+        let mut sim = RaftSim::new(3).await.expect("start in-memory raft sim");
+        let node_ids = sim.node_ids();
+        let leader = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader before stale-leader restart history partition");
+        let old_leader_id = leader.config().node_id.clone();
+        let majority = node_ids
+            .iter()
+            .filter(|node_id| *node_id != &old_leader_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(majority.len(), 2);
+        sim.partition(
+            &[old_leader_id.as_str()],
+            &[majority[0].as_str(), majority[1].as_str()],
+        );
+        wait_for_ready_leader_in(&sim, &majority, Duration::from_secs(5))
+            .await
+            .expect("majority partition should elect a ready leader");
+
+        let keys = vec![format!(
+            "sim-stale-restart-linear-history-key-{}",
+            Uuid::new_v4()
+        )];
+        let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
+        let order = Arc::new(AtomicUsize::new(1));
+        let partition_full_log_before = full_log_metrics_for_nodes(&sim, &majority);
+        let sim_phase = Arc::new(sim);
+        run_no_wait_history_phase(
+            Arc::clone(&sim_phase),
+            majority.clone(),
+            keys.clone(),
+            Arc::clone(&history),
+            Arc::clone(&order),
+            0,
+            3,
+            5,
+            "stale-restart-history",
+        )
+        .await;
+        let partition_index =
+            wait_for_ready_leader_in(&sim_phase, &majority, Duration::from_secs(5))
+                .await
+                .expect("majority leader after stale-restart history partition phase")
+                .commit_index();
+        let majority_ids = majority.iter().cloned().collect::<BTreeSet<_>>();
+        wait_for_applied_on(
+            &sim_phase,
+            &majority_ids,
+            partition_index,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("majority should apply history before stale leader restart");
+        assert_full_log_metrics_unchanged(
+            &sim_phase,
+            &partition_full_log_before,
+            "majority partition traffic",
+        );
+
+        sim = match Arc::try_unwrap(sim_phase) {
+            Ok(sim) => sim,
+            Err(_) => panic!("stale-leader history phase kept simulator references alive"),
+        };
+        sim.restart_node(&old_leader_id)
+            .expect("isolated stale leader should restart with durable local state");
+        let repair_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
+        sim.heal();
+        wait_for_all_applied(&sim, partition_index, Duration::from_secs(5))
+            .await
+            .expect("healed cluster should repair stale leader through partition history");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &repair_full_log_before,
+            "stale-leader restart repair",
+        );
+
+        let sim = Arc::new(sim);
+        let post_heal_full_log_before = full_log_metrics_for_nodes(&sim, &node_ids);
+        run_no_wait_history_phase(
+            Arc::clone(&sim),
+            node_ids,
+            keys,
+            Arc::clone(&history),
+            Arc::clone(&order),
+            1,
+            3,
+            5,
+            "stale-restart-history",
+        )
+        .await;
+        let final_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after stale-leader restart history heal")
+            .commit_index();
+        wait_for_all_applied(&sim, final_index, Duration::from_secs(5))
+            .await
+            .expect("stale-leader restart history should apply on all nodes");
+        assert_full_log_metrics_unchanged(&sim, &post_heal_full_log_before, "post-heal traffic");
+
+        let history = history.lock().expect("history").clone();
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::Acquired { .. })),
+            "stale-leader restart history should record successful acquires"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::NotAcquired)),
+            "stale-leader restart history should record contended no-wait acquires"
+        );
+        assert_lock_history_linearizable(&history);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_rolling_restart_no_wait_history_is_linearizable() {
+        let mut sim = RaftSim::new(3).await.expect("start in-memory raft sim");
+        let restart_order = sim.node_ids();
+        let keys = vec![format!("sim-rolling-linear-history-key-{}", Uuid::new_v4())];
+        let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
+        let order = Arc::new(AtomicUsize::new(1));
+
+        for (phase, restart_node_id) in restart_order.iter().enumerate() {
+            sim.wait_for_leader(Duration::from_secs(5))
+                .await
+                .expect("leader before rolling-restart history phase");
+            let phase_full_log_before = full_log_metrics_for_nodes(&sim, &restart_order);
+            let sim_phase = Arc::new(sim);
+            run_no_wait_history_phase(
+                Arc::clone(&sim_phase),
+                sim_phase.node_ids(),
+                keys.clone(),
+                Arc::clone(&history),
+                Arc::clone(&order),
+                phase,
+                3,
+                5,
+                "rolling-history",
+            )
+            .await;
+            let phase_index = sim_phase
+                .wait_for_leader(Duration::from_secs(5))
+                .await
+                .expect("leader after rolling-restart history phase")
+                .commit_index();
+            wait_for_all_applied(&sim_phase, phase_index, Duration::from_secs(5))
+                .await
+                .expect("history phase should apply before rolling restart");
+            assert_full_log_metrics_unchanged(
+                &sim_phase,
+                &phase_full_log_before,
+                "rolling-restart history traffic phase",
+            );
+
+            sim = match Arc::try_unwrap(sim_phase) {
+                Ok(sim) => sim,
+                Err(_) => panic!("rolling-restart history phase kept simulator references alive"),
+            };
+            sim.restart_node(restart_node_id)
+                .expect("rolling-restart history node should restart");
+            let restart_repair_full_log_before = full_log_metrics_for_nodes(&sim, &restart_order);
+            let restart_index = sim
+                .wait_for_leader(Duration::from_secs(5))
+                .await
+                .expect("leader after rolling-restart history node restart")
+                .commit_index();
+            wait_for_all_applied(&sim, restart_index, Duration::from_secs(5))
+                .await
+                .expect("cluster should converge after rolling restart");
+            assert_full_log_metrics_unchanged(
+                &sim,
+                &restart_repair_full_log_before,
+                "rolling-restart convergence repair",
+            );
+        }
+
+        let sim = Arc::new(sim);
+        let final_phase_full_log_before = full_log_metrics_for_nodes(&sim, &restart_order);
+        run_no_wait_history_phase(
+            Arc::clone(&sim),
+            sim.node_ids(),
+            keys,
+            Arc::clone(&history),
+            Arc::clone(&order),
+            restart_order.len(),
+            3,
+            5,
+            "rolling-history",
+        )
+        .await;
+        let final_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after final rolling-restart history phase")
+            .commit_index();
+        wait_for_all_applied(&sim, final_index, Duration::from_secs(5))
+            .await
+            .expect("final rolling-restart history should apply on all nodes");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &final_phase_full_log_before,
+            "final rolling-restart history traffic phase",
+        );
+
+        let history = history.lock().expect("history").clone();
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::Acquired { .. })),
+            "rolling-restart history test should record successful acquires"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::NotAcquired)),
+            "rolling-restart history test should record contended no-wait acquires"
+        );
+        assert_lock_history_linearizable(&history);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_memory_composite_lock_survives_failover_restart_and_log_repair() {
         let mut sim = RaftSim::new(3).await.expect("start in-memory raft sim");
@@ -987,10 +1522,56 @@ mod tests {
             .await
             .expect("majority should apply composite release");
 
-        sim.heal();
-        wait_for_all_applied(&sim, release_index, Duration::from_secs(5))
+        let majority_reacquired = acquire_key_on_node(
+            &sim,
+            &majority[0],
+            composite.keys[0].clone(),
+            "composite-majority-reacquire",
+        )
+        .await
+        .expect("majority-side single acquire should reach leader")
+        .expect("released composite member should grant on majority side");
+        let reacquire_index = wait_for_ready_leader_in(&sim, &majority, Duration::from_secs(5))
             .await
-            .expect("restarted old leader should repair through composite release");
+            .expect("majority leader after member-key reacquire")
+            .commit_index();
+        wait_for_applied_on(&sim, &majority_ids, reacquire_index, Duration::from_secs(5))
+            .await
+            .expect("majority should apply member-key reacquire before heal");
+
+        sim.heal();
+        wait_for_all_applied(&sim, reacquire_index, Duration::from_secs(5))
+            .await
+            .expect("restarted old leader should repair through composite release and member-key reacquire");
+
+        let repaired_old_leader_overlap = acquire_key_on_node(
+            &sim,
+            &old_leader_id,
+            composite.keys[0].clone(),
+            "composite-healed-overlap",
+        )
+        .await
+        .expect("old leader should proxy or handle overlapping acquire after heal");
+        assert!(
+            repaired_old_leader_overlap.is_none(),
+            "repaired old leader must not double-grant a key reacquired by the majority partition"
+        );
+        release_lock_on_node(
+            &sim,
+            &old_leader_id,
+            &majority_reacquired,
+            "composite-healed-majority-release",
+        )
+        .await
+        .expect("old leader should proxy or handle release of majority reacquire after heal");
+        let final_release_index = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader after releasing majority reacquire")
+            .commit_index();
+        wait_for_all_applied(&sim, final_release_index, Duration::from_secs(5))
+            .await
+            .expect("reacquired member release should apply on all nodes");
 
         for key in &composite.keys {
             let lock = acquire_key_on_node(&sim, &old_leader_id, key.clone(), "composite-healed")
@@ -1090,6 +1671,7 @@ mod tests {
                 minority_result,
                 Err(RaftSimError::Raft(
                     BrokerRaftError::QuorumUnavailable { .. }
+                        | BrokerRaftError::ClientProposalUncertain { .. }
                 )) | Err(RaftSimError::Raft(BrokerRaftError::NotLeader { .. }))
                     | Err(RaftSimError::Timeout { .. })
             ),
@@ -1177,6 +1759,7 @@ mod tests {
                 isolated_result,
                 Err(RaftSimError::Raft(
                     BrokerRaftError::QuorumUnavailable { .. }
+                        | BrokerRaftError::ClientProposalUncertain { .. }
                 )) | Err(RaftSimError::Raft(BrokerRaftError::NotLeader { .. }))
             ),
             "isolated old leader must not grant a write without quorum: {isolated_result:?}"
@@ -1313,6 +1896,7 @@ mod tests {
                 isolated_result,
                 Err(RaftSimError::Raft(
                     BrokerRaftError::QuorumUnavailable { .. }
+                        | BrokerRaftError::ClientProposalUncertain { .. }
                 )) | Err(RaftSimError::Raft(BrokerRaftError::NotLeader { .. }))
             ),
             "isolated old leader must not grant a write without quorum: {isolated_result:?}"
@@ -1452,6 +2036,8 @@ mod tests {
         let sent_before = append_entries_sent_total(&sim);
         let snapshot_fallbacks_before = append_snapshot_fallbacks_total(&sim);
         let snapshot_installs_before = install_snapshot_successes_total(&sim);
+        let catchup_node_ids = sim.node_ids();
+        let catchup_full_log_before = full_log_metrics_for_nodes(&sim, &catchup_node_ids);
 
         sim.reconnect_node(&lagging_id);
         let trigger = sim
@@ -1484,6 +2070,11 @@ mod tests {
             append_snapshot_fallbacks_total(&sim),
             snapshot_fallbacks_before,
             "ordinary retained-suffix catch-up must not fall back to InstallSnapshot"
+        );
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &catchup_full_log_before,
+            "ordinary retained-suffix catch-up",
         );
         assert_eq!(
             install_snapshot_successes_total(&sim),
@@ -1557,6 +2148,13 @@ mod tests {
             lagging_before.commit_index < target_before_reconnect,
             "disconnected follower should lag before snapshot catch-up"
         );
+        let leader_snapshot_full_log_before =
+            full_log_metrics_for_nodes(&sim, std::slice::from_ref(&leader_id));
+        let leader_snapshot_compactions_before = sim
+            .node(&leader_id)
+            .expect("leader node before snapshot catch-up")
+            .telemetry_snapshot()
+            .log_compactions_total;
 
         sim.reconnect_node(&lagging_id);
         let trigger = sim
@@ -1577,6 +2175,40 @@ mod tests {
         assert!(
             append_snapshot_fallbacks_total(&sim) > snapshot_fallbacks_before,
             "leader should fall back from AppendEntries to InstallSnapshot"
+        );
+        let leader_snapshot_full_log_after =
+            full_log_metrics_for_nodes(&sim, std::slice::from_ref(&leader_id));
+        let leader_full_log_before = leader_snapshot_full_log_before
+            .get(&leader_id)
+            .expect("leader full-log baseline");
+        let leader_full_log_after = leader_snapshot_full_log_after
+            .get(&leader_id)
+            .expect("leader full-log after snapshot catch-up");
+        assert_eq!(
+            leader_full_log_after.reads_total, leader_full_log_before.reads_total,
+            "leader InstallSnapshot catch-up should not perform a full retained-log scan"
+        );
+        assert_eq!(
+            leader_full_log_after.read_entries_total, leader_full_log_before.read_entries_total,
+            "leader InstallSnapshot catch-up should not read retained-log entries with a full scan"
+        );
+        assert_eq!(
+            leader_full_log_after.read_bytes_total, leader_full_log_before.read_bytes_total,
+            "leader InstallSnapshot catch-up should not read retained-log bytes with a full scan"
+        );
+        let leader_snapshot_compactions_after = sim
+            .node(&leader_id)
+            .expect("leader node after snapshot catch-up")
+            .telemetry_snapshot()
+            .log_compactions_total;
+        let leader_rewrite_delta = leader_full_log_after
+            .rewrites_total
+            .saturating_sub(leader_full_log_before.rewrites_total);
+        let leader_compaction_delta =
+            leader_snapshot_compactions_after.saturating_sub(leader_snapshot_compactions_before);
+        assert!(
+            leader_rewrite_delta <= leader_compaction_delta,
+            "leader InstallSnapshot catch-up should not rewrite the retained log except for real compaction; rewrite_delta={leader_rewrite_delta} compaction_delta={leader_compaction_delta}"
         );
         wait_for_all_applied(&sim, target_index, Duration::from_secs(5))
             .await
@@ -2142,6 +2774,196 @@ mod tests {
             .expect("release after leader removal");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn in_memory_shrunk_membership_failover_restarts_and_history_stay_incremental() {
+        let mut sim = RaftSim::new(5).await.expect("start five-node raft sim");
+        let seed = sim
+            .acquire(format!("sim-shrink-failover-seed-{}", Uuid::new_v4()))
+            .await
+            .expect("seed acquire before shrink/failover scenario");
+        sim.release(&seed)
+            .await
+            .expect("seed release before shrink/failover scenario");
+
+        let old_leader = sim
+            .wait_for_leader(Duration::from_secs(5))
+            .await
+            .expect("leader before shrink/failover scenario");
+        let old_leader_id = old_leader.config().node_id.clone();
+        let active_peers = old_leader.active_peers();
+        assert_eq!(active_peers.len(), 5);
+
+        let mut final_peers = active_peers
+            .iter()
+            .filter(|peer| peer.id != old_leader_id)
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>();
+        final_peers.sort_by(|left, right| left.id.cmp(&right.id));
+        let final_ids = final_peers
+            .iter()
+            .map(|peer| peer.id.clone())
+            .collect::<BTreeSet<_>>();
+        let final_node_ids = final_ids.iter().cloned().collect::<Vec<_>>();
+        let removed_ids = active_peers
+            .iter()
+            .filter(|peer| !final_ids.contains(&peer.id))
+            .map(|peer| peer.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(final_ids.len(), 3);
+        assert_eq!(removed_ids.len(), 2);
+        assert!(
+            removed_ids.contains(&old_leader_id),
+            "the initial leader must be removed by this shrink/failover scenario"
+        );
+
+        let final_index = old_leader
+            .change_membership(final_peers.clone())
+            .await
+            .expect("initial leader should commit its own removal");
+        wait_for_applied_on(&sim, &final_ids, final_index, Duration::from_secs(5))
+            .await
+            .expect("remaining voters should apply the shrunk membership");
+        wait_for_removed_member_guards(&sim, &removed_ids, Duration::from_secs(5))
+            .await
+            .expect("removed voters should guard public client requests");
+
+        for removed_id in &removed_ids {
+            assert_removed_node_rejects_client(&sim, removed_id).await;
+        }
+
+        let current_leader =
+            wait_for_ready_leader_in(&sim, &final_node_ids, Duration::from_secs(5))
+                .await
+                .expect("shrunk cluster should elect a ready leader");
+        let isolated_leader_id = current_leader.config().node_id.clone();
+        let survivor_ids = final_node_ids
+            .iter()
+            .filter(|node_id| *node_id != &isolated_leader_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(survivor_ids.len(), 2);
+        let survivor_set = survivor_ids.iter().cloned().collect::<BTreeSet<_>>();
+
+        sim.partition(
+            &[isolated_leader_id.as_str()],
+            &[survivor_ids[0].as_str(), survivor_ids[1].as_str()],
+        );
+        let survivor_leader = wait_for_ready_leader_in(&sim, &survivor_ids, Duration::from_secs(5))
+            .await
+            .expect("survivor quorum should elect a replacement leader");
+        assert_ne!(
+            survivor_leader.config().node_id,
+            isolated_leader_id,
+            "replacement leader should come from the two-node survivor quorum"
+        );
+
+        let partition_full_log_before = full_log_metrics_for_nodes(&sim, &survivor_ids);
+        let partition_lock = acquire_key_on_node(
+            &sim,
+            &survivor_ids[0],
+            format!("sim-shrink-failover-partition-{}", Uuid::new_v4()),
+            "shrink-failover-partition",
+        )
+        .await
+        .expect("survivor quorum acquire should complete")
+        .expect("survivor quorum acquire should grant");
+        release_lock_on_node(
+            &sim,
+            &survivor_ids[1],
+            &partition_lock,
+            "shrink-failover-partition",
+        )
+        .await
+        .expect("survivor quorum release should complete");
+        let partition_index = wait_for_ready_leader_in(&sim, &survivor_ids, Duration::from_secs(5))
+            .await
+            .expect("survivor quorum leader after partition traffic")
+            .commit_index();
+        wait_for_applied_on(&sim, &survivor_set, partition_index, Duration::from_secs(5))
+            .await
+            .expect("survivor quorum should apply partition traffic");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &partition_full_log_before,
+            "shrunk survivor-quorum partition traffic",
+        );
+
+        sim.restart_node(&isolated_leader_id)
+            .expect("restart isolated voter with durable local state");
+        let repair_full_log_before = full_log_metrics_for_nodes(&sim, &final_node_ids);
+        sim.heal();
+        wait_for_applied_on(&sim, &final_ids, partition_index, Duration::from_secs(5))
+            .await
+            .expect("healed shrunk cluster should repair the restarted voter");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &repair_full_log_before,
+            "shrunk cluster restarted-voter repair",
+        );
+
+        sim.restart_node(&survivor_ids[0])
+            .expect("rolling restart one survivor after heal");
+        let restored_leader =
+            wait_for_ready_leader_in(&sim, &final_node_ids, Duration::from_secs(5))
+                .await
+                .expect("shrunk cluster should keep service after rolling restart");
+        assert_eq!(restored_leader.active_cluster_size(), 3);
+        assert_eq!(restored_leader.active_quorum_size(), 2);
+        let restored_index = restored_leader.commit_index();
+        wait_for_applied_on(&sim, &final_ids, restored_index, Duration::from_secs(5))
+            .await
+            .expect("shrunk cluster should converge after rolling restart");
+
+        let history_full_log_before = full_log_metrics_for_nodes(&sim, &final_node_ids);
+        let sim = Arc::new(sim);
+        let history = Arc::new(Mutex::new(Vec::<LockHistoryOp>::new()));
+        let order = Arc::new(AtomicUsize::new(1));
+        run_no_wait_history_phase(
+            Arc::clone(&sim),
+            final_node_ids.clone(),
+            vec![format!(
+                "sim-shrink-failover-history-key-{}",
+                Uuid::new_v4()
+            )],
+            Arc::clone(&history),
+            Arc::clone(&order),
+            0,
+            3,
+            5,
+            "shrink-failover-history",
+        )
+        .await;
+        let final_commit_index =
+            wait_for_ready_leader_in(&sim, &final_node_ids, Duration::from_secs(5))
+                .await
+                .expect("leader after shrink/failover history")
+                .commit_index();
+        wait_for_applied_on(&sim, &final_ids, final_commit_index, Duration::from_secs(5))
+            .await
+            .expect("shrunk cluster should apply post-failover history");
+        assert_full_log_metrics_unchanged(
+            &sim,
+            &history_full_log_before,
+            "shrunk post-failover no-wait history traffic",
+        );
+
+        let history = history.lock().expect("history").clone();
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::Acquired { .. })),
+            "shrink/failover history should record successful acquires"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|op| matches!(op.result, LockHistoryResult::NotAcquired)),
+            "shrink/failover history should record contended no-wait acquires"
+        );
+        assert_lock_history_linearizable(&history);
+    }
+
     #[derive(Debug, Clone)]
     struct SimRng {
         state: u64,
@@ -2151,6 +2973,39 @@ mod tests {
     struct RaftSimCompositeLock {
         keys: Vec<String>,
         lock_uuid: String,
+    }
+
+    #[derive(Debug, Clone)]
+    struct LockHistoryOp {
+        key: String,
+        invoke_order: usize,
+        response_order: usize,
+        result: LockHistoryResult,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FullLogMetricSnapshot {
+        reads_total: u64,
+        read_bytes_total: u64,
+        read_entries_total: u64,
+        rewrites_total: u64,
+        rewrite_failures_total: u64,
+        rewrite_entries_total: u64,
+        rewrite_bytes_total: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    enum LockHistoryResult {
+        Acquired { lock_uuid: String },
+        NotAcquired,
+        Released { lock_uuid: String },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LinearModelOp {
+        AcquireGranted(u16),
+        AcquireRejected,
+        Release(u16),
     }
 
     impl SimRng {
@@ -2172,6 +3027,305 @@ mod tests {
             crate::routine_id!("ddl-routine-raft-sim-test-rng-index-1");
             debug_assert!(len > 0);
             (self.next_u64() as usize) % len
+        }
+    }
+
+    fn full_log_metrics_for_nodes(
+        sim: &RaftSim,
+        node_ids: &[String],
+    ) -> BTreeMap<String, FullLogMetricSnapshot> {
+        crate::routine_id!("ddl-routine-raft-sim-test-full-log-metrics-nodes-1");
+        node_ids
+            .iter()
+            .map(|node_id| {
+                let node = sim
+                    .node(node_id)
+                    .unwrap_or_else(|| panic!("node {node_id} should exist for metric snapshot"));
+                (node_id.clone(), full_log_metrics_for_node(node))
+            })
+            .collect()
+    }
+
+    fn full_log_metrics_for_node(node: &BrokerRaft) -> FullLogMetricSnapshot {
+        crate::routine_id!("ddl-routine-raft-sim-test-full-log-metrics-node-1");
+        let metrics = node.raft_metrics_text();
+        FullLogMetricSnapshot {
+            reads_total: metric_value(&metrics, "dd_rust_network_mutex_raft_log_full_reads_total"),
+            read_bytes_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+            ),
+            read_entries_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_read_entries_total",
+            ),
+            rewrites_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_rewrites_total",
+            ),
+            rewrite_failures_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+            ),
+            rewrite_entries_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
+            ),
+            rewrite_bytes_total: metric_value(
+                &metrics,
+                "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
+            ),
+        }
+    }
+
+    fn assert_full_log_metrics_unchanged(
+        sim: &RaftSim,
+        before: &BTreeMap<String, FullLogMetricSnapshot>,
+        label: &str,
+    ) {
+        crate::routine_id!("ddl-routine-raft-sim-test-full-log-metrics-unchanged-1");
+        let node_ids = before.keys().cloned().collect::<Vec<_>>();
+        let after = full_log_metrics_for_nodes(sim, &node_ids);
+        assert_eq!(
+            &after, before,
+            "{label} should not use full-log scans or rewrites; before={before:?} after={after:?}"
+        );
+    }
+
+    fn metric_value(metrics: &str, name: &str) -> u64 {
+        crate::routine_id!("ddl-routine-raft-sim-test-metric-value-1");
+        for line in metrics.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            if parts.next() == Some(name) {
+                let value = parts
+                    .next()
+                    .unwrap_or_else(|| panic!("metric {name} has no value"));
+                return value.parse::<u64>().unwrap_or_else(|err| {
+                    panic!("metric {name} value {value:?} is invalid: {err}")
+                });
+            }
+        }
+        panic!("metric {name} missing from raft metrics");
+    }
+
+    fn assert_lock_history_linearizable(history: &[LockHistoryOp]) {
+        crate::routine_id!("ddl-routine-raft-sim-test-linearizable-history-1");
+        let mut by_key = BTreeMap::<String, Vec<LockHistoryOp>>::new();
+        for op in history {
+            by_key.entry(op.key.clone()).or_default().push(op.clone());
+        }
+        for (key, ops) in by_key {
+            assert_linearizable_key_history(&key, &ops);
+        }
+    }
+
+    fn assert_linearizable_key_history(key: &str, ops: &[LockHistoryOp]) {
+        crate::routine_id!("ddl-routine-raft-sim-test-linearizable-key-history-1");
+        assert!(
+            ops.len() < 128,
+            "linearizability checker supports fewer than 128 operations per key; key={key} ops={}",
+            ops.len()
+        );
+        let mut lock_ids = BTreeMap::<String, u16>::new();
+        let mut granted_ids = BTreeSet::<u16>::new();
+        for op in ops {
+            let lock_uuid = match &op.result {
+                LockHistoryResult::Acquired { lock_uuid }
+                | LockHistoryResult::Released { lock_uuid } => lock_uuid,
+                LockHistoryResult::NotAcquired => continue,
+            };
+            if !lock_ids.contains_key(lock_uuid) {
+                let next_id = u16::try_from(lock_ids.len().saturating_add(1))
+                    .expect("linearizable history lock id should fit in u16");
+                lock_ids.insert(lock_uuid.clone(), next_id);
+            }
+        }
+
+        let model_ops = ops
+            .iter()
+            .map(|op| match &op.result {
+                LockHistoryResult::Acquired { lock_uuid } => {
+                    let id = *lock_ids
+                        .get(lock_uuid)
+                        .expect("granted lock uuid should be indexed");
+                    assert!(
+                        granted_ids.insert(id),
+                        "lock uuid {lock_uuid} was granted more than once for key {key}"
+                    );
+                    LinearModelOp::AcquireGranted(id)
+                }
+                LockHistoryResult::NotAcquired => LinearModelOp::AcquireRejected,
+                LockHistoryResult::Released { lock_uuid } => LinearModelOp::Release(
+                    *lock_ids
+                        .get(lock_uuid)
+                        .expect("released lock uuid should be indexed"),
+                ),
+            })
+            .collect::<Vec<_>>();
+        let predecessors = ops
+            .iter()
+            .map(|candidate| {
+                ops.iter()
+                    .enumerate()
+                    .filter_map(|(idx, predecessor)| {
+                        (predecessor.response_order < candidate.invoke_order)
+                            .then_some(1u128 << idx)
+                    })
+                    .fold(0u128, |acc, bit| acc | bit)
+            })
+            .collect::<Vec<_>>();
+        let all_done = if model_ops.is_empty() {
+            0
+        } else {
+            (1u128 << model_ops.len()) - 1
+        };
+        let mut memo = BTreeSet::<(u128, u16)>::new();
+        assert!(
+            search_linearized_history(0, 0, all_done, &model_ops, &predecessors, &mut memo),
+            "no linearization found for key {key}; ops={ops:?}"
+        );
+    }
+
+    fn search_linearized_history(
+        done: u128,
+        holder: u16,
+        all_done: u128,
+        ops: &[LinearModelOp],
+        predecessors: &[u128],
+        memo: &mut BTreeSet<(u128, u16)>,
+    ) -> bool {
+        crate::routine_id!("ddl-routine-raft-sim-test-search-linear-history-1");
+        if done == all_done {
+            return true;
+        }
+        if !memo.insert((done, holder)) {
+            return false;
+        }
+        for (idx, op) in ops.iter().enumerate() {
+            let bit = 1u128 << idx;
+            if done & bit != 0 || predecessors[idx] & !done != 0 {
+                continue;
+            }
+            let Some(next_holder) = apply_linear_model_op(holder, *op) else {
+                continue;
+            };
+            if search_linearized_history(done | bit, next_holder, all_done, ops, predecessors, memo)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn apply_linear_model_op(holder: u16, op: LinearModelOp) -> Option<u16> {
+        crate::routine_id!("ddl-routine-raft-sim-test-apply-linear-op-1");
+        match op {
+            LinearModelOp::AcquireGranted(lock_id) if holder == 0 => Some(lock_id),
+            LinearModelOp::AcquireGranted(_) => None,
+            LinearModelOp::AcquireRejected if holder != 0 => Some(holder),
+            LinearModelOp::AcquireRejected => None,
+            LinearModelOp::Release(lock_id) if holder == lock_id => Some(0),
+            LinearModelOp::Release(_) => None,
+        }
+    }
+
+    async fn run_no_wait_history_phase(
+        sim: Arc<RaftSim>,
+        node_ids: Vec<String>,
+        keys: Vec<String>,
+        history: Arc<Mutex<Vec<LockHistoryOp>>>,
+        order: Arc<AtomicUsize>,
+        phase: usize,
+        workers: usize,
+        steps: usize,
+        label: &str,
+    ) {
+        crate::routine_id!("ddl-routine-raft-sim-test-no-wait-history-phase-1");
+        assert!(!node_ids.is_empty(), "history phase needs node candidates");
+        assert!(!keys.is_empty(), "history phase needs lock keys");
+        assert!(workers > 0, "history phase needs workers");
+        let start = Arc::new(tokio::sync::Barrier::new(workers));
+        let label = label.to_string();
+        let mut tasks = Vec::new();
+
+        for worker in 0..workers {
+            let sim = Arc::clone(&sim);
+            let node_ids = node_ids.clone();
+            let keys = keys.clone();
+            let history = Arc::clone(&history);
+            let order = Arc::clone(&order);
+            let start = Arc::clone(&start);
+            let label = label.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                let mut state =
+                    0xCAFE_F00D_D15C_A11Du64 ^ ((phase as u64).wrapping_shl(17)) ^ worker as u64;
+                for step in 0..steps {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let key = keys[(state as usize) % keys.len()].clone();
+                    let node_id =
+                        &node_ids[(state.rotate_left(11) as usize + step) % node_ids.len()];
+                    let acquire_invoke = order.fetch_add(1, Ordering::SeqCst);
+                    let acquire = acquire_key_on_node(&sim, node_id, key.clone(), &label).await;
+                    let acquire_response = order.fetch_add(1, Ordering::SeqCst);
+                    let lock = match acquire {
+                        Ok(Some(lock)) => {
+                            history.lock().expect("history").push(LockHistoryOp {
+                                key: key.clone(),
+                                invoke_order: acquire_invoke,
+                                response_order: acquire_response,
+                                result: LockHistoryResult::Acquired {
+                                    lock_uuid: lock.lock_uuid.clone(),
+                                },
+                            });
+                            Some(lock)
+                        }
+                        Ok(None) => {
+                            history.lock().expect("history").push(LockHistoryOp {
+                                key,
+                                invoke_order: acquire_invoke,
+                                response_order: acquire_response,
+                                result: LockHistoryResult::NotAcquired,
+                            });
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                            None
+                        }
+                        Err(err) if retryable_sim_leader_error(&err) => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                            None
+                        }
+                        Err(err) => panic!("{label} acquire failed during phase {phase}: {err:?}"),
+                    };
+                    let Some(lock) = lock else {
+                        continue;
+                    };
+                    tokio::time::sleep(Duration::from_millis(2 + ((worker + step) % 3) as u64))
+                        .await;
+                    let release_invoke = order.fetch_add(1, Ordering::SeqCst);
+                    release_lock_on_node(&sim, node_id, &lock, &label)
+                        .await
+                        .expect("history phase release should succeed");
+                    let release_response = order.fetch_add(1, Ordering::SeqCst);
+                    history.lock().expect("history").push(LockHistoryOp {
+                        key: lock.key,
+                        invoke_order: release_invoke,
+                        response_order: release_response,
+                        result: LockHistoryResult::Released {
+                            lock_uuid: lock.lock_uuid,
+                        },
+                    });
+                }
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("history phase worker should not panic");
         }
     }
 
@@ -2282,7 +3436,7 @@ mod tests {
             } => Ok(None),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
-                response,
+                response: Box::new(response),
             }),
         }
     }
@@ -2334,7 +3488,7 @@ mod tests {
             } => Ok(None),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
-                response,
+                response: Box::new(response),
             }),
         }
     }
@@ -2347,29 +3501,41 @@ mod tests {
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-release-composite-node-1");
         let request_uuid = format!("sim-{label}-composite-release-{}", Uuid::new_v4());
-        let response = sim
-            .run_on_node(
-                node_id,
-                Request::Unlock {
-                    uuid: request_uuid.clone(),
-                    key: None,
-                    keys: Some(lock.keys.clone()),
-                    lock_uuid: Some(lock.lock_uuid.clone()),
-                    force: false,
-                },
-                &request_uuid,
-                Duration::from_secs(2),
-                false,
-            )
-            .await?
-            .ok_or_else(|| RaftSimError::NoResponse {
-                request_id: request_uuid.clone(),
-            })?;
+        let request = Request::Unlock {
+            uuid: request_uuid.clone(),
+            key: None,
+            keys: Some(lock.keys.clone()),
+            lock_uuid: Some(lock.lock_uuid.clone()),
+            force: false,
+        };
+        let response = retry_sim_response(
+            "raft node composite release",
+            DEFAULT_SIM_REQUEST_TIMEOUT,
+            |_| {
+                let request = request.clone();
+                let request_uuid = request_uuid.clone();
+                async move {
+                    sim.run_on_node(
+                        node_id,
+                        request,
+                        &request_uuid,
+                        Duration::from_secs(2),
+                        false,
+                    )
+                    .await
+                }
+            },
+            retryable_sim_leader_error,
+        )
+        .await?
+        .ok_or_else(|| RaftSimError::NoResponse {
+            request_id: request_uuid.clone(),
+        })?;
         match response {
             Response::Unlock { unlocked: true, .. } => Ok(()),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
-                response,
+                response: Box::new(response),
             }),
         }
     }
@@ -2382,29 +3548,41 @@ mod tests {
     ) -> Result<(), RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-test-release-lock-node-1");
         let request_uuid = format!("sim-{label}-release-{}", Uuid::new_v4());
-        let response = sim
-            .run_on_node(
-                node_id,
-                Request::Unlock {
-                    uuid: request_uuid.clone(),
-                    key: Some(lock.key.clone()),
-                    keys: None,
-                    lock_uuid: Some(lock.lock_uuid.clone()),
-                    force: false,
-                },
-                &request_uuid,
-                Duration::from_secs(2),
-                false,
-            )
-            .await?
-            .ok_or_else(|| RaftSimError::NoResponse {
-                request_id: request_uuid.clone(),
-            })?;
+        let request = Request::Unlock {
+            uuid: request_uuid.clone(),
+            key: Some(lock.key.clone()),
+            keys: None,
+            lock_uuid: Some(lock.lock_uuid.clone()),
+            force: false,
+        };
+        let response = retry_sim_response(
+            "raft node release",
+            DEFAULT_SIM_REQUEST_TIMEOUT,
+            |_| {
+                let request = request.clone();
+                let request_uuid = request_uuid.clone();
+                async move {
+                    sim.run_on_node(
+                        node_id,
+                        request,
+                        &request_uuid,
+                        Duration::from_secs(2),
+                        false,
+                    )
+                    .await
+                }
+            },
+            retryable_sim_leader_error,
+        )
+        .await?
+        .ok_or_else(|| RaftSimError::NoResponse {
+            request_id: request_uuid.clone(),
+        })?;
         match response {
             Response::Unlock { unlocked: true, .. } => Ok(()),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
-                response,
+                response: Box::new(response),
             }),
         }
     }

@@ -6,6 +6,8 @@
 //! override with `LMX_RANDOM_OPS=<n>` and replay failures with
 //! `LMX_FUZZ_SEED=<u64>`.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -98,7 +100,7 @@ fn seed_for() -> u64 {
             return seed;
         }
     }
-    let seed = 0xD15EA5E_D00D_F00D;
+    let seed = 0x0D15_EA5E_D00D_F00D;
     eprintln!("[random_ops_fuzz] using default seed {seed} (override with LMX_FUZZ_SEED=<u64>)");
     seed
 }

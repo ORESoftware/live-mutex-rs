@@ -29,6 +29,7 @@
 
 pub mod broker;
 pub mod broker_raft;
+pub mod cli_flags;
 pub mod client;
 pub mod config;
 pub mod metrics;
@@ -45,6 +46,7 @@ pub use broker_raft::{
     BrokerRaft, BrokerRaftConfig, BrokerRaftError, RaftCommand, RaftCompactionReport, RaftLogEntry,
     RaftLogStore, RaftMembership, RaftPeerConfig, RaftSnapshotMetadata,
 };
+pub use cli_flags::{load_broker_cli_config, BrokerCliConfig, BrokerCliEnv, CliFlagError};
 pub use client::{Client, ClientConfig, ClientError, LockGuard, LockInfo, RwClient};
 pub use config::{load_runtime_config, ConfigError, RuntimeConfig};
 pub use protocol::{Request, Response, MAX_COMPOSITE_KEYS, PROTOCOL_VERSION};

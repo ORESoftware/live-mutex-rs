@@ -419,6 +419,7 @@ struct RaftLearnerRemovalRequest {
 pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> std::io::Result<()> {
     crate::routine_id!("ddl-routine-server-run-raft-1");
     let raft = BrokerRaft::open(raft_config).map_err(raft_io_error)?;
+    let _shutdown_guard = BrokerRaftShutdownGuard(raft.clone());
     let metrics = Arc::new(crate::metrics::Metrics::new());
     let mut tasks = JoinSet::new();
     raft.spawn_raft_tasks_into(&mut tasks)
@@ -477,8 +478,16 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
     Ok(())
 }
 
+struct BrokerRaftShutdownGuard(BrokerRaft);
+
+impl Drop for BrokerRaftShutdownGuard {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 fn raft_io_error(err: BrokerRaftError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, err.to_string())
+    std::io::Error::other(err.to_string())
 }
 
 #[cfg(feature = "tls")]
@@ -715,7 +724,7 @@ where
                 break;
             }
             frames_seen = frames_seen.wrapping_add(1);
-            if frames_seen % yield_every == 0 {
+            if frames_seen.is_multiple_of(yield_every) {
                 tokio::task::yield_now().await;
             }
             // Re-apply TCP_QUICKACK *immediately* after we've consumed a
@@ -900,7 +909,7 @@ fn raft_http_authorized(state: &RaftAppState, headers: &HeaderMap) -> bool {
 fn http_request_id(
     headers: &HeaderMap,
     body_request_id: Option<&str>,
-) -> Result<String, AxumResponse> {
+) -> Result<String, Box<AxumResponse>> {
     crate::routine_id!("ddl-routine-server-http-request-id-1");
     const MAX_REQUEST_ID_LEN: usize = 256;
     let header_request_id = ["x-lmx-request-id", "idempotency-key", "x-idempotency-key"]
@@ -914,25 +923,29 @@ fn http_request_id(
         .filter(|value| !value.is_empty());
     let request_id = match (body_request_id, header_request_id) {
         (Some(body), Some(header)) if body != header => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "requestId and idempotency header disagree"
-                })),
-            )
-                .into_response());
+            return Err(Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "requestId and idempotency header disagree"
+                    })),
+                )
+                    .into_response(),
+            ));
         }
         (Some(value), _) | (_, Some(value)) => value.to_string(),
         (None, None) => Uuid::new_v4().to_string(),
     };
     if request_id.len() > MAX_REQUEST_ID_LEN {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("requestId must be at most {MAX_REQUEST_ID_LEN} bytes")
-            })),
-        )
-            .into_response());
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("requestId must be at most {MAX_REQUEST_ID_LEN} bytes")
+                })),
+            )
+                .into_response(),
+        ));
     }
     Ok(request_id)
 }
@@ -1153,6 +1166,7 @@ async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
 ///     currently serve writes (false on followers and quorum-less leaders).
 ///   - `X-Raft-Leader-Quorum-Age-Ms` / `X-Raft-Leader-Quorum-Timeout-Ms`.
 ///   - `X-Raft-Leader-Id` / `X-Raft-Leader-Addr` — the leader this node knows of.
+///
 /// The hint can be briefly stale during a failover; the follower proxy fallback
 /// still guarantees correctness regardless of where the request lands.
 async fn raft_leader_response_headers(
@@ -1258,7 +1272,7 @@ async fn raft_http_acquire(
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
         Err(response) => {
-            return observe_http_response(&state.metrics, "raft_http_acquire", started, response);
+            return observe_http_response(&state.metrics, "raft_http_acquire", started, *response);
         }
     };
     let request = Request::Lock {
@@ -1278,7 +1292,7 @@ async fn raft_http_acquire(
         .raft
         .run_ephemeral(request, &request_uuid, wait, true)
         .await;
-    let response = match outcome {
+    let mut response = match outcome {
         Ok(Some(Response::Lock {
             acquired,
             key,
@@ -1350,6 +1364,7 @@ async fn raft_http_acquire(
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
     };
+    insert_raft_response_header(response.headers_mut(), "x-lmx-request-id", &request_uuid);
     observe_http_response(&state.metrics, "raft_http_acquire", started, response)
 }
 
@@ -1372,7 +1387,7 @@ async fn raft_http_release(
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
         Err(response) => {
-            return observe_http_response(&state.metrics, "raft_http_release", started, response);
+            return observe_http_response(&state.metrics, "raft_http_release", started, *response);
         }
     };
     let outcome = state
@@ -1390,7 +1405,7 @@ async fn raft_http_release(
             false,
         )
         .await;
-    let response = match outcome {
+    let mut response = match outcome {
         Ok(Some(Response::Unlock { keys, unlocked, .. })) => {
             Json(ReleaseResponse { unlocked, keys }).into_response()
         }
@@ -1412,6 +1427,7 @@ async fn raft_http_release(
         Err(err @ BrokerRaftError::NotLeader { .. }) => raft_unavailable(err),
         Err(err) => raft_unavailable(err),
     };
+    insert_raft_response_header(response.headers_mut(), "x-lmx-request-id", &request_uuid);
     observe_http_response(&state.metrics, "raft_http_release", started, response)
 }
 
@@ -1442,6 +1458,22 @@ fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": error,
+            })),
+        )
+            .into_response(),
+        BrokerRaftError::ClientProposalUncertain {
+            index,
+            votes,
+            quorum,
+        } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "raft client proposal outcome unknown; retry the same request id",
+                "index": index,
+                "votes": votes,
+                "quorum": quorum,
+                "outcomeUnknown": true,
+                "retrySameRequestId": true,
             })),
         )
             .into_response(),
@@ -2061,7 +2093,7 @@ async fn http_acquire(
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
         Err(response) => {
-            return observe_http_response(&state.metrics, "http_acquire", started, response);
+            return observe_http_response(&state.metrics, "http_acquire", started, *response);
         }
     };
     let request = Request::Lock {
@@ -2171,7 +2203,7 @@ async fn http_release(
     let request_uuid = match http_request_id(&headers, req.request_id.as_deref()) {
         Ok(request_id) => request_id,
         Err(response) => {
-            return observe_http_response(&state.metrics, "http_release", started, response);
+            return observe_http_response(&state.metrics, "http_release", started, *response);
         }
     };
     let outcome = run_ephemeral(

@@ -11,7 +11,13 @@
 //! socket per worker per endpoint during server-side CPU profiling.
 //! Set BENCH_RAFT_METRICS=true to scrape BrokerRaft `/metrics` before and
 //! after the Raft run and print selected replication/proxy/compaction deltas,
-//! plus per-successful-cycle efficiency ratios.
+//! plus per-successful-cycle efficiency ratios. BENCH_RAFT_METRICS_ENDPOINTS
+//! defaults to BENCH_RAFT, so leader-routed traffic can still guard every local
+//! node when the endpoint list includes the full cluster. When metrics capture
+//! is on, BENCH_RAFT_FAIL_ON_FULL_LOG=true fails the benchmark if steady-state
+//! full-log reads or rewrites are observed.
+//! Optional BENCH_MIN_*_OPS_PER_SEC and BENCH_MAX_*_P99_MS thresholds fail the
+//! benchmark when a target falls below the configured performance floor.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -55,6 +61,7 @@ struct Config {
     redis_addr: String,
     broker_addr: String,
     raft_addrs: Vec<String>,
+    raft_metric_addrs: Vec<String>,
     raft_route: RaftRoute,
     workers: usize,
     keys: usize,
@@ -65,6 +72,20 @@ struct Config {
     auth_token: Option<String>,
     http_keep_alive: bool,
     capture_raft_metrics: bool,
+    fail_on_raft_full_log: bool,
+    fail_on_errors: bool,
+    fail_on_zero_success: bool,
+    perf_thresholds: PerfThresholds,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PerfThresholds {
+    min_redis_ops_per_sec: Option<f64>,
+    min_broker_ops_per_sec: Option<f64>,
+    min_raft_ops_per_sec: Option<f64>,
+    max_redis_p99_ms: Option<f64>,
+    max_broker_p99_ms: Option<f64>,
+    max_raft_p99_ms: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -82,6 +103,7 @@ struct Summary {
     errors: u64,
     latencies_us: Vec<u64>,
     metric_lines: Vec<String>,
+    fatal_errors: Vec<String>,
 }
 
 impl Summary {
@@ -90,6 +112,19 @@ impl Summary {
         self.not_acquired += worker.not_acquired;
         self.errors += worker.errors;
         self.latencies_us.extend(worker.latencies_us);
+    }
+
+    fn throughput(&self, duration: Duration) -> f64 {
+        if duration.is_zero() {
+            return 0.0;
+        }
+        self.ok as f64 / duration.as_secs_f64()
+    }
+
+    fn p99_ms(&self) -> f64 {
+        let mut latencies = self.latencies_us.clone();
+        latencies.sort_unstable();
+        percentile_ms(&latencies, 0.99)
     }
 }
 
@@ -128,14 +163,19 @@ async fn main() {
     if config.http_keep_alive {
         println!("http_keep_alive=true");
     }
+    if config.capture_raft_metrics {
+        println!("raft_metrics={}", config.raft_metric_addrs.join(","));
+    }
 
     let mut redis_summary = None;
     let mut broker_summary = None;
     let mut raft_summary = None;
+    let mut fatal_errors = Vec::new();
 
     if matches!(config.target, Target::Redis | Target::RedisRaft) {
         let summary = run_redis(config.clone()).await;
         print_summary("redis", &summary, config.duration);
+        fatal_errors.extend(config.perf_guard_failures("redis", &summary));
         redis_summary = Some(summary);
     }
     if matches!(
@@ -144,6 +184,7 @@ async fn main() {
     ) {
         let summary = run_broker(config.clone()).await;
         print_summary("broker", &summary, config.duration);
+        fatal_errors.extend(config.perf_guard_failures("broker", &summary));
         broker_summary = Some(summary);
     }
     if matches!(
@@ -153,11 +194,14 @@ async fn main() {
         let summary = run_raft(config.clone()).await;
         print_summary("raft", &summary, config.duration);
         print_metric_lines(&summary.metric_lines);
+        fatal_errors.extend(summary.fatal_errors.iter().cloned());
+        fatal_errors.extend(config.perf_guard_failures("raft", &summary));
         raft_summary = Some(summary);
     }
     if matches!(config.target, Target::All) {
         let summary = run_redis(config.clone()).await;
         print_summary("redis", &summary, config.duration);
+        fatal_errors.extend(config.perf_guard_failures("redis", &summary));
         redis_summary = Some(summary);
     }
 
@@ -166,6 +210,12 @@ async fn main() {
     }
     if let (Some(redis), Some(raft)) = (&redis_summary, &raft_summary) {
         print_ratio("redis", redis, "raft", raft);
+    }
+    if !fatal_errors.is_empty() {
+        for error in &fatal_errors {
+            eprintln!("{error}");
+        }
+        std::process::exit(2);
     }
 }
 
@@ -185,12 +235,17 @@ impl Config {
             Err(other) => panic!("BENCH_RAFT_ROUTE must be round-robin or leader; got {other:?}"),
         };
         let workers = env_parse("BENCH_WORKERS", 8).max(1);
+        let raft_addrs = parse_endpoint_list(
+            &env_string("BENCH_RAFT").unwrap_or_else(|| DEFAULT_RAFT_ADDR.into()),
+        );
+        let raft_metric_addrs = env_string("BENCH_RAFT_METRICS_ENDPOINTS")
+            .map(|value| parse_endpoint_list_with_default(&value, &raft_addrs))
+            .unwrap_or_else(|| raft_addrs.clone());
         Self {
             redis_addr: env_string("BENCH_REDIS").unwrap_or_else(|| DEFAULT_REDIS_ADDR.into()),
             broker_addr: env_string("BENCH_BROKER").unwrap_or_else(|| DEFAULT_BROKER_ADDR.into()),
-            raft_addrs: parse_endpoint_list(
-                &env_string("BENCH_RAFT").unwrap_or_else(|| DEFAULT_RAFT_ADDR.into()),
-            ),
+            raft_addrs,
+            raft_metric_addrs,
             raft_route,
             workers,
             keys: env_parse("BENCH_KEYS", workers * 16).max(1),
@@ -206,6 +261,83 @@ impl Config {
                 .or_else(|| env_string("LMX_LIVE_RAFT_AUTH_TOKEN")),
             http_keep_alive: env_bool("BENCH_HTTP_KEEPALIVE", false),
             capture_raft_metrics: env_bool("BENCH_RAFT_METRICS", false),
+            fail_on_raft_full_log: env_bool("BENCH_RAFT_FAIL_ON_FULL_LOG", true),
+            fail_on_errors: env_bool("BENCH_FAIL_ON_ERRORS", true),
+            fail_on_zero_success: env_bool("BENCH_FAIL_ON_ZERO_SUCCESS", true),
+            perf_thresholds: PerfThresholds::from_env(),
+        }
+    }
+
+    fn perf_guard_failures(&self, target: &str, summary: &Summary) -> Vec<String> {
+        let mut failures = Vec::new();
+        if self.fail_on_errors && summary.errors > 0 {
+            failures.push(format!(
+                "[perf-guard] {target} reported {} worker/request error(s); set BENCH_FAIL_ON_ERRORS=false to report without failing",
+                summary.errors
+            ));
+        }
+        if self.fail_on_zero_success && summary.ok == 0 {
+            failures.push(format!(
+                "[perf-guard] {target} completed 0 successful acquire/release cycles; set BENCH_FAIL_ON_ZERO_SUCCESS=false to report without failing"
+            ));
+        }
+        if let Some(min_ops) = self.perf_thresholds.min_ops_per_sec(target) {
+            let actual = summary.throughput(self.duration);
+            if actual < min_ops {
+                failures.push(format!(
+                    "[perf-guard] {target} throughput {:.3} ops/s below BENCH_MIN_{}_OPS_PER_SEC {:.3}",
+                    actual,
+                    target_env_name(target),
+                    min_ops
+                ));
+            }
+        }
+        if let Some(max_p99_ms) = self.perf_thresholds.max_p99_ms(target) {
+            let actual = summary.p99_ms();
+            if actual > max_p99_ms {
+                failures.push(format!(
+                    "[perf-guard] {target} p99 {:.3} ms above BENCH_MAX_{}_P99_MS {:.3}",
+                    actual,
+                    target_env_name(target),
+                    max_p99_ms
+                ));
+            }
+        }
+        failures
+    }
+}
+
+impl PerfThresholds {
+    fn from_env() -> Self {
+        Self {
+            min_redis_ops_per_sec: env_parse_optional_non_negative_f64(
+                "BENCH_MIN_REDIS_OPS_PER_SEC",
+            ),
+            min_broker_ops_per_sec: env_parse_optional_non_negative_f64(
+                "BENCH_MIN_BROKER_OPS_PER_SEC",
+            ),
+            min_raft_ops_per_sec: env_parse_optional_non_negative_f64("BENCH_MIN_RAFT_OPS_PER_SEC"),
+            max_redis_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_REDIS_P99_MS"),
+            max_broker_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_BROKER_P99_MS"),
+            max_raft_p99_ms: env_parse_optional_non_negative_f64("BENCH_MAX_RAFT_P99_MS"),
+        }
+    }
+
+    fn min_ops_per_sec(&self, target: &str) -> Option<f64> {
+        match target {
+            "redis" => self.min_redis_ops_per_sec,
+            "broker" => self.min_broker_ops_per_sec,
+            "raft" => self.min_raft_ops_per_sec,
+            _ => None,
+        }
+    }
+
+    fn max_p99_ms(&self, target: &str) -> Option<f64> {
+        match target {
+            "redis" => self.max_redis_p99_ms,
+            "broker" => self.max_broker_p99_ms,
+            "raft" => self.max_raft_p99_ms,
+            _ => None,
         }
     }
 }
@@ -339,6 +471,16 @@ async fn run_raft(config: Config) -> Summary {
         summary
             .metric_lines
             .extend(raft_metric_per_cycle_lines(&before, &after, summary.ok));
+        if config.fail_on_raft_full_log {
+            let failures = raft_full_log_guard_failures(&before, &after);
+            for failure in failures {
+                let message = format!(
+                    "[raft-metrics-guard] {failure}; set BENCH_RAFT_FAIL_ON_FULL_LOG=false to report without failing"
+                );
+                summary.metric_lines.push(message.clone());
+                summary.fatal_errors.push(message);
+            }
+        }
     }
     summary
 }
@@ -529,6 +671,10 @@ impl HttpWorkerClient {
 }
 
 fn parse_endpoint_list(value: &str) -> Vec<String> {
+    parse_endpoint_list_with_default(value, &[DEFAULT_RAFT_ADDR.to_string()])
+}
+
+fn parse_endpoint_list_with_default(value: &str, default: &[String]) -> Vec<String> {
     let endpoints = value
         .split(',')
         .map(str::trim)
@@ -536,7 +682,7 @@ fn parse_endpoint_list(value: &str) -> Vec<String> {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     if endpoints.is_empty() {
-        vec![DEFAULT_RAFT_ADDR.into()]
+        default.to_vec()
     } else {
         endpoints
     }
@@ -614,7 +760,7 @@ async fn collect(handles: Vec<tokio::task::JoinHandle<WorkerStats>>) -> Summary 
 fn print_summary(name: &str, summary: &Summary, duration: Duration) {
     let mut latencies = summary.latencies_us.clone();
     latencies.sort_unstable();
-    let throughput = summary.ok as f64 / duration.as_secs_f64();
+    let throughput = summary.throughput(duration);
     let avg = if latencies.is_empty() {
         0.0
     } else {
@@ -692,6 +838,26 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
     (
         "append_frame_mismatches",
         "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total",
+    ),
+    (
+        "admission_probes",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probes_total",
+    ),
+    (
+        "admission_probe_success",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probe_successes_total",
+    ),
+    (
+        "admission_probe_fail",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probe_failures_total",
+    ),
+    (
+        "admission_probe_acks",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probe_acks_total",
+    ),
+    (
+        "admission_probe_us",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total",
     ),
     (
         "follower_conflicts",
@@ -846,7 +1012,7 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
 
 async fn capture_raft_metric_snapshot(config: &Config, phase: &str) -> MetricSnapshot {
     let mut snapshot = MetricSnapshot::default();
-    for endpoint in &config.raft_addrs {
+    for endpoint in &config.raft_metric_addrs {
         match timeout(
             config.io_timeout,
             http_request(
@@ -957,6 +1123,14 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_append_entries_log_bytes_total",
     ),
     (
+        "admission_probe",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probes_total",
+    ),
+    (
+        "admission_probe_us",
+        "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total",
+    ),
+    (
         "follower_appended",
         "dd_rust_network_mutex_raft_follower_append_appended_entries_total",
     ),
@@ -1010,6 +1184,37 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
     ),
 ];
 
+const RAFT_FULL_LOG_GUARD_METRICS: &[(&str, &str)] = &[
+    (
+        "full_log_reads",
+        "dd_rust_network_mutex_raft_log_full_reads_total",
+    ),
+    (
+        "full_log_read_bytes",
+        "dd_rust_network_mutex_raft_log_full_read_bytes_total",
+    ),
+    (
+        "full_log_read_entries",
+        "dd_rust_network_mutex_raft_log_full_read_entries_total",
+    ),
+    (
+        "full_log_rewrites",
+        "dd_rust_network_mutex_raft_log_full_rewrites_total",
+    ),
+    (
+        "full_log_rewrite_failures",
+        "dd_rust_network_mutex_raft_log_full_rewrite_failures_total",
+    ),
+    (
+        "full_log_rewrite_bytes",
+        "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
+    ),
+    (
+        "full_log_rewrite_entries",
+        "dd_rust_network_mutex_raft_log_full_rewrite_entries_total",
+    ),
+];
+
 fn raft_metric_per_cycle_lines(
     before: &MetricSnapshot,
     after: &MetricSnapshot,
@@ -1038,6 +1243,24 @@ fn raft_metric_per_cycle_lines(
     }
     lines.push(current);
     lines
+}
+
+fn raft_full_log_guard_failures(before: &MetricSnapshot, after: &MetricSnapshot) -> Vec<String> {
+    let mut deltas = Vec::new();
+    for (label, metric_name) in RAFT_FULL_LOG_GUARD_METRICS {
+        let delta = metric_delta(before, after, metric_name);
+        if delta > 0.0 {
+            deltas.push(format!("{label}={}", format_metric_delta(delta)));
+        }
+    }
+    if deltas.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "full-log activity observed during raft benchmark window: {}",
+            deltas.join(" ")
+        )]
+    }
 }
 
 fn metric_delta(before: &MetricSnapshot, after: &MetricSnapshot, metric_name: &str) -> f64 {
@@ -1098,17 +1321,46 @@ where
         .unwrap_or(default)
 }
 
-fn env_bool(key: &str, default: bool) -> bool {
-    env_string(key)
-        .and_then(|value| parse_bool(&value))
-        .unwrap_or(default)
+fn env_parse_optional_non_negative_f64(key: &'static str) -> Option<f64> {
+    let value = env_string(key)?;
+    Some(parse_non_negative_f64_env_value(key, &value))
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
+fn parse_non_negative_f64_env_value(key: &'static str, value: &str) -> f64 {
+    let parsed = value
+        .parse::<f64>()
+        .unwrap_or_else(|_| panic!("{key} must be a non-negative finite number; got {value:?}"));
+    if !parsed.is_finite() || parsed < 0.0 {
+        panic!("{key} must be a non-negative finite number; got {value:?}");
+    }
+    parsed
+}
+
+fn env_bool(key: &'static str, default: bool) -> bool {
+    match env_string(key) {
+        Some(value) => {
+            parse_bool_env_value(key, &value).unwrap_or_else(|message| panic!("{message}"))
+        }
+        None => default,
+    }
+}
+
+fn parse_bool_env_value(key: &'static str, value: &str) -> Result<bool, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "y" | "on" => Some(true),
-        "0" | "false" | "no" | "n" | "off" => Some(false),
-        _ => None,
+        "1" | "true" | "yes" | "y" | "on" => Ok(true),
+        "0" | "false" | "no" | "n" | "off" => Ok(false),
+        _ => Err(format!(
+            "{key} must be true/false, 1/0, yes/no, y/n, or on/off; got {value:?}"
+        )),
+    }
+}
+
+fn target_env_name(target: &str) -> &'static str {
+    match target {
+        "redis" => "REDIS",
+        "broker" => "BROKER",
+        "raft" => "RAFT",
+        _ => "UNKNOWN",
     }
 }
 
@@ -1121,6 +1373,7 @@ Configuration is environment driven:\n\
   BENCH_REDIS=127.0.0.1:6379\n\
   BENCH_BROKER=127.0.0.1:6971\n\
   BENCH_RAFT=127.0.0.1:6972[,127.0.0.1:6973,...]\n\
+  BENCH_RAFT_METRICS_ENDPOINTS=<defaults to BENCH_RAFT>\n\
   BENCH_RAFT_ROUTE=round-robin|leader\n\
   BENCH_WORKERS=8\n\
   BENCH_KEYS=128\n\
@@ -1130,6 +1383,15 @@ Configuration is environment driven:\n\
   BENCH_HTTP_AUTH_TOKEN=<token>\n\
   BENCH_HTTP_KEEPALIVE=false\n\
   BENCH_RAFT_METRICS=false\n\
+  BENCH_RAFT_FAIL_ON_FULL_LOG=true\n\
+  BENCH_FAIL_ON_ERRORS=true\n\
+  BENCH_FAIL_ON_ZERO_SUCCESS=true\n\
+  BENCH_MIN_REDIS_OPS_PER_SEC=<optional floor>\n\
+  BENCH_MIN_BROKER_OPS_PER_SEC=<optional floor>\n\
+  BENCH_MIN_RAFT_OPS_PER_SEC=<optional floor>\n\
+  BENCH_MAX_REDIS_P99_MS=<optional ceiling>\n\
+  BENCH_MAX_BROKER_P99_MS=<optional ceiling>\n\
+  BENCH_MAX_RAFT_P99_MS=<optional ceiling>\n\
 \n\
 Example:\n\
   BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
@@ -1587,6 +1849,140 @@ mod tests {
     }
 
     #[test]
+    fn parse_bool_env_value_accepts_documented_forms() {
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "TRUE").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "yes").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "y").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "on").unwrap());
+        assert!(!parse_bool_env_value("BENCH_RAFT_METRICS", "FALSE").unwrap());
+        assert!(!parse_bool_env_value("BENCH_RAFT_METRICS", "0").unwrap());
+        assert!(!parse_bool_env_value("BENCH_RAFT_METRICS", "n").unwrap());
+        assert!(!parse_bool_env_value("BENCH_RAFT_METRICS", "off").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_env_value_rejects_typos_instead_of_defaulting_false() {
+        let message = parse_bool_env_value("BENCH_RAFT_METRICS", "treu")
+            .expect_err("boolean env typo should be rejected");
+
+        assert!(message.contains("BENCH_RAFT_METRICS"));
+        assert!(message.contains("treu"));
+    }
+
+    #[test]
+    fn parse_perf_threshold_accepts_non_negative_finite_values() {
+        assert_eq!(
+            parse_non_negative_f64_env_value("BENCH_MIN_RAFT_OPS_PER_SEC", "0"),
+            0.0
+        );
+        assert_eq!(
+            parse_non_negative_f64_env_value("BENCH_MAX_RAFT_P99_MS", "12.5"),
+            12.5
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "BENCH_MIN_RAFT_OPS_PER_SEC must be a non-negative finite number")]
+    fn parse_perf_threshold_rejects_negative_values() {
+        let _ = parse_non_negative_f64_env_value("BENCH_MIN_RAFT_OPS_PER_SEC", "-1");
+    }
+
+    #[test]
+    #[should_panic(expected = "BENCH_MAX_RAFT_P99_MS must be a non-negative finite number")]
+    fn parse_perf_threshold_rejects_non_finite_values() {
+        let _ = parse_non_negative_f64_env_value("BENCH_MAX_RAFT_P99_MS", "NaN");
+    }
+
+    #[test]
+    fn summary_throughput_zero_duration_is_zero_not_nan() {
+        let summary = Summary {
+            ok: 7,
+            ..Summary::default()
+        };
+
+        assert_eq!(summary.throughput(Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn perf_guard_reports_throughput_latency_and_error_failures() {
+        let config = Config {
+            redis_addr: DEFAULT_REDIS_ADDR.to_string(),
+            broker_addr: DEFAULT_BROKER_ADDR.to_string(),
+            raft_addrs: vec![DEFAULT_RAFT_ADDR.to_string()],
+            raft_metric_addrs: vec![DEFAULT_RAFT_ADDR.to_string()],
+            raft_route: RaftRoute::RoundRobin,
+            workers: 1,
+            keys: 1,
+            duration: Duration::from_secs(2),
+            ttl_ms: 5_000,
+            io_timeout: Duration::from_millis(DEFAULT_IO_TIMEOUT_MS),
+            target: Target::Raft,
+            auth_token: None,
+            http_keep_alive: false,
+            capture_raft_metrics: false,
+            fail_on_raft_full_log: true,
+            fail_on_errors: true,
+            fail_on_zero_success: true,
+            perf_thresholds: PerfThresholds {
+                min_raft_ops_per_sec: Some(10.0),
+                max_raft_p99_ms: Some(1.0),
+                ..PerfThresholds::default()
+            },
+        };
+        let summary = Summary {
+            ok: 4,
+            errors: 1,
+            latencies_us: vec![2_000, 2_000, 2_000, 2_000],
+            ..Summary::default()
+        };
+
+        let failures = config.perf_guard_failures("raft", &summary);
+
+        assert_eq!(failures.len(), 3);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("reported 1 worker/request error")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MIN_RAFT_OPS_PER_SEC")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MAX_RAFT_P99_MS")));
+    }
+
+    #[test]
+    fn perf_guard_rejects_zero_success_by_default_but_can_report_only() {
+        let mut config = Config {
+            redis_addr: DEFAULT_REDIS_ADDR.to_string(),
+            broker_addr: DEFAULT_BROKER_ADDR.to_string(),
+            raft_addrs: vec![DEFAULT_RAFT_ADDR.to_string()],
+            raft_metric_addrs: vec![DEFAULT_RAFT_ADDR.to_string()],
+            raft_route: RaftRoute::RoundRobin,
+            workers: 1,
+            keys: 1,
+            duration: Duration::from_secs(1),
+            ttl_ms: 5_000,
+            io_timeout: Duration::from_millis(DEFAULT_IO_TIMEOUT_MS),
+            target: Target::Raft,
+            auth_token: None,
+            http_keep_alive: false,
+            capture_raft_metrics: false,
+            fail_on_raft_full_log: true,
+            fail_on_errors: true,
+            fail_on_zero_success: true,
+            perf_thresholds: PerfThresholds::default(),
+        };
+        let summary = Summary::default();
+
+        let failures = config.perf_guard_failures("raft", &summary);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("BENCH_FAIL_ON_ZERO_SUCCESS=false"));
+
+        config.fail_on_zero_success = false;
+        assert!(config.perf_guard_failures("raft", &summary).is_empty());
+    }
+
+    #[test]
     fn parse_host_port_accepts_plain_or_http_endpoint() {
         assert_eq!(
             parse_host_port("127.0.0.1:6972").unwrap(),
@@ -1611,6 +2007,24 @@ mod tests {
         assert_eq!(
             parse_endpoint_list(" , "),
             vec![DEFAULT_RAFT_ADDR.to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_metric_endpoint_list_defaults_to_configured_raft_endpoints() {
+        let configured = vec![
+            "127.0.0.1:6972".to_string(),
+            "127.0.0.1:6973".to_string(),
+            "127.0.0.1:6974".to_string(),
+        ];
+
+        assert_eq!(
+            parse_endpoint_list_with_default(" , ", &configured),
+            configured
+        );
+        assert_eq!(
+            parse_endpoint_list_with_default("127.0.0.1:7999", &configured),
+            vec!["127.0.0.1:7999".to_string()]
         );
     }
 
@@ -1641,13 +2055,13 @@ mod tests {
 
     #[test]
     fn parse_bool_accepts_common_env_values() {
-        assert_eq!(parse_bool("true"), Some(true));
-        assert_eq!(parse_bool("1"), Some(true));
-        assert_eq!(parse_bool("on"), Some(true));
-        assert_eq!(parse_bool("false"), Some(false));
-        assert_eq!(parse_bool("0"), Some(false));
-        assert_eq!(parse_bool("off"), Some(false));
-        assert_eq!(parse_bool("maybe"), None);
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "true").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "1").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "on").unwrap());
+        assert!(!parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "false").unwrap());
+        assert!(!parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "0").unwrap());
+        assert!(!parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "off").unwrap());
+        assert!(parse_bool_env_value("BENCH_HTTP_KEEPALIVE", "maybe").is_err());
     }
 
     #[test]
@@ -1690,6 +2104,26 @@ nan_value NaN\n",
         before.values.insert(
             "dd_rust_network_mutex_raft_append_entries_frame_size_mismatches_total".into(),
             0.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probes_total".into(),
+            4.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_successes_total".into(),
+            4.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_failures_total".into(),
+            0.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_acks_total".into(),
+            8.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total".into(),
+            1000.0,
         );
         before.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
@@ -1772,6 +2206,26 @@ nan_value NaN\n",
             2.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probes_total".into(),
+            14.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_successes_total".into(),
+            13.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_failures_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_acks_total".into(),
+            28.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total".into(),
+            3500.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_follower_append_conflicts_total".into(),
             7.0,
         );
@@ -1841,6 +2295,11 @@ nan_value NaN\n",
         assert!(joined.contains("append_rpc=+32"));
         assert!(joined.contains("proxy_forwarded=+4"));
         assert!(joined.contains("append_frame_mismatches=+2"));
+        assert!(joined.contains("admission_probes=+10"));
+        assert!(joined.contains("admission_probe_success=+9"));
+        assert!(joined.contains("admission_probe_fail=+1"));
+        assert!(joined.contains("admission_probe_acks=+20"));
+        assert!(joined.contains("admission_probe_us=+2500"));
         assert!(joined.contains("follower_conflicts=+4"));
         assert!(joined.contains("follower_rewrites=+1"));
         assert!(joined.contains("follower_appended=+18"));
@@ -1873,6 +2332,14 @@ nan_value NaN\n",
         before.values.insert(
             "dd_rust_network_mutex_raft_append_entries_log_bytes_total".into(),
             1000.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probes_total".into(),
+            5.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total".into(),
+            1200.0,
         );
         before.values.insert(
             "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
@@ -1929,6 +2396,14 @@ nan_value NaN\n",
             1402.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probes_total".into(),
+            13.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_client_admission_quorum_probe_us_total".into(),
+            2200.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_follower_append_appended_entries_total".into(),
             32.0,
         );
@@ -1975,6 +2450,8 @@ nan_value NaN\n",
         assert!(joined.contains("append_rpc=1.500"));
         assert!(joined.contains("append_entries=3"));
         assert!(joined.contains("append_log_bytes=100.500"));
+        assert!(joined.contains("admission_probe=2"));
+        assert!(joined.contains("admission_probe_us=250"));
         assert!(joined.contains("follower_appended=5"));
         assert!(joined.contains("follower_rewrites=1"));
         assert!(joined.contains("proxy_forwarded=1.500"));
@@ -1994,6 +2471,131 @@ nan_value NaN\n",
                 .join("\n");
 
         assert!(line.contains("unavailable because raft completed 0 successful cycles"));
+    }
+
+    #[test]
+    fn raft_full_log_guard_ignores_unchanged_startup_baseline() {
+        let mut before = MetricSnapshot::default();
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            3.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        let after = MetricSnapshot {
+            values: before.values.clone(),
+            ..MetricSnapshot::default()
+        };
+
+        assert!(raft_full_log_guard_failures(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn raft_full_log_guard_reports_positive_full_log_deltas() {
+        let mut before = MetricSnapshot::default();
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            2.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            1024.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            4.0,
+        );
+
+        let mut after = MetricSnapshot::default();
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_reads_total".into(),
+            3.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_read_bytes_total".into(),
+            4096.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrites_total".into(),
+            1.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_full_rewrite_entries_total".into(),
+            6.0,
+        );
+
+        let joined = raft_full_log_guard_failures(&before, &after).join("\n");
+
+        assert!(joined.contains("full-log activity observed"));
+        assert!(joined.contains("full_log_reads=+1"));
+        assert!(joined.contains("full_log_read_bytes=+3072"));
+        assert!(joined.contains("full_log_rewrite_entries=+2"));
+        assert!(!joined.contains("full_log_rewrites="));
+    }
+
+    #[tokio::test]
+    async fn raft_metric_snapshot_uses_metric_endpoints_not_request_endpoints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metrics server");
+        let metrics_endpoint = listener.local_addr().expect("metrics addr").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept metrics scrape");
+            let mut buf = [0u8; 512];
+            let n = stream.read(&mut buf).await.expect("read scrape request");
+            let request = String::from_utf8_lossy(&buf[..n]);
+            assert!(request.starts_with("GET /metrics "));
+            let body = b"dd_rust_network_mutex_raft_log_full_reads_total 5\n";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .await
+                .expect("write metrics header");
+            stream.write_all(body).await.expect("write metrics body");
+            stream.shutdown().await.expect("shutdown metrics server");
+        });
+        let config = Config {
+            redis_addr: DEFAULT_REDIS_ADDR.to_string(),
+            broker_addr: DEFAULT_BROKER_ADDR.to_string(),
+            raft_addrs: vec!["127.0.0.1:9".to_string()],
+            raft_metric_addrs: vec![metrics_endpoint],
+            raft_route: RaftRoute::Leader,
+            workers: 1,
+            keys: 1,
+            duration: Duration::from_secs(1),
+            ttl_ms: 5_000,
+            io_timeout: Duration::from_secs(1),
+            target: Target::Raft,
+            auth_token: None,
+            http_keep_alive: false,
+            capture_raft_metrics: true,
+            fail_on_raft_full_log: true,
+            fail_on_errors: true,
+            fail_on_zero_success: true,
+            perf_thresholds: PerfThresholds::default(),
+        };
+
+        let snapshot = capture_raft_metric_snapshot(&config, "test").await;
+
+        assert_eq!(snapshot.successful_endpoints, 1);
+        assert!(snapshot.errors.is_empty(), "{:?}", snapshot.errors);
+        assert_eq!(
+            snapshot
+                .values
+                .get("dd_rust_network_mutex_raft_log_full_reads_total")
+                .copied(),
+            Some(5.0)
+        );
+        server.await.expect("metrics server");
     }
 
     #[tokio::test]

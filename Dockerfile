@@ -45,7 +45,8 @@ WORKDIR /app
 # binary even if its fingerprint somehow matches the dummy. Deps
 # stay cached (only the package itself is invalidated), so this adds
 # only a few seconds.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY vendor ./vendor
 RUN mkdir -p src \
   && echo "fn main() {}" > src/main.rs \
   && printf 'pub fn __stub() {}\n' > src/lib.rs \
@@ -81,6 +82,7 @@ RUN apt-get update \
 
 COPY --from=build /app/target/release/dd-rust-network-mutex /usr/local/bin/dd-rust-network-mutex
 COPY lmx.toml /etc/dd-rust-network-mutex/lmx.toml
+COPY .cli-flags.toml /etc/dd-rust-network-mutex/.cli-flags.toml
 
 ENV LMX_BIND_HOST=0.0.0.0 \
     LMX_TCP_PORT=6970 \

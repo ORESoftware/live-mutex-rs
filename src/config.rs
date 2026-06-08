@@ -41,6 +41,12 @@ pub enum ConfigError {
     },
     #[error("invalid socket address `{value}` from {from}")]
     InvalidSocketAddr { value: String, from: String },
+    #[error(
+        "invalid boolean value `{value}` for env var {key}; expected true/false, 1/0, yes/no, or on/off"
+    )]
+    InvalidBoolEnv { key: &'static str, value: String },
+    #[error("invalid unsigned integer value `{value}` for env var {key}")]
+    InvalidIntegerEnv { key: &'static str, value: String },
     #[error(transparent)]
     Raft(#[from] BrokerRaftError),
 }
@@ -95,10 +101,12 @@ struct RaftFileConfig {
     snapshot_interval_ms: Option<u64>,
     snapshot_max_log_entries: Option<u64>,
     snapshot_max_log_bytes: Option<u64>,
+    snapshot_max_log_age_ms: Option<u64>,
     trailing_log_entries: Option<u64>,
     append_entries_max_entries: Option<usize>,
     append_entries_max_bytes: Option<usize>,
     append_entries_max_inline_batches: Option<usize>,
+    target_quorum_extra_fanout: Option<usize>,
     install_snapshot_chunk_bytes: Option<usize>,
     install_snapshot_max_staged_bytes: Option<u64>,
     install_snapshot_max_staged_transfers: Option<usize>,
@@ -182,10 +190,10 @@ fn build_server_config(
         .or(file.http_port)
         .unwrap_or(6971);
 
-    let disable_tcp = env_bool("LMX_DISABLE_TCP")
+    let disable_tcp = env_bool("LMX_DISABLE_TCP")?
         .or(file.disable_tcp)
         .unwrap_or(false);
-    let disable_http = env_bool("LMX_DISABLE_HTTP")
+    let disable_http = env_bool("LMX_DISABLE_HTTP")?
         .or(file.disable_http)
         .unwrap_or(false);
 
@@ -225,10 +233,10 @@ fn build_server_config(
         http_bind,
         auth_token,
         broker,
-        tcp_nodelay: env_bool("LMX_TCP_NODELAY")
+        tcp_nodelay: env_bool("LMX_TCP_NODELAY")?
             .or(file.tcp_nodelay)
             .unwrap_or(true),
-        tcp_quickack: env_bool("LMX_TCP_QUICKACK")
+        tcp_quickack: env_bool("LMX_TCP_QUICKACK")?
             .or(file.tcp_quickack)
             .unwrap_or(true),
         status_bind,
@@ -269,7 +277,7 @@ fn build_broker_config(file: &BrokerFileConfig) -> BrokerConfig {
 fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigError> {
     crate::routine_id!("ddl-routine-config-build-raft-1");
     let mut cfg = BrokerRaftConfig::default();
-    cfg.enabled = env_bool("LMX_RAFT_ENABLED")
+    cfg.enabled = env_bool("LMX_RAFT_ENABLED")?
         .or(file.enabled)
         .unwrap_or(cfg.enabled);
     cfg.node_id = env_string("LMX_RAFT_NODE_ID")
@@ -286,88 +294,99 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
     cfg.data_dir = env_path("LMX_RAFT_DATA_DIR")
         .or_else(|| file.data_dir.clone())
         .unwrap_or(cfg.data_dir);
-    cfg.data_dir_lock = env_bool("LMX_RAFT_DATA_DIR_LOCK")
+    cfg.data_dir_lock = env_bool("LMX_RAFT_DATA_DIR_LOCK")?
         .or(file.data_dir_lock)
         .unwrap_or(cfg.data_dir_lock);
     cfg.heartbeat_interval = Duration::from_millis(
-        env_parse("LMX_RAFT_HEARTBEAT_INTERVAL_MS")
+        env_parse_strict("LMX_RAFT_HEARTBEAT_INTERVAL_MS")?
             .or(file.heartbeat_interval_ms)
             .unwrap_or(cfg.heartbeat_interval.as_millis() as u64),
     );
     cfg.election_timeout_min = Duration::from_millis(
-        env_parse("LMX_RAFT_ELECTION_TIMEOUT_MIN_MS")
+        env_parse_strict("LMX_RAFT_ELECTION_TIMEOUT_MIN_MS")?
             .or(file.election_timeout_min_ms)
             .unwrap_or(cfg.election_timeout_min.as_millis() as u64),
     );
     cfg.election_timeout_max = Duration::from_millis(
-        env_parse("LMX_RAFT_ELECTION_TIMEOUT_MAX_MS")
+        env_parse_strict("LMX_RAFT_ELECTION_TIMEOUT_MAX_MS")?
             .or(file.election_timeout_max_ms)
             .unwrap_or(cfg.election_timeout_max.as_millis() as u64),
     );
     cfg.snapshot_interval = Duration::from_millis(
-        env_parse("LMX_RAFT_SNAPSHOT_INTERVAL_MS")
+        env_parse_strict("LMX_RAFT_SNAPSHOT_INTERVAL_MS")?
             .or(file.snapshot_interval_ms)
             .unwrap_or(cfg.snapshot_interval.as_millis() as u64),
     );
-    cfg.snapshot_max_log_entries = env_parse("LMX_RAFT_SNAPSHOT_MAX_LOG_ENTRIES")
+    cfg.snapshot_max_log_entries = env_parse_strict("LMX_RAFT_SNAPSHOT_MAX_LOG_ENTRIES")?
         .or(file.snapshot_max_log_entries)
         .unwrap_or(cfg.snapshot_max_log_entries);
-    cfg.snapshot_max_log_bytes = env_parse("LMX_RAFT_SNAPSHOT_MAX_LOG_BYTES")
+    cfg.snapshot_max_log_bytes = env_parse_strict("LMX_RAFT_SNAPSHOT_MAX_LOG_BYTES")?
         .or(file.snapshot_max_log_bytes)
         .unwrap_or(cfg.snapshot_max_log_bytes);
-    cfg.trailing_log_entries = env_parse("LMX_RAFT_TRAILING_LOG_ENTRIES")
+    cfg.snapshot_max_log_age = Duration::from_millis(
+        env_parse_strict("LMX_RAFT_SNAPSHOT_MAX_LOG_AGE_MS")?
+            .or(file.snapshot_max_log_age_ms)
+            .unwrap_or(cfg.snapshot_max_log_age.as_millis() as u64),
+    );
+    cfg.trailing_log_entries = env_parse_strict("LMX_RAFT_TRAILING_LOG_ENTRIES")?
         .or(file.trailing_log_entries)
         .unwrap_or(cfg.trailing_log_entries);
-    cfg.append_entries_max_entries = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES")
+    cfg.append_entries_max_entries = env_parse_strict("LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES")?
         .or(file.append_entries_max_entries)
         .unwrap_or(cfg.append_entries_max_entries);
-    cfg.append_entries_max_bytes = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES")
+    cfg.append_entries_max_bytes = env_parse_strict("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES")?
         .or(file.append_entries_max_bytes)
         .unwrap_or(cfg.append_entries_max_bytes);
-    cfg.append_entries_max_inline_batches = env_parse("LMX_RAFT_APPEND_ENTRIES_MAX_INLINE_BATCHES")
-        .or(file.append_entries_max_inline_batches)
-        .unwrap_or(cfg.append_entries_max_inline_batches);
-    cfg.install_snapshot_chunk_bytes = env_parse("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES")
+    cfg.append_entries_max_inline_batches =
+        env_parse_strict("LMX_RAFT_APPEND_ENTRIES_MAX_INLINE_BATCHES")?
+            .or(file.append_entries_max_inline_batches)
+            .unwrap_or(cfg.append_entries_max_inline_batches);
+    cfg.target_quorum_extra_fanout = env_parse_strict("LMX_RAFT_TARGET_QUORUM_EXTRA_FANOUT")?
+        .or(file.target_quorum_extra_fanout)
+        .unwrap_or(cfg.target_quorum_extra_fanout);
+    cfg.install_snapshot_chunk_bytes = env_parse_strict("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES")?
         .or(file.install_snapshot_chunk_bytes)
         .unwrap_or(cfg.install_snapshot_chunk_bytes);
-    cfg.install_snapshot_max_staged_bytes = env_parse("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES")
-        .or(file.install_snapshot_max_staged_bytes)
-        .unwrap_or(cfg.install_snapshot_max_staged_bytes);
+    cfg.install_snapshot_max_staged_bytes =
+        env_parse_strict("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES")?
+            .or(file.install_snapshot_max_staged_bytes)
+            .unwrap_or(cfg.install_snapshot_max_staged_bytes);
     cfg.install_snapshot_max_staged_transfers =
-        env_parse("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS")
+        env_parse_strict("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS")?
             .or(file.install_snapshot_max_staged_transfers)
             .unwrap_or(cfg.install_snapshot_max_staged_transfers);
     cfg.install_snapshot_stale_transfer_after = Duration::from_millis(
-        env_parse("LMX_RAFT_INSTALL_SNAPSHOT_STALE_TRANSFER_MS")
+        env_parse_strict("LMX_RAFT_INSTALL_SNAPSHOT_STALE_TRANSFER_MS")?
             .or(file.install_snapshot_stale_transfer_ms)
             .unwrap_or(cfg.install_snapshot_stale_transfer_after.as_millis() as u64),
     );
-    cfg.client_batch_max_entries = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES")
+    cfg.client_batch_max_entries = env_parse_strict("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES")?
         .or(file.client_batch_max_entries)
         .unwrap_or(cfg.client_batch_max_entries);
-    cfg.client_pipeline_max_batches = env_parse("LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES")
+    cfg.client_pipeline_max_batches = env_parse_strict("LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES")?
         .or(file.client_pipeline_max_batches)
         .unwrap_or(cfg.client_pipeline_max_batches);
-    cfg.client_batch_max_pending = env_parse("LMX_RAFT_CLIENT_BATCH_MAX_PENDING")
+    cfg.client_batch_max_pending = env_parse_strict("LMX_RAFT_CLIENT_BATCH_MAX_PENDING")?
         .or(file.client_batch_max_pending)
         .unwrap_or(cfg.client_batch_max_pending);
     cfg.client_batch_max_delay = Duration::from_millis(
-        env_parse("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS")
+        env_parse_strict("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS")?
             .or(file.client_batch_max_delay_ms)
             .unwrap_or(cfg.client_batch_max_delay.as_millis() as u64),
     );
-    cfg.client_response_cache_max_entries = env_parse("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES")
-        .or(file.client_response_cache_max_entries)
-        .unwrap_or(cfg.client_response_cache_max_entries);
+    cfg.client_response_cache_max_entries =
+        env_parse_strict("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES")?
+            .or(file.client_response_cache_max_entries)
+            .unwrap_or(cfg.client_response_cache_max_entries);
     cfg.proxy_retry_budget = Duration::from_millis(
-        env_parse("LMX_RAFT_PROXY_RETRY_BUDGET_MS")
+        env_parse_strict("LMX_RAFT_PROXY_RETRY_BUDGET_MS")?
             .or(file.proxy_retry_budget_ms)
             .unwrap_or(cfg.proxy_retry_budget.as_millis() as u64),
     );
-    cfg.sync_log = env_bool("LMX_RAFT_SYNC_LOG")
+    cfg.sync_log = env_bool("LMX_RAFT_SYNC_LOG")?
         .or(file.sync_log)
         .unwrap_or(cfg.sync_log);
-    cfg.sync_commit = env_bool("LMX_RAFT_SYNC_COMMIT")
+    cfg.sync_commit = env_bool("LMX_RAFT_SYNC_COMMIT")?
         .or(file.sync_commit)
         .unwrap_or(cfg.sync_commit);
     cfg.peer_token =
@@ -423,9 +442,47 @@ where
     env_string(key).and_then(|v| v.parse::<T>().ok())
 }
 
-fn env_bool(key: &str) -> Option<bool> {
+fn env_parse_strict<T>(key: &'static str) -> Result<Option<T>, ConfigError>
+where
+    T: std::str::FromStr,
+{
+    crate::routine_id!("ddl-routine-config-env-parse-strict-1");
+    env_string(key)
+        .map(|value| parse_integer_env_value(key, &value))
+        .transpose()
+}
+
+fn env_bool(key: &'static str) -> Result<Option<bool>, ConfigError> {
     crate::routine_id!("ddl-routine-config-env-bool-1");
-    env_string(key).map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+    env_string(key)
+        .map(|value| parse_bool_env_value(key, &value))
+        .transpose()
+}
+
+fn parse_bool_env_value(key: &'static str, value: &str) -> Result<bool, ConfigError> {
+    crate::routine_id!("ddl-routine-config-parse-bool-env-1");
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBoolEnv {
+            key,
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn parse_integer_env_value<T>(key: &'static str, value: &str) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+{
+    crate::routine_id!("ddl-routine-config-parse-integer-env-1");
+    value
+        .trim()
+        .parse::<T>()
+        .map_err(|_| ConfigError::InvalidIntegerEnv {
+            key,
+            value: value.to_string(),
+        })
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -438,6 +495,95 @@ fn non_empty(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn clear(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().expect("config env lock")
+    }
+
+    fn clear_server_envs() -> Vec<EnvVarGuard> {
+        vec![
+            EnvVarGuard::clear("LMX_BIND_HOST"),
+            EnvVarGuard::clear("LMX_TCP_PORT"),
+            EnvVarGuard::clear("LMX_HTTP_PORT"),
+            EnvVarGuard::clear("LMX_DISABLE_TCP"),
+            EnvVarGuard::clear("LMX_DISABLE_HTTP"),
+            EnvVarGuard::clear("LMX_STATUS_PORT"),
+            EnvVarGuard::clear("LMX_UDS_PATH"),
+            EnvVarGuard::clear("LMX_AUTH_TOKEN"),
+            EnvVarGuard::clear("LMX_TCP_NODELAY"),
+            EnvVarGuard::clear("LMX_TCP_QUICKACK"),
+            EnvVarGuard::clear("LMX_TLS_CERT"),
+            EnvVarGuard::clear("LMX_TLS_KEY"),
+        ]
+    }
+
+    fn clear_raft_bool_envs() -> Vec<EnvVarGuard> {
+        vec![
+            EnvVarGuard::clear("LMX_RAFT_ENABLED"),
+            EnvVarGuard::clear("LMX_RAFT_DATA_DIR_LOCK"),
+            EnvVarGuard::clear("LMX_RAFT_SYNC_LOG"),
+            EnvVarGuard::clear("LMX_RAFT_SYNC_COMMIT"),
+        ]
+    }
+
+    fn clear_raft_numeric_envs() -> Vec<EnvVarGuard> {
+        vec![
+            EnvVarGuard::clear("LMX_RAFT_HEARTBEAT_INTERVAL_MS"),
+            EnvVarGuard::clear("LMX_RAFT_ELECTION_TIMEOUT_MIN_MS"),
+            EnvVarGuard::clear("LMX_RAFT_ELECTION_TIMEOUT_MAX_MS"),
+            EnvVarGuard::clear("LMX_RAFT_SNAPSHOT_INTERVAL_MS"),
+            EnvVarGuard::clear("LMX_RAFT_SNAPSHOT_MAX_LOG_ENTRIES"),
+            EnvVarGuard::clear("LMX_RAFT_SNAPSHOT_MAX_LOG_BYTES"),
+            EnvVarGuard::clear("LMX_RAFT_SNAPSHOT_MAX_LOG_AGE_MS"),
+            EnvVarGuard::clear("LMX_RAFT_TRAILING_LOG_ENTRIES"),
+            EnvVarGuard::clear("LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES"),
+            EnvVarGuard::clear("LMX_RAFT_APPEND_ENTRIES_MAX_BYTES"),
+            EnvVarGuard::clear("LMX_RAFT_APPEND_ENTRIES_MAX_INLINE_BATCHES"),
+            EnvVarGuard::clear("LMX_RAFT_TARGET_QUORUM_EXTRA_FANOUT"),
+            EnvVarGuard::clear("LMX_RAFT_INSTALL_SNAPSHOT_CHUNK_BYTES"),
+            EnvVarGuard::clear("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_BYTES"),
+            EnvVarGuard::clear("LMX_RAFT_INSTALL_SNAPSHOT_MAX_STAGED_TRANSFERS"),
+            EnvVarGuard::clear("LMX_RAFT_INSTALL_SNAPSHOT_STALE_TRANSFER_MS"),
+            EnvVarGuard::clear("LMX_RAFT_CLIENT_BATCH_MAX_ENTRIES"),
+            EnvVarGuard::clear("LMX_RAFT_CLIENT_PIPELINE_MAX_BATCHES"),
+            EnvVarGuard::clear("LMX_RAFT_CLIENT_BATCH_MAX_PENDING"),
+            EnvVarGuard::clear("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS"),
+            EnvVarGuard::clear("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES"),
+            EnvVarGuard::clear("LMX_RAFT_PROXY_RETRY_BUDGET_MS"),
+        ]
+    }
 
     #[test]
     fn parses_raft_peer_quorum_from_toml() {
@@ -447,9 +593,11 @@ mod tests {
             enabled = false
             node_id = "node-1"
             data_dir_lock = false
+            snapshot_max_log_age_ms = 9876
             append_entries_max_entries = 17
             append_entries_max_bytes = 12345
             append_entries_max_inline_batches = 9
+            target_quorum_extra_fanout = 1
             install_snapshot_chunk_bytes = 54321
             install_snapshot_max_staged_bytes = 654321
             install_snapshot_max_staged_transfers = 5
@@ -484,8 +632,10 @@ mod tests {
         assert_eq!(raft.quorum_size(), 2);
         assert_eq!(raft.append_entries_max_entries, 17);
         assert!(!raft.data_dir_lock);
+        assert_eq!(raft.snapshot_max_log_age, Duration::from_millis(9876));
         assert_eq!(raft.append_entries_max_bytes, 12345);
         assert_eq!(raft.append_entries_max_inline_batches, 9);
+        assert_eq!(raft.target_quorum_extra_fanout, 1);
         assert_eq!(raft.install_snapshot_chunk_bytes, 54321);
         assert_eq!(raft.install_snapshot_max_staged_bytes, 654321);
         assert_eq!(raft.install_snapshot_max_staged_transfers, 5);
@@ -505,6 +655,139 @@ mod tests {
     }
 
     #[test]
+    fn parse_bool_env_value_accepts_explicit_true_and_false_forms() {
+        assert!(parse_bool_env_value("LMX_RAFT_ENABLED", "TRUE").expect("TRUE"));
+        assert!(parse_bool_env_value("LMX_RAFT_ENABLED", "yes").expect("yes"));
+        assert!(parse_bool_env_value("LMX_RAFT_ENABLED", "on").expect("on"));
+        assert!(!parse_bool_env_value("LMX_RAFT_ENABLED", "FALSE").expect("FALSE"));
+        assert!(!parse_bool_env_value("LMX_RAFT_ENABLED", "0").expect("0"));
+        assert!(!parse_bool_env_value("LMX_RAFT_ENABLED", "off").expect("off"));
+    }
+
+    #[test]
+    fn parse_integer_env_value_accepts_unsigned_forms() {
+        let entries: usize = parse_integer_env_value("LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES", "256")
+            .expect("usize value");
+        let bytes: u64 = parse_integer_env_value("LMX_RAFT_SNAPSHOT_MAX_LOG_BYTES", "67108864")
+            .expect("u64 value");
+
+        assert_eq!(entries, 256);
+        assert_eq!(bytes, 67_108_864);
+    }
+
+    #[test]
+    fn server_boolean_env_rejects_invalid_values_instead_of_silently_disabling_http() {
+        let _env_lock = lock_env();
+        let mut guards = clear_server_envs();
+        guards.push(EnvVarGuard::set("LMX_DISABLE_HTTP", "flase"));
+
+        let err = build_server_config(&ServerFileConfig::default(), BrokerConfig::default())
+            .expect_err("invalid server boolean env should fail config loading");
+        match err {
+            ConfigError::InvalidBoolEnv { key, value } => {
+                assert_eq!(key, "LMX_DISABLE_HTTP");
+                assert_eq!(value, "flase");
+            }
+            other => panic!("unexpected config error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_boolean_env_accepts_explicit_false_socket_tuning_values() {
+        let _env_lock = lock_env();
+        let mut guards = clear_server_envs();
+        guards.push(EnvVarGuard::set("LMX_DISABLE_HTTP", "off"));
+        guards.push(EnvVarGuard::set("LMX_TCP_NODELAY", "NO"));
+        guards.push(EnvVarGuard::set("LMX_TCP_QUICKACK", "0"));
+
+        let cfg = build_server_config(&ServerFileConfig::default(), BrokerConfig::default())
+            .expect("valid server boolean env values");
+
+        assert!(cfg.http_bind.is_some());
+        assert!(!cfg.tcp_nodelay);
+        assert!(!cfg.tcp_quickack);
+    }
+
+    #[test]
+    fn raft_boolean_env_rejects_invalid_values_instead_of_disabling_durability() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_bool_envs();
+        guards.push(EnvVarGuard::set("LMX_RAFT_SYNC_LOG", "tru"));
+
+        let err = build_raft_config(&RaftFileConfig::default())
+            .expect_err("invalid Raft boolean env should fail config loading");
+        match err {
+            ConfigError::InvalidBoolEnv { key, value } => {
+                assert_eq!(key, "LMX_RAFT_SYNC_LOG");
+                assert_eq!(value, "tru");
+            }
+            other => panic!("unexpected config error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raft_boolean_env_accepts_explicit_false_durability_values() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_bool_envs();
+        guards.push(EnvVarGuard::set("LMX_RAFT_SYNC_LOG", "off"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_SYNC_COMMIT", "NO"));
+
+        let raft = build_raft_config(&RaftFileConfig::default()).expect("valid false env values");
+
+        assert!(!raft.sync_log);
+        assert!(!raft.sync_commit);
+    }
+
+    #[test]
+    fn raft_numeric_env_rejects_invalid_values_instead_of_keeping_default_batch_size() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_bool_envs();
+        guards.extend(clear_raft_numeric_envs());
+        guards.push(EnvVarGuard::set(
+            "LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES",
+            "two-fifty-six",
+        ));
+
+        let err = build_raft_config(&RaftFileConfig::default())
+            .expect_err("invalid Raft numeric env should fail config loading");
+        match err {
+            ConfigError::InvalidIntegerEnv { key, value } => {
+                assert_eq!(key, "LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES");
+                assert_eq!(value, "two-fifty-six");
+            }
+            other => panic!("unexpected config error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raft_numeric_env_overrides_file_values_explicitly() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_bool_envs();
+        guards.extend(clear_raft_numeric_envs());
+        guards.push(EnvVarGuard::set(
+            "LMX_RAFT_APPEND_ENTRIES_MAX_ENTRIES",
+            "11",
+        ));
+        guards.push(EnvVarGuard::set("LMX_RAFT_HEARTBEAT_INTERVAL_MS", "75"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_SNAPSHOT_MAX_LOG_AGE_MS", "1234"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_TARGET_QUORUM_EXTRA_FANOUT", "2"));
+        let file = RaftFileConfig {
+            append_entries_max_entries: Some(17),
+            heartbeat_interval_ms: Some(50),
+            snapshot_max_log_age_ms: Some(9876),
+            target_quorum_extra_fanout: Some(1),
+            ..RaftFileConfig::default()
+        };
+
+        let raft = build_raft_config(&file).expect("valid Raft numeric env overrides");
+
+        assert_eq!(raft.append_entries_max_entries, 11);
+        assert_eq!(raft.heartbeat_interval, Duration::from_millis(75));
+        assert_eq!(raft.snapshot_max_log_age, Duration::from_millis(1234));
+        assert_eq!(raft.target_quorum_extra_fanout, 2);
+    }
+
+    #[test]
     fn shipped_regular_config_keeps_raft_disabled_with_three_node_plan() {
         let cfg: ConfigFile =
             toml::from_str(include_str!("../lmx.toml")).expect("shipped lmx.toml parses");
@@ -520,7 +803,9 @@ mod tests {
         assert_eq!(cfg.raft.snapshot_interval_ms, Some(1_800_000));
         assert_eq!(cfg.raft.snapshot_max_log_entries, Some(100_000));
         assert_eq!(cfg.raft.snapshot_max_log_bytes, Some(67_108_864));
+        assert_eq!(cfg.raft.snapshot_max_log_age_ms, Some(1_800_000));
         assert_eq!(cfg.raft.trailing_log_entries, Some(10_000));
+        assert_eq!(cfg.raft.target_quorum_extra_fanout, Some(0));
 
         let peer_ids = cfg
             .raft
@@ -534,6 +819,8 @@ mod tests {
         assert!(!raft.enabled);
         assert_eq!(raft.cluster_size(), 3);
         assert_eq!(raft.quorum_size(), 2);
+        assert_eq!(raft.snapshot_max_log_age, Duration::from_millis(1_800_000));
+        assert_eq!(raft.target_quorum_extra_fanout, 0);
     }
 
     #[test]
@@ -558,10 +845,12 @@ mod tests {
         assert_eq!(cfg.raft.snapshot_interval_ms, Some(1_800_000));
         assert_eq!(cfg.raft.snapshot_max_log_entries, Some(100_000));
         assert_eq!(cfg.raft.snapshot_max_log_bytes, Some(67_108_864));
+        assert_eq!(cfg.raft.snapshot_max_log_age_ms, Some(1_800_000));
         assert_eq!(cfg.raft.trailing_log_entries, Some(10_000));
         assert_eq!(cfg.raft.append_entries_max_entries, Some(256));
         assert_eq!(cfg.raft.append_entries_max_bytes, Some(1_048_576));
         assert_eq!(cfg.raft.append_entries_max_inline_batches, Some(64));
+        assert_eq!(cfg.raft.target_quorum_extra_fanout, Some(0));
         assert_eq!(cfg.raft.install_snapshot_chunk_bytes, Some(1_048_576));
         assert_eq!(
             cfg.raft.install_snapshot_max_staged_bytes,
@@ -594,7 +883,9 @@ mod tests {
         assert!(raft.data_dir_lock);
         assert_eq!(raft.append_entries_max_bytes, 1_048_576);
         assert_eq!(raft.append_entries_max_inline_batches, 64);
+        assert_eq!(raft.target_quorum_extra_fanout, 0);
         assert_eq!(raft.install_snapshot_chunk_bytes, 1_048_576);
+        assert_eq!(raft.snapshot_max_log_age, Duration::from_millis(1_800_000));
         assert_eq!(raft.client_batch_max_entries, 32);
         assert_eq!(raft.client_pipeline_max_batches, 4);
         assert_eq!(raft.client_batch_max_pending, 8192);
