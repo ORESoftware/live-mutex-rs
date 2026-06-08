@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -596,6 +596,112 @@ fn frame_yield_every() -> usize {
         .unwrap_or(DEFAULT_FRAME_YIELD_EVERY)
 }
 
+/// Maximum concurrent TCP/UDS client connections. Beyond this, a new connection
+/// is accepted and immediately closed, so a connection flood can't exhaust
+/// client slots, writer tasks, and per-connection read buffers. Override via
+/// `LMX_MAX_CONNECTIONS` (any non-zero integer).
+const DEFAULT_MAX_CONNECTIONS: u64 = 4096;
+
+/// How long an *unauthenticated* connection has to complete the auth handshake
+/// before it is dropped. This bounds slowloris / idle-hold attacks on the
+/// pre-auth phase without affecting authenticated, long-lived lock holders
+/// (which legitimately keep an otherwise-idle connection open). Override via
+/// `LMX_AUTH_HANDSHAKE_MS`; `0` disables the deadline. Only applies when an auth
+/// token is configured.
+const DEFAULT_AUTH_HANDSHAKE_MS: u64 = 10_000;
+
+static ACTIVE_STREAM_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+
+fn max_connections() -> u64 {
+    crate::routine_id!("ddl-routine-max-connections-Cn4");
+    std::env::var("LMX_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+}
+
+fn auth_handshake_timeout() -> Option<Duration> {
+    crate::routine_id!("ddl-routine-auth-handshake-timeout-Hk9");
+    let ms = std::env::var("LMX_AUTH_HANDSHAKE_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AUTH_HANDSHAKE_MS);
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// RAII guard bounding concurrent stream connections; `None` when at capacity.
+struct StreamConnGuard {
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl StreamConnGuard {
+    fn try_acquire(max: u64, metrics: Arc<crate::metrics::Metrics>) -> Option<Self> {
+        if ACTIVE_STREAM_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= max {
+            ACTIVE_STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+            metrics.stream_connection_cap_drops_total.inc();
+            None
+        } else {
+            metrics.stream_connections_active.inc();
+            Some(StreamConnGuard { metrics })
+        }
+    }
+}
+
+impl Drop for StreamConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        self.metrics.stream_connections_active.dec();
+    }
+}
+
+#[cfg(test)]
+mod conn_limit_tests {
+    use super::*;
+
+    #[test]
+    fn stream_conn_guard_caps_and_releases() {
+        ACTIVE_STREAM_CONNECTIONS.store(0, Ordering::SeqCst);
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let g1 = StreamConnGuard::try_acquire(2, Arc::clone(&metrics));
+        let g2 = StreamConnGuard::try_acquire(2, Arc::clone(&metrics));
+        assert!(g1.is_some() && g2.is_some());
+        assert_eq!(ACTIVE_STREAM_CONNECTIONS.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.stream_connections_active.get(), 2);
+
+        // At capacity: rejected, and the count is not left inflated.
+        assert!(StreamConnGuard::try_acquire(2, Arc::clone(&metrics)).is_none());
+        assert_eq!(ACTIVE_STREAM_CONNECTIONS.load(Ordering::SeqCst), 2);
+        assert_eq!(metrics.stream_connections_active.get(), 2);
+        assert_eq!(metrics.stream_connection_cap_drops_total.get(), 1);
+
+        // Releasing a slot makes room again.
+        drop(g1);
+        assert_eq!(ACTIVE_STREAM_CONNECTIONS.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.stream_connections_active.get(), 1);
+        let g3 = StreamConnGuard::try_acquire(2, Arc::clone(&metrics));
+        assert!(g3.is_some());
+        assert_eq!(metrics.stream_connections_active.get(), 2);
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(ACTIVE_STREAM_CONNECTIONS.load(Ordering::SeqCst), 0);
+        assert_eq!(metrics.stream_connections_active.get(), 0);
+        assert_eq!(metrics.stream_connection_cap_drops_total.get(), 1);
+        let rendered = metrics.render(&Broker::new(BrokerConfig::default()));
+        assert!(rendered.contains("dd_rust_network_mutex_stream_connections_active 0"));
+        assert!(rendered.contains("dd_rust_network_mutex_stream_connection_cap_drops_total 1"));
+    }
+
+    #[test]
+    fn auth_handshake_timeout_disabled_when_zero() {
+        // Default is enabled; `0` disables it. (Parsing is env-driven, so we
+        // only assert the constant/branch invariants here.)
+        assert_eq!(DEFAULT_AUTH_HANDSHAKE_MS, 10_000);
+        assert!(Duration::from_millis(DEFAULT_AUTH_HANDSHAKE_MS) > Duration::ZERO);
+    }
+}
+
 /// Read one newline-terminated frame into `buf`, refusing to grow
 /// past `max_bytes`. Returns:
 ///
@@ -669,6 +775,16 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     crate::routine_id!("ddl-routine-98pGTji7SYVytpEQBA");
+    // Bound total concurrent connections before allocating any per-connection
+    // state (client slot, writer task, read buffer). Over the cap we accept and
+    // immediately close so a flood can't exhaust resources.
+    let _conn_guard = match StreamConnGuard::try_acquire(max_connections(), Arc::clone(&metrics)) {
+        Some(guard) => guard,
+        None => {
+            warn!(target: "lmx::tcp", "connection cap reached; dropping new connection");
+            return Ok(());
+        }
+    };
     let (read, mut write) = tokio::io::split(stream);
     let (client_id, mut rx) = broker.register_client();
     let mut buf: Vec<u8> = Vec::new();
@@ -677,6 +793,13 @@ where
     let frame_cap = max_frame_bytes();
     let yield_every = frame_yield_every();
     let mut frames_seen: usize = 0;
+    // Drop an unauthenticated connection that doesn't finish the handshake in
+    // time (the post-auth phase is never deadlined, so holders aren't affected).
+    let auth_deadline = if authed {
+        None
+    } else {
+        auth_handshake_timeout().map(|to| Instant::now() + to)
+    };
 
     let writer_task = tokio::spawn(async move {
         while let Some(resp) = rx.recv().await {
@@ -697,7 +820,33 @@ where
 
     let result = async {
         loop {
-            let got_frame = match read_frame_bounded(&mut reader, &mut buf, frame_cap).await {
+            // Enforce the auth-handshake deadline only while unauthenticated;
+            // once authed we read with no timeout so a long-lived holder can sit
+            // idle on an open connection.
+            let frame_res = match auth_deadline.filter(|_| !authed) {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(
+                        remaining,
+                        read_frame_bounded(&mut reader, &mut buf, frame_cap),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_elapsed) => {
+                            metrics.auth_failures_total.inc();
+                            warn!(
+                                target: "lmx::tcp",
+                                client=%client_id,
+                                "auth handshake deadline exceeded; dropping connection"
+                            );
+                            break;
+                        }
+                    }
+                }
+                None => read_frame_bounded(&mut reader, &mut buf, frame_cap).await,
+            };
+            let got_frame = match frame_res {
                 Ok(b) => b,
                 Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
                     // Oversized / unframed input from the peer. Surface
@@ -765,6 +914,11 @@ where
                 }
             };
             if !authed {
+                if matches!(request, Request::Version { .. }) {
+                    broker.handle_request(client_id, request);
+                    metrics.observe_request_duration("stream_frame", frame_started.elapsed());
+                    continue;
+                }
                 if let Request::Auth { uuid, token } = &request {
                     if Some(token) == auth_token.as_ref() {
                         authed = true;

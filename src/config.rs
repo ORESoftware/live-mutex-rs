@@ -120,6 +120,8 @@ struct RaftFileConfig {
     sync_log: Option<bool>,
     sync_commit: Option<bool>,
     peer_token: Option<String>,
+    max_inbound_rpc_connections: Option<usize>,
+    inbound_rpc_idle_timeout_ms: Option<u64>,
     peers: Vec<RaftPeerConfig>,
 }
 
@@ -395,6 +397,14 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
         .unwrap_or(cfg.sync_commit);
     cfg.peer_token =
         env_string("LMX_RAFT_PEER_TOKEN").or_else(|| non_empty(file.peer_token.clone()));
+    cfg.max_inbound_rpc_connections = env_parse_strict("LMX_RAFT_MAX_INBOUND_RPC_CONNECTIONS")?
+        .or(file.max_inbound_rpc_connections)
+        .unwrap_or(cfg.max_inbound_rpc_connections);
+    cfg.inbound_rpc_idle_timeout = Duration::from_millis(
+        env_parse_strict("LMX_RAFT_INBOUND_RPC_IDLE_TIMEOUT_MS")?
+            .or(file.inbound_rpc_idle_timeout_ms)
+            .unwrap_or(cfg.inbound_rpc_idle_timeout.as_millis() as u64),
+    );
     cfg.peers = file.peers.clone();
     Ok(cfg)
 }
@@ -596,6 +606,8 @@ mod tests {
             EnvVarGuard::clear("LMX_RAFT_CLIENT_BATCH_MAX_DELAY_MS"),
             EnvVarGuard::clear("LMX_RAFT_CLIENT_RESPONSE_CACHE_MAX_ENTRIES"),
             EnvVarGuard::clear("LMX_RAFT_PROXY_RETRY_BUDGET_MS"),
+            EnvVarGuard::clear("LMX_RAFT_MAX_INBOUND_RPC_CONNECTIONS"),
+            EnvVarGuard::clear("LMX_RAFT_INBOUND_RPC_IDLE_TIMEOUT_MS"),
         ]
     }
 
@@ -625,6 +637,8 @@ mod tests {
             sync_log = false
             sync_commit = false
             peer_token = "cluster-secret"
+            max_inbound_rpc_connections = 222
+            inbound_rpc_idle_timeout_ms = 333
 
             [[raft.peers]]
             id = "node-1"
@@ -666,6 +680,8 @@ mod tests {
         assert!(!raft.sync_log);
         assert!(!raft.sync_commit);
         assert_eq!(raft.peer_token.as_deref(), Some("cluster-secret"));
+        assert_eq!(raft.max_inbound_rpc_connections, 222);
+        assert_eq!(raft.inbound_rpc_idle_timeout, Duration::from_millis(333));
     }
 
     #[test]
@@ -785,11 +801,16 @@ mod tests {
         guards.push(EnvVarGuard::set("LMX_RAFT_HEARTBEAT_INTERVAL_MS", "75"));
         guards.push(EnvVarGuard::set("LMX_RAFT_SNAPSHOT_MAX_LOG_AGE_MS", "1234"));
         guards.push(EnvVarGuard::set("LMX_RAFT_TARGET_QUORUM_EXTRA_FANOUT", "2"));
+        guards.push(EnvVarGuard::set(
+            "LMX_RAFT_INBOUND_RPC_IDLE_TIMEOUT_MS",
+            "444",
+        ));
         let file = RaftFileConfig {
             append_entries_max_entries: Some(17),
             heartbeat_interval_ms: Some(50),
             snapshot_max_log_age_ms: Some(9876),
             target_quorum_extra_fanout: Some(1),
+            inbound_rpc_idle_timeout_ms: Some(555),
             ..RaftFileConfig::default()
         };
 
@@ -799,6 +820,7 @@ mod tests {
         assert_eq!(raft.heartbeat_interval, Duration::from_millis(75));
         assert_eq!(raft.snapshot_max_log_age, Duration::from_millis(1234));
         assert_eq!(raft.target_quorum_extra_fanout, 2);
+        assert_eq!(raft.inbound_rpc_idle_timeout, Duration::from_millis(444));
     }
 
     #[test]
@@ -880,6 +902,8 @@ mod tests {
         assert_eq!(cfg.raft.proxy_retry_budget_ms, Some(2000));
         assert_eq!(cfg.raft.sync_log, Some(true));
         assert_eq!(cfg.raft.sync_commit, Some(true));
+        assert_eq!(cfg.raft.max_inbound_rpc_connections, Some(1024));
+        assert_eq!(cfg.raft.inbound_rpc_idle_timeout_ms, Some(30_000));
 
         let peer_ids = cfg
             .raft
@@ -907,6 +931,8 @@ mod tests {
         assert_eq!(raft.proxy_retry_budget, Duration::from_millis(2000));
         assert!(raft.sync_log);
         assert!(raft.sync_commit);
+        assert_eq!(raft.max_inbound_rpc_connections, 1024);
+        assert_eq!(raft.inbound_rpc_idle_timeout, Duration::from_millis(30_000));
     }
 
     #[test]

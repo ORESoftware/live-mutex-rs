@@ -24,7 +24,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify, OnceCell};
+use tokio::sync::{
+    oneshot, Mutex as AsyncMutex, Notify, OnceCell, OwnedSemaphorePermit, Semaphore,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, error, info, warn};
 
@@ -47,6 +49,8 @@ const SNAPSHOT_PART_FILE_SUFFIX: &str = ".json.part";
 const RAFT_RPC_PROTOCOL_VERSION: u64 = 1;
 const RAFT_RPC_MIN_PROTOCOL_VERSION_FIELD: &str = "minProtocolVersion";
 const DEFAULT_RAFT_RPC_MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_INBOUND_RPC_CONNECTIONS: usize = 1024;
+const DEFAULT_INBOUND_RPC_IDLE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_APPEND_ENTRIES_MAX_ENTRIES: usize = 256;
 const DEFAULT_APPEND_ENTRIES_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_APPEND_ENTRIES_MAX_INLINE_BATCHES: usize = 64;
@@ -187,6 +191,14 @@ pub struct BrokerRaftConfig {
     /// Optional shared secret required on Raft peer RPC frames. When unset,
     /// the peer listener preserves the existing trusted-network behavior.
     pub peer_token: Option<String>,
+    /// Maximum concurrent inbound Raft peer RPC streams accepted by this node.
+    /// Excess sockets are accepted and immediately dropped before frame buffers
+    /// or long-lived stream tasks are allocated.
+    pub max_inbound_rpc_connections: usize,
+    /// Maximum time an inbound Raft peer RPC stream may sit without delivering
+    /// the next complete frame. Idle streams are closed so admitted sockets
+    /// cannot retain inbound connection slots forever.
+    pub inbound_rpc_idle_timeout: Duration,
     pub peers: Vec<RaftPeerConfig>,
 }
 
@@ -226,6 +238,8 @@ impl Default for BrokerRaftConfig {
             sync_log: true,
             sync_commit: true,
             peer_token: None,
+            max_inbound_rpc_connections: DEFAULT_MAX_INBOUND_RPC_CONNECTIONS,
+            inbound_rpc_idle_timeout: Duration::from_millis(DEFAULT_INBOUND_RPC_IDLE_TIMEOUT_MS),
             peers: Vec::new(),
         }
     }
@@ -405,6 +419,16 @@ impl BrokerRaftConfig {
                 "raft.proxy_retry_budget_ms must be greater than 0".into(),
             ));
         }
+        if self.max_inbound_rpc_connections == 0 {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.max_inbound_rpc_connections must be greater than 0".into(),
+            ));
+        }
+        if self.inbound_rpc_idle_timeout.is_zero() {
+            return Err(BrokerRaftError::InvalidConfig(
+                "raft.inbound_rpc_idle_timeout_ms must be greater than 0".into(),
+            ));
+        }
         validate_raft_rpc_max_frame_bytes_env(self, node_id)?;
         Ok(())
     }
@@ -572,6 +596,9 @@ pub struct RaftTelemetrySnapshot {
     pub raft_rpc_outbound_frame_rejections_total: u64,
     pub raft_rpc_malformed_frames_total: u64,
     pub raft_rpc_protocol_rejections_total: u64,
+    pub raft_rpc_inbound_connections_active: u64,
+    pub raft_rpc_inbound_connection_cap_drops_total: u64,
+    pub raft_rpc_inbound_idle_timeouts_total: u64,
     pub raft_rpc_outbound_requests_total: u64,
     pub raft_rpc_outbound_request_us_total: u64,
     pub raft_rpc_connection_waits_total: u64,
@@ -2766,6 +2793,9 @@ struct BrokerRaftTelemetry {
     raft_rpc_outbound_frame_rejections_total: AtomicU64,
     raft_rpc_malformed_frames_total: AtomicU64,
     raft_rpc_protocol_rejections_total: AtomicU64,
+    raft_rpc_inbound_connections_active: AtomicU64,
+    raft_rpc_inbound_connection_cap_drops_total: AtomicU64,
+    raft_rpc_inbound_idle_timeouts_total: AtomicU64,
     raft_rpc_outbound_requests_total: AtomicU64,
     raft_rpc_outbound_request_us_total: AtomicU64,
     raft_rpc_connection_waits_total: AtomicU64,
@@ -5142,6 +5172,7 @@ pub struct BrokerRaft {
     apply_snapshot_lock: Arc<Mutex<()>>,
     post_commit_fanout: Arc<Mutex<PostCommitFanoutState>>,
     rpc_connections: Arc<Mutex<BTreeMap<String, Arc<AsyncMutex<RaftRpcConnection>>>>>,
+    inbound_rpc_slots: Arc<Semaphore>,
     in_memory_transport: Option<Arc<RaftInMemoryNetwork>>,
     snapshot_transfers: Arc<Mutex<BTreeMap<String, PendingSnapshotTransfer>>>,
     prepared_install_snapshot_cache: Arc<Mutex<Option<Arc<PreparedInstallSnapshot>>>>,
@@ -5167,6 +5198,31 @@ pub struct BrokerRaft {
     install_snapshot_before_frame_build: InstallSnapshotBeforeFrameBuildHook,
     #[cfg(test)]
     request_vote_before_log_freshness: RequestVoteBeforeLogFreshnessHook,
+}
+
+struct InboundRpcConnectionGuard {
+    _permit: OwnedSemaphorePermit,
+    telemetry: Arc<BrokerRaftTelemetry>,
+}
+
+impl InboundRpcConnectionGuard {
+    fn new(permit: OwnedSemaphorePermit, telemetry: Arc<BrokerRaftTelemetry>) -> Self {
+        telemetry
+            .raft_rpc_inbound_connections_active
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            _permit: permit,
+            telemetry,
+        }
+    }
+}
+
+impl Drop for InboundRpcConnectionGuard {
+    fn drop(&mut self) {
+        self.telemetry
+            .raft_rpc_inbound_connections_active
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl BrokerRaft {
@@ -5434,6 +5490,7 @@ impl BrokerRaft {
             apply_snapshot_lock: Arc::new(Mutex::new(())),
             post_commit_fanout: Arc::new(Mutex::new(PostCommitFanoutState::default())),
             rpc_connections: Arc::new(Mutex::new(BTreeMap::new())),
+            inbound_rpc_slots: Arc::new(Semaphore::new(config.max_inbound_rpc_connections)),
             in_memory_transport,
             snapshot_transfers: Arc::new(Mutex::new(BTreeMap::new())),
             prepared_install_snapshot_cache: Arc::new(Mutex::new(None)),
@@ -6531,6 +6588,18 @@ impl BrokerRaft {
                 .telemetry
                 .raft_rpc_protocol_rejections_total
                 .load(Ordering::Relaxed),
+            raft_rpc_inbound_connections_active: self
+                .telemetry
+                .raft_rpc_inbound_connections_active
+                .load(Ordering::Relaxed),
+            raft_rpc_inbound_connection_cap_drops_total: self
+                .telemetry
+                .raft_rpc_inbound_connection_cap_drops_total
+                .load(Ordering::Relaxed),
+            raft_rpc_inbound_idle_timeouts_total: self
+                .telemetry
+                .raft_rpc_inbound_idle_timeouts_total
+                .load(Ordering::Relaxed),
             raft_rpc_outbound_requests_total: self
                 .telemetry
                 .raft_rpc_outbound_requests_total
@@ -7262,6 +7331,15 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_rpc_protocol_rejections_total Raft peer RPC request or response frames rejected because their minProtocolVersion is higher than this binary supports.\n",
                 "# TYPE dd_rust_network_mutex_raft_rpc_protocol_rejections_total counter\n",
                 "dd_rust_network_mutex_raft_rpc_protocol_rejections_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_rpc_inbound_connections_active Current inbound Raft peer RPC streams admitted below raft.max_inbound_rpc_connections.\n",
+                "# TYPE dd_rust_network_mutex_raft_rpc_inbound_connections_active gauge\n",
+                "dd_rust_network_mutex_raft_rpc_inbound_connections_active {}\n",
+                "# HELP dd_rust_network_mutex_raft_rpc_inbound_connection_cap_drops_total Inbound Raft peer RPC sockets dropped because raft.max_inbound_rpc_connections was reached.\n",
+                "# TYPE dd_rust_network_mutex_raft_rpc_inbound_connection_cap_drops_total counter\n",
+                "dd_rust_network_mutex_raft_rpc_inbound_connection_cap_drops_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total Inbound Raft peer RPC streams closed because no complete frame arrived before raft.inbound_rpc_idle_timeout_ms.\n",
+                "# TYPE dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total counter\n",
+                "dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_rpc_outbound_requests_total Logical outbound Raft peer RPC attempts sent by this node.\n",
                 "# TYPE dd_rust_network_mutex_raft_rpc_outbound_requests_total counter\n",
                 "dd_rust_network_mutex_raft_rpc_outbound_requests_total {}\n",
@@ -7386,6 +7464,9 @@ impl BrokerRaft {
             snapshot.raft_rpc_outbound_frame_rejections_total,
             snapshot.raft_rpc_malformed_frames_total,
             snapshot.raft_rpc_protocol_rejections_total,
+            snapshot.raft_rpc_inbound_connections_active,
+            snapshot.raft_rpc_inbound_connection_cap_drops_total,
+            snapshot.raft_rpc_inbound_idle_timeouts_total,
             snapshot.raft_rpc_outbound_requests_total,
             snapshot.raft_rpc_outbound_request_us_total,
             snapshot.raft_rpc_connection_waits_total,
@@ -8384,6 +8465,32 @@ impl BrokerRaft {
         }
     }
 
+    fn try_acquire_inbound_rpc_connection(
+        &self,
+        peer: SocketAddr,
+    ) -> Option<InboundRpcConnectionGuard> {
+        crate::routine_id!("ddl-routine-broker-raft-acquire-inbound-rpc-connection-1");
+        match Arc::clone(&self.inbound_rpc_slots).try_acquire_owned() {
+            Ok(permit) => Some(InboundRpcConnectionGuard::new(
+                permit,
+                Arc::clone(&self.telemetry),
+            )),
+            Err(_) => {
+                self.telemetry
+                    .raft_rpc_inbound_connection_cap_drops_total
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    %peer,
+                    max_inbound_rpc_connections = self.config.max_inbound_rpc_connections,
+                    "raft inbound RPC connection cap reached; dropping accepted socket",
+                );
+                None
+            }
+        }
+    }
+
     pub async fn spawn_raft_tasks(&self) -> Result<Vec<JoinHandle<()>>, BrokerRaftError> {
         crate::routine_id!("ddl-routine-broker-raft-spawn-tasks-1");
         let bind_addr = self.config.bind_addr.ok_or_else(|| {
@@ -8418,8 +8525,14 @@ impl BrokerRaft {
                                 "failed to enable TCP_NODELAY on accepted raft RPC socket",
                             );
                         }
+                        let Some(conn_guard) = accept_node.try_acquire_inbound_rpc_connection(peer)
+                        else {
+                            drop(stream);
+                            continue;
+                        };
                         let node = accept_node.clone();
                         tokio::spawn(async move {
+                            let _conn_guard = conn_guard;
                             if let Err(err) = node.handle_rpc_stream(stream, Some(peer)).await {
                                 warn!(target: "lmx::raft", %peer, error=%err, "raft RPC failed");
                             }
@@ -8483,8 +8596,14 @@ impl BrokerRaft {
                                 "failed to enable TCP_NODELAY on accepted raft RPC socket",
                             );
                         }
+                        let Some(conn_guard) = accept_node.try_acquire_inbound_rpc_connection(peer)
+                        else {
+                            drop(stream);
+                            continue;
+                        };
                         let node = accept_node.clone();
                         tokio::spawn(async move {
+                            let _conn_guard = conn_guard;
                             if let Err(err) = node.handle_rpc_stream(stream, Some(peer)).await {
                                 warn!(target: "lmx::raft", %peer, error=%err, "raft RPC failed");
                             }
@@ -9849,7 +9968,7 @@ impl BrokerRaft {
                 } else {
                     progress.match_index.saturating_add(1).max(1)
                 };
-                if progress.next_index > conservative_next_index {
+                if progress.next_index != conservative_next_index {
                     debug!(
                         target: "lmx::raft",
                         node_id = %self.config.node_id,
@@ -9858,7 +9977,7 @@ impl BrokerRaft {
                         match_index = progress.match_index,
                         prev_next_index = progress.next_index,
                         next_index = conservative_next_index,
-                        "raft reset promoted voter progress before final membership catch-up",
+                        "raft normalized promoted voter progress before final membership catch-up",
                     );
                     progress.next_index = conservative_next_index;
                     changed = true;
@@ -11377,17 +11496,36 @@ impl BrokerRaft {
         crate::routine_id!("ddl-routine-broker-raft-handle-rpc-stream-1");
         let mut reader = TokioBufReader::new(stream);
         let max_frame_bytes = raft_rpc_max_frame_bytes();
+        let idle_timeout = self.config.inbound_rpc_idle_timeout;
         loop {
             if self.is_shutdown() {
                 return Ok(());
             }
             let read_result = tokio::select! {
                 _ = self.shutdown_notify.notified() => return Ok(()),
-                read_result = read_raft_frame_bounded_counted(
-                    &mut reader,
-                    max_frame_bytes,
-                    &self.telemetry.raft_rpc_inbound_frame_rejections_total,
-                ) => read_result,
+                read_result = tokio::time::timeout(
+                    idle_timeout,
+                    read_raft_frame_bounded_counted(
+                        &mut reader,
+                        max_frame_bytes,
+                        &self.telemetry.raft_rpc_inbound_frame_rejections_total,
+                    ),
+                ) => match read_result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.telemetry
+                            .raft_rpc_inbound_idle_timeouts_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        debug!(
+                            target: "lmx::raft",
+                            node_id = %self.config.node_id,
+                            ?peer,
+                            idle_timeout_ms = duration_ms_u64(idle_timeout),
+                            "raft inbound RPC stream closed after idle timeout",
+                        );
+                        return Ok(());
+                    }
+                },
             };
             let line = match read_result {
                 Ok(line) => line,
@@ -26139,6 +26277,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use serde_json::json;
+    use tokio::io::AsyncReadExt;
     use uuid::Uuid;
 
     static RAFT_FRAME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -29359,6 +29498,44 @@ mod tests {
             err,
             BrokerRaftError::InvalidConfig(message)
                 if message.contains("peer_token") && message.contains("whitespace")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_zero_inbound_rpc_connection_cap() {
+        let dir = temp_dir("raft-config-zero-inbound-rpc-cap");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.max_inbound_rpc_connections = 0;
+
+        let err = cfg
+            .validate()
+            .expect_err("zero inbound RPC connection cap must be rejected");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("max_inbound_rpc_connections")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn broker_raft_config_rejects_zero_inbound_rpc_idle_timeout() {
+        let dir = temp_dir("raft-config-zero-inbound-rpc-idle-timeout");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.enabled = true;
+        cfg.inbound_rpc_idle_timeout = Duration::ZERO;
+
+        let err = cfg
+            .validate()
+            .expect_err("zero inbound RPC idle timeout must be rejected");
+        assert!(matches!(
+            err,
+            BrokerRaftError::InvalidConfig(message)
+                if message.contains("inbound_rpc_idle_timeout_ms")
         ));
 
         let _ = fs::remove_dir_all(dir);
@@ -32688,6 +32865,124 @@ mod tests {
             raft.leader_progress_generation(),
             before_generation,
             "lowering n4 nextIndex should wake catch-up waiters"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promoted_voter_catchup_resets_untrusted_progress_above_local_tail() {
+        let dir = temp_dir("raft-promoted-voter-catchup-resets-untrusted-tail");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..7 {
+            raft.log.append(2, RaftCommand::Noop).expect("append seed");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.membership = RaftMembership::from_simple(vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+            ]);
+            runtime.leader_progress.insert(
+                "n4".into(),
+                RaftPeerProgress {
+                    next_index: 101,
+                    match_index: 100,
+                },
+            );
+        }
+
+        let before_generation = raft.leader_progress_generation();
+        raft.prepare_promoted_voter_catch_up_progress(&[test_peer("n4", 7983)], 7);
+
+        assert_eq!(
+            raft.runtime.lock().leader_progress.get("n4").copied(),
+            Some(RaftPeerProgress {
+                next_index: 8,
+                match_index: 0,
+            }),
+            "promoted voter progress above the leader tail must be reset before catch-up"
+        );
+        assert_ne!(
+            raft.leader_progress_generation(),
+            before_generation,
+            "resetting untrusted promoted-voter progress should wake catch-up waiters"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn promoted_voter_catchup_normalizes_low_next_index_to_known_match() {
+        let dir = temp_dir("raft-promoted-voter-catchup-normalizes-low-next");
+        let cfg = test_raft_config(dir.clone());
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        for _ in 0..7 {
+            raft.log.append(2, RaftCommand::Noop).expect("append seed");
+        }
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 2;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.membership = RaftMembership::from_simple(vec![
+                test_peer("n1", 7980),
+                test_peer("n2", 7981),
+                test_peer("n3", 7982),
+                test_peer("n4", 7983),
+                test_peer("n5", 7984),
+            ]);
+            runtime.leader_progress.insert(
+                "n4".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 4,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n5".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let before_generation = raft.leader_progress_generation();
+        raft.prepare_promoted_voter_catch_up_progress(
+            &[test_peer("n4", 7983), test_peer("n5", 7984)],
+            7,
+        );
+
+        {
+            let runtime = raft.runtime.lock();
+            assert_eq!(
+                runtime.leader_progress.get("n4").copied(),
+                Some(RaftPeerProgress {
+                    next_index: 5,
+                    match_index: 4,
+                }),
+                "known promoted-voter progress should resume exactly at matchIndex + 1"
+            );
+            assert_eq!(
+                runtime.leader_progress.get("n5").copied(),
+                Some(RaftPeerProgress {
+                    next_index: 8,
+                    match_index: 0,
+                }),
+                "unknown promoted-voter progress should probe the local tail before falling back through conflict repair"
+            );
+        }
+        assert_ne!(
+            raft.leader_progress_generation(),
+            before_generation,
+            "normalizing promoted-voter nextIndex should wake catch-up waiters"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -47159,6 +47454,159 @@ mod tests {
         ));
         assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_connection_waits_total 0"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn membership_full_fanout_waits_for_busy_peer_connection() {
+        let dir = temp_dir("raft-membership-full-fanout-waits-busy-peer");
+        let listener_n2 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind busy membership peer");
+        let addr_n2 = listener_n2.local_addr().expect("busy peer addr");
+        let listener_n3 = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind held membership peer");
+        let addr_n3 = listener_n3.local_addr().expect("held peer addr");
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.heartbeat_interval = Duration::from_millis(10);
+        cfg.election_timeout_min = Duration::from_millis(250);
+        cfg.election_timeout_max = Duration::from_millis(500);
+        cfg.append_entries_max_entries = 16;
+        cfg.append_entries_max_bytes = usize::MAX;
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: addr_n2.to_string(),
+            },
+            RaftPeerConfig {
+                id: "n3".into(),
+                addr: addr_n3.to_string(),
+            },
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let entry = raft
+            .log
+            .append(
+                1,
+                RaftCommand::SetMembership {
+                    membership: raft.membership(),
+                },
+            )
+            .expect("append membership entry");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 1;
+            runtime.role = RaftRole::Leader;
+            runtime.leader_id = Some("n1".into());
+            runtime.leader_progress.insert(
+                "n2".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+            runtime.leader_progress.insert(
+                "n3".into(),
+                RaftPeerProgress {
+                    next_index: 1,
+                    match_index: 0,
+                },
+            );
+        }
+
+        let busy_connection = Arc::new(AsyncMutex::new(RaftRpcConnection::default()));
+        raft.rpc_connections
+            .lock()
+            .insert("n2".into(), Arc::clone(&busy_connection));
+        let busy_guard = busy_connection
+            .try_lock()
+            .expect("hold membership peer connection busy");
+
+        let (mut n2_seen, release_n2, server_n2) =
+            spawn_held_append_entries_peer(listener_n2, 0, vec![entry.index]);
+        let (n3_seen, release_n3, server_n3) =
+            spawn_held_append_entries_peer(listener_n3, 0, vec![entry.index]);
+        let replicate = {
+            let raft = raft.clone();
+            tokio::spawn(async move {
+                raft.replicate_until_quorum_without_commit_advance_full_fanout(entry.index)
+                    .await
+            })
+        };
+
+        tokio::time::timeout(Duration::from_secs(1), n3_seen)
+            .await
+            .expect("free membership peer should be contacted")
+            .expect("free membership peer request signal");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft.telemetry_snapshot().raft_rpc_connection_waits_total > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("full fanout should wait on the busy membership peer");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !replicate.is_finished(),
+            "held free peer plus busy peer should prevent quorum before the busy peer is released"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut n2_seen)
+                .await
+                .is_err(),
+            "busy membership peer must not receive AppendEntries before the pooled connection is released"
+        );
+
+        let before_release = raft.telemetry_snapshot();
+        assert_eq!(before_release.replication_busy_peer_skips_total, 0);
+        assert_eq!(
+            before_release.replication_quorum_busy_peer_replacements_total,
+            0
+        );
+        assert_eq!(before_release.raft_rpc_connection_waits_total, 1);
+
+        drop(busy_guard);
+        tokio::time::timeout(Duration::from_secs(1), n2_seen)
+            .await
+            .expect("released busy membership peer should be contacted")
+            .expect("busy membership peer request signal");
+        release_n2
+            .send(())
+            .expect("release busy membership peer response");
+        let acks = tokio::time::timeout(Duration::from_secs(1), replicate)
+            .await
+            .expect("full fanout membership quorum should finish after busy release")
+            .expect("membership full fanout task")
+            .expect("membership full fanout result");
+        assert_eq!(acks, BTreeSet::from(["n1".to_string(), "n2".to_string()]));
+
+        let after_release = raft.telemetry_snapshot();
+        assert_eq!(after_release.replication_quorum_successes_total, 1);
+        assert_eq!(after_release.replication_busy_peer_skips_total, 0);
+        assert_eq!(
+            after_release.replication_quorum_busy_peer_replacements_total,
+            0
+        );
+        assert_eq!(after_release.raft_rpc_connection_waits_total, 1);
+        assert!(after_release.raft_rpc_connection_wait_us_total > 0);
+        assert_eq!(after_release.append_entries_requests_total, 2);
+        assert_eq!(after_release.replication_quorum_extra_fanout_peers_total, 1);
+        assert_eq!(
+            after_release.replication_quorum_limited_fanout_rounds_total,
+            0
+        );
+
+        release_n3
+            .send(())
+            .expect("release held free membership peer response");
+        server_n2.await.expect("busy membership peer server");
+        server_n3.await.expect("free membership peer server");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -73386,6 +73834,292 @@ mod tests {
             "timing out before acquiring the strict pooled connection must not count a sent RPC"
         );
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn inbound_raft_rpc_connection_cap_drops_excess_sockets() {
+        let dir = temp_dir("raft-rpc-inbound-connection-cap");
+        let probe_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe listener");
+        let addr = probe_listener.local_addr().expect("probe listener addr");
+        drop(probe_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.bind_addr = Some(addr);
+        cfg.advertise_addr = Some(addr.to_string());
+        cfg.peers[0].addr = addr.to_string();
+        cfg.max_inbound_rpc_connections = 1;
+        cfg.election_timeout_min = Duration::from_secs(60);
+        cfg.election_timeout_max = Duration::from_secs(120);
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let tasks = raft.spawn_raft_tasks().await.expect("spawn raft tasks");
+
+        let first = TcpStream::connect(addr)
+            .await
+            .expect("connect first inbound rpc stream");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("first inbound rpc stream should consume the only slot");
+
+        let mut second = TcpStream::connect(addr)
+            .await
+            .expect("connect second inbound rpc stream");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), second.read(&mut byte))
+            .await
+            .expect("second inbound rpc stream should be dropped promptly")
+            .expect("read second inbound rpc stream");
+        assert_eq!(
+            read, 0,
+            "excess inbound Raft RPC socket should be closed without a frame"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connection_cap_drops_total
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("dropped inbound rpc stream should be counted");
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.raft_rpc_inbound_connections_active, 1);
+        assert_eq!(telemetry.raft_rpc_inbound_connection_cap_drops_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_connections_active 1"));
+        assert!(
+            metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_connection_cap_drops_total 1")
+        );
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("released inbound rpc stream should decrement active gauge");
+
+        raft.shutdown();
+        for task in tasks {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn inbound_raft_rpc_idle_timeout_releases_connection_slot() {
+        let dir = temp_dir("raft-rpc-inbound-idle-timeout");
+        let probe_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind idle-timeout probe listener");
+        let addr = probe_listener.local_addr().expect("probe listener addr");
+        drop(probe_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.bind_addr = Some(addr);
+        cfg.advertise_addr = Some(addr.to_string());
+        cfg.peers[0].addr = addr.to_string();
+        cfg.max_inbound_rpc_connections = 1;
+        cfg.inbound_rpc_idle_timeout = Duration::from_millis(50);
+        cfg.election_timeout_min = Duration::from_secs(60);
+        cfg.election_timeout_max = Duration::from_secs(120);
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let tasks = raft.spawn_raft_tasks().await.expect("spawn raft tasks");
+
+        let mut first = TcpStream::connect(addr)
+            .await
+            .expect("connect idle inbound rpc stream");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle stream should consume the only slot before timing out");
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), first.read(&mut byte))
+            .await
+            .expect("idle inbound rpc stream should be closed by timeout")
+            .expect("read idle inbound rpc stream");
+        assert_eq!(read, 0, "idle inbound Raft RPC socket should be closed");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let telemetry = raft.telemetry_snapshot();
+                if telemetry.raft_rpc_inbound_connections_active == 0
+                    && telemetry.raft_rpc_inbound_idle_timeouts_total == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle timeout should be counted and release the slot");
+
+        let mut second = TcpStream::connect(addr)
+            .await
+            .expect("connect second inbound rpc stream after idle timeout");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("released inbound slot should admit a later stream");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.raft_rpc_inbound_connection_cap_drops_total, 0);
+        assert_eq!(telemetry.raft_rpc_inbound_idle_timeouts_total, 1);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total 1"));
+
+        let _ = second.shutdown().await;
+        raft.shutdown();
+        for task in tasks {
+            task.abort();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn inbound_raft_rpc_partial_frame_idle_timeout_releases_connection_slot() {
+        let dir = temp_dir("raft-rpc-inbound-partial-frame-idle-timeout");
+        let probe_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial-frame idle-timeout probe listener");
+        let addr = probe_listener.local_addr().expect("probe listener addr");
+        drop(probe_listener);
+
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.bind_addr = Some(addr);
+        cfg.advertise_addr = Some(addr.to_string());
+        cfg.peers[0].addr = addr.to_string();
+        cfg.max_inbound_rpc_connections = 1;
+        cfg.inbound_rpc_idle_timeout = Duration::from_millis(50);
+        cfg.election_timeout_min = Duration::from_secs(60);
+        cfg.election_timeout_max = Duration::from_secs(120);
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        let tasks = raft.spawn_raft_tasks().await.expect("spawn raft tasks");
+
+        let mut first = TcpStream::connect(addr)
+            .await
+            .expect("connect partial inbound rpc stream");
+        first
+            .write_all(br#"{"type":"appendEntries""#)
+            .await
+            .expect("write partial raft rpc frame");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("partial stream should consume the only slot before timing out");
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), first.read(&mut byte))
+            .await
+            .expect("partial inbound rpc stream should be closed by timeout")
+            .expect("read partial inbound rpc stream");
+        assert_eq!(
+            read, 0,
+            "partial inbound Raft RPC frame should be closed without waiting for newline"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let telemetry = raft.telemetry_snapshot();
+                if telemetry.raft_rpc_inbound_connections_active == 0
+                    && telemetry.raft_rpc_inbound_idle_timeouts_total == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("partial-frame idle timeout should be counted and release the slot");
+
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.raft_rpc_inbound_connection_cap_drops_total, 0);
+        assert_eq!(telemetry.raft_rpc_inbound_frame_rejections_total, 0);
+        assert_eq!(telemetry.raft_rpc_malformed_frames_total, 0);
+        let metrics = raft.raft_metrics_text();
+        assert!(metrics.contains("dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total 1"));
+
+        let mut second = TcpStream::connect(addr)
+            .await
+            .expect("connect after partial-frame timeout");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if raft
+                    .telemetry_snapshot()
+                    .raft_rpc_inbound_connections_active
+                    == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("partial-frame timeout should release slot for later peers");
+
+        let _ = second.shutdown().await;
+        raft.shutdown();
+        for task in tasks {
+            task.abort();
+        }
         let _ = fs::remove_dir_all(dir);
     }
 

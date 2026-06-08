@@ -774,6 +774,9 @@ run_broker_raft_singletons \
   final_membership_entry_commits_under_current_joint_quorum \
   finish_existing_install_snapshot_rejects_current_active_staged_learner_before_commit_advance \
   in_memory_peer_rpc_rejects_response_type_mismatch \
+  inbound_raft_rpc_connection_cap_drops_excess_sockets \
+  inbound_raft_rpc_idle_timeout_releases_connection_slot \
+  inbound_raft_rpc_partial_frame_idle_timeout_releases_connection_slot \
   is_leader_uses_cached_role_when_runtime_lock_is_contended \
   lagging_peer_catches_up_over_bounded_append_batches \
   latest_snapshot_file_rejects_stable_metadata_drift \
@@ -791,6 +794,8 @@ run_broker_raft_singletons \
   prebuilt_skip_busy_send_returns_without_counting_outbound_rpc \
   preselected_append_entries_frame_rejects_oversize_and_stale_lens \
   preselected_append_entries_frame_uses_cached_lens_for_exact_fit \
+  promoted_voter_catchup_normalizes_low_next_index_to_known_match \
+  promoted_voter_catchup_resets_untrusted_progress_above_local_tail \
   raft_client_id_sequence_resumes_after_reopen_above_log_tail \
   raft_client_ids_are_namespaced_by_node_and_do_not_collide_on_drop \
   raft_proxy_request_to_follower_is_not_reproxied \

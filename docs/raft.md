@@ -256,10 +256,11 @@ Implemented:
   validation before append. None increment protocol-rejection or malformed-frame
   telemetry,
 - a local mixed-binary rolling-upgrade smoke has been executed with
-  `LMX_RAFT_OLD_REF=HEAD~1` from old ref `44eff3c` to the current binary. It
-  drives public no-wait HTTP lock traffic while rolling each node and passed
-  the single-key linearizability checker. This is local loopback binary-skew
-  evidence, not live/staging rollout proof,
+  `LMX_RAFT_OLD_REF=HEAD~1` from old ref `225c991` to the current worktree
+  binary (`e47414a` plus local Raft hardening changes). It drives public
+  no-wait HTTP lock traffic while rolling each node and passed the single-key
+  linearizability checker. This is local loopback binary-skew evidence, not
+  live/staging rollout proof,
 - live peer-response protocol-skew regressions send syntactically valid
   `AppendEntries` and `InstallSnapshot` responses that advertise a future
   required `minProtocolVersion`; the leader counts the protocol rejection and
@@ -665,7 +666,14 @@ Implemented:
   `dd_rust_network_mutex_raft_rpc_auth_rejections_total`; valid JSON peer RPC
   request/response frames that explicitly declare a higher `minProtocolVersion`
   than this binary supports are rejected before dispatch and increment
-  `dd_rust_network_mutex_raft_rpc_protocol_rejections_total`. The compatibility
+  `dd_rust_network_mutex_raft_rpc_protocol_rejections_total`; inbound peer RPC
+  streams are capped by `raft.max_inbound_rpc_connections` before per-stream
+  frame buffers or request tasks are allocated, with current usage and drops
+  exposed as `dd_rust_network_mutex_raft_rpc_inbound_connections_active` and
+  `dd_rust_network_mutex_raft_rpc_inbound_connection_cap_drops_total`; admitted
+  streams that do not deliver another complete frame within
+  `raft.inbound_rpc_idle_timeout_ms` are closed and counted by
+  `dd_rust_network_mutex_raft_rpc_inbound_idle_timeouts_total`. The compatibility
   guard scans only the top-level field, so nested future payload fields with the
   same name are ignored and ordinary decode compatibility remains additive.
   Future-protocol inbound requests are rejected before term, vote, role, leader
@@ -1087,6 +1095,11 @@ Implemented:
 - bounded leader-local client admission through `client_batch_max_pending`, so a
   stalled quorum rejects before appending new log entries instead of growing the
   pending queue without bound,
+- bounded inbound Raft peer RPC admission through
+  `max_inbound_rpc_connections`, so a peer/socket flood is dropped at accept time
+  before spawning unbounded stream handlers, plus
+  `inbound_rpc_idle_timeout_ms` so admitted sockets cannot hold those slots
+  forever while idle,
 - bounded replicated HTTP request-id response caching for idempotent retries:
   repeated `/v1/lock` or `/v1/unlock` calls with the same `requestId` or
   idempotency header and the same payload return the cached response instead of
@@ -1271,10 +1284,32 @@ Interpretation:
   `BENCH_HTTP_KEEPALIVE=true`; set `BENCH_HTTP_KEEPALIVE=false` when you
   intentionally want to include one-shot connection setup in a profile.
 
+Fresh 2026-06-08 local smoke on the current worktree, same
+`profiling` profile, 4 workers, 128 keys, 1 second benchmark windows, and an
+auth-enabled environment inherited from `ALL_DOGS`/`LMX_AUTH_TOKEN`:
+
+| Target | Durability | Route | Ops/sec | p50 | p95 | Full-log reads/rewrites |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Redis | n/a | direct | 65,526 | 0.057 ms | 0.090 ms | n/a |
+| Broker | n/a | direct | 37,498 | 0.101 ms | 0.145 ms | n/a |
+| BrokerRaft | `sync_log=true`, `sync_commit=true` | leader | 76 | 52.013 ms | 60.296 ms | 0 / 0 |
+| BrokerRaft | `sync_log=false`, `sync_commit=false` | leader | 542 | 7.035 ms | 9.977 ms | 0 / 0 |
+| BrokerRaft | `sync_log=false`, `sync_commit=false` | round-robin/follower proxy | 485 | 8.926 ms | 10.736 ms | 0 / 0 |
+
+The round-robin/follower-proxy run forwarded 648 proxy requests with zero
+proxy errors. Compared with leader-preferred routing in the unsafe-durability
+sample, proxying cost roughly 10 percent throughput and about 1.9 ms p50 on
+this host.
+
 A macOS `sample(1)` capture for 32-worker, keepalive, unsafe-durability
 BrokerRaft wrote `target/profiles/raft-leader-server.sample.txt`. In that short
 sample, visible hot frames were primarily HTTP connection/route cleanup and
 client response-cache mutex waits; it did not show full-log scan/replace work.
+The 2026-06-08 4-worker samples wrote
+`target/profiles/broker-server.sample.txt` and
+`target/profiles/raft-leader-server.sample.txt`; BrokerRaft again showed HTTP
+route/JSON work, client response-cache mutex waits, leader-readiness/visible
+commit checks, and replication tasks rather than full-log hot-path work.
 `perf` and `flamegraph-rs` were not installed in `PATH` on this host, but
 `scripts/profile-broker.sh perf` and `scripts/profile-broker.sh flamegraph`
 are wired for Linux/perf and `flamegraph-rs/flamegraph` captures when those
@@ -1791,6 +1826,11 @@ flamegraph to the server process. `scripts/profile-broker.sh flamegraph` drives
 the standalone `flamegraph` binary for `SAMPLE_SECONDS` and interrupts it
 directly, so Broker/BrokerRaft server profiling does not require GNU
 `timeout(1)` on macOS.
+When the profiling environment has HTTP auth enabled through
+`BENCH_HTTP_AUTH_TOKEN`, `BENCH_RAFT_AUTH_TOKEN`, `LMX_LIVE_RAFT_AUTH_TOKEN`,
+`ALL_DOGS`, or `LMX_AUTH_TOKEN`, the wrapper forwards the token to
+`redis_vs_raft_bench` without printing it, so local authenticated runs produce
+real throughput evidence instead of `401 unauthorized` noise.
 For `PROFILE_TARGET=raft`, the wrapper now defaults the benchmark's
 `BENCH_RAFT_METRICS` guard to every local Raft node even when request traffic is
 leader-preferred, so full-log read/rewrite deltas on followers are caught too.
@@ -1919,7 +1959,8 @@ LMX_RAFT_OLD_REF=HEAD~1 scripts/raft-version-skew.sh
 
 Local evidence collected on 2026-06-08: this command, run as
 `LMX_RAFT_OLD_REF=HEAD~1 LMX_RAFT_VERSION_SKEW_PROFILE=debug TEST_THREADS=1 scripts/raft-version-skew.sh`,
-built old ref `44eff3c` and the current binary, then passed
+built old ref `225c991` and the current worktree binary (`e47414a` plus local
+Raft hardening changes), then passed
 `mixed_binary_rolling_upgrade_preserves_no_wait_linearizability`.
 
 If the old binary already exists as an artifact, bypass the worktree build and

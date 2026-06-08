@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use prometheus::{HistogramOpts, HistogramVec, IntCounter, Registry, TextEncoder};
+use prometheus::{HistogramOpts, HistogramVec, IntCounter, IntGauge, Registry, TextEncoder};
 
 use crate::broker::Broker;
 
@@ -33,6 +33,8 @@ pub struct Metrics {
     pub auth_failures_total: IntCounter,
     pub tcp_connections_total: IntCounter,
     pub uds_connections_total: IntCounter,
+    pub stream_connections_active: IntGauge,
+    pub stream_connection_cap_drops_total: IntCounter,
     /// Number of accepted TCP sockets where `setsockopt(TCP_NODELAY, 1)`
     /// returned ok. Lets operators confirm the experiment from
     /// upstream `live-mutex#22` is wired through at runtime.
@@ -78,6 +80,16 @@ impl Metrics {
         let uds_connections_total = IntCounter::new(
             "dd_rust_network_mutex_uds_connections_total",
             "Accepted Unix domain socket client connections.",
+        )
+        .unwrap();
+        let stream_connections_active = IntGauge::new(
+            "dd_rust_network_mutex_stream_connections_active",
+            "Currently active TCP/UDS stream client connections admitted below LMX_MAX_CONNECTIONS.",
+        )
+        .unwrap();
+        let stream_connection_cap_drops_total = IntCounter::new(
+            "dd_rust_network_mutex_stream_connection_cap_drops_total",
+            "TCP/UDS stream client connections dropped because LMX_MAX_CONNECTIONS was reached.",
         )
         .unwrap();
         let tcp_nodelay_applied_total = IntCounter::new(
@@ -138,6 +150,12 @@ impl Metrics {
             .register(Box::new(uds_connections_total.clone()))
             .ok();
         registry
+            .register(Box::new(stream_connections_active.clone()))
+            .ok();
+        registry
+            .register(Box::new(stream_connection_cap_drops_total.clone()))
+            .ok();
+        registry
             .register(Box::new(tcp_nodelay_applied_total.clone()))
             .ok();
         registry
@@ -162,6 +180,8 @@ impl Metrics {
             auth_failures_total,
             tcp_connections_total,
             uds_connections_total,
+            stream_connections_active,
+            stream_connection_cap_drops_total,
             tcp_nodelay_applied_total,
             tcp_quickack_applied_total,
             request_duration_seconds,

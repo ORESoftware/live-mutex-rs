@@ -31,6 +31,19 @@ sample_interval_ms="${SAMPLE_INTERVAL_MS:-1}"
 perf_freq="${PERF_FREQ:-997}"
 bench_raft_metrics="${BENCH_RAFT_METRICS:-}"
 bench_raft_metrics_endpoints="${BENCH_RAFT_METRICS_ENDPOINTS:-}"
+bench_http_auth_token="${BENCH_HTTP_AUTH_TOKEN:-}"
+if [ -z "$bench_http_auth_token" ]; then
+  bench_http_auth_token="${BENCH_RAFT_AUTH_TOKEN:-}"
+fi
+if [ -z "$bench_http_auth_token" ]; then
+  bench_http_auth_token="${LMX_LIVE_RAFT_AUTH_TOKEN:-}"
+fi
+if [ -z "$bench_http_auth_token" ]; then
+  bench_http_auth_token="${ALL_DOGS:-}"
+fi
+if [ -z "$bench_http_auth_token" ]; then
+  bench_http_auth_token="${LMX_AUTH_TOKEN:-}"
+fi
 
 mkdir -p "$out_dir"
 
@@ -57,6 +70,10 @@ trap cleanup EXIT
 
 usage() {
   local raft_metrics_default="${bench_raft_metrics:-$capture_metrics}"
+  local auth_status="<unset>"
+  if [ -n "$bench_http_auth_token" ]; then
+    auth_status="<set>"
+  fi
   echo "usage: $0 [bench|sample|perf|flamegraph]" >&2
   echo "env: PROFILE_TARGET=$profile_target # broker|raft|redis" >&2
   echo "env: PROFILE=$profile OUT_DIR=$out_dir BROKER_HOST=$broker_host BROKER_HTTP_PORT=$broker_http_port" >&2
@@ -66,6 +83,7 @@ usage() {
   echo "env: RAFT_BENCH_ROUTE=$raft_bench_route # leader|round-robin for PROFILE_TARGET=raft" >&2
   echo "env: BENCH_WORKERS=$bench_workers BENCH_KEYS=$bench_keys BENCH_DURATION_MS=$bench_duration_ms" >&2
   echo "env: BENCH_HTTP_KEEPALIVE=$bench_http_keepalive" >&2
+  echo "env: BENCH_HTTP_AUTH_TOKEN=$auth_status # falls back to BENCH_RAFT_AUTH_TOKEN, LMX_LIVE_RAFT_AUTH_TOKEN, ALL_DOGS, or LMX_AUTH_TOKEN" >&2
   echo "env: BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=${BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH:-<optional>}" >&2
   echo "env: BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=${BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE:-<optional>}" >&2
   echo "env: BENCH_RAFT_METRICS=$raft_metrics_default BENCH_RAFT_METRICS_ENDPOINTS=${bench_raft_metrics_endpoints:-<all-local-raft-nodes>}" >&2
@@ -529,6 +547,7 @@ start_benchmark() {
       BENCH_RAFT="$raft_bench_endpoints" \
       BENCH_RAFT_METRICS_ENDPOINTS="$raft_metrics_endpoints" \
       BENCH_RAFT_ROUTE="$raft_bench_route" \
+      BENCH_HTTP_AUTH_TOKEN="$bench_http_auth_token" \
       BENCH_WORKERS="$bench_workers" \
       BENCH_KEYS="$bench_keys" \
       BENCH_DURATION_MS="$bench_duration_ms" \
@@ -540,6 +559,7 @@ start_benchmark() {
   else
     BENCH_TARGET=broker \
       BENCH_BROKER="$broker_host:$broker_http_port" \
+      BENCH_HTTP_AUTH_TOKEN="$bench_http_auth_token" \
       BENCH_WORKERS="$bench_workers" \
       BENCH_KEYS="$bench_keys" \
       BENCH_DURATION_MS="$bench_duration_ms" \

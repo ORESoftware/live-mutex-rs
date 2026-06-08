@@ -8,15 +8,42 @@
 //! the offender once the line crosses `LMX_MAX_FRAME_BYTES` (or the
 //! built-in default), and stays available to honest peers.
 
+use std::ffi::OsString;
 use std::time::Duration;
 
 use dd_rust_network_mutex::{
     broker::BrokerConfig,
+    client::{Client, ClientConfig},
     server::{run as run_server, ServerConfig},
 };
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+
+static SERVER_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 fn cfg(tcp: std::net::SocketAddr) -> ServerConfig {
     ServerConfig {
@@ -35,6 +62,13 @@ fn cfg(tcp: std::net::SocketAddr) -> ServerConfig {
 
 fn cfg_with_broker(tcp: std::net::SocketAddr, broker: BrokerConfig) -> ServerConfig {
     ServerConfig { broker, ..cfg(tcp) }
+}
+
+fn cfg_with_auth(tcp: std::net::SocketAddr, token: &str) -> ServerConfig {
+    ServerConfig {
+        auth_token: Some(token.to_string()),
+        ..cfg(tcp)
+    }
 }
 
 async fn ephemeral_addr() -> std::net::SocketAddr {
@@ -84,11 +118,114 @@ async fn disabled_ttl_sweeper_does_not_stop_server() {
 }
 
 #[tokio::test]
+async fn auth_enabled_tcp_allows_version_probe_before_auth() {
+    let _env_lock = SERVER_ENV_LOCK.lock().await;
+
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg_with_auth(addr, "secret-token")));
+    wait_listening(addr).await;
+
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let (read, mut write) = sock.into_split();
+    let mut reader = BufReader::new(read);
+
+    let version = json!({
+        "type": "version",
+        "uuid": "preauth-version",
+        "value": "0.1.0"
+    })
+    .to_string();
+    write.write_all(version.as_bytes()).await.unwrap();
+    write.write_all(b"\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    let line = read_reply_line(&mut reader).await;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["type"], "version");
+    assert_eq!(reply["uuid"], "preauth-version");
+    assert_eq!(reply["ok"], true);
+
+    let auth = json!({
+        "type": "auth",
+        "uuid": "preauth-token",
+        "token": "secret-token"
+    })
+    .to_string();
+    write.write_all(auth.as_bytes()).await.unwrap();
+    write.write_all(b"\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    let line = read_reply_line(&mut reader).await;
+    let reply: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(reply["type"], "auth");
+    assert_eq!(reply["uuid"], "preauth-token");
+    assert_eq!(reply["ok"], true);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn rust_client_connects_to_auth_enabled_tcp_server() {
+    let _env_lock = SERVER_ENV_LOCK.lock().await;
+
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg_with_auth(addr, "secret-token")));
+    wait_listening(addr).await;
+
+    let client = Client::connect_tcp(
+        addr,
+        ClientConfig {
+            auth_token: Some("secret-token".to_string()),
+            ..ClientConfig::default()
+        },
+    )
+    .await
+    .expect("auth-enabled Rust client should connect");
+    let guard = client
+        .acquire("auth-enabled-client-regression", Duration::from_secs(1))
+        .await
+        .expect("auth-enabled client acquire");
+    client
+        .release(&guard)
+        .await
+        .expect("auth-enabled client release");
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn auth_handshake_timeout_drops_idle_pre_auth_connection() {
+    let _env_lock = SERVER_ENV_LOCK.lock().await;
+    let _auth_timeout = EnvVarGuard::set("LMX_AUTH_HANDSHAKE_MS", "50");
+
+    let addr = ephemeral_addr().await;
+    let server = tokio::spawn(run_server(cfg_with_auth(addr, "secret-token")));
+    wait_listening(addr).await;
+
+    let mut sock = TcpStream::connect(addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut byte))
+        .await
+        .expect("idle pre-auth connection should be closed by handshake deadline")
+        .expect("read after auth timeout");
+    assert_eq!(
+        read, 0,
+        "idle pre-auth connection should close without sending a frame"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
 async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
     // Force a small cap so the test stays fast. 4 KiB is well below
     // a real composite-lock JSON payload so any actual call would
     // still fit; here we explicitly send way more.
-    std::env::set_var("LMX_MAX_FRAME_BYTES", "4096");
+    let _env_lock = SERVER_ENV_LOCK.lock().await;
+    let _frame_cap = EnvVarGuard::set("LMX_MAX_FRAME_BYTES", "4096");
 
     let addr = ephemeral_addr().await;
     let server = tokio::spawn(run_server(cfg(addr)));
@@ -154,7 +291,6 @@ async fn oversized_frame_disconnects_offender_and_keeps_broker_available() {
 
     server.abort();
     let _ = server.await;
-    std::env::remove_var("LMX_MAX_FRAME_BYTES");
 }
 
 #[tokio::test]
@@ -358,7 +494,8 @@ async fn broker_preserves_split_utf8_jsonl_frame() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn broker_drains_large_jsonl_burst_with_frame_yield_option() {
-    std::env::set_var("LMX_FRAME_YIELD_EVERY", "1");
+    let _env_lock = SERVER_ENV_LOCK.lock().await;
+    let _frame_yield = EnvVarGuard::set("LMX_FRAME_YIELD_EVERY", "1");
 
     let addr = ephemeral_addr().await;
     let server = tokio::spawn(run_server(cfg(addr)));
@@ -397,7 +534,6 @@ async fn broker_drains_large_jsonl_burst_with_frame_yield_option() {
 
     server.abort();
     let _ = server.await;
-    std::env::remove_var("LMX_FRAME_YIELD_EVERY");
 }
 
 #[tokio::test]
