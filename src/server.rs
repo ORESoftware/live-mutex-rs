@@ -11,9 +11,11 @@
 //!    serverless/Lambda callers. Long-poll support via `?wait_ms=` /
 //!    `waitMs` body field.
 //!
-//! Auth: when `LMX_AUTH_TOKEN` is set, every TCP/UDS connection must send
-//! `{"type":"auth","token":"..."}` first; HTTP callers must include
-//! `Authorization: Bearer <token>` (or `X-LMX-Auth: <token>`).
+//! Auth: when an auth token is configured (from `ALL_DOGS`, else
+//! `LMX_AUTH_TOKEN`, else the config file), every TCP/UDS connection must send
+//! `{"type":"auth","token":"..."}` first; HTTP callers must include the token in
+//! an `Auth: <token>` header (or `Authorization: Bearer <token>` /
+//! `X-LMX-Auth: <token>`).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -872,38 +874,34 @@ fn observe_http_response(
     response
 }
 
+/// True if any accepted auth header carries `token`. Header names are
+/// case-insensitive, so `Auth` and `auth` match the same `"auth"` lookup.
+/// Accepted forms:
+///   - `Authorization: Bearer <token>`
+///   - `Auth: <token>`        (gateway/operator convention; value from `ALL_DOGS`)
+///   - `X-LMX-Auth: <token>`  (legacy custom header)
+fn http_token_matches(headers: &HeaderMap, token: &str) -> bool {
+    crate::routine_id!("ddl-routine-server-http-token-matches-1");
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(token)
+        || header("auth") == Some(token)
+        || header("x-lmx-auth") == Some(token)
+}
+
 fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     crate::routine_id!("ddl-routine-68-wt_8VTaRoe5rbQz");
-    let Some(token) = state.auth_token.as_ref() else {
-        return true;
-    };
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let custom = headers
-        .get("x-lmx-auth")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
+    match state.auth_token.as_ref() {
+        None => true,
+        Some(token) => http_token_matches(headers, token),
+    }
 }
 
 fn raft_http_authorized(state: &RaftAppState, headers: &HeaderMap) -> bool {
     crate::routine_id!("ddl-routine-server-raft-http-auth-1");
-    let Some(token) = state.auth_token.as_ref() else {
-        return true;
-    };
-    let bearer = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
-    let custom = headers
-        .get("x-lmx-auth")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    bearer.as_deref() == Some(token.as_str()) || custom.as_deref() == Some(token.as_str())
+    match state.auth_token.as_ref() {
+        None => true,
+        Some(token) => http_token_matches(headers, token),
+    }
 }
 
 fn http_request_id(

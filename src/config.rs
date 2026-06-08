@@ -225,7 +225,11 @@ fn build_server_config(
         .transpose()?;
 
     let uds_path = env_path("LMX_UDS_PATH").or_else(|| file.uds_path.clone());
-    let auth_token = env_string("LMX_AUTH_TOKEN").or_else(|| non_empty(file.auth_token.clone()));
+    // `ALL_DOGS` is the gateway/operator auth convention (the value sent as the
+    // `Auth` header); `LMX_AUTH_TOKEN` and the config file are fallbacks.
+    let auth_token = env_string("ALL_DOGS")
+        .or_else(|| env_string("LMX_AUTH_TOKEN"))
+        .or_else(|| non_empty(file.auth_token.clone()));
 
     Ok(ServerConfig {
         tcp_bind,
@@ -555,6 +559,16 @@ mod tests {
             EnvVarGuard::clear("LMX_RAFT_DATA_DIR_LOCK"),
             EnvVarGuard::clear("LMX_RAFT_SYNC_LOG"),
             EnvVarGuard::clear("LMX_RAFT_SYNC_COMMIT"),
+        ]
+    }
+
+    fn clear_raft_identity_envs() -> Vec<EnvVarGuard> {
+        vec![
+            EnvVarGuard::clear("LMX_RAFT_NODE_ID"),
+            EnvVarGuard::clear("LMX_RAFT_BIND_ADDR"),
+            EnvVarGuard::clear("LMX_RAFT_ADVERTISE_ADDR"),
+            EnvVarGuard::clear("LMX_RAFT_DATA_DIR"),
+            EnvVarGuard::clear("LMX_RAFT_PEER_TOKEN"),
         ]
     }
 
@@ -893,5 +907,80 @@ mod tests {
         assert_eq!(raft.proxy_retry_budget, Duration::from_millis(2000));
         assert!(raft.sync_log);
         assert!(raft.sync_commit);
+    }
+
+    #[test]
+    fn shipped_raft_config_env_identity_override_builds_second_voter() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_identity_envs();
+        guards.extend(clear_raft_bool_envs());
+        guards.extend(clear_raft_numeric_envs());
+        guards.push(EnvVarGuard::set("LMX_RAFT_NODE_ID", "node-2"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_ADVERTISE_ADDR", "node-2:7980"));
+
+        let cfg: ConfigFile =
+            toml::from_str(include_str!("../lmx-raft.toml")).expect("shipped lmx-raft.toml parses");
+        let runtime = build_runtime_config(cfg, None).expect("node-2 env override validates");
+
+        assert!(runtime.raft.enabled);
+        assert_eq!(runtime.raft.node_id, "node-2");
+        assert_eq!(runtime.raft.advertise_addr.as_deref(), Some("node-2:7980"));
+        assert_eq!(runtime.raft.cluster_size(), 3);
+        assert_eq!(runtime.raft.quorum_size(), 2);
+        assert_eq!(
+            runtime
+                .raft
+                .peers
+                .iter()
+                .find(|peer| peer.id == "node-2")
+                .map(|peer| peer.addr.as_str()),
+            Some("node-2:7980")
+        );
+    }
+
+    #[test]
+    fn shipped_raft_config_env_identity_override_allows_bootstrap_learner() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_identity_envs();
+        guards.extend(clear_raft_bool_envs());
+        guards.extend(clear_raft_numeric_envs());
+        guards.push(EnvVarGuard::set("LMX_RAFT_NODE_ID", "node-4"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_ADVERTISE_ADDR", "node-4:7980"));
+
+        let cfg: ConfigFile =
+            toml::from_str(include_str!("../lmx-raft.toml")).expect("shipped lmx-raft.toml parses");
+        let runtime =
+            build_runtime_config(cfg, None).expect("bootstrap learner env override validates");
+
+        assert!(runtime.raft.enabled);
+        assert_eq!(runtime.raft.node_id, "node-4");
+        assert_eq!(runtime.raft.advertise_addr.as_deref(), Some("node-4:7980"));
+        assert_eq!(
+            runtime.raft.peers.iter().any(|peer| peer.id == "node-4"),
+            false
+        );
+        assert_eq!(runtime.raft.cluster_size(), 3);
+        assert_eq!(runtime.raft.quorum_size(), 2);
+    }
+
+    #[test]
+    fn shipped_raft_config_rejects_env_identity_advertise_mismatch() {
+        let _env_lock = lock_env();
+        let mut guards = clear_raft_identity_envs();
+        guards.extend(clear_raft_bool_envs());
+        guards.extend(clear_raft_numeric_envs());
+        guards.push(EnvVarGuard::set("LMX_RAFT_NODE_ID", "node-2"));
+        guards.push(EnvVarGuard::set("LMX_RAFT_ADVERTISE_ADDR", "node-22:7980"));
+
+        let cfg: ConfigFile =
+            toml::from_str(include_str!("../lmx-raft.toml")).expect("shipped lmx-raft.toml parses");
+        let err = build_runtime_config(cfg, None)
+            .expect_err("local voter advertise mismatch must fail validation");
+
+        assert!(
+            err.to_string()
+                .contains("raft local voter `node-2` advertises"),
+            "unexpected config error: {err}"
+        );
     }
 }

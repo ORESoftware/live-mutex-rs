@@ -1390,6 +1390,25 @@ async fn http_api_enforces_auth_with_either_header_form() {
         custom_ok.starts_with("HTTP/1.1 200"),
         "got: {custom_ok:.120}"
     );
+
+    // The gateway `Auth` header (value from the ALL_DOGS env) is accepted too.
+    let auth_header_ok = post(
+        http_port,
+        &["Auth: the-token"],
+        r#"{"key":"d","ttlMs":1000}"#,
+    )
+    .await;
+    assert!(
+        auth_header_ok.starts_with("HTTP/1.1 200"),
+        "Auth header should authorize: {auth_header_ok:.120}"
+    );
+
+    // A wrong `Auth` header is still rejected.
+    let auth_header_wrong = post(http_port, &["Auth: nope"], r#"{"key":"e"}"#).await;
+    assert!(
+        auth_header_wrong.starts_with("HTTP/1.1 401"),
+        "wrong Auth header must be 401: {auth_header_wrong:.120}"
+    );
 }
 
 // ---- HTTP API validation -------------------------------------------------
