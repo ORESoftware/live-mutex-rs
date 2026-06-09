@@ -3,6 +3,12 @@
 # Topology: 1 control-plane + 3 workers. Matches the documented 3-node Raft
 # quorum (node-1/node-2/node-3 -> commits with 2 votes; see lmx-raft.toml).
 #
+# Hardening:
+#   - All published host ports bind to 127.0.0.1 (listenAddress) so the broker
+#     listeners are reachable only from this machine, never the LAN. Change the
+#     listenAddress to 0.0.0.0 only if you deliberately need off-host access.
+#   - The API server also binds loopback (networking.apiServerAddress).
+#
 # Usage:
 #   kind create cluster --config kind.yaml
 #   kubectl --context kind-live-mutex-rs get nodes
@@ -21,6 +27,8 @@
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: live-mutex-rs
+networking:
+  apiServerAddress: "127.0.0.1"
 nodes:
   - role: control-plane
   - role: worker
@@ -29,9 +37,11 @@ nodes:
     extraPortMappings:
       - containerPort: 6970
         hostPort: 6970
+        listenAddress: "127.0.0.1"
         protocol: TCP
       - containerPort: 6971
         hostPort: 6971
+        listenAddress: "127.0.0.1"
         protocol: TCP
   - role: worker
     labels:
@@ -39,9 +49,11 @@ nodes:
     extraPortMappings:
       - containerPort: 6970
         hostPort: 6972
+        listenAddress: "127.0.0.1"
         protocol: TCP
       - containerPort: 6971
         hostPort: 6973
+        listenAddress: "127.0.0.1"
         protocol: TCP
   - role: worker
     labels:
@@ -49,7 +61,9 @@ nodes:
     extraPortMappings:
       - containerPort: 6970
         hostPort: 6974
+        listenAddress: "127.0.0.1"
         protocol: TCP
       - containerPort: 6971
         hostPort: 6975
+        listenAddress: "127.0.0.1"
         protocol: TCP

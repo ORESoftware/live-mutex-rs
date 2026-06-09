@@ -4,8 +4,16 @@
 #   - kind.yaml maps host ports 6970-6975; this maps 7970-7975 (no overlap).
 #   - kind uses kubeconfig context "kind-live-mutex-rs" and the "kind" docker
 #     network; k3d uses "k3d-live-mutex-rs" and its own "k3d-live-mutex-rs"
-#     network. Both API servers bind a random host port, so they never clash.
+#     network. Both API servers bind loopback, so they never clash.
 # => a kind cluster and this k3d cluster can run at the same time.
+#
+# Hardening:
+#   - All published host ports bind 127.0.0.1 only (host IP prefix on each
+#     mapping) so broker listeners are not exposed to the LAN.
+#   - The Kubernetes API binds 127.0.0.1 (kubeAPI.hostIP).
+#   - traefik and klipper servicelb are disabled: brokers are reached via the
+#     explicit per-agent port maps below, not via Ingress/LoadBalancer, so the
+#     load-balancer components only add attack surface and host-port grabs.
 #
 # Usage:
 #   k3d cluster create --config k3d.yaml
@@ -22,23 +30,27 @@ metadata:
   name: live-mutex-rs
 servers: 1
 agents: 3
+kubeAPI:
+  hostIP: "127.0.0.1"
 ports:
-  - port: "7970:6970"
+  - port: "127.0.0.1:7970:6970"
     nodeFilters: ["agent:0"]
-  - port: "7971:6971"
+  - port: "127.0.0.1:7971:6971"
     nodeFilters: ["agent:0"]
-  - port: "7972:6970"
+  - port: "127.0.0.1:7972:6970"
     nodeFilters: ["agent:1"]
-  - port: "7973:6971"
+  - port: "127.0.0.1:7973:6971"
     nodeFilters: ["agent:1"]
-  - port: "7974:6970"
+  - port: "127.0.0.1:7974:6970"
     nodeFilters: ["agent:2"]
-  - port: "7975:6971"
+  - port: "127.0.0.1:7975:6971"
     nodeFilters: ["agent:2"]
 options:
   k3s:
     extraArgs:
       - arg: "--disable=traefik"
+        nodeFilters: ["server:*"]
+      - arg: "--disable=servicelb"
         nodeFilters: ["server:*"]
     nodeLabels:
       - label: "lmx-node=node-1"
