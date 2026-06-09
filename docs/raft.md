@@ -1929,7 +1929,12 @@ history, but skips the strict full-log metric guard because a round-robin LB can
 route the before/after `/metrics` scrapes to different pods. The hardening gate
 and soak wrapper require `LMX_LIVE_RAFT_METRICS_ENDPOINTS` by default whenever
 `RUN_K8S_RAFT_LIVE=true`; set `RUN_K8S_RAFT_LIVE_REQUIRE_METRICS=false` only
-when deliberately collecting behavior-only live smoke evidence:
+when deliberately collecting behavior-only live smoke evidence. The live smoke
+uses `LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS=10000`,
+`LMX_LIVE_RAFT_KUBECTL_REQUEST_TIMEOUT=5s`, and
+`LMX_LIVE_RAFT_KUBECTL_PROCESS_TIMEOUT_MS=15000` by default so an unreachable
+Raft Service or Kubernetes API fails quickly instead of stalling the gate; raise
+those values only for a known-slow control plane or Service path:
 
 ```bash
 LMX_LIVE_RAFT_HTTP=live-mutex-rs-raft.default.svc.cluster.local:6971 \
@@ -2029,9 +2034,10 @@ entries, replicated log bytes, admission probes, admission probe microseconds,
 client batches, client batch entries, client pipeline batches, client queue wait
 microseconds, client refill rounds/entries, client commit-lane waits and wait
 microseconds, follower appended entries, follower suffix rewrites, proxy
-forwards, snapshot chunks, commit-slot writes, commit-slot bytes, append-log
-file opens, full-log reads, read failures, read bytes/entries, rewrites, rewrite
-failures, and rewrite bytes/entries. That line
+forwards, snapshot chunks, commit-slot writes, commit-slot bytes,
+commit-slot write microseconds, append-log file opens, append-log write
+microseconds, full-log reads, read failures, read bytes/entries, rewrites,
+rewrite failures, and rewrite bytes/entries. That line
 is the quickest check for accidental full-log send behavior:
 `append_log_bytes` per cycle should stay tied to the new entries being
 replicated, not to the total retained history. It also shows whether a slow
@@ -2043,7 +2049,10 @@ regresses even if throughput still clears a loose floor:
 `BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH` checks
 `client_batch_entries / client_batches`, and
 `BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE` checks commit-sidecar write
-pressure per successful acquire/release cycle.
+pressure per successful acquire/release cycle. Use
+`BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE` and
+`BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE` to cap cumulative durable
+append-log and commit-sidecar write/flush/fsync time per successful cycle.
 Benchmark boolean knobs now fail fast on typos instead of silently falling back
 to `false`; accepted forms are `true/false`, `1/0`, `yes/no`, `y/n`, and
 `on/off`.

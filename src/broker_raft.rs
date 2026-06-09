@@ -721,6 +721,7 @@ pub struct RaftTelemetrySnapshot {
     pub log_write_rollbacks_total: u64,
     pub log_write_rollback_errors_total: u64,
     pub log_append_file_opens_total: u64,
+    pub log_append_write_us_total: u64,
     pub log_append_file_cache_invalidations_total: u64,
     pub log_rewrite_temp_cleanups_total: u64,
     pub log_rewrite_temp_cleanup_errors_total: u64,
@@ -730,6 +731,7 @@ pub struct RaftTelemetrySnapshot {
     pub log_trailing_partial_recovery_errors_total: u64,
     pub hard_state_commit_slot_writes_total: u64,
     pub hard_state_commit_slot_write_bytes_total: u64,
+    pub hard_state_commit_slot_write_us_total: u64,
     pub hard_state_commit_slot_write_errors_total: u64,
     pub hard_state_commit_slot_file_opens_total: u64,
     pub hard_state_commit_slot_recoveries_total: u64,
@@ -2918,6 +2920,7 @@ struct BrokerRaftTelemetry {
     log_write_rollbacks_total: AtomicU64,
     log_write_rollback_errors_total: AtomicU64,
     log_append_file_opens_total: AtomicU64,
+    log_append_write_us_total: AtomicU64,
     log_append_file_cache_invalidations_total: AtomicU64,
     log_rewrite_temp_cleanups_total: AtomicU64,
     log_rewrite_temp_cleanup_errors_total: AtomicU64,
@@ -2927,6 +2930,7 @@ struct BrokerRaftTelemetry {
     log_trailing_partial_recovery_errors_total: AtomicU64,
     hard_state_commit_slot_writes_total: AtomicU64,
     hard_state_commit_slot_write_bytes_total: AtomicU64,
+    hard_state_commit_slot_write_us_total: AtomicU64,
     hard_state_commit_slot_write_errors_total: AtomicU64,
     hard_state_commit_slot_file_opens_total: AtomicU64,
     hard_state_commit_slot_recoveries_total: AtomicU64,
@@ -7076,6 +7080,10 @@ impl BrokerRaft {
                 .telemetry
                 .log_append_file_opens_total
                 .load(Ordering::Relaxed),
+            log_append_write_us_total: self
+                .telemetry
+                .log_append_write_us_total
+                .load(Ordering::Relaxed),
             log_append_file_cache_invalidations_total: self
                 .telemetry
                 .log_append_file_cache_invalidations_total
@@ -7111,6 +7119,10 @@ impl BrokerRaft {
             hard_state_commit_slot_write_bytes_total: self
                 .telemetry
                 .hard_state_commit_slot_write_bytes_total
+                .load(Ordering::Relaxed),
+            hard_state_commit_slot_write_us_total: self
+                .telemetry
+                .hard_state_commit_slot_write_us_total
                 .load(Ordering::Relaxed),
             hard_state_commit_slot_write_errors_total: self
                 .telemetry
@@ -7798,6 +7810,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_log_append_file_opens_total Append-only Raft log file opens; should be much lower than appended batches while the path remains stable.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_append_file_opens_total counter\n",
                 "dd_rust_network_mutex_raft_log_append_file_opens_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_log_append_write_us_total Cumulative microseconds spent writing, flushing, and optionally fsyncing append-only Raft log batches.\n",
+                "# TYPE dd_rust_network_mutex_raft_log_append_write_us_total counter\n",
+                "dd_rust_network_mutex_raft_log_append_write_us_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total Live append-only Raft log file handles discarded because the path changed, a destructive rewrite was about to run, or an append error made reuse unsafe.\n",
                 "# TYPE dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total counter\n",
                 "dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total {}\n",
@@ -7961,6 +7976,7 @@ impl BrokerRaft {
             snapshot.log_write_rollbacks_total,
             snapshot.log_write_rollback_errors_total,
             snapshot.log_append_file_opens_total,
+            snapshot.log_append_write_us_total,
             snapshot.log_append_file_cache_invalidations_total,
             snapshot.log_rewrite_temp_cleanups_total,
             snapshot.log_rewrite_temp_cleanup_errors_total,
@@ -7996,6 +8012,9 @@ impl BrokerRaft {
                 "# HELP dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total Fixed-slot bytes written for commit-only hard-state sidecar updates.\n",
                 "# TYPE dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total counter\n",
                 "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total {}\n",
+                "# HELP dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total Cumulative microseconds spent writing, flushing, and optionally fsyncing commit-only hard-state sidecar slots.\n",
+                "# TYPE dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total counter\n",
+                "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total {}\n",
                 "# HELP dd_rust_network_mutex_raft_hard_state_commit_slot_write_errors_total Commit-only hard-state sidecar writes that failed before cached hard-state mutation.\n",
                 "# TYPE dd_rust_network_mutex_raft_hard_state_commit_slot_write_errors_total counter\n",
                 "dd_rust_network_mutex_raft_hard_state_commit_slot_write_errors_total {}\n",
@@ -8017,6 +8036,7 @@ impl BrokerRaft {
             ),
             snapshot.hard_state_commit_slot_writes_total,
             snapshot.hard_state_commit_slot_write_bytes_total,
+            snapshot.hard_state_commit_slot_write_us_total,
             snapshot.hard_state_commit_slot_write_errors_total,
             snapshot.hard_state_commit_slot_file_opens_total,
             snapshot.hard_state_commit_slot_recoveries_total,
@@ -23212,6 +23232,7 @@ fn proxy_error_is_terminal(error: &str) -> bool {
         // BrokerRaftError::UnsupportedClientRequest
         || error.contains("unsupported raft client request")
         || error.contains("raft proxy sender")
+        || error.contains("raft ephemeral request uuid must not be empty")
 }
 
 fn proxy_error_is_not_leader(error: &str) -> bool {
@@ -24125,6 +24146,7 @@ fn write_hard_state_commit_slot_with_cache(
                 BrokerRaftError::Rpc("raft hard-state commit sidecar cache was empty".into())
             })?
             .file;
+        let write_started = Instant::now();
         file.seek(SeekFrom::Start(hard_state_commit_slot_offset(generation)))?;
         file.write_all(body.as_slice())?;
         file.flush()?;
@@ -24135,6 +24157,11 @@ fn write_hard_state_commit_slot_with_cache(
             if let Some(parent) = path.parent() {
                 sync_dir(parent)?;
             }
+        }
+        if let Some(telemetry) = telemetry {
+            telemetry
+                .hard_state_commit_slot_write_us_total
+                .fetch_add(duration_us_u64(write_started.elapsed()), Ordering::Relaxed);
         }
         Ok(HARD_STATE_COMMIT_SLOT_BYTES as u64)
     })();
@@ -25456,10 +25483,16 @@ fn append_serialized_log_entries_with_cache(
             .as_mut()
             .ok_or_else(|| BrokerRaftError::Rpc("raft log append cache was empty".into()))?
             .file;
+        let write_started = Instant::now();
         file.write_all(body)?;
         file.flush()?;
         if sync_log {
             file.sync_data()?;
+        }
+        if let Some(telemetry) = telemetry {
+            telemetry
+                .log_append_write_us_total
+                .fetch_add(duration_us_u64(write_started.elapsed()), Ordering::Relaxed);
         }
         Ok(())
     })();
@@ -39602,6 +39635,7 @@ mod tests {
         );
         assert!(metrics.contains("dd_rust_network_mutex_raft_follower_append_rewrites_total 0"));
         assert!(metrics.contains("dd_rust_network_mutex_raft_log_append_file_opens_total 1"));
+        assert!(metrics.contains("dd_rust_network_mutex_raft_log_append_write_us_total "));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total 0"));
 
@@ -56601,6 +56635,110 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn follower_proxy_does_not_retry_terminal_malformed_proxy_error() {
+        let dir = temp_dir("raft-follower-proxy-terminal-malformed");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rejecting leader");
+        let leader_addr = listener.local_addr().expect("rejecting leader addr");
+        let mut cfg = test_raft_config(dir.clone());
+        cfg.proxy_retry_budget = Duration::from_millis(500);
+        cfg.peers = vec![
+            test_peer("n1", 7980),
+            RaftPeerConfig {
+                id: "n2".into(),
+                addr: leader_addr.to_string(),
+            },
+            test_peer("n3", 7982),
+        ];
+        let raft = BrokerRaft::open(cfg).expect("open raft");
+        {
+            let mut runtime = raft.runtime.lock();
+            runtime.current_term = 7;
+            runtime.role = RaftRole::Follower;
+            runtime.leader_id = Some("n2".into());
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_for_server = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept rejecting leader");
+            let mut reader = TokioBufReader::new(stream);
+            let line = read_raft_frame_bounded(&mut reader, raft_rpc_max_frame_bytes())
+                .await
+                .expect("read proxied request");
+            let rpc: RaftRpc = serde_json::from_str(&line).expect("parse proxied request");
+            match rpc {
+                RaftRpc::ProxyRequest {
+                    auth_token: None,
+                    request_uuid,
+                    is_acquire: false,
+                    ..
+                } => assert_eq!(request_uuid, "proxy-terminal-malformed"),
+                other => panic!("unexpected proxy rpc: {other:?}"),
+            }
+            seen_for_server.fetch_add(1, Ordering::SeqCst);
+            let body = serde_json::to_vec(&RaftRpcResponse::ProxyResponse {
+                term: 7,
+                response: None,
+                error: Some("raft RPC error: raft ephemeral request uuid must not be empty".into()),
+                leader_id: None,
+                leader_addr: None,
+            })
+            .expect("serialize proxy response");
+            reader
+                .get_mut()
+                .write_all(&body)
+                .await
+                .expect("write proxy response");
+            reader
+                .get_mut()
+                .write_all(b"\n")
+                .await
+                .expect("write proxy newline");
+            reader
+                .get_mut()
+                .flush()
+                .await
+                .expect("flush proxy response");
+        });
+
+        let err = raft
+            .proxy_ephemeral_request_to_leader(
+                Request::Unlock {
+                    uuid: "proxy-terminal-malformed".into(),
+                    key: Some("proxy-terminal-key".into()),
+                    keys: None,
+                    lock_uuid: Some("proxy-terminal-lock".into()),
+                    force: false,
+                },
+                "proxy-terminal-malformed",
+                Duration::ZERO,
+                false,
+            )
+            .await
+            .expect_err("terminal leader-side proxy error should not retry");
+
+        assert!(
+            matches!(err, BrokerRaftError::Rpc(ref error) if error.contains("request uuid must not be empty")),
+            "unexpected proxy error: {err:?}"
+        );
+        server.await.expect("rejecting leader server");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "terminal proxy errors must not be retried against the leader"
+        );
+        assert!(raft.log.read_entries().expect("entries").is_empty());
+        let telemetry = raft.telemetry_snapshot();
+        assert_eq!(telemetry.proxy_requests_forwarded_total, 1);
+        assert_eq!(telemetry.proxy_request_errors_total, 1);
+        assert_eq!(telemetry.proxy_request_retries_total, 0);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn proxy_error_terminal_classifier_marks_non_retryable_errors() {
         assert!(proxy_error_is_terminal(
@@ -56614,6 +56752,9 @@ mod tests {
         ));
         assert!(proxy_error_is_terminal(
             "raft proxy sender `n2` at `127.0.0.1:7981` is not active at that address in current membership"
+        ));
+        assert!(proxy_error_is_terminal(
+            "raft RPC error: raft ephemeral request uuid must not be empty"
         ));
         assert!(!proxy_error_is_terminal("not leader"));
         assert!(proxy_error_is_not_leader(
@@ -67364,6 +67505,9 @@ mod tests {
             .hard_state_commit_slot_write_bytes_total
             .store((HARD_STATE_COMMIT_SLOT_BYTES as u64) * 2, Ordering::Relaxed);
         raft.telemetry
+            .hard_state_commit_slot_write_us_total
+            .store(1234, Ordering::Relaxed);
+        raft.telemetry
             .hard_state_commit_slot_write_errors_total
             .store(1, Ordering::Relaxed);
         raft.telemetry
@@ -67390,6 +67534,8 @@ mod tests {
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total {}",
             (HARD_STATE_COMMIT_SLOT_BYTES as u64) * 2
         )));
+        assert!(metrics
+            .contains("dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total 1234"));
         assert!(metrics
             .contains("dd_rust_network_mutex_raft_hard_state_commit_slot_write_errors_total 1"));
         assert!(metrics

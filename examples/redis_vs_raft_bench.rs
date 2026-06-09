@@ -20,7 +20,8 @@
 //! benchmark when a target falls below the configured performance floor.
 //! Optional BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH and
 //! BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE thresholds fail Raft metric runs
-//! when batching efficiency regresses.
+//! when batching efficiency regresses. Optional BENCH_MAX_RAFT_*_WRITE_US_PER_CYCLE
+//! thresholds fail when durable storage time per successful cycle regresses.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -91,6 +92,8 @@ struct PerfThresholds {
     max_raft_p99_ms: Option<f64>,
     min_raft_client_batch_entries_per_batch: Option<f64>,
     max_raft_commit_slot_writes_per_cycle: Option<f64>,
+    max_raft_log_append_write_us_per_cycle: Option<f64>,
+    max_raft_commit_slot_write_us_per_cycle: Option<f64>,
 }
 
 #[derive(Debug, Default)]
@@ -331,6 +334,12 @@ impl PerfThresholds {
             max_raft_commit_slot_writes_per_cycle: env_parse_optional_non_negative_f64(
                 "BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE",
             ),
+            max_raft_log_append_write_us_per_cycle: env_parse_optional_non_negative_f64(
+                "BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE",
+            ),
+            max_raft_commit_slot_write_us_per_cycle: env_parse_optional_non_negative_f64(
+                "BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE",
+            ),
         }
     }
 
@@ -407,6 +416,32 @@ impl PerfThresholds {
                         max_commit_writes_per_cycle
                     ));
                 }
+            }
+        }
+        if let Some(max_us_per_cycle) = self.max_raft_log_append_write_us_per_cycle {
+            if let Some(failure) = raft_metric_per_cycle_ceiling_failure(
+                before,
+                after,
+                successful_cycles,
+                "dd_rust_network_mutex_raft_log_append_write_us_total",
+                "log append write us",
+                "BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE",
+                max_us_per_cycle,
+            ) {
+                failures.push(failure);
+            }
+        }
+        if let Some(max_us_per_cycle) = self.max_raft_commit_slot_write_us_per_cycle {
+            if let Some(failure) = raft_metric_per_cycle_ceiling_failure(
+                before,
+                after,
+                successful_cycles,
+                "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total",
+                "commit-slot write us",
+                "BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE",
+                max_us_per_cycle,
+            ) {
+                failures.push(failure);
             }
         }
         failures
@@ -1058,6 +1093,10 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_log_append_file_opens_total",
     ),
     (
+        "log_append_write_us",
+        "dd_rust_network_mutex_raft_log_append_write_us_total",
+    ),
+    (
         "log_append_cache_invalidations",
         "dd_rust_network_mutex_raft_log_append_file_cache_invalidations_total",
     ),
@@ -1100,6 +1139,10 @@ const RAFT_BENCH_METRICS: &[(&str, &str)] = &[
     (
         "commit_slot_bytes",
         "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total",
+    ),
+    (
+        "commit_slot_write_us",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total",
     ),
     (
         "commit_slot_errors",
@@ -1313,8 +1356,16 @@ const RAFT_BENCH_PER_CYCLE_METRICS: &[(&str, &str)] = &[
         "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total",
     ),
     (
+        "commit_slot_write_us",
+        "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total",
+    ),
+    (
         "log_append_opens",
         "dd_rust_network_mutex_raft_log_append_file_opens_total",
+    ),
+    (
+        "log_append_write_us",
+        "dd_rust_network_mutex_raft_log_append_write_us_total",
     ),
     (
         "full_log_reads",
@@ -1436,6 +1487,30 @@ fn raft_full_log_guard_failures(before: &MetricSnapshot, after: &MetricSnapshot)
 fn metric_delta(before: &MetricSnapshot, after: &MetricSnapshot, metric_name: &str) -> f64 {
     after.values.get(metric_name).copied().unwrap_or(0.0)
         - before.values.get(metric_name).copied().unwrap_or(0.0)
+}
+
+fn raft_metric_per_cycle_ceiling_failure(
+    before: &MetricSnapshot,
+    after: &MetricSnapshot,
+    successful_cycles: u64,
+    metric_name: &str,
+    label: &str,
+    env_name: &str,
+    max_value: f64,
+) -> Option<String> {
+    if successful_cycles == 0 {
+        return Some(format!(
+            "[raft-metrics-guard] {label} per cycle unavailable because raft completed 0 successful cycles while {env_name}={max_value:.3}"
+        ));
+    }
+    let actual = metric_delta(before, after, metric_name) / successful_cycles as f64;
+    if actual > max_value {
+        Some(format!(
+            "[raft-metrics-guard] {label} per cycle {actual:.3} above {env_name} {max_value:.3}"
+        ))
+    } else {
+        None
+    }
 }
 
 fn format_metric_delta(value: f64) -> String {
@@ -1564,6 +1639,8 @@ Configuration is environment driven:\n\
   BENCH_MAX_RAFT_P99_MS=<optional ceiling>\n\
   BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=<optional floor; requires BENCH_RAFT_METRICS=true>\n\
   BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=<optional ceiling; requires BENCH_RAFT_METRICS=true>\n\
+  BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE=<optional ceiling; requires BENCH_RAFT_METRICS=true>\n\
+  BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE=<optional ceiling; requires BENCH_RAFT_METRICS=true>\n\
 \n\
 Example:\n\
   BENCH_TARGET=broker-raft BENCH_BROKER=127.0.0.1:6971 BENCH_RAFT=127.0.0.1:6972 \\\n\
@@ -2127,6 +2204,8 @@ mod tests {
         let thresholds = PerfThresholds {
             min_raft_client_batch_entries_per_batch: Some(4.0),
             max_raft_commit_slot_writes_per_cycle: Some(0.5),
+            max_raft_log_append_write_us_per_cycle: Some(100.0),
+            max_raft_commit_slot_write_us_per_cycle: Some(75.0),
             ..PerfThresholds::default()
         };
         let before = MetricSnapshot::default();
@@ -2143,16 +2222,30 @@ mod tests {
             "dd_rust_network_mutex_raft_hard_state_commit_slot_writes_total".into(),
             8.0,
         );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_append_write_us_total".into(),
+            1000.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total".into(),
+            600.0,
+        );
 
         let failures = thresholds.raft_metric_guard_failures(&before, &after, 4);
 
-        assert_eq!(failures.len(), 2);
+        assert_eq!(failures.len(), 4);
         assert!(failures
             .iter()
             .any(|failure| failure.contains("BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH")));
         assert!(failures
             .iter()
             .any(|failure| failure.contains("BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE")));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.contains("BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE")));
     }
 
     #[test]
@@ -2391,6 +2484,14 @@ nan_value NaN\n",
             2048.0,
         );
         before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total".into(),
+            3000.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_append_write_us_total".into(),
+            4000.0,
+        );
+        before.values.insert(
             "dd_rust_network_mutex_raft_log_compaction_failures_total".into(),
             1.0,
         );
@@ -2535,6 +2636,14 @@ nan_value NaN\n",
             8192.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total".into(),
+            7000.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_append_write_us_total".into(),
+            10_000.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_log_compaction_failures_total".into(),
             3.0,
         );
@@ -2608,6 +2717,8 @@ nan_value NaN\n",
         assert!(joined.contains("follower_appended=+18"));
         assert!(joined.contains("commit_slot_writes=+6"));
         assert!(joined.contains("commit_slot_bytes=+6144"));
+        assert!(joined.contains("commit_slot_write_us=+4000"));
+        assert!(joined.contains("log_append_write_us=+6000"));
         assert!(joined.contains("snapshot_frame_mismatches=+3"));
         assert!(joined.contains("compaction_failures=+2"));
         assert!(joined.contains("compaction_trim_failures=+1"));
@@ -2696,6 +2807,14 @@ nan_value NaN\n",
         before.values.insert(
             "dd_rust_network_mutex_raft_hard_state_commit_slot_write_bytes_total".into(),
             5120.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total".into(),
+            1000.0,
+        );
+        before.values.insert(
+            "dd_rust_network_mutex_raft_log_append_write_us_total".into(),
+            2000.0,
         );
         before.values.insert(
             "dd_rust_network_mutex_raft_log_full_reads_total".into(),
@@ -2804,6 +2923,14 @@ nan_value NaN\n",
             13312.0,
         );
         after.values.insert(
+            "dd_rust_network_mutex_raft_hard_state_commit_slot_write_us_total".into(),
+            3000.0,
+        );
+        after.values.insert(
+            "dd_rust_network_mutex_raft_log_append_write_us_total".into(),
+            6000.0,
+        );
+        after.values.insert(
             "dd_rust_network_mutex_raft_log_full_reads_total".into(),
             1.0,
         );
@@ -2857,6 +2984,8 @@ nan_value NaN\n",
         assert!(joined.contains("proxy_forwarded=1.500"));
         assert!(joined.contains("commit_slot_writes=2"));
         assert!(joined.contains("commit_slot_bytes=2048"));
+        assert!(joined.contains("commit_slot_write_us=500"));
+        assert!(joined.contains("log_append_write_us=1000"));
         assert!(joined.contains("full_log_reads=0"));
         assert!(joined.contains("full_log_read_failures=0"));
         assert!(joined.contains("full_log_read_bytes=0"));

@@ -8,14 +8,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+
+const DEFAULT_LIVE_HTTP_REQUEST_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_KUBECTL_REQUEST_TIMEOUT: &str = "5s";
+const DEFAULT_KUBECTL_PROCESS_TIMEOUT_MS: u64 = 15_000;
+const KUBECTL_OUTPUT_PREVIEW_BYTES: usize = 4096;
 
 fn require_http() -> String {
     env::var("LMX_LIVE_RAFT_HTTP").expect(
@@ -501,6 +506,50 @@ fn parse_live_positive_u64(name: &str, value: &str) -> u64 {
     parsed
 }
 
+fn live_http_request_timeout_from(value: Option<&str>) -> Duration {
+    let millis = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_live_positive_u64("LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS", value))
+        .unwrap_or(DEFAULT_LIVE_HTTP_REQUEST_TIMEOUT_MS);
+    Duration::from_millis(millis)
+}
+
+fn live_http_request_timeout() -> Duration {
+    let value = env::var("LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS").ok();
+    live_http_request_timeout_from(value.as_deref())
+}
+
+fn kubectl_request_timeout_arg_from(value: Option<&str>) -> Option<String> {
+    let value = value
+        .map(str::trim)
+        .unwrap_or(DEFAULT_KUBECTL_REQUEST_TIMEOUT);
+    if value.is_empty() || value == "0" || value.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(format!("--request-timeout={value}"))
+    }
+}
+
+fn kubectl_request_timeout_arg() -> Option<String> {
+    let value = env::var("LMX_LIVE_RAFT_KUBECTL_REQUEST_TIMEOUT").ok();
+    kubectl_request_timeout_arg_from(value.as_deref())
+}
+
+fn kubectl_process_timeout_from(value: Option<&str>) -> Duration {
+    let millis = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| parse_live_positive_u64("LMX_LIVE_RAFT_KUBECTL_PROCESS_TIMEOUT_MS", value))
+        .unwrap_or(DEFAULT_KUBECTL_PROCESS_TIMEOUT_MS);
+    Duration::from_millis(millis)
+}
+
+fn kubectl_process_timeout() -> Duration {
+    let value = env::var("LMX_LIVE_RAFT_KUBECTL_PROCESS_TIMEOUT_MS").ok();
+    kubectl_process_timeout_from(value.as_deref())
+}
+
 fn assert_live_raft_cluster_status(
     status: &Value,
     expected_cluster_size: u64,
@@ -887,8 +936,8 @@ fn run_kubectl(args: &[&str]) {
         "kubectl command failed: {} {}\nstdout:\n{}\nstderr:\n{}",
         env::var("KUBECTL").unwrap_or_else(|_| "kubectl".into()),
         args.join(" "),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        kubectl_output_preview(&output.stdout),
+        kubectl_output_preview(&output.stderr)
     );
 }
 
@@ -900,10 +949,58 @@ fn run_kubectl_output(args: &[&str]) -> std::process::Output {
             command.arg("--context").arg(context);
         }
     }
+    if let Some(timeout_arg) = kubectl_request_timeout_arg() {
+        command.arg(timeout_arg);
+    }
     command.args(args);
-    command
-        .output()
-        .unwrap_or_else(|err| panic!("failed to spawn {kubectl}: {err}"))
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let process_timeout = kubectl_process_timeout();
+    let started = Instant::now();
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to spawn {kubectl}: {err}"));
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .unwrap_or_else(|err| panic!("failed to collect {kubectl} output: {err}"));
+            }
+            Ok(None) if started.elapsed() >= process_timeout => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap_or_else(|err| {
+                    panic!("failed to collect timed out {kubectl} output: {err}")
+                });
+                panic!(
+                    "kubectl command timed out after {process_timeout:?}: {} {}\nstdout:\n{}\nstderr:\n{}",
+                    kubectl,
+                    args.join(" "),
+                    kubectl_output_preview(&output.stdout),
+                    kubectl_output_preview(&output.stderr)
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => panic!("failed to wait for {kubectl}: {err}"),
+        }
+    }
+}
+
+fn kubectl_output_preview(output: &[u8]) -> String {
+    let output = String::from_utf8_lossy(output);
+    if output.len() <= KUBECTL_OUTPUT_PREVIEW_BYTES {
+        return output.into_owned();
+    }
+
+    let mut preview = String::new();
+    for (idx, ch) in output.char_indices() {
+        if idx >= KUBECTL_OUTPUT_PREVIEW_BYTES {
+            break;
+        }
+        preview.push(ch);
+    }
+    format!("{preview}\n... truncated after {KUBECTL_OUTPUT_PREVIEW_BYTES} bytes ...")
 }
 
 fn kubectl_pod_uid(namespace: &str, pod: &str) -> String {
@@ -919,8 +1016,8 @@ fn kubectl_pod_uid(namespace: &str, pod: &str) -> String {
     assert!(
         output.status.success(),
         "failed to read BrokerRaft leader pod UID for {pod}\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        kubectl_output_preview(&output.stdout),
+        kubectl_output_preview(&output.stderr)
     );
     let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
     assert!(
@@ -957,6 +1054,22 @@ fn wait_for_pod_uid_change(namespace: &str, pod: &str, old_uid: &str, timeout: D
 }
 
 async fn http_request(
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> std::io::Result<(u16, String)> {
+    let timeout = live_http_request_timeout();
+    match tokio::time::timeout(timeout, http_request_once(endpoint, method, path, body)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("live BrokerRaft HTTP request timed out after {timeout:?}: {method} {endpoint}{path}"),
+        )),
+    }
+}
+
+async fn http_request_once(
     endpoint: &str,
     method: &str,
     path: &str,
@@ -1024,6 +1137,31 @@ fn uuid_short() -> String {
 mod tests {
     use super::*;
 
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct TestEnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TestEnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
     #[test]
     fn parse_live_metrics_endpoints_trims_and_drops_empty_entries() {
         assert_eq!(
@@ -1089,6 +1227,99 @@ mod tests {
     #[should_panic(expected = "TEST_VALUE must be a positive integer")]
     fn parse_live_positive_u64_rejects_non_numeric_values() {
         parse_live_positive_u64("TEST_VALUE", "five");
+    }
+
+    #[test]
+    fn live_http_request_timeout_defaults_and_parses_millis() {
+        assert_eq!(
+            live_http_request_timeout_from(None),
+            Duration::from_millis(DEFAULT_LIVE_HTTP_REQUEST_TIMEOUT_MS)
+        );
+        assert_eq!(
+            live_http_request_timeout_from(Some("2500")),
+            Duration::from_millis(2500)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_http_request_times_out_against_half_open_service() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _timeout = TestEnvVarGuard::set("LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS", "40");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind half-open HTTP listener");
+        let endpoint = listener.local_addr().expect("listener addr").to_string();
+
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept half-open client");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        });
+
+        let started = Instant::now();
+        let err = http_request(&endpoint, "GET", "/raft/status", None)
+            .await
+            .expect_err("half-open live HTTP request should time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "half-open live HTTP request should fail near the configured timeout, not wait for server close"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "kubectl command timed out after")]
+    async fn kubectl_process_timeout_kills_stuck_child() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _kubectl = TestEnvVarGuard::set("KUBECTL", "/bin/sleep");
+        let _context = TestEnvVarGuard::set("LMX_LIVE_RAFT_KUBE_CONTEXT", "");
+        let _request_timeout =
+            TestEnvVarGuard::set("LMX_LIVE_RAFT_KUBECTL_REQUEST_TIMEOUT", "none");
+        let _process_timeout =
+            TestEnvVarGuard::set("LMX_LIVE_RAFT_KUBECTL_PROCESS_TIMEOUT_MS", "40");
+
+        let _ = run_kubectl_output(&["5"]);
+    }
+
+    #[test]
+    fn kubectl_request_timeout_arg_defaults_to_fail_fast() {
+        assert_eq!(
+            kubectl_request_timeout_arg_from(None),
+            Some("--request-timeout=5s".to_string())
+        );
+        assert_eq!(
+            kubectl_request_timeout_arg_from(Some(" 2s ")),
+            Some("--request-timeout=2s".to_string())
+        );
+    }
+
+    #[test]
+    fn kubectl_request_timeout_arg_can_be_disabled_explicitly() {
+        assert_eq!(kubectl_request_timeout_arg_from(Some("")), None);
+        assert_eq!(kubectl_request_timeout_arg_from(Some("0")), None);
+        assert_eq!(kubectl_request_timeout_arg_from(Some("none")), None);
+    }
+
+    #[test]
+    fn kubectl_process_timeout_defaults_and_parses_millis() {
+        assert_eq!(
+            kubectl_process_timeout_from(None),
+            Duration::from_millis(DEFAULT_KUBECTL_PROCESS_TIMEOUT_MS)
+        );
+        assert_eq!(
+            kubectl_process_timeout_from(Some("250")),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn kubectl_output_preview_truncates_large_outputs() {
+        let output = vec![b'x'; KUBECTL_OUTPUT_PREVIEW_BYTES + 10];
+        let preview = kubectl_output_preview(&output);
+        assert!(preview.contains("truncated after 4096 bytes"));
+        assert!(preview.starts_with(&"x".repeat(KUBECTL_OUTPUT_PREVIEW_BYTES)));
+        assert!(!preview.starts_with(&"x".repeat(KUBECTL_OUTPUT_PREVIEW_BYTES + 1)));
     }
 
     #[test]

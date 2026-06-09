@@ -12,6 +12,8 @@ bench_keys="${BENCH_KEYS:-128}"
 bench_duration_ms="${BENCH_DURATION_MS:-3000}"
 bench_min_raft_batch_entries="${BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH:-}"
 bench_max_raft_commit_slot_writes="${BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE:-}"
+bench_max_raft_log_append_write_us="${BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE:-}"
+bench_max_raft_commit_slot_write_us="${BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE:-}"
 run_bench="${RUN_BENCH:-true}"
 run_clippy="${RUN_CLIPPY:-true}"
 clippy_scope="${CLIPPY_SCOPE:-all-targets}"
@@ -57,6 +59,8 @@ env:
   BENCH_MAX_RAFT_P99_MS=<optional>
   BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=${bench_min_raft_batch_entries:-<optional>}
   BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=${bench_max_raft_commit_slot_writes:-<optional>}
+  BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE=${bench_max_raft_log_append_write_us:-<optional>}
+  BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE=${bench_max_raft_commit_slot_write_us:-<optional>}
 EOF
 }
 
@@ -928,6 +932,8 @@ if [ "$run_bench" = true ]; then
     BENCH_RAFT_METRICS=true \
     BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH="$bench_min_raft_batch_entries" \
     BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE="$bench_max_raft_commit_slot_writes" \
+    BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE="$bench_max_raft_log_append_write_us" \
+    BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE="$bench_max_raft_commit_slot_write_us" \
     "$script_dir/profile-broker.sh" bench
 
   run env PROFILE="$profile" \
@@ -940,6 +946,8 @@ if [ "$run_bench" = true ]; then
     BENCH_RAFT_METRICS=true \
     BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH="$bench_min_raft_batch_entries" \
     BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE="$bench_max_raft_commit_slot_writes" \
+    BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE="$bench_max_raft_log_append_write_us" \
+    BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE="$bench_max_raft_commit_slot_write_us" \
     "$script_dir/profile-broker.sh" bench
 fi
 

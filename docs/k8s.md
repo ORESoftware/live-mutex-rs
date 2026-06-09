@@ -476,6 +476,17 @@ Service HTTP endpoint per Raft node. The hardening gate and soak wrapper require
 that list by default when `RUN_K8S_RAFT_LIVE=true`; direct cargo smoke runs can
 omit it for behavior-only evidence.
 
+The Kubernetes-driven failover smoke is intentionally fail-fast when the
+control plane or Raft Service is unreachable: each live HTTP request is capped
+by `LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS=10000`, it passes
+`--request-timeout=5s` to `kubectl`, and kills any still-running `kubectl` child
+after 15 seconds. Override those bounds with
+`LMX_LIVE_RAFT_HTTP_REQUEST_TIMEOUT_MS=30000`,
+`LMX_LIVE_RAFT_KUBECTL_REQUEST_TIMEOUT=10s`, and
+`LMX_LIVE_RAFT_KUBECTL_PROCESS_TIMEOUT_MS=30000`; set
+`LMX_LIVE_RAFT_KUBECTL_REQUEST_TIMEOUT=none` only when a specific kubectl plugin
+or proxy cannot tolerate the global request-timeout flag.
+
 The ignored Raft live smoke also has an opt-in failover path. It observes the
 leader through `/raft/status`, records a bounded no-wait acquire/release
 history through the Service, deletes that leader pod with `kubectl` while more

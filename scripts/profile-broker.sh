@@ -86,6 +86,8 @@ usage() {
   echo "env: BENCH_HTTP_AUTH_TOKEN=$auth_status # falls back to BENCH_RAFT_AUTH_TOKEN, LMX_LIVE_RAFT_AUTH_TOKEN, ALL_DOGS, or LMX_AUTH_TOKEN" >&2
   echo "env: BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH=${BENCH_MIN_RAFT_CLIENT_BATCH_ENTRIES_PER_BATCH:-<optional>}" >&2
   echo "env: BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE=${BENCH_MAX_RAFT_COMMIT_SLOT_WRITES_PER_CYCLE:-<optional>}" >&2
+  echo "env: BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE=${BENCH_MAX_RAFT_LOG_APPEND_WRITE_US_PER_CYCLE:-<optional>}" >&2
+  echo "env: BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE=${BENCH_MAX_RAFT_COMMIT_SLOT_WRITE_US_PER_CYCLE:-<optional>}" >&2
   echo "env: BENCH_RAFT_METRICS=$raft_metrics_default BENCH_RAFT_METRICS_ENDPOINTS=${bench_raft_metrics_endpoints:-<all-local-raft-nodes>}" >&2
   echo "env: CAPTURE_METRICS=$capture_metrics METRICS_TIMEOUT_SECONDS=$metrics_timeout_s" >&2
 }
