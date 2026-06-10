@@ -95,6 +95,8 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
+        runAsUser: 100          # curlimages/curl's uid (named "curl"); explicit so
+        runAsGroup: 100         # kubelet can verify non-root (named USER can't be verified)
         seccompProfile:
           type: RuntimeDefault
       containers:
