@@ -92,9 +92,19 @@ spec:
         role: verify
     spec:
       restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: verify
-          image: curlimages/curl:latest
+          image: curlimages/curl:8.11.1   # pinned (not :latest); image runs as uid 100
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           command: ["sh", "/scripts/verify.sh"]
           env:
             - name: WORKERS
