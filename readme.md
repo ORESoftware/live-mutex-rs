@@ -1,4 +1,12 @@
-# live-mutex-rs
+<!-- BEGIN k8s-cluster-submodule-notice -->
+> [!NOTE]
+> **Canonical source.** This repository is the source of truth for its code. It
+> is also vendored as a **secondary** git submodule of
+> [ORESoftware/k8s-cluster](https://github.com/ORESoftware/k8s-cluster) at
+> `remote/submodules/rust-network-mutex-rs` — make changes here, not in that submodule checkout.
+>
+> On disk: source clone `~/codes/ores/live-mutex-rs` · submodule checkout `~/codes/ores/k8s-cluster/remote/submodules/rust-network-mutex-rs`.
+<!-- END k8s-cluster-submodule-notice --># live-mutex-rs
 
 [![CI: cargo test](https://img.shields.io/badge/test-cargo%20test-blue?style=flat-square)](#local-development)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
