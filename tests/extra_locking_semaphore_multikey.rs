@@ -110,7 +110,10 @@ fn e1_exclusive_handoff_issues_monotonic_fencing_tokens() {
     assert!(!acq_b, "B must fail fast while A holds k");
 
     // A releases, B re-acquires with a STRICTLY HIGHER fencing token.
-    broker.handle_request(a, unlock_key("a-unlock", "k", &uuid_a.expect("A lock_uuid")));
+    broker.handle_request(
+        a,
+        unlock_key("a-unlock", "k", &uuid_a.expect("A lock_uuid")),
+    );
     let _ = drain(&mut a_rx);
     broker.handle_request(b, lock_req("b2", "k", None, false));
     let (acq_b2, _, fence_b2) = single_grant(&drain(&mut b_rx)).expect("B retry reply");
