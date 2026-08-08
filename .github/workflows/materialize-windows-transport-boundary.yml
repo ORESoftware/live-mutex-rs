@@ -6,6 +6,7 @@ on:
       - fix/rust-1-97-clippy-baseline
     paths:
       - .github/workflows/materialize-windows-transport-boundary.yml
+      - .github/scripts/disambiguate-client-uds-materializer.py
       - .github/scripts/materialize-windows-transport-boundary.py
 
 permissions:
@@ -35,7 +36,11 @@ jobs:
           components: rustfmt, clippy
 
       - name: Materialize portable transport boundary
-        run: python3 .github/scripts/materialize-windows-transport-boundary.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/disambiguate-client-uds-materializer.py
+          python3 .github/scripts/materialize-windows-transport-boundary.py
 
       - name: Verify Unix behavior remains strict
         shell: bash
