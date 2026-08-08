@@ -33,7 +33,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - name: Apply only the two Rust 1.97 lint migrations
+      - name: Apply only the three observed Rust 1.97 lint migrations
         shell: bash
         run: |
           set -euo pipefail
@@ -51,27 +51,58 @@ jobs:
 
           config = Path('src/config.rs')
           config_text = config.read_text(encoding='utf-8')
-          pattern = re.compile(
+          boolean_pattern = re.compile(
               r'(?P<indent>^[ \t]*)assert_eq!\(\s*'
               r'runtime\.raft\.peers\.iter\(\)\.any\(\|peer\| peer\.id == "node-4"\),\s*'
               r'false\s*'
               r'\);',
               re.MULTILINE,
           )
-          matches = list(pattern.finditer(config_text))
+          matches = list(boolean_pattern.finditer(config_text))
           replacement = (
               r'\g<indent>assert!(!runtime.raft.peers.iter().any(|peer| peer.id == "node-4"));'
           )
           if len(matches) != 1:
               raise SystemExit(f'expected one boolean comparison assertion, got {len(matches)}')
-          config_text, count = pattern.subn(replacement, config_text, count=1)
+          config_text, count = boolean_pattern.subn(replacement, config_text, count=1)
           if count != 1:
               raise SystemExit(f'expected one config replacement, got {count}')
           config.write_text(config_text, encoding='utf-8')
+
+          integration = Path('tests/extra_locking_semaphore_multikey.rs')
+          integration_text = integration.read_text(encoding='utf-8')
+          import_anchor = 'use tokio::sync::mpsc::UnboundedReceiver;\n\n'
+          type_alias = (
+              'type CompositeGrant = (\n'
+              '    bool,\n'
+              '    Option<String>,\n'
+              '    Option<std::collections::BTreeMap<String, u64>>,\n'
+              ');\n\n'
+          )
+          old_signature = (
+              'fn composite_grant(\n'
+              '    msgs: &[Response],\n'
+              ') -> Option<(\n'
+              '    bool,\n'
+              '    Option<String>,\n'
+              '    Option<std::collections::BTreeMap<String, u64>>,\n'
+              ')> {\n'
+          )
+          new_signature = 'fn composite_grant(msgs: &[Response]) -> Option<CompositeGrant> {\n'
+          if integration_text.count(import_anchor) != 1:
+              raise SystemExit('expected one integration-test import anchor')
+          if integration_text.count(old_signature) != 1 or integration_text.count(new_signature) != 0:
+              raise SystemExit('unexpected composite helper signature')
+          integration_text = integration_text.replace(
+              import_anchor,
+              import_anchor + type_alias,
+              1,
+          ).replace(old_signature, new_signature, 1)
+          integration.write_text(integration_text, encoding='utf-8')
           PY
           cargo fmt --all
           git diff --check
-          test "$(git diff --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs'
+          test "$(git diff --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs tests/extra_locking_semaphore_multikey.rs'
 
       - name: Verify strict lint and focused behavior
         shell: bash
@@ -80,6 +111,7 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked config::tests -- --nocapture
           cargo test --locked sockopt::tests -- --nocapture
+          cargo test --locked --test extra_locking_semaphore_multikey -- --nocapture
 
       - name: Commit the bounded baseline repair
         shell: bash
@@ -87,7 +119,7 @@ jobs:
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add src/config.rs src/sockopt.rs
-          test "$(git diff --cached --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs'
+          git add src/config.rs src/sockopt.rs tests/extra_locking_semaphore_multikey.rs
+          test "$(git diff --cached --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs tests/extra_locking_semaphore_multikey.rs'
           git commit -m 'fix: satisfy Rust 1.97 Clippy baseline'
           git push origin HEAD:fix/rust-1-97-clippy-baseline
