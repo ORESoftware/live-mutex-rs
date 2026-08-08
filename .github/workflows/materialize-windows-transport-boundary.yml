@@ -1,0 +1,203 @@
+name: Materialize Windows transport boundary
+
+on:
+  push:
+    branches:
+      - fix/rust-1-97-clippy-baseline
+    paths:
+      - .github/workflows/materialize-windows-transport-boundary.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-transport-boundary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  materialize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact cleanup branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: fix/rust-1-97-clippy-baseline
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install pinned Rust toolchain action
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Materialize the portable TCP and Unix-only UDS boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          client = Path('src/client.rs')
+          text = client.read_text(encoding='utf-8')
+          old_import = 'use tokio::net::{TcpStream, UnixStream};'
+          new_import = 'use tokio::net::TcpStream;\n#[cfg(unix)]\nuse tokio::net::UnixStream;'
+          if text.count(old_import) != 1 or text.count(new_import) != 0:
+              raise SystemExit('unexpected client transport import state')
+          text = text.replace(old_import, new_import, 1)
+          uds_marker = '    pub async fn connect_uds(\n'
+          cfg_uds_marker = '    #[cfg(unix)]\n    pub async fn connect_uds(\n'
+          if text.count(uds_marker) != 1 or text.count(cfg_uds_marker) != 0:
+              raise SystemExit('unexpected client UDS method state')
+          text = text.replace(uds_marker, cfg_uds_marker, 1)
+          start_marker = '    async fn start<S>(stream: S, config: ClientConfig) -> Result<Self, ClientError>\n'
+          windows_stub = '''    #[cfg(not(unix))]
+    pub async fn connect_uds(
+        path: impl AsRef<Path>,
+        config: ClientConfig,
+    ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-client-uds-unsupported-windows-P4n");
+        let _ = (path.as_ref(), config);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unix-domain sockets are unavailable on this platform; use connect_tcp",
+        )
+        .into())
+    }
+
+'''
+          if text.count(start_marker) != 1 or windows_stub in text:
+              raise SystemExit('unexpected client start/stub state')
+          text = text.replace(start_marker, windows_stub + start_marker, 1)
+          client.write_text(text, encoding='utf-8')
+
+          server = Path('src/server.rs')
+          text = server.read_text(encoding='utf-8')
+          old_import = 'use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};'
+          new_import = (
+              'use tokio::net::{TcpListener, TcpStream};\n'
+              '#[cfg(unix)]\n'
+              'use tokio::net::{UnixListener, UnixStream};'
+          )
+          if text.count(old_import) != 1 or text.count(new_import) != 0:
+              raise SystemExit('unexpected server transport import state')
+          text = text.replace(old_import, new_import, 1)
+
+          old_fd = '''                        let fd: std::os::fd::RawFd = {
+                            use std::os::fd::AsRawFd;
+                            sock.as_raw_fd()
+                        };'''
+          new_fd = '                        let fd = crate::sockopt::socket_handle(&sock);'
+          if text.count(old_fd) != 1 or text.count(new_fd) != 0:
+              raise SystemExit('unexpected accepted-socket handle state')
+          text = text.replace(old_fd, new_fd, 1)
+
+          old_field = '        fd: std::os::fd::RawFd,'
+          new_field = '        fd: crate::sockopt::SocketHandle,'
+          if text.count(old_field) != 1 or text.count(new_field) != 0:
+              raise SystemExit('unexpected AfterRead handle state')
+          text = text.replace(old_field, new_field, 1)
+
+          uds_block = '    if let Some(path) = config.uds_path.clone() {\n'
+          cfg_uds_block = '    #[cfg(unix)]\n    if let Some(path) = config.uds_path.clone() {\n'
+          if text.count(uds_block) != 1 or text.count(cfg_uds_block) != 0:
+              raise SystemExit('unexpected server UDS listener state')
+          text = text.replace(uds_block, cfg_uds_block, 1)
+
+          status_marker = '    let status_info = Arc::new(build_status_info(&config));\n'
+          windows_uds = '''    #[cfg(not(unix))]
+    if let Some(path) = config.uds_path.as_ref() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Unix-domain socket listener {} is unavailable on this platform",
+                path.display()
+            ),
+        ));
+    }
+
+'''
+          if text.count(status_marker) != 1 or windows_uds in text:
+              raise SystemExit('unexpected server status/Windows UDS state')
+          text = text.replace(status_marker, windows_uds + status_marker, 1)
+
+          uds_helper = '#[allow(dead_code)]\nasync fn _ensure_uds_handler_compiles(\n'
+          cfg_uds_helper = '#[cfg(unix)]\n#[allow(dead_code)]\nasync fn _ensure_uds_handler_compiles(\n'
+          if text.count(uds_helper) != 1 or text.count(cfg_uds_helper) != 0:
+              raise SystemExit('unexpected UDS helper state')
+          text = text.replace(uds_helper, cfg_uds_helper, 1)
+          server.write_text(text, encoding='utf-8')
+
+          sockopt = Path('src/sockopt.rs')
+          text = sockopt.read_text(encoding='utf-8')
+          old_import = '''#[cfg(any(test, feature = "tls"))]
+#[allow(unused_imports)]
+use std::os::fd::AsRawFd;
+'''
+          new_import = '''#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
+
+#[cfg(unix)]
+pub type SocketHandle = RawFd;
+#[cfg(windows)]
+pub type SocketHandle = RawSocket;
+
+/// Capture the platform-native socket handle before a stream is moved into
+/// an optional TLS wrapper. QUICKACK uses it only on Linux; other platforms
+/// retain the handle solely so the shared read hook remains portable.
+pub fn socket_handle(stream: &tokio::net::TcpStream) -> SocketHandle {
+    crate::routine_id!("ddl-routine-socket-handle-portable-W7m");
+    #[cfg(unix)]
+    {
+        stream.as_raw_fd()
+    }
+    #[cfg(windows)]
+    {
+        stream.as_raw_socket()
+    }
+}
+'''
+          if text.count(old_import) != 1 or 'pub type SocketHandle' in text:
+              raise SystemExit('unexpected sockopt import/handle state')
+          text = text.replace(old_import, new_import, 1)
+          old_sig = 'pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {'
+          new_sig = 'pub fn apply_quickack(_fd: SocketHandle) -> io::Result<bool> {'
+          if text.count(old_sig) != 1 or text.count(new_sig) != 0:
+              raise SystemExit('unexpected QUICKACK signature state')
+          text = text.replace(old_sig, new_sig, 1)
+          old_test = '        let fd = stream.as_raw_fd();'
+          new_test = '        let fd = socket_handle(&stream);'
+          if text.count(old_test) != 1 or text.count(new_test) != 0:
+              raise SystemExit('unexpected QUICKACK test handle state')
+          text = text.replace(old_test, new_test, 1)
+          sockopt.write_text(text, encoding='utf-8')
+          PY
+
+          cargo fmt --all
+          git diff --check
+          actual="$(git diff --name-only | sort | paste -sd ' ' -)"
+          test "$actual" = 'src/client.rs src/server.rs src/sockopt.rs'
+
+      - name: Verify Unix behavior remains strict
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked sockopt::tests -- --nocapture
+          cargo test --locked client::tests -- --nocapture
+
+      - name: Commit only the transport boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/client.rs src/server.rs src/sockopt.rs
+          actual="$(git diff --cached --name-only | sort | paste -sd ' ' -)"
+          test "$actual" = 'src/client.rs src/server.rs src/sockopt.rs'
+          git commit -m 'fix: compile TCP transport on Windows'
+          git push origin HEAD:fix/rust-1-97-clippy-baseline
