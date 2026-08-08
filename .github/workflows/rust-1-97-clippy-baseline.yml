@@ -1,0 +1,93 @@
+name: Materialize Rust 1.97 Clippy baseline
+
+on:
+  push:
+    branches:
+      - fix/rust-1-97-clippy-baseline
+    paths:
+      - .github/workflows/rust-1-97-clippy-baseline.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rust-1-97-clippy-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  materialize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out exact cleanup branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: fix/rust-1-97-clippy-baseline
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Install pinned Rust toolchain action
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Apply only the two Rust 1.97 lint migrations
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          sockopt = Path('src/sockopt.rs')
+          sockopt_text = sockopt.read_text(encoding='utf-8')
+          old_return = '        return Ok(true);'
+          new_return = '        Ok(true)'
+          if sockopt_text.count(old_return) != 1 or sockopt_text.count(new_return) != 0:
+              raise SystemExit('unexpected TCP_QUICKACK return shape')
+          sockopt.write_text(sockopt_text.replace(old_return, new_return), encoding='utf-8')
+
+          config = Path('src/config.rs')
+          config_text = config.read_text(encoding='utf-8')
+          pattern = re.compile(
+              r'(?P<indent>^[ \t]*)assert!\(\s*'
+              r'cfg\.raft\.proxy_retry_budget\s*>=\s*4\s*&&\s*'
+              r'cfg\.raft\.proxy_retry_budget\s*<=\s*150\s*'
+              r'\);',
+              re.MULTILINE,
+          )
+          matches = list(pattern.finditer(config_text))
+          replacement = (
+              r'\g<indent>assert!((4..=150).contains(&cfg.raft.proxy_retry_budget));'
+          )
+          if len(matches) != 1:
+              raise SystemExit(f'expected one proxy retry range assertion, got {len(matches)}')
+          config_text, count = pattern.subn(replacement, config_text, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one config replacement, got {count}')
+          config.write_text(config_text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check
+          test "$(git diff --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs'
+
+      - name: Verify strict lint and focused behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked config::tests -- --nocapture
+          cargo test --locked sockopt::tests -- --nocapture
+
+      - name: Commit the bounded baseline repair
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/config.rs src/sockopt.rs
+          test "$(git diff --cached --name-only | sort | paste -sd ' ' -)" = 'src/config.rs src/sockopt.rs'
+          git commit -m 'fix: satisfy Rust 1.97 Clippy baseline'
+          git push origin HEAD:fix/rust-1-97-clippy-baseline
