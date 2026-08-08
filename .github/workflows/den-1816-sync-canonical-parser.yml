@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out consumer branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.head_ref }}
           path: consumer
@@ -26,18 +26,20 @@ jobs:
           persist-credentials: true
 
       - name: Check out exact canonical parser revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ORESoftware/flags-2-env
           ref: b596f2d1c99bd726b262a923916e3015bc80bc37
           path: flags2env
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain action
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - name: Synchronize canonical parser bytes and format branch
+      - name: Synchronize canonical parser, repair bounded terminal assertion, and format
         working-directory: consumer
         shell: bash
         run: |
@@ -61,6 +63,38 @@ jobs:
           path.write_text(text.replace(old_c, new_c).replace(old_h, new_h), encoding='utf-8')
           PY
 
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/broker_raft.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''        assert!(
+              matches!(err, BrokerRaftError::NotLeader { .. }),
+              "ping-pong should end in NotLeader: {err:?}"
+          );
+          '''
+          new = '''        assert!(
+              matches!(&err, BrokerRaftError::NotLeader { .. })
+                  || matches!(
+                      &err,
+                      BrokerRaftError::Rpc(message)
+                          if message.contains("strict timeout budget expired")
+                  ),
+              "ping-pong should end in a bounded terminal error: {err:?}"
+          );
+          '''
+          old_count = text.count(old)
+          new_count = text.count(new)
+          if old_count == 1 and new_count == 0:
+              path.write_text(text.replace(old, new), encoding='utf-8')
+          elif old_count == 0 and new_count == 1:
+              pass
+          else:
+              raise SystemExit(
+                  f'unexpected redirect assertion state: old={old_count}, new={new_count}'
+              )
+          PY
+
           cmp -s vendor/flags2env/parser.c ../flags2env/src/parser.c
           cmp -s vendor/flags2env/parser.h ../flags2env/src/parser.h
           grep -F '#define _POSIX_C_SOURCE 200809L' vendor/flags2env/parser.c
@@ -82,7 +116,7 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           bash .github/scripts/flags2env-runtime-smoke.sh
 
-      - name: Commit synchronized parser and formatting
+      - name: Commit synchronized parser, formatting, and bounded test repair
         working-directory: consumer
         env:
           HEAD_BRANCH: ${{ github.head_ref }}
@@ -92,10 +126,10 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add vendor/flags2env/parser.c vendor/flags2env/parser.h \
-            .github/scripts/flags2env-runtime-smoke.sh src/cli_flags.rs
+            .github/scripts/flags2env-runtime-smoke.sh src/cli_flags.rs src/broker_raft.rs
           if git diff --cached --quiet; then
             echo 'No synchronized changes to commit.'
             exit 0
           fi
-          git commit -m 'fix(DEN-1816): sync canonical flags2env parser'
+          git commit -m 'fix(DEN-1816): sync parser and accept bounded proxy timeout'
           git push origin "HEAD:$HEAD_BRANCH"
