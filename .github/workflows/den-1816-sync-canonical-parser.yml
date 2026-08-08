@@ -65,33 +65,41 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('src/broker_raft.rs')
           text = path.read_text(encoding='utf-8')
-          old = '''        assert!(
-              matches!(err, BrokerRaftError::NotLeader { .. }),
-              "ping-pong should end in NotLeader: {err:?}"
-          );
-          '''
-          new = '''        assert!(
-              matches!(&err, BrokerRaftError::NotLeader { .. })
-                  || matches!(
-                      &err,
-                      BrokerRaftError::Rpc(message)
-                          if message.contains("strict timeout budget expired")
-                  ),
-              "ping-pong should end in a bounded terminal error: {err:?}"
-          );
-          '''
-          old_count = text.count(old)
-          new_count = text.count(new)
-          if old_count == 1 and new_count == 0:
-              path.write_text(text.replace(old, new), encoding='utf-8')
-          elif old_count == 0 and new_count == 1:
+          old_pattern = re.compile(
+              r'(?m)^\s*assert!\(\n'
+              r'\s*matches!\(err, BrokerRaftError::NotLeader \{ \.\. \}\),\n'
+              r'\s*"ping-pong should end in NotLeader: \{err:\?\}"\n'
+              r'\s*\);\n'
+          )
+          replacement = '\n'.join([
+              '        assert!(',
+              '            matches!(&err, BrokerRaftError::NotLeader { .. })',
+              '                || matches!(',
+              '                    &err,',
+              '                    BrokerRaftError::Rpc(message)',
+              '                        if message.contains("strict timeout budget expired")',
+              '                ),',
+              '            "ping-pong should end in a bounded terminal error: {err:?}"',
+              '        );',
+              '',
+          ])
+          new_marker = 'ping-pong should end in a bounded terminal error: {err:?}'
+          old_matches = list(old_pattern.finditer(text))
+          new_count = text.count(new_marker)
+          if len(old_matches) == 1 and new_count == 0:
+              text, replaced = old_pattern.subn(replacement, text, count=1)
+              if replaced != 1:
+                  raise SystemExit(f'expected one redirect assertion replacement, got {replaced}')
+              path.write_text(text, encoding='utf-8')
+          elif len(old_matches) == 0 and new_count == 1:
               pass
           else:
               raise SystemExit(
-                  f'unexpected redirect assertion state: old={old_count}, new={new_count}'
+                  f'unexpected redirect assertion state: old={len(old_matches)}, new={new_count}'
               )
           PY
 
