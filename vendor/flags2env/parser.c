@@ -17,8 +17,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #elif defined(_WIN32)
-#include <shellapi.h>
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 #ifndef PATH_MAX
