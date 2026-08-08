@@ -981,10 +981,7 @@ mod tests {
         assert!(runtime.raft.enabled);
         assert_eq!(runtime.raft.node_id, "node-4");
         assert_eq!(runtime.raft.advertise_addr.as_deref(), Some("node-4:7980"));
-        assert_eq!(
-            runtime.raft.peers.iter().any(|peer| peer.id == "node-4"),
-            false
-        );
+        assert!(!runtime.raft.peers.iter().any(|peer| peer.id == "node-4"));
         assert_eq!(runtime.raft.cluster_size(), 3);
         assert_eq!(runtime.raft.quorum_size(), 2);
     }

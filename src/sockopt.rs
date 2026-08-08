@@ -52,7 +52,7 @@ pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
     {
