@@ -52,18 +52,18 @@ jobs:
           config = Path('src/config.rs')
           config_text = config.read_text(encoding='utf-8')
           pattern = re.compile(
-              r'(?P<indent>^[ \t]*)assert!\(\s*'
-              r'cfg\.raft\.proxy_retry_budget\s*>=\s*4\s*&&\s*'
-              r'cfg\.raft\.proxy_retry_budget\s*<=\s*150\s*'
+              r'(?P<indent>^[ \t]*)assert_eq!\(\s*'
+              r'runtime\.raft\.peers\.iter\(\)\.any\(\|peer\| peer\.id == "node-4"\),\s*'
+              r'false\s*'
               r'\);',
               re.MULTILINE,
           )
           matches = list(pattern.finditer(config_text))
           replacement = (
-              r'\g<indent>assert!((4..=150).contains(&cfg.raft.proxy_retry_budget));'
+              r'\g<indent>assert!(!runtime.raft.peers.iter().any(|peer| peer.id == "node-4"));'
           )
           if len(matches) != 1:
-              raise SystemExit(f'expected one proxy retry range assertion, got {len(matches)}')
+              raise SystemExit(f'expected one boolean comparison assertion, got {len(matches)}')
           config_text, count = pattern.subn(replacement, config_text, count=1)
           if count != 1:
               raise SystemExit(f'expected one config replacement, got {count}')
