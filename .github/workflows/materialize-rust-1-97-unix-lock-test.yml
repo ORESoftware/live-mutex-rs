@@ -1,0 +1,86 @@
+name: Materialize Unix-only Raft lock test boundary
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - .github/workflows/materialize-rust-1-97-unix-lock-test.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    if: >-
+      github.head_ref == 'fix/rust-1-97-clippy-baseline' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out exact product branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+          persist-credentials: true
+          show-progress: false
+
+      - name: Gate the advisory-lock test at its real platform boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/broker_raft.rs')
+          text = path.read_text(encoding='utf-8')
+          marker = (
+              'dir.join(DATA_DIR_LOCK_FILE).exists(),\n'
+              '            "open should create the advisory lock file"'
+          )
+          if text.count(marker) != 1:
+              raise SystemExit('expected exactly one advisory-lock creation assertion')
+          marker_index = text.index(marker)
+          test_index = text.rfind('    #[test]\n', 0, marker_index)
+          if test_index < 0:
+              raise SystemExit('could not find the owning test attribute')
+          function_window = text[test_index:marker_index]
+          if function_window.count('    fn ') != 1:
+              raise SystemExit('advisory-lock assertion is not owned by exactly one test')
+          preceding = text[max(0, test_index - 80):test_index]
+          if '#[cfg(unix)]' in preceding:
+              raise SystemExit('advisory-lock test is already Unix-gated')
+          text = text[:test_index] + '    #[cfg(unix)]\n' + text[test_index:]
+          path.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate the Linux product baseline
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+
+      - name: Run strict checks and the Unix lock tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked broker_open_data_dir_lock --lib -- --nocapture
+
+      - name: Commit product repair and delete materializer
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/materialize-rust-1-97-unix-lock-test.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/broker_raft.rs \
+            .github/workflows/materialize-rust-1-97-unix-lock-test.yml
+          git diff --cached --check
+          git commit -m 'fix: gate advisory-lock test to Unix platforms'
+          git push origin "HEAD:$HEAD_BRANCH"
