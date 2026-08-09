@@ -26830,6 +26830,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn broker_open_rejects_second_live_data_dir_owner_and_releases_on_drop() {
         let dir = temp_dir("raft-open-data-dir-lock");
