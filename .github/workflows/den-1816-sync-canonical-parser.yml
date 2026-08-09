@@ -106,12 +106,14 @@ jobs:
           python3 <<'PY'
           from pathlib import Path
 
-          repairs = {
-              Path('src/sockopt.rs'): (
+          repairs = [
+              (
+                  Path('src/sockopt.rs'),
                   '        return Ok(true);\n',
                   '        Ok(true)\n',
               ),
-              Path('src/config.rs'): (
+              (
+                  Path('src/config.rs'),
                   '        assert_eq!(\n'
                   '            runtime.raft.peers.iter().any(|peer| peer.id == "node-4"),\n'
                   '            false\n'
@@ -122,8 +124,34 @@ jobs:
                   '            .iter()\n'
                   '            .any(|peer| peer.id == "node-4"));\n',
               ),
-          }
-          for path, (old, new) in repairs.items():
+              (
+                  Path('tests/extra_locking_semaphore_multikey.rs'),
+                  'use tokio::sync::mpsc::UnboundedReceiver;\n\nfn drain',
+                  'use tokio::sync::mpsc::UnboundedReceiver;\n\n'
+                  'type CompositeGrant = (\n'
+                  '    bool,\n'
+                  '    Option<String>,\n'
+                  '    Option<std::collections::BTreeMap<String, u64>>,\n'
+                  ');\n\nfn drain',
+              ),
+              (
+                  Path('tests/extra_locking_semaphore_multikey.rs'),
+                  'fn composite_grant(\n'
+                  '    msgs: &[Response],\n'
+                  ') -> Option<(\n'
+                  '    bool,\n'
+                  '    Option<String>,\n'
+                  '    Option<std::collections::BTreeMap<String, u64>>,\n'
+                  ')> {\n',
+                  'fn composite_grant(msgs: &[Response]) -> Option<CompositeGrant> {\n',
+              ),
+              (
+                  Path('tests/k8s_raft_live_smoke.rs'),
+                  '    found.then(|| total as u64)\n',
+                  '    found.then_some(total as u64)\n',
+              ),
+          ]
+          for path, old, new in repairs:
               text = path.read_text(encoding='utf-8')
               if text.count(old) != 1:
                   raise SystemExit(
@@ -164,7 +192,8 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add vendor/flags2env/parser.c vendor/flags2env/parser.h \
             .github/scripts/flags2env-runtime-smoke.sh src/cli_flags.rs src/broker_raft.rs \
-            src/sockopt.rs src/config.rs
+            src/sockopt.rs src/config.rs tests/extra_locking_semaphore_multikey.rs \
+            tests/k8s_raft_live_smoke.rs
           if git diff --cached --quiet; then
             echo 'No synchronized changes to commit.'
             exit 0
