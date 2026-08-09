@@ -15,6 +15,12 @@ use dd_rust_network_mutex::{
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
+type CompositeGrant = (
+    bool,
+    Option<String>,
+    Option<std::collections::BTreeMap<String, u64>>,
+);
+
 fn drain(rx: &mut UnboundedReceiver<Response>) -> Vec<Response> {
     let mut out = Vec::new();
     while let Ok(msg) = rx.try_recv() {
@@ -75,13 +81,7 @@ fn single_grant(msgs: &[Response]) -> Option<(bool, Option<String>, Option<u64>)
     })
 }
 
-fn composite_grant(
-    msgs: &[Response],
-) -> Option<(
-    bool,
-    Option<String>,
-    Option<std::collections::BTreeMap<String, u64>>,
-)> {
+fn composite_grant(msgs: &[Response]) -> Option<CompositeGrant> {
     msgs.iter().find_map(|m| match m {
         Response::CompositeLock {
             acquired,
