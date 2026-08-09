@@ -37,7 +37,7 @@ pub enum ConfigError {
     #[error("failed to parse config file `{path}`: {source}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("invalid socket address `{value}` from {from}")]
     InvalidSocketAddr { value: String, from: String },
@@ -158,7 +158,7 @@ fn read_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
     })?;
     toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(source),
     })
 }
 
