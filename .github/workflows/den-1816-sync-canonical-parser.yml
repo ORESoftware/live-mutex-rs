@@ -103,6 +103,35 @@ jobs:
               )
           PY
 
+          python3 <<'PY'
+          from pathlib import Path
+
+          repairs = {
+              Path('src/sockopt.rs'): (
+                  '        return Ok(true);\n',
+                  '        Ok(true)\n',
+              ),
+              Path('src/config.rs'): (
+                  '        assert_eq!(\n'
+                  '            runtime.raft.peers.iter().any(|peer| peer.id == "node-4"),\n'
+                  '            false\n'
+                  '        );\n',
+                  '        assert!(!runtime\n'
+                  '            .raft\n'
+                  '            .peers\n'
+                  '            .iter()\n'
+                  '            .any(|peer| peer.id == "node-4"));\n',
+              ),
+          }
+          for path, (old, new) in repairs.items():
+              text = path.read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise SystemExit(
+                      f'expected exactly one Rust 1.97 compatibility pattern in {path}'
+                  )
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
           cmp -s vendor/flags2env/parser.c ../flags2env/src/parser.c
           cmp -s vendor/flags2env/parser.h ../flags2env/src/parser.h
           grep -F '#define _POSIX_C_SOURCE 200809L' vendor/flags2env/parser.c
@@ -134,10 +163,11 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add vendor/flags2env/parser.c vendor/flags2env/parser.h \
-            .github/scripts/flags2env-runtime-smoke.sh src/cli_flags.rs src/broker_raft.rs
+            .github/scripts/flags2env-runtime-smoke.sh src/cli_flags.rs src/broker_raft.rs \
+            src/sockopt.rs src/config.rs
           if git diff --cached --quiet; then
             echo 'No synchronized changes to commit.'
             exit 0
           fi
-          git commit -m 'fix(DEN-1816): sync parser and accept bounded proxy timeout'
+          git commit -m 'fix(DEN-1816): sync parser and repair strict validation'
           git push origin "HEAD:$HEAD_BRANCH"
