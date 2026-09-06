@@ -670,7 +670,7 @@ fn prometheus_metric_value(metrics: &str, name: &str) -> Option<u64> {
             found = true;
         }
     }
-    found.then(|| total as u64)
+    found.then_some(total as u64)
 }
 
 async fn http_json_retrying_unavailable(

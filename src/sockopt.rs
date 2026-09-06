@@ -21,9 +21,30 @@
 
 use std::io;
 
-#[cfg(any(test, feature = "tls"))]
-#[allow(unused_imports)]
-use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, RawSocket};
+
+#[cfg(unix)]
+pub type SocketHandle = RawFd;
+#[cfg(windows)]
+pub type SocketHandle = RawSocket;
+
+/// Capture the platform-native socket handle before a stream is moved into
+/// an optional TLS wrapper. QUICKACK uses it only on Linux; other platforms
+/// retain the handle solely so the shared read hook remains portable.
+pub fn socket_handle(stream: &tokio::net::TcpStream) -> SocketHandle {
+    crate::routine_id!("ddl-routine-socket-handle-portable-W7m");
+    #[cfg(unix)]
+    {
+        stream.as_raw_fd()
+    }
+    #[cfg(windows)]
+    {
+        stream.as_raw_socket()
+    }
+}
 
 /// Apply `TCP_NODELAY = 1` to a TCP stream. Errors are not fatal — the
 /// option is a hint, and we shouldn't fail the connection on a tunable.
@@ -35,7 +56,7 @@ pub fn apply_nodelay(stream: &tokio::net::TcpStream) -> io::Result<()> {
 /// Apply `TCP_QUICKACK = 1` on Linux. No-op on non-Linux. Returns `Ok(false)`
 /// on platforms where the option doesn't exist so callers can update a
 /// "applied" counter only on real applications.
-pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {
+pub fn apply_quickack(_fd: SocketHandle) -> io::Result<bool> {
     crate::routine_id!("ddl-routine-FrCnst7QDKZRlB2v54");
     #[cfg(target_os = "linux")]
     {
@@ -52,7 +73,7 @@ pub fn apply_quickack(_fd: std::os::fd::RawFd) -> io::Result<bool> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -94,7 +115,7 @@ mod tests {
             let _ = listener.accept().await;
         });
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let fd = stream.as_raw_fd();
+        let fd = socket_handle(&stream);
         // On Linux this returns Ok(true). On macOS / BSD it's a no-op
         // (Ok(false)) — the function MUST NOT fail just because the
         // option doesn't exist there, otherwise the broker can't run on

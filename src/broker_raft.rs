@@ -37,6 +37,7 @@ const LOG_FILE: &str = "raft-log.ndjson";
 const SNAPSHOT_FILE: &str = "raft-snapshot.json";
 const HARD_STATE_FILE: &str = "raft-hard-state.json";
 const HARD_STATE_COMMIT_FILE: &str = "raft-hard-state-commit.slots";
+#[cfg(unix)]
 const DATA_DIR_LOCK_FILE: &str = "broker-raft.lock";
 const HARD_STATE_COMMIT_SLOT_BYTES: usize = 512;
 const HARD_STATE_COMMIT_SLOTS: u64 = 2;
@@ -26829,6 +26830,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn broker_open_rejects_second_live_data_dir_owner_and_releases_on_drop() {
         let dir = temp_dir("raft-open-data-dir-lock");
