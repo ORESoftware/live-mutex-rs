@@ -33,7 +33,9 @@ use axum::{
     Json, Router,
 };
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
@@ -202,10 +204,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                         // Snapshot the fd *before* `sock` is moved into a
                         // TLS wrapper. The fd lives as long as the
                         // connection (TLS owns the underlying socket).
-                        let fd: std::os::fd::RawFd = {
-                            use std::os::fd::AsRawFd;
-                            sock.as_raw_fd()
-                        };
+                        let fd = crate::sockopt::socket_handle(&sock);
                         let after_read = AfterRead::Tcp {
                             fd,
                             flags: tcp_flags_c.clone(),
@@ -262,6 +261,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
         }));
     }
 
+    #[cfg(unix)]
     if let Some(path) = config.uds_path.clone() {
         let listener = UnixListener::bind(&path).map_err(|err| {
             std::io::Error::new(
@@ -301,6 +301,17 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
                 }
             }
         }));
+    }
+
+    #[cfg(not(unix))]
+    if let Some(path) = config.uds_path.as_ref() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "Unix-domain socket listener {} is unavailable on this platform",
+                path.display()
+            ),
+        ));
     }
 
     let status_info = Arc::new(build_status_info(&config));
@@ -529,7 +540,7 @@ pub(crate) enum AfterRead {
     /// queueing a delayed ACK. The `quickack` decision is read
     /// dynamically from the shared `TcpFlags`.
     Tcp {
-        fd: std::os::fd::RawFd,
+        fd: crate::sockopt::SocketHandle,
         flags: Arc<TcpFlags>,
     },
 }
@@ -989,6 +1000,7 @@ async fn _ensure_tcp_handler_compiles(
     handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 async fn _ensure_uds_handler_compiles(
     sock: UnixStream,

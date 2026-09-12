@@ -22,7 +22,9 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -176,6 +178,7 @@ impl Client {
         Self::start(stream, config).await
     }
 
+    #[cfg(unix)]
     pub async fn connect_uds(
         path: impl AsRef<Path>,
         config: ClientConfig,
@@ -183,6 +186,20 @@ impl Client {
         crate::routine_id!("ddl-routine-rymSP7H4L8S6yqNSir");
         let stream = UnixStream::connect(path.as_ref()).await?;
         Self::start(stream, config).await
+    }
+
+    #[cfg(not(unix))]
+    pub async fn connect_uds(
+        path: impl AsRef<Path>,
+        config: ClientConfig,
+    ) -> Result<Self, ClientError> {
+        crate::routine_id!("ddl-routine-client-uds-unsupported-windows-P4n");
+        let _ = (path.as_ref(), config);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Unix-domain sockets are unavailable on this platform; use connect_tcp",
+        )
+        .into())
     }
 
     async fn start<S>(stream: S, config: ClientConfig) -> Result<Self, ClientError>
