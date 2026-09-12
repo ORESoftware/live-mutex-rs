@@ -561,9 +561,12 @@ type = "integer"
         let source = tree.path().join("source/.cli-flags.toml");
         write_contract(&source);
 
-        let err =
-            resolve_cli_flags_config_path_from(Some(PathBuf::from("relative.toml")), None, vec![source])
-                .expect_err("invalid explicit selector must not fall through");
+        let err = resolve_cli_flags_config_path_from(
+            Some(PathBuf::from("relative.toml")),
+            None,
+            vec![source],
+        )
+        .expect_err("invalid explicit selector must not fall through");
         assert!(matches!(err, CliFlagError::ExplicitConfigMustBeAbsolute));
     }
 
@@ -582,13 +585,14 @@ type = "integer"
         write_contract(&colocated);
         write_contract(&fixed);
 
-        let resolved =
-            resolve_cli_flags_config_path_from(None, Some(executable), vec![fixed])
-                .expect("trusted candidates")
-                .expect("packaged contract");
+        let resolved = resolve_cli_flags_config_path_from(None, Some(executable), vec![fixed])
+            .expect("trusted candidates")
+            .expect("packaged contract");
         assert_eq!(
             resolved,
-            packaged.canonicalize().expect("canonical packaged contract")
+            packaged
+                .canonicalize()
+                .expect("canonical packaged contract")
         );
     }
 
@@ -600,13 +604,9 @@ type = "integer"
         write_contract(&fixed);
         write_contract(&source);
 
-        let resolved = resolve_cli_flags_config_path_from(
-            None,
-            None,
-            vec![fixed.clone(), source],
-        )
-        .expect("trusted candidates")
-        .expect("fixed contract");
+        let resolved = resolve_cli_flags_config_path_from(None, None, vec![fixed.clone(), source])
+            .expect("trusted candidates")
+            .expect("fixed contract");
         assert_eq!(
             resolved,
             fixed.canonicalize().expect("canonical fixed contract")
@@ -626,17 +626,20 @@ type = "integer"
         write_contract(&attacker);
         write_contract(&packaged);
 
-        let resolved =
-            resolve_cli_flags_config_path_from(None, Some(executable), Vec::new())
-                .expect("trusted candidates")
-                .expect("packaged contract");
+        let resolved = resolve_cli_flags_config_path_from(None, Some(executable), Vec::new())
+            .expect("trusted candidates")
+            .expect("packaged contract");
         assert_ne!(
             resolved,
-            attacker.canonicalize().expect("canonical attacker contract")
+            attacker
+                .canonicalize()
+                .expect("canonical attacker contract")
         );
         assert_eq!(
             resolved,
-            packaged.canonicalize().expect("canonical packaged contract")
+            packaged
+                .canonicalize()
+                .expect("canonical packaged contract")
         );
     }
 

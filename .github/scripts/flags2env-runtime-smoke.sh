@@ -137,8 +137,8 @@ grep -F -- \
   Dockerfile
 
 test "$(git hash-object vendor/flags2env/parser.c)" \
-  = "2567d723ccdf9f0703dda5dfebac8ac2cb0ff2dd"
+  = "0f41fd4384a4230d190b15d83cbbd33d47a3247e"
 test "$(git hash-object vendor/flags2env/parser.h)" \
-  = "56668698e50bafd8ce1dc49518a93bf9e564d7b5"
+  = "356186dbb31055e4dc3d8688a7692ff773bfd987"
 
 echo "live-mutex-rs trusted flags runtime smoke passed"

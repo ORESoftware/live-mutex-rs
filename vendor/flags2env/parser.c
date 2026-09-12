@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "parser.h"
 
 #include <ctype.h>
@@ -17,8 +21,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #elif defined(_WIN32)
-#include <shellapi.h>
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 #ifndef PATH_MAX
@@ -31,9 +35,17 @@
 #define F2E_MAX_ENV 128
 #define F2E_MAX_VALUE 1024
 #define F2E_MAX_LINE 4096
-#define F2E_MAX_META_PAIRS 3
-#define F2E_MAX_PAIRS (F2E_MAX_FLAGS + F2E_MAX_META_PAIRS)
+#define F2E_MAX_LOGICAL_LINE (F2E_MAX_LINE * 32)
+#define F2E_MAX_META_PAIRS 4
+#define F2E_MAX_COMMANDS 96
+#define F2E_MAX_COMMAND_DEPTH 16
+#define F2E_SCOPE_ROOT (-1)
+/* lenient scope: no subcommand was matched (e.g. a wrapper script stripped
+   it), so scoped flags resolve globally when the name is unambiguous */
+#define F2E_SCOPE_LENIENT (-2)
+#define F2E_MAX_PAIRS (F2E_MAX_FLAGS + F2E_MAX_META_PAIRS + F2E_MAX_COMMANDS)
 #define F2E_MAX_ENV_FILE_KEYS 512
+#define F2E_DEFAULT_COMMAND_ENV "FLAGS2ENV_COMMAND"
 
 #define F2E_HELP_COL_OPTIONS (1u << 0)
 #define F2E_HELP_COL_ENV (1u << 1)
@@ -47,7 +59,10 @@ typedef enum {
   F2E_TYPE_STRING = 0,
   F2E_TYPE_BOOL = 1,
   F2E_TYPE_INT = 2,
-  F2E_TYPE_JSON = 3
+  F2E_TYPE_FLOAT = 3,
+  F2E_TYPE_JSON = 4,
+  F2E_TYPE_ARRAY = 5,
+  F2E_TYPE_MAP = 6
 } F2EValueType;
 
 typedef struct {
@@ -66,11 +81,29 @@ typedef struct {
   int has_default;
   char default_value[F2E_MAX_VALUE];
   char help[F2E_MAX_VALUE];
+  int command; /* index into F2EConfig.commands; F2E_SCOPE_ROOT for global flags */
 } F2EFlag;
+
+typedef struct {
+  char name[F2E_MAX_NAME];
+  char aliases[F2E_MAX_ALIASES][F2E_MAX_NAME];
+  size_t alias_count;
+  char env[F2E_MAX_ENV];
+  char help[F2E_MAX_VALUE];
+  int parent; /* index into F2EConfig.commands; F2E_SCOPE_ROOT for top-level commands */
+  int allow_unknown;
+  int allow_unknown_set; /* command overrides [parse] allow_unknown for its scope */
+} F2ECommand;
 
 typedef struct {
   F2EFlag flags[F2E_MAX_FLAGS];
   size_t flag_count;
+  F2ECommand commands[F2E_MAX_COMMANDS];
+  size_t command_count;
+  char command_env[F2E_MAX_ENV];
+  int too_many_commands;
+  char invalid_command_table[F2E_MAX_VALUE];
+  int has_invalid_command_table;
   int allow_separated_values;
   int stop_at_first_positional;
   char positionals_env[F2E_MAX_ENV];
@@ -113,8 +146,19 @@ typedef enum {
   F2E_SECTION_PARSE = 1,
   F2E_SECTION_FLAG = 2,
   F2E_SECTION_HELP = 3,
-  F2E_SECTION_ENV_AUDIT = 4
+  F2E_SECTION_ENV_AUDIT = 4,
+  F2E_SECTION_COMMAND = 5
 } F2EConfigSection;
+
+typedef struct {
+  int commands[F2E_MAX_COMMAND_DEPTH];
+  size_t depth;
+} F2ECommandPath;
+
+/* defined alongside the parse loop; used earlier by help rendering */
+static void f2e_resolve_command_path(F2EConfig *config, int argc, const char *const argv[], F2ECommandPath *path_out);
+/* defined alongside help rendering; used earlier by completion generation */
+static size_t f2e_help_collect_scope_flags(const F2EConfig *config, int scope, size_t out[F2E_MAX_FLAGS]);
 
 typedef struct {
   F2EBuffer buffer;
@@ -276,6 +320,59 @@ static void f2e_strip_comment(char *line) {
   }
 }
 
+static int f2e_array_value_is_complete(const char *value) {
+  const char *cursor = f2e_trim_left((char *)value);
+  if (*cursor != '[') {
+    return 1;
+  }
+
+  int depth = 0;
+  int in_quote = 0;
+  int escaped = 0;
+  for (; *cursor; cursor++) {
+    if (escaped) {
+      escaped = 0;
+      continue;
+    }
+    if (*cursor == '\\' && in_quote) {
+      escaped = 1;
+      continue;
+    }
+    if (*cursor == '"') {
+      in_quote = !in_quote;
+      continue;
+    }
+    if (in_quote) {
+      continue;
+    }
+    if (*cursor == '[') {
+      depth++;
+    } else if (*cursor == ']') {
+      depth--;
+      if (depth <= 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+static int f2e_append_logical_config_line(char *target,
+                                          size_t target_size,
+                                          const char *fragment) {
+  size_t used = strlen(target);
+  size_t fragment_len = strlen(fragment);
+  size_t separator = used > 0 ? 1 : 0;
+  if (used + separator + fragment_len + 1 > target_size) {
+    return 0;
+  }
+  if (separator) {
+    target[used++] = '\n';
+  }
+  memcpy(target + used, fragment, fragment_len + 1);
+  return 1;
+}
+
 static int f2e_parse_quoted_string(const char *input, char *out, size_t out_size) {
   const char *cursor = f2e_trim_left((char *)input);
   size_t len = 0;
@@ -359,42 +456,209 @@ static F2EFlag *f2e_add_flag(F2EConfig *config, const char *name) {
   F2EFlag *flag = &config->flags[config->flag_count++];
   memset(flag, 0, sizeof(*flag));
   flag->type = F2E_TYPE_STRING;
+  flag->command = F2E_SCOPE_ROOT;
   f2e_strlcpy(flag->name, name, sizeof(flag->name));
   f2e_add_alias(flag, name);
   return flag;
 }
 
-static F2EFlag *f2e_find_flag_by_alias(F2EConfig *config, const char *alias) {
-  for (size_t i = 0; i < config->flag_count; i++) {
-    F2EFlag *flag = &config->flags[i];
-    for (size_t j = 0; j < flag->alias_count; j++) {
-      if (f2e_streq(flag->aliases[j], alias)) {
-        return flag;
-      }
-    }
+static int f2e_scope_parent(const F2EConfig *config, int scope) {
+  if (scope < 0 || (size_t)scope >= config->command_count) {
+    return F2E_SCOPE_ROOT;
   }
-  return NULL;
+  return config->commands[scope].parent;
 }
 
-static const F2EFlag *f2e_find_flag_by_alias_const(const F2EConfig *config, const char *alias) {
+/* Searches every scope; sets *ambiguous when distinct flags share the name. */
+static const F2EFlag *f2e_find_flag_any_scope_by_alias(const F2EConfig *config, const char *alias, int *ambiguous) {
+  const F2EFlag *found = NULL;
   for (size_t i = 0; i < config->flag_count; i++) {
     const F2EFlag *flag = &config->flags[i];
     for (size_t j = 0; j < flag->alias_count; j++) {
-      if (f2e_streq(flag->aliases[j], alias)) {
-        return flag;
+      if (!f2e_streq(flag->aliases[j], alias)) {
+        continue;
+      }
+      if (found && found != flag) {
+        if (ambiguous) {
+          *ambiguous = 1;
+        }
+        return NULL;
+      }
+      found = flag;
+    }
+  }
+  return found;
+}
+
+static const F2EFlag *f2e_find_flag_any_scope_by_short(const F2EConfig *config, char short_name, int *ambiguous) {
+  const F2EFlag *found = NULL;
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (flag->short_name != short_name) {
+      continue;
+    }
+    if (found && found != flag) {
+      if (ambiguous) {
+        *ambiguous = 1;
+      }
+      return NULL;
+    }
+    found = flag;
+  }
+  return found;
+}
+
+/*
+ * Flag lookups resolve against a command scope: the scope's own flags win,
+ * then each ancestor up to the global (root) flags. A subcommand can thereby
+ * reuse an alias or short flag that means something else elsewhere.
+ *
+ * F2E_SCOPE_LENIENT is used when commands are declared but argv selected
+ * none (a wrapper may have consumed the subcommand): root flags win, and a
+ * name that is unambiguous across all scopes resolves as if it were global.
+ */
+static const F2EFlag *f2e_find_flag_by_alias_const(const F2EConfig *config, int scope, const char *alias) {
+  if (scope == F2E_SCOPE_LENIENT) {
+    const F2EFlag *root = f2e_find_flag_by_alias_const(config, F2E_SCOPE_ROOT, alias);
+    if (root) {
+      return root;
+    }
+    return f2e_find_flag_any_scope_by_alias(config, alias, NULL);
+  }
+  for (;;) {
+    for (size_t i = 0; i < config->flag_count; i++) {
+      const F2EFlag *flag = &config->flags[i];
+      if (flag->command != scope) {
+        continue;
+      }
+      for (size_t j = 0; j < flag->alias_count; j++) {
+        if (f2e_streq(flag->aliases[j], alias)) {
+          return flag;
+        }
+      }
+    }
+    if (scope < 0) {
+      return NULL;
+    }
+    scope = f2e_scope_parent(config, scope);
+  }
+}
+
+static F2EFlag *f2e_find_flag_by_alias(F2EConfig *config, int scope, const char *alias) {
+  return (F2EFlag *)f2e_find_flag_by_alias_const(config, scope, alias);
+}
+
+static F2EFlag *f2e_find_flag_by_short(F2EConfig *config, int scope, char short_name) {
+  if (scope == F2E_SCOPE_LENIENT) {
+    F2EFlag *root = f2e_find_flag_by_short(config, F2E_SCOPE_ROOT, short_name);
+    if (root) {
+      return root;
+    }
+    return (F2EFlag *)f2e_find_flag_any_scope_by_short(config, short_name, NULL);
+  }
+  for (;;) {
+    for (size_t i = 0; i < config->flag_count; i++) {
+      if (config->flags[i].command == scope && config->flags[i].short_name == short_name) {
+        return &config->flags[i];
+      }
+    }
+    if (scope < 0) {
+      return NULL;
+    }
+    scope = f2e_scope_parent(config, scope);
+  }
+}
+
+static int f2e_find_command_by_name(const F2EConfig *config, int parent, const char *name) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    if (config->commands[i].parent == parent && f2e_streq(config->commands[i].name, name)) {
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+static int f2e_find_command_by_token(const F2EConfig *config, int parent, const char *token) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->parent != parent) {
+      continue;
+    }
+    if (f2e_streq(command->name, token)) {
+      return (int)i;
+    }
+    for (size_t j = 0; j < command->alias_count; j++) {
+      if (f2e_streq(command->aliases[j], token)) {
+        return (int)i;
       }
     }
   }
-  return NULL;
+  return -1;
 }
 
-static F2EFlag *f2e_find_flag_by_short(F2EConfig *config, char short_name) {
-  for (size_t i = 0; i < config->flag_count; i++) {
-    if (config->flags[i].short_name == short_name) {
-      return &config->flags[i];
+static int f2e_command_has_children(const F2EConfig *config, int scope) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    if (config->commands[i].parent == scope) {
+      return 1;
     }
   }
-  return NULL;
+  return 0;
+}
+
+static size_t f2e_command_depth(const F2EConfig *config, int index) {
+  size_t depth = 0;
+  while (index >= 0 && (size_t)index < config->command_count && depth <= F2E_MAX_COMMANDS) {
+    depth++;
+    index = config->commands[index].parent;
+  }
+  return depth;
+}
+
+static int f2e_command_path_label(const F2EConfig *config, int index, char *out, size_t out_size) {
+  if (!out || out_size == 0) {
+    return 0;
+  }
+  out[0] = '\0';
+  int chain[F2E_MAX_COMMANDS];
+  size_t depth = 0;
+  while (index >= 0 && (size_t)index < config->command_count && depth < F2E_MAX_COMMANDS) {
+    chain[depth++] = index;
+    index = config->commands[index].parent;
+  }
+  size_t used = 0;
+  for (size_t i = depth; i > 0; i--) {
+    const char *name = config->commands[chain[i - 1]].name;
+    size_t name_len = strlen(name);
+    if (used + name_len + (used > 0 ? 1 : 0) + 1 > out_size) {
+      return 0;
+    }
+    if (used > 0) {
+      out[used++] = ' ';
+    }
+    memcpy(out + used, name, name_len);
+    used += name_len;
+  }
+  out[used] = '\0';
+  return 1;
+}
+
+static int f2e_find_or_add_command(F2EConfig *config, int parent, const char *name) {
+  if (!name || name[0] == '\0') {
+    return -1;
+  }
+  int existing = f2e_find_command_by_name(config, parent, name);
+  if (existing >= 0) {
+    return existing;
+  }
+  if (config->command_count >= F2E_MAX_COMMANDS) {
+    config->too_many_commands = 1;
+    return -1;
+  }
+  F2ECommand *command = &config->commands[config->command_count];
+  memset(command, 0, sizeof(*command));
+  f2e_strlcpy(command->name, name, sizeof(command->name));
+  command->parent = parent;
+  return (int)config->command_count++;
 }
 
 static int f2e_parse_alias_list(char aliases[][F2E_MAX_NAME], size_t *alias_count, const char *value) {
@@ -592,8 +856,23 @@ static int f2e_parse_type(const char *value, F2EValueType *type) {
     *type = F2E_TYPE_INT;
     return 1;
   }
+  if (f2e_streq(parsed, "float") || f2e_streq(parsed, "double") ||
+      f2e_streq(parsed, "number") || f2e_streq(parsed, "decimal")) {
+    *type = F2E_TYPE_FLOAT;
+    return 1;
+  }
   if (f2e_streq(parsed, "json")) {
     *type = F2E_TYPE_JSON;
+    return 1;
+  }
+  if (f2e_streq(parsed, "array") || f2e_streq(parsed, "list") ||
+      f2e_streq(parsed, "json-array")) {
+    *type = F2E_TYPE_ARRAY;
+    return 1;
+  }
+  if (f2e_streq(parsed, "map") || f2e_streq(parsed, "object") ||
+      f2e_streq(parsed, "dictionary") || f2e_streq(parsed, "json-object")) {
+    *type = F2E_TYPE_MAP;
     return 1;
   }
   return 0;
@@ -832,6 +1111,105 @@ static int f2e_json_value_is_valid(const char *value) {
   return *cursor == '\0';
 }
 
+static int f2e_table_keyword_is_commands(const char *word) {
+  return f2e_streq(word, "commands") || f2e_streq(word, "command") ||
+         f2e_streq(word, "subcommands") || f2e_streq(word, "subcommand");
+}
+
+static int f2e_table_keyword_is_flags(const char *word) {
+  return f2e_streq(word, "flags") || f2e_streq(word, "flag");
+}
+
+static void f2e_record_invalid_command_table(F2EConfig *config, const char *table) {
+  if (!config->has_invalid_command_table) {
+    config->has_invalid_command_table = 1;
+    f2e_strlcpy(config->invalid_command_table, table, sizeof(config->invalid_command_table));
+  }
+}
+
+/*
+ * Parses a [commands.*] table header such as:
+ *   [commands.add]
+ *   [commands.add.flags.all]
+ *   [commands.remote.commands.add.flags.fetch]
+ * Nesting is arbitrary: each `commands.<name>` segment descends one level and
+ * an optional trailing `flags.<name>` declares a flag scoped to that command.
+ * Keyword and name positions strictly alternate, so command names can even be
+ * the literal words "commands" or "flags" without ambiguity.
+ * Returns 0 when the table is not commands-shaped; otherwise returns 1 and
+ * sets *section_out (plus *flag_out or *command_out).
+ */
+static int f2e_load_commands_table(F2EConfig *config,
+                                   const char *table,
+                                   F2EConfigSection *section_out,
+                                   F2EFlag **flag_out,
+                                   int *command_out) {
+  char copy[F2E_MAX_LINE];
+  f2e_strlcpy(copy, table, sizeof(copy));
+  char *segments[2 * F2E_MAX_COMMAND_DEPTH + 2];
+  size_t segment_count = 0;
+  for (char *cursor = copy; cursor;) {
+    if (segment_count >= sizeof(segments) / sizeof(segments[0])) {
+      return 0;
+    }
+    char *dot = strchr(cursor, '.');
+    if (dot) {
+      *dot = '\0';
+    }
+    segments[segment_count++] = f2e_trim(cursor);
+    cursor = dot ? dot + 1 : NULL;
+  }
+
+  if (segment_count < 2 || !f2e_table_keyword_is_commands(segments[0])) {
+    return 0;
+  }
+
+  *section_out = F2E_SECTION_NONE;
+  *flag_out = NULL;
+  *command_out = F2E_SCOPE_ROOT;
+
+  int scope = F2E_SCOPE_ROOT;
+  size_t index = 0;
+  while (index < segment_count) {
+    if (f2e_table_keyword_is_commands(segments[index])) {
+      if (index + 1 >= segment_count || segments[index + 1][0] == '\0') {
+        f2e_record_invalid_command_table(config, table);
+        return 1;
+      }
+      int next = f2e_find_or_add_command(config, scope, segments[index + 1]);
+      if (next < 0) {
+        return 1;
+      }
+      scope = next;
+      index += 2;
+      continue;
+    }
+    if (f2e_table_keyword_is_flags(segments[index])) {
+      if (index + 2 != segment_count || segments[index + 1][0] == '\0') {
+        f2e_record_invalid_command_table(config, table);
+        return 1;
+      }
+      F2EFlag *flag = f2e_add_flag(config, segments[index + 1]);
+      if (flag) {
+        flag->command = scope;
+        *flag_out = flag;
+        *section_out = F2E_SECTION_FLAG;
+      }
+      return 1;
+    }
+    /* a bare segment where a keyword belongs — usually a shorthand like
+       [commands.publish.init.flags.x]; nesting must spell out the keyword
+       ([commands.publish.commands.init.flags.x]) so command names can never
+       clash with the "commands"/"flags" keywords */
+    f2e_record_invalid_command_table(config, table);
+    return 1;
+  }
+
+  *command_out = scope;
+  *section_out = F2E_SECTION_COMMAND;
+  return 1;
+}
+
 static int f2e_load_config(const char *config_path, F2EConfig *config) {
   memset(config, 0, sizeof(*config));
   config->allow_separated_values = 1;
@@ -843,14 +1221,41 @@ static int f2e_load_config(const char *config_path, F2EConfig *config) {
   }
 
   F2EFlag *current = NULL;
+  int current_command = F2E_SCOPE_ROOT;
   F2EConfigSection section = F2E_SECTION_NONE;
   char line[F2E_MAX_LINE];
+  char logical_line[F2E_MAX_LOGICAL_LINE];
   while (fgets(line, sizeof(line), file)) {
     f2e_strip_comment(line);
     char *trimmed = f2e_trim(line);
     if (trimmed[0] == '\0') {
       continue;
     }
+
+    f2e_strlcpy(logical_line, trimmed, sizeof(logical_line));
+    char *logical_eq = strchr(logical_line, '=');
+    if (logical_eq) {
+      char *logical_value = f2e_trim(logical_eq + 1);
+      while (*logical_value == '[' && !f2e_array_value_is_complete(logical_value)) {
+        if (!fgets(line, sizeof(line), file)) {
+          break;
+        }
+        f2e_strip_comment(line);
+        char *continuation = f2e_trim(line);
+        if (continuation[0] == '\0') {
+          continue;
+        }
+        if (!f2e_append_logical_config_line(logical_line,
+                                            sizeof(logical_line),
+                                            continuation)) {
+          fclose(file);
+          return 0;
+        }
+        logical_eq = strchr(logical_line, '=');
+        logical_value = f2e_trim(logical_eq + 1);
+      }
+    }
+    trimmed = f2e_trim(logical_line);
 
     if (trimmed[0] == '[') {
       char *end = strchr(trimmed, ']');
@@ -860,11 +1265,21 @@ static int f2e_load_config(const char *config_path, F2EConfig *config) {
       }
       *end = '\0';
       char *table = f2e_trim(trimmed + 1);
+      current_command = F2E_SCOPE_ROOT;
       const char prefix[] = "flags.";
+      const char global_prefix[] = "global.flags.";
       if (strncmp(table, prefix, sizeof(prefix) - 1) == 0) {
         char *name = f2e_trim(table + sizeof(prefix) - 1);
         current = f2e_add_flag(config, name);
         section = F2E_SECTION_FLAG;
+      } else if (strncmp(table, global_prefix, sizeof(global_prefix) - 1) == 0) {
+        /* explicit spelling of the global namespace: [global.flags.x] is the
+           same as [flags.x] and applies to every subcommand scope */
+        char *name = f2e_trim(table + sizeof(global_prefix) - 1);
+        current = f2e_add_flag(config, name);
+        section = F2E_SECTION_FLAG;
+      } else if (f2e_load_commands_table(config, table, &section, &current, &current_command)) {
+        /* section, current, and current_command are set by the helper */
       } else if (f2e_streq(table, "parse") || f2e_streq(table, "parser")) {
         current = NULL;
         section = F2E_SECTION_PARSE;
@@ -931,6 +1346,14 @@ static int f2e_load_config(const char *config_path, F2EConfig *config) {
         char parsed[F2E_MAX_ENV];
         if (f2e_parse_bare_value(value, parsed, sizeof(parsed))) {
           f2e_strlcpy(config->errors_env, parsed, sizeof(config->errors_env));
+        }
+      } else if (f2e_streq(key, "command_env") ||
+                 f2e_streq(key, "commands_env") ||
+                 f2e_streq(key, "subcommand_env") ||
+                 f2e_streq(key, "command_path_env")) {
+        char parsed[F2E_MAX_ENV];
+        if (f2e_parse_bare_value(value, parsed, sizeof(parsed))) {
+          f2e_strlcpy(config->command_env, parsed, sizeof(config->command_env));
         }
       } else if (f2e_streq(key, "help_url") || f2e_streq(key, "url")) {
         char parsed[F2E_MAX_VALUE];
@@ -1002,6 +1425,36 @@ static int f2e_load_config(const char *config_path, F2EConfig *config) {
       continue;
     }
 
+    if (section == F2E_SECTION_COMMAND) {
+      if (current_command < 0 || (size_t)current_command >= config->command_count) {
+        continue;
+      }
+      F2ECommand *command = &config->commands[current_command];
+      if (f2e_streq(key, "help") || f2e_streq(key, "description") || f2e_streq(key, "summary")) {
+        char parsed[F2E_MAX_VALUE];
+        if (f2e_parse_bare_value(value, parsed, sizeof(parsed))) {
+          f2e_strlcpy(command->help, parsed, sizeof(command->help));
+        }
+      } else if (f2e_streq(key, "aliases")) {
+        f2e_parse_alias_list(command->aliases, &command->alias_count, value);
+      } else if (f2e_streq(key, "env")) {
+        char parsed[F2E_MAX_ENV];
+        if (f2e_parse_bare_value(value, parsed, sizeof(parsed))) {
+          f2e_strlcpy(command->env, parsed, sizeof(command->env));
+        }
+      } else if (f2e_streq(key, "allow_unknown") ||
+                 f2e_streq(key, "allow_hidden") ||
+                 f2e_streq(key, "allow_unrecognized") ||
+                 f2e_streq(key, "allow_unknown_options")) {
+        int parsed = 0;
+        if (f2e_parse_config_bool(value, &parsed)) {
+          command->allow_unknown = parsed;
+          command->allow_unknown_set = 1;
+        }
+      }
+      continue;
+    }
+
     if (section != F2E_SECTION_FLAG || !current) {
       continue;
     }
@@ -1046,6 +1499,9 @@ static int f2e_load_config(const char *config_path, F2EConfig *config) {
   }
 
   fclose(file);
+  if (config->command_count > 0 && config->command_env[0] == '\0') {
+    f2e_strlcpy(config->command_env, F2E_DEFAULT_COMMAND_ENV, sizeof(config->command_env));
+  }
   return 1;
 }
 
@@ -1149,7 +1605,7 @@ static F2EPair *f2e_find_pair(F2EPair *pairs, size_t pair_count, const char *key
 }
 
 static void f2e_set_pair(F2EPair *pairs, size_t pair_count, const char *key, const char *value) {
-  if (!key || key[0] == '\0') {
+  if (!pairs || !key || key[0] == '\0') {
     return;
   }
   F2EPair *pair = f2e_find_pair(pairs, pair_count, key);
@@ -1422,7 +1878,7 @@ static char *f2e_audit_report(F2EAudit *audit, int *status_out) {
     return f2e_empty_json_object();
   }
 
-  F2EBuffer report;
+  F2EBuffer report = {0};
   if (!f2e_buffer_init(&report)) {
     if (status_out) {
       *status_out = 1;
@@ -1458,7 +1914,7 @@ static char *f2e_audit_report(F2EAudit *audit, int *status_out) {
 }
 
 static char *f2e_pairs_to_json(F2EPair *pairs, size_t pair_count) {
-  F2EBuffer buffer;
+  F2EBuffer buffer = {0};
   if (!f2e_buffer_init(&buffer)) {
     return NULL;
   }
@@ -1543,14 +1999,78 @@ static int f2e_int_value_is_valid(const char *value) {
   return errno != ERANGE && end && *end == '\0';
 }
 
+static int f2e_float_value_is_valid(const char *value) {
+  if (!value || value[0] == '\0') {
+    return 0;
+  }
+  const char *cursor = value;
+  if (*cursor == '+' || *cursor == '-') {
+    cursor++;
+  }
+  if (!isdigit((unsigned char)*cursor)) {
+    return 0;
+  }
+  while (isdigit((unsigned char)*cursor)) {
+    cursor++;
+  }
+  if (*cursor == '.') {
+    cursor++;
+    if (!isdigit((unsigned char)*cursor)) {
+      return 0;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+      cursor++;
+    }
+  }
+  if (*cursor == 'e' || *cursor == 'E') {
+    cursor++;
+    if (*cursor == '+' || *cursor == '-') {
+      cursor++;
+    }
+    if (!isdigit((unsigned char)*cursor)) {
+      return 0;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+      cursor++;
+    }
+  }
+  if (*cursor != '\0') {
+    return 0;
+  }
+
+  errno = 0;
+  char *end = NULL;
+  (void)strtod(value, &end);
+  return errno != ERANGE && end && *end == '\0';
+}
+
+static int f2e_json_container_is_valid(const char *value, char opening) {
+  if (!value) {
+    return 0;
+  }
+  const char *cursor = value;
+  f2e_json_skip_ws(&cursor);
+  if (*cursor != opening || !f2e_json_parse_value(&cursor, 0)) {
+    return 0;
+  }
+  f2e_json_skip_ws(&cursor);
+  return *cursor == '\0';
+}
+
 static const char *f2e_value_type_name(F2EValueType type) {
   switch (type) {
     case F2E_TYPE_BOOL:
       return "bool";
     case F2E_TYPE_INT:
       return "integer";
+    case F2E_TYPE_FLOAT:
+      return "double";
     case F2E_TYPE_JSON:
       return "JSON";
+    case F2E_TYPE_ARRAY:
+      return "array";
+    case F2E_TYPE_MAP:
+      return "map";
     case F2E_TYPE_STRING:
     default:
       return "string";
@@ -1576,8 +2096,26 @@ static int f2e_normalize_flag_value(const F2EFlag *flag, const char *value, char
       }
       f2e_strlcpy(out, value, out_size);
       return 1;
+    case F2E_TYPE_FLOAT:
+      if (!f2e_float_value_is_valid(value)) {
+        return 0;
+      }
+      f2e_strlcpy(out, value, out_size);
+      return 1;
     case F2E_TYPE_JSON:
       if (!f2e_json_value_is_valid(value)) {
+        return 0;
+      }
+      f2e_strlcpy(out, value, out_size);
+      return 1;
+    case F2E_TYPE_ARRAY:
+      if (!f2e_json_container_is_valid(value, '[')) {
+        return 0;
+      }
+      f2e_strlcpy(out, value, out_size);
+      return 1;
+    case F2E_TYPE_MAP:
+      if (!f2e_json_container_is_valid(value, '{')) {
         return 0;
       }
       f2e_strlcpy(out, value, out_size);
@@ -1594,7 +2132,11 @@ static void f2e_report_invalid_value(F2EJsonList *errors, const F2EFlag *flag, c
     return;
   }
   char message[512];
-  if (flag->type == F2E_TYPE_JSON) {
+  if (flag->type == F2E_TYPE_ARRAY) {
+    snprintf(message, sizeof(message), "flags.%s value \"%s\" is not a valid JSON array", f2e_audit_flag_name(flag), value ? value : "");
+  } else if (flag->type == F2E_TYPE_MAP) {
+    snprintf(message, sizeof(message), "flags.%s value \"%s\" is not a valid JSON object", f2e_audit_flag_name(flag), value ? value : "");
+  } else if (flag->type == F2E_TYPE_JSON) {
     snprintf(message, sizeof(message), "flags.%s value \"%s\" is not valid JSON", f2e_audit_flag_name(flag), value ? value : "");
   } else {
     snprintf(message, sizeof(message), "flags.%s value \"%s\" is not a valid %s",
@@ -1624,7 +2166,7 @@ static int f2e_try_set_bool_value(F2EFlag *flag, F2EPair *pairs, size_t pair_cou
   return 1;
 }
 
-static int f2e_token_looks_like_known_option(F2EConfig *config, const char *token) {
+static int f2e_token_looks_like_known_option(F2EConfig *config, int scope, const char *token) {
   if (!token || token[0] != '-' || token[1] == '\0') {
     return 0;
   }
@@ -1636,16 +2178,33 @@ static int f2e_token_looks_like_known_option(F2EConfig *config, const char *toke
     if (eq) {
       *eq = '\0';
     }
-    if (f2e_find_flag_by_alias(config, copy)) {
+    if (f2e_find_flag_by_alias(config, scope, copy)) {
       return 1;
     }
+    if (scope == F2E_SCOPE_LENIENT) {
+      /* an ambiguous name is still a declared option; it is accepted but not
+         applied, rather than reported as unknown */
+      int ambiguous = 0;
+      f2e_find_flag_any_scope_by_alias(config, copy, &ambiguous);
+      if (ambiguous) {
+        return 1;
+      }
+    }
     if (strncmp(copy, "no-", 3) == 0) {
-      F2EFlag *flag = f2e_find_flag_by_alias(config, copy + 3);
+      F2EFlag *flag = f2e_find_flag_by_alias(config, scope, copy + 3);
       return flag && flag->type == F2E_TYPE_BOOL;
     }
     return 0;
   }
-  return f2e_find_flag_by_short(config, token[1]) != NULL;
+  if (f2e_find_flag_by_short(config, scope, token[1])) {
+    return 1;
+  }
+  if (scope == F2E_SCOPE_LENIENT) {
+    int ambiguous = 0;
+    f2e_find_flag_any_scope_by_short(config, token[1], &ambiguous);
+    return ambiguous;
+  }
+  return 0;
 }
 
 static int f2e_token_looks_like_option(const char *token) {
@@ -1662,7 +2221,10 @@ static int f2e_can_consume_separated_value(const F2EFlag *flag, const char *toke
   if (flag && flag->type == F2E_TYPE_INT) {
     return f2e_int_value_is_valid(token);
   }
-  if (flag && flag->type == F2E_TYPE_JSON) {
+  if (flag && flag->type == F2E_TYPE_FLOAT) {
+    return f2e_float_value_is_valid(token);
+  }
+  if (flag && (flag->type == F2E_TYPE_JSON || flag->type == F2E_TYPE_ARRAY || flag->type == F2E_TYPE_MAP)) {
     return f2e_json_value_is_valid(token);
   }
   return 0;
@@ -1704,14 +2266,22 @@ static int f2e_token_sets_allow_unknown(const char *token, int *out) {
   return 0;
 }
 
-static int f2e_resolve_allow_unknown(const F2EConfig *config, int argc, const char *const argv[]) {
+/*
+ * Resolves the starting allow-unknown state. forced_out reports whether a
+ * runtime source (env var or --allow-unknown token) chose the value; a forced
+ * value applies everywhere, while a config-derived value can still be
+ * overridden per command scope by [commands.*] allow_unknown.
+ */
+static int f2e_resolve_allow_unknown(const F2EConfig *config, int argc, const char *const argv[], int *forced_out) {
   int allow_unknown = config ? config->allow_unknown : 0;
+  int forced = 0;
   int parsed = 0;
   if (f2e_runtime_bool_from_env("FLAGS2ENV_ALLOW_UNKNOWN", &parsed) ||
       f2e_runtime_bool_from_env("F2E_ALLOW_UNKNOWN", &parsed) ||
       f2e_runtime_bool_from_env("FLAGS2ENV_ALLOW_HIDDEN", &parsed) ||
       f2e_runtime_bool_from_env("F2E_ALLOW_HIDDEN", &parsed)) {
     allow_unknown = parsed;
+    forced = 1;
   }
 
   for (int i = 0; i < argc; i++) {
@@ -1724,7 +2294,11 @@ static int f2e_resolve_allow_unknown(const F2EConfig *config, int argc, const ch
     }
     if (f2e_token_sets_allow_unknown(token, &parsed)) {
       allow_unknown = parsed;
+      forced = 1;
     }
+  }
+  if (forced_out) {
+    *forced_out = forced;
   }
   return allow_unknown;
 }
@@ -1741,12 +2315,40 @@ static void f2e_apply_defaults(F2EConfig *config, F2EPair *pairs, size_t pair_co
   }
 }
 
-static int f2e_can_bundle_bool_shorts(F2EConfig *config, const char *shorts) {
+static int f2e_command_path_contains(const F2ECommandPath *path, int index) {
+  if (!path) {
+    return 0;
+  }
+  for (size_t i = 0; i < path->depth; i++) {
+    if (path->commands[i] == index) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Defaults only apply for global flags and flags scoped to an active command. */
+static void f2e_apply_defaults_for_path(F2EConfig *config, F2EPair *pairs, size_t pair_count, const F2ECommandPath *path) {
+  for (size_t i = 0; i < config->flag_count; i++) {
+    F2EFlag *flag = &config->flags[i];
+    if (flag->command != F2E_SCOPE_ROOT && !f2e_command_path_contains(path, flag->command)) {
+      continue;
+    }
+    if (flag->env[0] != '\0' && flag->has_default) {
+      char normalized[F2E_MAX_VALUE];
+      if (f2e_normalize_flag_value(flag, flag->default_value, normalized, sizeof(normalized))) {
+        f2e_set_pair(pairs, pair_count, flag->env, normalized);
+      }
+    }
+  }
+}
+
+static int f2e_can_bundle_bool_shorts(F2EConfig *config, int scope, const char *shorts) {
   if (!shorts || shorts[0] == '\0') {
     return 0;
   }
   for (const char *cursor = shorts; *cursor; cursor++) {
-    F2EFlag *flag = f2e_find_flag_by_short(config, *cursor);
+    F2EFlag *flag = f2e_find_flag_by_short(config, scope, *cursor);
     if (!flag || flag->env[0] == '\0' || flag->type != F2E_TYPE_BOOL) {
       return 0;
     }
@@ -1754,16 +2356,16 @@ static int f2e_can_bundle_bool_shorts(F2EConfig *config, const char *shorts) {
   return 1;
 }
 
-static void f2e_apply_bool_short_bundle(F2EConfig *config, F2EPair *pairs, size_t pair_count, const char *shorts) {
+static void f2e_apply_bool_short_bundle(F2EConfig *config, int scope, F2EPair *pairs, size_t pair_count, const char *shorts) {
   for (const char *cursor = shorts; *cursor; cursor++) {
-    F2EFlag *flag = f2e_find_flag_by_short(config, *cursor);
+    F2EFlag *flag = f2e_find_flag_by_short(config, scope, *cursor);
     if (flag && flag->env[0] != '\0' && flag->type == F2E_TYPE_BOOL) {
       f2e_set_pair(pairs, pair_count, flag->env, "true");
     }
   }
 }
 
-static void f2e_apply_long_arg(F2EConfig *config, F2EPair *pairs, size_t pair_count, const char *token, int *index, int argc, const char *const argv[], F2EJsonList *errors) {
+static void f2e_apply_long_arg(F2EConfig *config, int scope, F2EPair *pairs, size_t pair_count, const char *token, int *index, int argc, const char *const argv[], F2EJsonList *errors) {
   char name[F2E_MAX_NAME];
   char inline_value[F2E_MAX_VALUE];
   int has_inline_value = 0;
@@ -1778,9 +2380,9 @@ static void f2e_apply_long_arg(F2EConfig *config, F2EPair *pairs, size_t pair_co
     has_inline_value = 1;
   }
 
-  F2EFlag *flag = f2e_find_flag_by_alias(config, name);
+  F2EFlag *flag = f2e_find_flag_by_alias(config, scope, name);
   if (!flag && strncmp(name, "no-", 3) == 0) {
-    flag = f2e_find_flag_by_alias(config, name + 3);
+    flag = f2e_find_flag_by_alias(config, scope, name + 3);
     if (flag && flag->type == F2E_TYPE_BOOL) {
       negated = 1;
     } else {
@@ -1817,13 +2419,13 @@ static void f2e_apply_long_arg(F2EConfig *config, F2EPair *pairs, size_t pair_co
   }
 }
 
-static void f2e_apply_short_arg(F2EConfig *config, F2EPair *pairs, size_t pair_count, const char *token, int *index, int argc, const char *const argv[], F2EJsonList *errors) {
+static void f2e_apply_short_arg(F2EConfig *config, int scope, F2EPair *pairs, size_t pair_count, const char *token, int *index, int argc, const char *const argv[], F2EJsonList *errors) {
   if (token[1] == '\0') {
     return;
   }
 
   char short_name = token[1];
-  F2EFlag *first = f2e_find_flag_by_short(config, short_name);
+  F2EFlag *first = f2e_find_flag_by_short(config, scope, short_name);
   if (!first || first->env[0] == '\0') {
     return;
   }
@@ -1864,8 +2466,8 @@ static void f2e_apply_short_arg(F2EConfig *config, F2EPair *pairs, size_t pair_c
     return;
   }
 
-  if (f2e_can_bundle_bool_shorts(config, token + 1)) {
-    f2e_apply_bool_short_bundle(config, pairs, pair_count, token + 1);
+  if (f2e_can_bundle_bool_shorts(config, scope, token + 1)) {
+    f2e_apply_bool_short_bundle(config, scope, pairs, pair_count, token + 1);
     return;
   }
 
@@ -1886,8 +2488,23 @@ static void f2e_audit_bool_value_aliases(const F2EFlag *flag, F2EAudit *audit) {
                     f2e_audit_flag_name(flag),
                     flag->default_value);
     }
+    if (flag->has_default && flag->type == F2E_TYPE_FLOAT && !f2e_float_value_is_valid(flag->default_value)) {
+      f2e_audit_add(audit, 1, "flags.%s default \"%s\" is not a valid double",
+                    f2e_audit_flag_name(flag),
+                    flag->default_value);
+    }
     if (flag->has_default && flag->type == F2E_TYPE_JSON && !f2e_json_value_is_valid(flag->default_value)) {
       f2e_audit_add(audit, 1, "flags.%s default \"%s\" is not valid JSON",
+                    f2e_audit_flag_name(flag),
+                    flag->default_value);
+    }
+    if (flag->has_default && flag->type == F2E_TYPE_ARRAY && !f2e_json_container_is_valid(flag->default_value, '[')) {
+      f2e_audit_add(audit, 1, "flags.%s default \"%s\" is not a valid JSON array",
+                    f2e_audit_flag_name(flag),
+                    flag->default_value);
+    }
+    if (flag->has_default && flag->type == F2E_TYPE_MAP && !f2e_json_container_is_valid(flag->default_value, '{')) {
+      f2e_audit_add(audit, 1, "flags.%s default \"%s\" is not a valid JSON object",
                     f2e_audit_flag_name(flag),
                     flag->default_value);
     }
@@ -1940,11 +2557,102 @@ static void f2e_audit_bool_value_aliases(const F2EFlag *flag, F2EAudit *audit) {
   }
 }
 
+static void f2e_audit_command_semantics(const F2EConfig *config, F2EAudit *audit) {
+  if (config->too_many_commands) {
+    f2e_audit_add(audit, 1, "too many [commands.*] tables declared (max %d)", F2E_MAX_COMMANDS);
+  }
+  if (config->has_invalid_command_table) {
+    f2e_audit_add(audit, 1,
+                  "[%s] is not a valid commands table; nest subcommands with an explicit keyword, e.g. [commands.<name>.commands.<name>.flags.<flag>]",
+                  config->invalid_command_table);
+  }
+  if (config->command_count > 0) {
+    if (config->command_env[0] == '\0' || !f2e_env_name_is_valid(config->command_env)) {
+      f2e_audit_add(audit, 1, "parse.command_env \"%s\" is not a valid env var name", config->command_env);
+    }
+  } else if (config->command_env[0] != '\0') {
+    f2e_audit_add(audit, 0, "parse.command_env is set but no [commands.*] tables are declared");
+  }
+
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    char label[F2E_MAX_VALUE];
+    if (!f2e_command_path_label(config, (int)i, label, sizeof(label))) {
+      f2e_strlcpy(label, command->name, sizeof(label));
+    }
+    if (!f2e_option_name_is_valid(command->name)) {
+      f2e_audit_add(audit, 1, "commands.%s has an unsafe command name", label);
+    }
+    if (f2e_command_depth(config, (int)i) > F2E_MAX_COMMAND_DEPTH) {
+      f2e_audit_add(audit, 1, "commands.%s is nested deeper than %d levels", label, F2E_MAX_COMMAND_DEPTH);
+    }
+    if (command->env[0] != '\0' && !f2e_env_name_is_valid(command->env)) {
+      f2e_audit_add(audit, 1, "commands.%s env \"%s\" is not a valid env var name", label, command->env);
+    }
+    for (size_t j = 0; j < command->alias_count; j++) {
+      const char *alias = command->aliases[j];
+      if (alias[0] == '\0' || alias[0] == '-' || !f2e_option_name_is_valid(alias)) {
+        f2e_audit_add(audit, 1, "commands.%s alias \"%s\" contains unsafe characters", label, alias);
+      } else if (f2e_streq(alias, command->name)) {
+        f2e_audit_add(audit, 1, "commands.%s alias \"%s\" duplicates its canonical name", label, alias);
+      }
+    }
+    if (command->env[0] != '\0') {
+      for (size_t j = 0; j < config->flag_count; j++) {
+        if (f2e_streq(config->flags[j].env, command->env)) {
+          f2e_audit_add(audit, 1, "commands.%s env \"%s\" collides with flags.%s env",
+                        label,
+                        command->env,
+                        f2e_audit_flag_name(&config->flags[j]));
+        }
+      }
+      if (config->command_env[0] != '\0' && f2e_streq(command->env, config->command_env)) {
+        f2e_audit_add(audit, 1, "commands.%s env \"%s\" collides with parse.command_env", label, command->env);
+      }
+    }
+    for (size_t j = i + 1; j < config->command_count; j++) {
+      const F2ECommand *sibling = &config->commands[j];
+      if (sibling->parent != command->parent) {
+        continue;
+      }
+      int clash = f2e_streq(command->name, sibling->name);
+      for (size_t a = 0; !clash && a < command->alias_count; a++) {
+        clash = f2e_streq(command->aliases[a], sibling->name);
+        for (size_t b = 0; !clash && b < sibling->alias_count; b++) {
+          clash = f2e_streq(command->aliases[a], sibling->aliases[b]);
+        }
+      }
+      for (size_t b = 0; !clash && b < sibling->alias_count; b++) {
+        clash = f2e_streq(command->name, sibling->aliases[b]);
+      }
+      if (clash) {
+        char sibling_label[F2E_MAX_VALUE];
+        if (!f2e_command_path_label(config, (int)j, sibling_label, sizeof(sibling_label))) {
+          f2e_strlcpy(sibling_label, sibling->name, sizeof(sibling_label));
+        }
+        f2e_audit_add(audit, 1, "commands.%s and commands.%s share a name or alias", label, sibling_label);
+      }
+    }
+  }
+
+  if (config->command_env[0] != '\0' && config->command_count > 0) {
+    for (size_t i = 0; i < config->flag_count; i++) {
+      if (f2e_streq(config->flags[i].env, config->command_env)) {
+        f2e_audit_add(audit, 1, "parse.command_env collides with flags.%s env \"%s\"",
+                      f2e_audit_flag_name(&config->flags[i]),
+                      config->command_env);
+      }
+    }
+  }
+}
+
 static void f2e_audit_config_semantics(const F2EConfig *config, F2EAudit *audit) {
-  if (config->flag_count == 0) {
-    f2e_audit_add(audit, 1, "no [flags.*] tables declared");
+  if (config->flag_count == 0 && config->command_count == 0) {
+    f2e_audit_add(audit, 1, "no [flags.*] or [commands.*] tables declared");
     return;
   }
+
+  f2e_audit_command_semantics(config, audit);
 
   for (size_t i = 0; i < config->flag_count; i++) {
     const F2EFlag *flag = &config->flags[i];
@@ -2053,7 +2761,7 @@ static void f2e_audit_config_semantics(const F2EConfig *config, F2EAudit *audit)
       for (size_t alias_index = 0; alias_index < left->alias_count; alias_index++) {
         char negated_alias[F2E_MAX_NAME + 3];
         snprintf(negated_alias, sizeof(negated_alias), "no-%s", left->aliases[alias_index]);
-        const F2EFlag *clash = f2e_find_flag_by_alias_const(config, negated_alias);
+        const F2EFlag *clash = f2e_find_flag_by_alias_const(config, left->command, negated_alias);
         if (clash) {
           f2e_audit_add(audit, 1, "alias \"%s\" clashes with negated bool flag flags.%s",
                         negated_alias,
@@ -2064,6 +2772,11 @@ static void f2e_audit_config_semantics(const F2EConfig *config, F2EAudit *audit)
 
     for (size_t j = i + 1; j < config->flag_count; j++) {
       const F2EFlag *right = &config->flags[j];
+      /* the same alias, short flag, or env may be reused by a different
+         command scope; duplicates are only errors within one scope */
+      if (left->command != right->command) {
+        continue;
+      }
       if (left->env[0] != '\0' && right->env[0] != '\0' && f2e_streq(left->env, right->env)) {
         f2e_audit_add(audit, 1, "flags.%s and flags.%s both map to env \"%s\"",
                       f2e_audit_flag_name(left),
@@ -2267,6 +2980,16 @@ static int f2e_config_ignores_env_key(const F2EConfig *config, const char *key) 
   }
   for (size_t i = 0; i < config->env_audit_ignored_count; i++) {
     if (f2e_streq(config->env_audit_ignored_keys[i], key)) {
+      return 1;
+    }
+  }
+  /* command markers are derived at parse time, so .env files may set or omit
+     them freely without tripping the audit */
+  if (config->command_count > 0 && config->command_env[0] != '\0' && f2e_streq(config->command_env, key)) {
+    return 1;
+  }
+  for (size_t i = 0; i < config->command_count; i++) {
+    if (config->commands[i].env[0] != '\0' && f2e_streq(config->commands[i].env, key)) {
       return 1;
     }
   }
@@ -2501,6 +3224,26 @@ static int f2e_completion_add_bool_values(F2EBuffer *bool_values, const F2EFlag 
   return 1;
 }
 
+static int f2e_completion_collect_commands(const F2EConfig *config, F2EBuffer *command_words) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->parent != F2E_SCOPE_ROOT) {
+      continue;
+    }
+    if (!f2e_option_name_is_valid(command->name) ||
+        !f2e_completion_append_word(command_words, command->name)) {
+      return 0;
+    }
+    for (size_t j = 0; j < command->alias_count; j++) {
+      if (!f2e_option_name_is_valid(command->aliases[j]) ||
+          !f2e_completion_append_word(command_words, command->aliases[j])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 static int f2e_completion_collect_bash_words(const F2EConfig *config,
                                              F2EBuffer *all_options,
                                              F2EBuffer *value_options,
@@ -2515,7 +3258,9 @@ static int f2e_completion_collect_bash_words(const F2EConfig *config,
 
   for (size_t i = 0; i < config->flag_count; i++) {
     const F2EFlag *flag = &config->flags[i];
-    if (flag->env[0] == '\0') {
+    /* completion scripts are static; only global options and top-level
+       command names are offered */
+    if (flag->env[0] == '\0' || flag->command != F2E_SCOPE_ROOT) {
       continue;
     }
     for (size_t j = 0; j < flag->alias_count; j++) {
@@ -2572,29 +3317,388 @@ static void f2e_completion_free_words(F2EBuffer *a, F2EBuffer *b, F2EBuffer *c, 
   free(d->data);
 }
 
+static int f2e_completion_scope_key(const F2EConfig *config, int scope, char *out, size_t out_size) {
+  if (scope < 0) {
+    if (out_size == 0) {
+      return 0;
+    }
+    out[0] = '\0';
+    return 1;
+  }
+  return f2e_command_path_label(config, scope, out, out_size);
+}
+
+/* Effective option words for one command scope: own flags plus inherited,
+   unshadowed ancestors, mirroring how the parser resolves them. */
+static int f2e_completion_scope_flag_words(const F2EConfig *config,
+                                           int scope,
+                                           F2EBuffer *all_options,
+                                           F2EBuffer *value_options,
+                                           F2EBuffer *bool_value_options) {
+  size_t indexes[F2E_MAX_FLAGS];
+  size_t count = f2e_help_collect_scope_flags(config, scope, indexes);
+  for (size_t k = 0; k < count; k++) {
+    const F2EFlag *flag = &config->flags[indexes[k]];
+    if (flag->env[0] == '\0') {
+      continue;
+    }
+    for (size_t j = 0; j < flag->alias_count; j++) {
+      if (!f2e_option_name_is_valid(flag->aliases[j])) {
+        return 0;
+      }
+      char option[F2E_MAX_NAME + 4];
+      snprintf(option, sizeof(option), "--%s", flag->aliases[j]);
+      if (!f2e_completion_append_word(all_options, option)) {
+        return 0;
+      }
+      if (flag->type == F2E_TYPE_BOOL) {
+        if (!f2e_completion_append_word(bool_value_options, option) ||
+            !f2e_completion_add_option_word(all_options, "--no-", flag->aliases[j], NULL)) {
+          return 0;
+        }
+      } else {
+        if (!f2e_completion_append_word(value_options, option) ||
+            !f2e_completion_add_option_word(all_options, "--", flag->aliases[j], "=")) {
+          return 0;
+        }
+      }
+    }
+    if (flag->short_name != '\0') {
+      if (!isalnum((unsigned char)flag->short_name)) {
+        return 0;
+      }
+      if (f2e_find_flag_by_short((F2EConfig *)config, scope, flag->short_name) == flag) {
+        char short_option[3] = {'-', flag->short_name, '\0'};
+        if (!f2e_completion_append_word(all_options, short_option)) {
+          return 0;
+        }
+        if (flag->type == F2E_TYPE_BOOL) {
+          if (!f2e_completion_append_word(bool_value_options, short_option)) {
+            return 0;
+          }
+        } else if (!f2e_completion_append_word(value_options, short_option)) {
+          return 0;
+        }
+      }
+    }
+  }
+  return 1;
+}
+
+static int f2e_completion_scope_child_commands(const F2EConfig *config, int scope, F2EBuffer *words) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->parent != scope) {
+      continue;
+    }
+    if (!f2e_option_name_is_valid(command->name) ||
+        !f2e_completion_append_word(words, command->name)) {
+      return 0;
+    }
+    for (size_t j = 0; j < command->alias_count; j++) {
+      if (!f2e_option_name_is_valid(command->aliases[j]) ||
+          !f2e_completion_append_word(words, command->aliases[j])) {
+        return 0;
+      }
+    }
+  }
+  return 1;
+}
+
+static int f2e_completion_emit_case_entry(F2EBuffer *script, const char *pattern, const char *value) {
+  return f2e_buffer_append(script, "    '") &&
+         f2e_buffer_append(script, pattern) &&
+         f2e_buffer_append(script, "') printf '%s' '") &&
+         f2e_buffer_append(script, value ? value : "") &&
+         f2e_buffer_append(script, "' ;;\n");
+}
+
+/*
+ * Emits the shared scope-lookup helper functions (POSIX case statements, so
+ * they work in both bash 3.2 and zsh):
+ *   <fn>_opts <scope>            effective option words for the scope
+ *   <fn>_value_opts <scope>      options that consume a separate value
+ *   <fn>_bool_value_opts <scope> bool options that may consume a value
+ *   <fn>_cmds <scope>            child command words for the scope
+ *   <fn>_child <scope> <word>    resolved child scope key, or empty
+ *   <fn>_consumes_value <scope> <previous> <word>
+ *                                whether word is an option value, not a command
+ */
+static int f2e_completion_emit_scope_helpers(const F2EConfig *config, F2EBuffer *script, const char *function_name, const char *bool_values) {
+  int scopes[F2E_MAX_COMMANDS + 1];
+  size_t scope_count = 0;
+  scopes[scope_count++] = F2E_SCOPE_ROOT;
+  for (size_t i = 0; i < config->command_count; i++) {
+    scopes[scope_count++] = (int)i;
+  }
+
+  const char *suffixes[] = {"_opts", "_value_opts", "_bool_value_opts"};
+  for (size_t which = 0; which < 3; which++) {
+    if (!f2e_buffer_append(script, function_name) ||
+        !f2e_buffer_append(script, suffixes[which]) ||
+        !f2e_buffer_append(script, "() {\n  case \"$1\" in\n")) {
+      return 0;
+    }
+    for (size_t s = 0; s < scope_count; s++) {
+      char key[F2E_MAX_VALUE];
+      if (!f2e_completion_scope_key(config, scopes[s], key, sizeof(key))) {
+        return 0;
+      }
+      F2EBuffer all_options = {0};
+      F2EBuffer value_options = {0};
+      F2EBuffer bool_value_options = {0};
+      if (!f2e_buffer_init(&all_options) || !f2e_buffer_init(&value_options) || !f2e_buffer_init(&bool_value_options)) {
+        free(all_options.data);
+        free(value_options.data);
+        free(bool_value_options.data);
+        return 0;
+      }
+      int collected = f2e_completion_scope_flag_words(config, scopes[s], &all_options, &value_options, &bool_value_options);
+      const F2EBuffer *chosen = which == 0 ? &all_options : which == 1 ? &value_options : &bool_value_options;
+      int ok = collected && f2e_completion_emit_case_entry(script, key, chosen->data);
+      free(all_options.data);
+      free(value_options.data);
+      free(bool_value_options.data);
+      if (!ok) {
+        return 0;
+      }
+    }
+    if (!f2e_buffer_append(script, "    *) printf '%s' '' ;;\n  esac\n}\n")) {
+      return 0;
+    }
+  }
+
+  if (!f2e_buffer_append(script, function_name) ||
+      !f2e_buffer_append(script, "_cmds() {\n  case \"$1\" in\n")) {
+    return 0;
+  }
+  for (size_t s = 0; s < scope_count; s++) {
+    char key[F2E_MAX_VALUE];
+    if (!f2e_completion_scope_key(config, scopes[s], key, sizeof(key))) {
+      return 0;
+    }
+    F2EBuffer words = {0};
+    if (!f2e_buffer_init(&words)) {
+      return 0;
+    }
+    int ok = f2e_completion_scope_child_commands(config, scopes[s], &words) &&
+             f2e_completion_emit_case_entry(script, key, words.data);
+    free(words.data);
+    if (!ok) {
+      return 0;
+    }
+  }
+  if (!f2e_buffer_append(script, "    *) printf '%s' '' ;;\n  esac\n}\n")) {
+    return 0;
+  }
+
+  if (!f2e_buffer_append(script, function_name) ||
+      !f2e_buffer_append(script, "_child() {\n  case \"$1|$2\" in\n")) {
+    return 0;
+  }
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    char parent_key[F2E_MAX_VALUE];
+    char child_key[F2E_MAX_VALUE];
+    if (!f2e_completion_scope_key(config, command->parent, parent_key, sizeof(parent_key)) ||
+        !f2e_completion_scope_key(config, (int)i, child_key, sizeof(child_key))) {
+      return 0;
+    }
+    char pattern[F2E_MAX_VALUE * 2];
+    snprintf(pattern, sizeof(pattern), "%s|%s", parent_key, command->name);
+    if (!f2e_completion_emit_case_entry(script, pattern, child_key)) {
+      return 0;
+    }
+    for (size_t j = 0; j < command->alias_count; j++) {
+      snprintf(pattern, sizeof(pattern), "%s|%s", parent_key, command->aliases[j]);
+      if (!f2e_completion_emit_case_entry(script, pattern, child_key)) {
+        return 0;
+      }
+    }
+  }
+  if (!f2e_buffer_append(script, "    *) printf '%s' '' ;;\n  esac\n}\n") ||
+      !f2e_buffer_append(script, function_name) ||
+      !f2e_buffer_append(script, "_consumes_value() {\n"
+                                 "  local value_opts bool_value_opts\n"
+                                 "  value_opts=\"$(") ||
+      !f2e_buffer_append(script, function_name) ||
+      !f2e_buffer_append(script, "_value_opts \"$1\")\"\n"
+                                 "  case \" $value_opts \" in\n"
+                                 "    *\" $2 \"*) return 0 ;;\n"
+                                 "  esac\n"
+                                 "  bool_value_opts=\"$(") ||
+      !f2e_buffer_append(script, function_name) ||
+      !f2e_buffer_append(script, "_bool_value_opts \"$1\")\"\n"
+                                 "  case \" $bool_value_opts \" in\n"
+                                 "    *\" $2 \"*)\n"
+                                 "      case \" ") ||
+      !f2e_buffer_append(script, bool_values ? bool_values : "") ||
+      !f2e_buffer_append(script, " \" in\n"
+                                 "        *\" $3 \"*) return 0 ;;\n"
+                                 "      esac\n"
+                                 "      ;;\n"
+                                 "  esac\n"
+                                 "  return 1\n"
+                                 "}\n")) {
+    return 0;
+  }
+  return 1;
+}
+
+/*
+ * Scope-aware bash completion for configs with [commands.*]: the generated
+ * function walks the words typed so far to find the active command scope,
+ * then offers that scope's options and child commands. Still fully static —
+ * neither flags2env nor the TOML file is consulted at completion time.
+ */
+static char *f2e_completion_script_bash_commands(const F2EConfig *config, const char *command_name) {
+  F2EBuffer bool_values = {0};
+  memset(&bool_values, 0, sizeof(bool_values));
+  if (!f2e_buffer_init(&bool_values)) {
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (flag->env[0] != '\0' && flag->type == F2E_TYPE_BOOL &&
+        !f2e_completion_add_bool_values(&bool_values, flag)) {
+      free(bool_values.data);
+      return NULL;
+    }
+  }
+
+  char command[F2E_MAX_NAME];
+  if (!f2e_completion_command_name(command_name, command, sizeof(command))) {
+    free(bool_values.data);
+    return NULL;
+  }
+  char function_name[F2E_MAX_NAME * 2];
+  f2e_completion_function_name(command, function_name, sizeof(function_name));
+
+  F2EBuffer script = {0};
+  if (!f2e_buffer_init(&script)) {
+    free(bool_values.data);
+    return NULL;
+  }
+
+  int ok = f2e_buffer_append(&script, "# flags2env bash completion (subcommand-aware)\n") &&
+           f2e_completion_emit_scope_helpers(config, &script, function_name, bool_values.data) &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "() {\n"
+                                      "  local cur prev opt opts value_opts bool_value_opts bool_values cmds scope child w i matched stopped\n"
+                                      "  COMPREPLY=()\n"
+                                      "  cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+                                      "  prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n"
+                                      "  scope=''\n"
+                                      "  matched=0\n"
+                                      "  stopped=0\n"
+                                      "  for ((i=1; i<COMP_CWORD; i++)); do\n"
+                                      "    w=\"${COMP_WORDS[i]}\"\n"
+                                      "    if [ \"$w\" = \"--\" ]; then\n"
+                                      "      return 0\n"
+                                      "    fi\n") &&
+           f2e_buffer_append(&script, "    if ") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_consumes_value \"$scope\" \"${COMP_WORDS[i-1]}\" \"$w\"; then\n"
+                                      "      continue\n"
+                                      "    fi\n"
+                                      "    case \"$w\" in\n"
+                                      "      -*) continue ;;\n"
+                                      "    esac\n"
+                                      "    if [ \"$stopped\" = 1 ]; then\n"
+                                      "      continue\n"
+                                      "    fi\n"
+                                      "    child=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_child \"$scope\" \"$w\")\"\n"
+                                      "    if [ -n \"$child\" ]; then\n"
+                                      "      scope=\"$child\"\n"
+                                      "      matched=1\n"
+                                      "    elif [ \"$matched\" = 1 ]; then\n"
+                                      "      stopped=1\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_opts \"$scope\")\"\n  value_opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_value_opts \"$scope\")\"\n  bool_value_opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_bool_value_opts \"$scope\")\"\n  bool_values=") &&
+           f2e_buffer_append_shell_single_quoted(&script, bool_values.data) &&
+           f2e_buffer_append(&script, "\n  cmds=''\n"
+                                      "  if [ \"$stopped\" = 0 ]; then\n"
+                                      "    cmds=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_cmds \"$scope\")\"\n"
+                                      "  fi\n"
+                                      "  for opt in $bool_value_opts; do\n"
+                                      "    if [ \"$prev\" = \"$opt\" ]; then\n"
+                                      "      COMPREPLY=( $(compgen -W \"$bool_values\" -- \"$cur\") )\n"
+                                      "      return 0\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  for opt in $value_opts; do\n"
+                                      "    if [ \"$prev\" = \"$opt\" ]; then\n"
+                                      "      return 0\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  case \"$cur\" in\n"
+                                      "    -*) COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") ) ;;\n"
+                                      "    *)\n"
+                                      "      if [ -n \"$cmds\" ]; then\n"
+                                      "        COMPREPLY=( $(compgen -W \"$cmds\" -- \"$cur\") )\n"
+                                      "      fi\n"
+                                      "      ;;\n"
+                                      "  esac\n"
+                                      "  return 0\n"
+                                      "}\n"
+                                      "complete -o default -F ") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, " -- ") &&
+           f2e_buffer_append_shell_single_quoted(&script, command) &&
+           f2e_buffer_append_char(&script, '\n');
+
+  free(bool_values.data);
+  if (!ok) {
+    free(script.data);
+    return NULL;
+  }
+  return script.data;
+}
+
 static char *f2e_completion_script_bash(const F2EConfig *config, const char *command_name) {
-  F2EBuffer options;
-  F2EBuffer value_options;
-  F2EBuffer bool_value_options;
-  F2EBuffer bool_values;
+  if (config->command_count > 0) {
+    return f2e_completion_script_bash_commands(config, command_name);
+  }
+  F2EBuffer options = {0};
+  F2EBuffer value_options = {0};
+  F2EBuffer bool_value_options = {0};
+  F2EBuffer bool_values = {0};
+  F2EBuffer command_words = {0};
   memset(&options, 0, sizeof(options));
   memset(&value_options, 0, sizeof(value_options));
   memset(&bool_value_options, 0, sizeof(bool_value_options));
   memset(&bool_values, 0, sizeof(bool_values));
-  if (!f2e_completion_collect_bash_words(config, &options, &value_options, &bool_value_options, &bool_values)) {
+  memset(&command_words, 0, sizeof(command_words));
+  if (!f2e_completion_collect_bash_words(config, &options, &value_options, &bool_value_options, &bool_values) ||
+      !f2e_buffer_init(&command_words) ||
+      !f2e_completion_collect_commands(config, &command_words)) {
     f2e_completion_free_words(&options, &value_options, &bool_value_options, &bool_values);
+    free(command_words.data);
     return NULL;
   }
 
-  F2EBuffer script;
+  F2EBuffer script = {0};
   if (!f2e_buffer_init(&script)) {
     f2e_completion_free_words(&options, &value_options, &bool_value_options, &bool_values);
+    free(command_words.data);
     return NULL;
   }
 
   char command[F2E_MAX_NAME];
   if (!f2e_completion_command_name(command_name, command, sizeof(command))) {
     f2e_completion_free_words(&options, &value_options, &bool_value_options, &bool_values);
+    free(command_words.data);
     free(script.data);
     return NULL;
   }
@@ -2604,7 +3708,7 @@ static char *f2e_completion_script_bash(const F2EConfig *config, const char *com
   if (!f2e_buffer_append(&script, "# flags2env bash completion\n") ||
       !f2e_buffer_append(&script, function_name) ||
       !f2e_buffer_append(&script, "() {\n"
-                                  "  local cur prev opt opts value_opts bool_value_opts bool_values\n"
+                                  "  local cur prev opt opts value_opts bool_value_opts bool_values cmds\n"
                                   "  COMPREPLY=()\n"
                                   "  cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                                   "  prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n"
@@ -2616,6 +3720,8 @@ static char *f2e_completion_script_bash(const F2EConfig *config, const char *com
       !f2e_buffer_append_shell_single_quoted(&script, bool_value_options.data) ||
       !f2e_buffer_append(&script, "\n  bool_values=") ||
       !f2e_buffer_append_shell_single_quoted(&script, bool_values.data) ||
+      !f2e_buffer_append(&script, "\n  cmds=") ||
+      !f2e_buffer_append_shell_single_quoted(&script, command_words.data) ||
       !f2e_buffer_append(&script, "\n"
                                   "  for opt in $bool_value_opts; do\n"
                                   "    if [ \"$prev\" = \"$opt\" ]; then\n"
@@ -2630,6 +3736,11 @@ static char *f2e_completion_script_bash(const F2EConfig *config, const char *com
                                   "  done\n"
                                   "  case \"$cur\" in\n"
                                   "    -*) COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") ) ;;\n"
+                                  "    *)\n"
+                                  "      if [ -n \"$cmds\" ]; then\n"
+                                  "        COMPREPLY=( $(compgen -W \"$cmds\" -- \"$cur\") )\n"
+                                  "      fi\n"
+                                  "      ;;\n"
                                   "  esac\n"
                                   "  return 0\n"
                                   "}\n"
@@ -2640,10 +3751,12 @@ static char *f2e_completion_script_bash(const F2EConfig *config, const char *com
       !f2e_buffer_append_char(&script, '\n')) {
     free(script.data);
     f2e_completion_free_words(&options, &value_options, &bool_value_options, &bool_values);
+    free(command_words.data);
     return NULL;
   }
 
   f2e_completion_free_words(&options, &value_options, &bool_value_options, &bool_values);
+  free(command_words.data);
   return script.data;
 }
 
@@ -2654,8 +3767,8 @@ static int f2e_completion_zsh_append_spec(F2EBuffer *script, const F2EBuffer *sp
 }
 
 static int f2e_completion_zsh_option_spec(F2EBuffer *script, const char *option, const F2EFlag *flag, int bool_negated) {
-  F2EBuffer spec;
-  F2EBuffer values;
+  F2EBuffer spec = {0};
+  F2EBuffer values = {0};
   if (!f2e_buffer_init(&spec)) {
     return 0;
   }
@@ -2695,8 +3808,132 @@ static int f2e_completion_zsh_option_spec(F2EBuffer *script, const char *option,
   return ok;
 }
 
+/*
+ * Scope-aware zsh completion for configs with [commands.*]: shares the same
+ * generated scope-lookup helpers as the bash script (plain POSIX case
+ * statements) and offers scope options, child commands, and bool values.
+ */
+static char *f2e_completion_script_zsh_commands(const F2EConfig *config, const char *command_name) {
+  F2EBuffer bool_values = {0};
+  memset(&bool_values, 0, sizeof(bool_values));
+  if (!f2e_buffer_init(&bool_values)) {
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (flag->env[0] != '\0' && flag->type == F2E_TYPE_BOOL &&
+        !f2e_completion_add_bool_values(&bool_values, flag)) {
+      free(bool_values.data);
+      return NULL;
+    }
+  }
+
+  char command[F2E_MAX_NAME];
+  if (!f2e_completion_command_name(command_name, command, sizeof(command))) {
+    free(bool_values.data);
+    return NULL;
+  }
+  char function_name[F2E_MAX_NAME * 2];
+  f2e_completion_function_name(command, function_name, sizeof(function_name));
+
+  F2EBuffer script = {0};
+  if (!f2e_buffer_init(&script)) {
+    free(bool_values.data);
+    return NULL;
+  }
+
+  int ok = f2e_buffer_append(&script, "#compdef ") &&
+           f2e_buffer_append(&script, command) &&
+           f2e_buffer_append(&script, "\n# flags2env zsh completion (subcommand-aware)\n") &&
+           f2e_completion_emit_scope_helpers(config, &script, function_name, bool_values.data) &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "() {\n"
+                                      "  local cur prev opt opts value_opts bool_value_opts bool_values cmds scope child w i matched stopped\n"
+                                      "  cur=\"${words[CURRENT]}\"\n"
+                                      "  prev=\"${words[CURRENT-1]}\"\n"
+                                      "  scope=''\n"
+                                      "  matched=0\n"
+                                      "  stopped=0\n"
+                                      "  for ((i=2; i<CURRENT; i++)); do\n"
+                                      "    w=\"${words[i]}\"\n"
+                                      "    if [ \"$w\" = \"--\" ]; then\n"
+                                      "      _files\n"
+                                      "      return\n"
+                                      "    fi\n") &&
+           f2e_buffer_append(&script, "    if ") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_consumes_value \"$scope\" \"${words[i-1]}\" \"$w\"; then\n"
+                                      "      continue\n"
+                                      "    fi\n"
+                                      "    case \"$w\" in\n"
+                                      "      -*) continue ;;\n"
+                                      "    esac\n"
+                                      "    if [ \"$stopped\" = 1 ]; then\n"
+                                      "      continue\n"
+                                      "    fi\n"
+                                      "    child=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_child \"$scope\" \"$w\")\"\n"
+                                      "    if [ -n \"$child\" ]; then\n"
+                                      "      scope=\"$child\"\n"
+                                      "      matched=1\n"
+                                      "    elif [ \"$matched\" = 1 ]; then\n"
+                                      "      stopped=1\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_opts \"$scope\")\"\n  value_opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_value_opts \"$scope\")\"\n  bool_value_opts=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_bool_value_opts \"$scope\")\"\n  bool_values=") &&
+           f2e_buffer_append_shell_single_quoted(&script, bool_values.data) &&
+           f2e_buffer_append(&script, "\n  cmds=''\n"
+                                      "  if [ \"$stopped\" = 0 ]; then\n"
+                                      "    cmds=\"$(") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, "_cmds \"$scope\")\"\n"
+                                      "  fi\n"
+                                      "  for opt in ${=bool_value_opts}; do\n"
+                                      "    if [ \"$prev\" = \"$opt\" ]; then\n"
+                                      "      compadd -- ${=bool_values}\n"
+                                      "      return\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  for opt in ${=value_opts}; do\n"
+                                      "    if [ \"$prev\" = \"$opt\" ]; then\n"
+                                      "      _files\n"
+                                      "      return\n"
+                                      "    fi\n"
+                                      "  done\n"
+                                      "  case \"$cur\" in\n"
+                                      "    -*) compadd -- ${=opts} ;;\n"
+                                      "    *)\n"
+                                      "      if [ -n \"$cmds\" ]; then\n"
+                                      "        compadd -- ${=cmds}\n"
+                                      "      else\n"
+                                      "        _files\n"
+                                      "      fi\n"
+                                      "      ;;\n"
+                                      "  esac\n"
+                                      "}\n") &&
+           f2e_buffer_append(&script, function_name) &&
+           f2e_buffer_append(&script, " \"$@\"\n");
+
+  free(bool_values.data);
+  if (!ok) {
+    free(script.data);
+    return NULL;
+  }
+  return script.data;
+}
+
 static char *f2e_completion_script_zsh(const F2EConfig *config, const char *command_name) {
-  F2EBuffer script;
+  if (config->command_count > 0) {
+    return f2e_completion_script_zsh_commands(config, command_name);
+  }
+  F2EBuffer script = {0};
   if (!f2e_buffer_init(&script)) {
     return NULL;
   }
@@ -2720,7 +3957,7 @@ static char *f2e_completion_script_zsh(const F2EConfig *config, const char *comm
 
   for (size_t i = 0; i < config->flag_count; i++) {
     const F2EFlag *flag = &config->flags[i];
-    if (flag->env[0] == '\0') {
+    if (flag->env[0] == '\0' || flag->command != F2E_SCOPE_ROOT) {
       continue;
     }
     for (size_t j = 0; j < flag->alias_count; j++) {
@@ -2752,6 +3989,28 @@ static char *f2e_completion_script_zsh(const F2EConfig *config, const char *comm
         free(script.data);
         return NULL;
       }
+    }
+  }
+
+  if (f2e_command_has_children(config, F2E_SCOPE_ROOT)) {
+    F2EBuffer command_words = {0};
+    if (!f2e_buffer_init(&command_words) ||
+        !f2e_completion_collect_commands(config, &command_words)) {
+      free(command_words.data);
+      free(script.data);
+      return NULL;
+    }
+    F2EBuffer spec = {0};
+    int ok = f2e_buffer_init(&spec) &&
+             f2e_buffer_append(&spec, "1:command:(") &&
+             f2e_buffer_append(&spec, command_words.data) &&
+             f2e_buffer_append_char(&spec, ')') &&
+             f2e_completion_zsh_append_spec(&script, &spec);
+    free(spec.data);
+    free(command_words.data);
+    if (!ok) {
+      free(script.data);
+      return NULL;
     }
   }
 
@@ -2804,6 +4063,801 @@ char *f2e_completion_script(const char *shell, const char *command_name) {
   char *script = f2e_completion_script_from_file(path, shell, command_name);
   free(path);
   return script;
+}
+
+static int f2e_codegen_identifier_is_valid(const char *value) {
+  if (!value || !(isalpha((unsigned char)value[0]) || value[0] == '_')) {
+    return 0;
+  }
+  for (const char *cursor = value + 1; *cursor; cursor++) {
+    if (!(isalnum((unsigned char)*cursor) || *cursor == '_')) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static const char *f2e_codegen_typescript_type(F2EValueType type) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return "boolean";
+    case F2E_TYPE_INT:
+    case F2E_TYPE_FLOAT:
+      return "number";
+    case F2E_TYPE_JSON:
+      return "unknown";
+    case F2E_TYPE_ARRAY:
+      return "unknown[]";
+    case F2E_TYPE_MAP:
+      return "Record<string, unknown>";
+    case F2E_TYPE_STRING:
+    default:
+      return "string";
+  }
+}
+
+static const char *f2e_codegen_python_type(F2EValueType type) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return "bool";
+    case F2E_TYPE_INT:
+      return "int";
+    case F2E_TYPE_FLOAT:
+      return "float";
+    case F2E_TYPE_JSON:
+      return "Any";
+    case F2E_TYPE_ARRAY:
+      return "List[Any]";
+    case F2E_TYPE_MAP:
+      return "Dict[str, Any]";
+    case F2E_TYPE_STRING:
+    default:
+      return "str";
+  }
+}
+
+static const char *f2e_codegen_go_type(F2EValueType type) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return "bool";
+    case F2E_TYPE_INT:
+      return "int64";
+    case F2E_TYPE_FLOAT:
+      return "float64";
+    case F2E_TYPE_JSON:
+      return "any";
+    case F2E_TYPE_ARRAY:
+      return "[]any";
+    case F2E_TYPE_MAP:
+      return "map[string]any";
+    case F2E_TYPE_STRING:
+    default:
+      return "string";
+  }
+}
+
+static const char *f2e_codegen_rust_type(F2EValueType type) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return "bool";
+    case F2E_TYPE_INT:
+      return "i64";
+    case F2E_TYPE_FLOAT:
+      return "f64";
+    case F2E_TYPE_JSON:
+      return "serde_json::Value";
+    case F2E_TYPE_ARRAY:
+      return "Vec<serde_json::Value>";
+    case F2E_TYPE_MAP:
+      return "std::collections::HashMap<String, serde_json::Value>";
+    case F2E_TYPE_STRING:
+    default:
+      return "String";
+  }
+}
+
+static const char *f2e_codegen_java_type(F2EValueType type, int optional) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return optional ? "Boolean" : "boolean";
+    case F2E_TYPE_INT:
+      return optional ? "Long" : "long";
+    case F2E_TYPE_FLOAT:
+      return optional ? "Double" : "double";
+    case F2E_TYPE_JSON:
+      return "Object";
+    case F2E_TYPE_ARRAY:
+      return "List<Object>";
+    case F2E_TYPE_MAP:
+      return "Map<String, Object>";
+    case F2E_TYPE_STRING:
+    default:
+      return "String";
+  }
+}
+
+static const char *f2e_codegen_csharp_type(F2EValueType type) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return "bool";
+    case F2E_TYPE_INT:
+      return "long";
+    case F2E_TYPE_FLOAT:
+      return "double";
+    case F2E_TYPE_JSON:
+      return "JsonElement";
+    case F2E_TYPE_ARRAY:
+      return "IReadOnlyList<JsonElement>";
+    case F2E_TYPE_MAP:
+      return "IReadOnlyDictionary<string, JsonElement>";
+    case F2E_TYPE_STRING:
+    default:
+      return "string";
+  }
+}
+
+static const char *f2e_codegen_dart_type(F2EValueType type, int optional) {
+  switch (type) {
+    case F2E_TYPE_BOOL:
+      return optional ? "bool?" : "bool";
+    case F2E_TYPE_INT:
+      return optional ? "int?" : "int";
+    case F2E_TYPE_FLOAT:
+      return optional ? "double?" : "double";
+    case F2E_TYPE_JSON:
+      return "Object?";
+    case F2E_TYPE_ARRAY:
+      return optional ? "List<Object?>?" : "List<Object?>";
+    case F2E_TYPE_MAP:
+      return optional ? "Map<String, Object?>?" : "Map<String, Object?>";
+    case F2E_TYPE_STRING:
+    default:
+      return optional ? "String?" : "String";
+  }
+}
+
+static char *f2e_codegen_typescript(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "/* Generated by flags2env from .cli-flags.toml. Do not edit. */\n\nexport interface ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, " {\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "  ") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        (!flag->has_default && !f2e_buffer_append_char(&source, '?')) ||
+        !f2e_buffer_append(&source, ": ") ||
+        !f2e_buffer_append(&source, f2e_codegen_typescript_type(flag->type)) ||
+        !f2e_buffer_append(&source, ";\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_codegen_python(const F2EConfig *config, const char *type_name) {
+  size_t optional_count = 0;
+  for (size_t i = 0; i < config->flag_count; i++) {
+    optional_count += config->flags[i].has_default ? 0u : 1u;
+  }
+
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "# Generated by flags2env from .cli-flags.toml. Do not edit.\n\nfrom typing import Any, Dict, List, TypedDict\n\n")) {
+    free(source.data);
+    return NULL;
+  }
+
+  if (optional_count > 0) {
+    if (!f2e_buffer_append(&source, "class _") ||
+        !f2e_buffer_append(&source, type_name) ||
+        !f2e_buffer_append(&source, "Optional(TypedDict, total=False):\n")) {
+      free(source.data);
+      return NULL;
+    }
+    for (size_t i = 0; i < config->flag_count; i++) {
+      const F2EFlag *flag = &config->flags[i];
+      if (flag->has_default) {
+        continue;
+      }
+      if (!f2e_buffer_append(&source, "    ") ||
+          !f2e_buffer_append(&source, flag->env) ||
+          !f2e_buffer_append(&source, ": ") ||
+          !f2e_buffer_append(&source, f2e_codegen_python_type(flag->type)) ||
+          !f2e_buffer_append_char(&source, '\n')) {
+        free(source.data);
+        return NULL;
+      }
+    }
+    if (!f2e_buffer_append_char(&source, '\n') ||
+        !f2e_buffer_append(&source, "class ") ||
+        !f2e_buffer_append(&source, type_name) ||
+        !f2e_buffer_append(&source, "(_") ||
+        !f2e_buffer_append(&source, type_name) ||
+        !f2e_buffer_append(&source, "Optional):\n")) {
+      free(source.data);
+      return NULL;
+    }
+  } else if (!f2e_buffer_append(&source, "class ") ||
+             !f2e_buffer_append(&source, type_name) ||
+             !f2e_buffer_append(&source, "(TypedDict):\n")) {
+    free(source.data);
+    return NULL;
+  }
+
+  size_t required_count = 0;
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!flag->has_default) {
+      continue;
+    }
+    required_count++;
+    if (!f2e_buffer_append(&source, "    ") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, ": ") ||
+        !f2e_buffer_append(&source, f2e_codegen_python_type(flag->type)) ||
+        !f2e_buffer_append_char(&source, '\n')) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (required_count == 0 && !f2e_buffer_append(&source, "    pass\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_codegen_go(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "// Code generated by flags2env from .cli-flags.toml. DO NOT EDIT.\n\npackage generated\n\ntype ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, " struct {\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "\t") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append_char(&source, ' ') ||
+        (!flag->has_default && !f2e_buffer_append_char(&source, '*')) ||
+        !f2e_buffer_append(&source, f2e_codegen_go_type(flag->type)) ||
+        !f2e_buffer_append(&source, " `json:\"") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        (!flag->has_default && !f2e_buffer_append(&source, ",omitempty")) ||
+        !f2e_buffer_append(&source, "\"`\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_codegen_rust(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "// Generated by flags2env from .cli-flags.toml. Do not edit.\n\n#[allow(non_snake_case)]\n#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]\npub struct ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, " {\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!flag->has_default && !f2e_buffer_append(&source, "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n")) {
+      free(source.data);
+      return NULL;
+    }
+    if (!f2e_buffer_append(&source, "    pub ") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, ": ") ||
+        (!flag->has_default && !f2e_buffer_append(&source, "Option<")) ||
+        !f2e_buffer_append(&source, f2e_codegen_rust_type(flag->type)) ||
+        (!flag->has_default && !f2e_buffer_append_char(&source, '>')) ||
+        !f2e_buffer_append(&source, ",\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_codegen_java(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "// Generated by flags2env from .cli-flags.toml. Do not edit.\npackage generated;\n\nimport java.util.List;\nimport java.util.Map;\n\npublic record ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, "(\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "    ") ||
+        !f2e_buffer_append(&source, f2e_codegen_java_type(flag->type, !flag->has_default)) ||
+        !f2e_buffer_append_char(&source, ' ') ||
+        !f2e_buffer_append(&source, flag->env) ||
+        (i + 1 < config->flag_count && !f2e_buffer_append_char(&source, ',')) ||
+        !f2e_buffer_append_char(&source, '\n')) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, ") {}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_codegen_csharp(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "// Generated by flags2env from .cli-flags.toml. Do not edit.\nusing System.Collections.Generic;\nusing System.Text.Json;\n\nnamespace Generated;\n\npublic sealed record ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, "(\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "    ") ||
+        !f2e_buffer_append(&source, f2e_codegen_csharp_type(flag->type)) ||
+        (!flag->has_default && !f2e_buffer_append_char(&source, '?')) ||
+        !f2e_buffer_append_char(&source, ' ') ||
+        !f2e_buffer_append(&source, flag->env) ||
+        (i + 1 < config->flag_count && !f2e_buffer_append_char(&source, ',')) ||
+        !f2e_buffer_append_char(&source, '\n')) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, ");\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static int f2e_codegen_dart_append_json_read(F2EBuffer *source, const F2EFlag *flag) {
+  const int optional = !flag->has_default;
+  if (!f2e_buffer_append(source, "      ") ||
+      !f2e_buffer_append(source, flag->env) ||
+      !f2e_buffer_append(source, ": ")) {
+    return 0;
+  }
+
+  switch (flag->type) {
+    case F2E_TYPE_BOOL:
+      if (!f2e_buffer_append(source, "json['") ||
+          !f2e_buffer_append(source, flag->env) ||
+          !f2e_buffer_append(source, optional ? "'] as bool?" : "'] as bool")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_INT:
+      if (!f2e_buffer_append(source, "json['") ||
+          !f2e_buffer_append(source, flag->env) ||
+          !f2e_buffer_append(source, optional ? "'] as int?" : "'] as int")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_FLOAT:
+      if (optional) {
+        if (!f2e_buffer_append(source, "json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] == null ? null : (json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] as num).toDouble()")) {
+          return 0;
+        }
+      } else if (!f2e_buffer_append(source, "(json['") ||
+                 !f2e_buffer_append(source, flag->env) ||
+                 !f2e_buffer_append(source, "'] as num).toDouble()")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_ARRAY:
+      if (optional) {
+        if (!f2e_buffer_append(source, "json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] == null ? null : (json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] as List<dynamic>).cast<Object?>()")) {
+          return 0;
+        }
+      } else if (!f2e_buffer_append(source, "(json['") ||
+                 !f2e_buffer_append(source, flag->env) ||
+                 !f2e_buffer_append(source, "'] as List<dynamic>).cast<Object?>()")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_MAP:
+      if (optional) {
+        if (!f2e_buffer_append(source, "json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] == null ? null : (json['") ||
+            !f2e_buffer_append(source, flag->env) ||
+            !f2e_buffer_append(source, "'] as Map<dynamic, dynamic>).cast<String, Object?>()")) {
+          return 0;
+        }
+      } else if (!f2e_buffer_append(source, "(json['") ||
+                 !f2e_buffer_append(source, flag->env) ||
+                 !f2e_buffer_append(source, "'] as Map<dynamic, dynamic>).cast<String, Object?>()")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_JSON:
+      if (!f2e_buffer_append(source, "json['") ||
+          !f2e_buffer_append(source, flag->env) ||
+          !f2e_buffer_append(source, "']")) {
+        return 0;
+      }
+      break;
+    case F2E_TYPE_STRING:
+    default:
+      if (!f2e_buffer_append(source, "json['") ||
+          !f2e_buffer_append(source, flag->env) ||
+          !f2e_buffer_append(source, optional ? "'] as String?" : "'] as String")) {
+        return 0;
+      }
+      break;
+  }
+  return f2e_buffer_append(source, ",\n");
+}
+
+static char *f2e_codegen_dart(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "// Generated by flags2env from .cli-flags.toml. Do not edit.\n\nfinal class ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, " {\n  const ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, "({\n")) {
+    free(source.data);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, flag->has_default ? "    required this." : "    this.") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, ",\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "  });\n\n")) {
+    free(source.data);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "  final ") ||
+        !f2e_buffer_append(&source, f2e_codegen_dart_type(flag->type, !flag->has_default)) ||
+        !f2e_buffer_append_char(&source, ' ') ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, ";\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+
+  if (!f2e_buffer_append(&source, "\n  factory ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, ".fromJson(Map<String, dynamic> json) {\n    return ") ||
+      !f2e_buffer_append(&source, type_name) ||
+      !f2e_buffer_append(&source, "(\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    if (!f2e_codegen_dart_append_json_read(&source, &config->flags[i])) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "    );\n  }\n\n  Map<String, Object?> toJson() => <String, Object?>{\n")) {
+    free(source.data);
+    return NULL;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, "        '") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, "': ") ||
+        !f2e_buffer_append(&source, flag->env) ||
+        !f2e_buffer_append(&source, ",\n")) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (!f2e_buffer_append(&source, "      };\n}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static int f2e_codegen_append_default_json(F2EBuffer *buffer, const F2EFlag *flag) {
+  if (!buffer || !flag || !flag->has_default) {
+    return 0;
+  }
+  switch (flag->type) {
+    case F2E_TYPE_STRING:
+      return f2e_buffer_append_json_string(buffer, flag->default_value);
+    case F2E_TYPE_BOOL: {
+      const char *canonical = NULL;
+      return f2e_bool_value_alias(flag, flag->default_value, &canonical) && f2e_buffer_append(buffer, canonical);
+    }
+    case F2E_TYPE_INT: {
+      char canonical[64];
+      snprintf(canonical, sizeof(canonical), "%lld", strtoll(flag->default_value, NULL, 10));
+      return f2e_buffer_append(buffer, canonical);
+    }
+    case F2E_TYPE_FLOAT: {
+      char canonical[128];
+      snprintf(canonical, sizeof(canonical), "%.17g", strtod(flag->default_value, NULL));
+      return f2e_buffer_append(buffer, canonical);
+    }
+    case F2E_TYPE_JSON:
+    case F2E_TYPE_ARRAY:
+    case F2E_TYPE_MAP:
+      return f2e_buffer_append(buffer, flag->default_value);
+    default:
+      return 0;
+  }
+}
+
+static int f2e_codegen_append_json_schema_type(F2EBuffer *source, F2EValueType type, int *wrote) {
+  const char *schema = NULL;
+  switch (type) {
+    case F2E_TYPE_STRING:
+      schema = "\"type\":\"string\"";
+      break;
+    case F2E_TYPE_BOOL:
+      schema = "\"type\":\"boolean\"";
+      break;
+    case F2E_TYPE_INT:
+      schema = "\"type\":\"integer\"";
+      break;
+    case F2E_TYPE_FLOAT:
+      schema = "\"type\":\"number\"";
+      break;
+    case F2E_TYPE_ARRAY:
+      schema = "\"type\":\"array\",\"items\":{}";
+      break;
+    case F2E_TYPE_MAP:
+      schema = "\"type\":\"object\",\"additionalProperties\":true";
+      break;
+    case F2E_TYPE_JSON:
+    default:
+      break;
+  }
+  if (!schema) {
+    return 1;
+  }
+  if ((*wrote && !f2e_buffer_append_char(source, ',')) || !f2e_buffer_append(source, schema)) {
+    return 0;
+  }
+  *wrote = 1;
+  return 1;
+}
+
+static char *f2e_codegen_json_schema(const F2EConfig *config, const char *type_name) {
+  F2EBuffer source = {0};
+  if (!f2e_buffer_init(&source) ||
+      !f2e_buffer_append(&source, "{\n  \"$schema\": \"https://json-schema.org/draft/2020-12/schema\",\n  \"title\": ") ||
+      !f2e_buffer_append_json_string(&source, type_name) ||
+      !f2e_buffer_append(&source,
+                         ",\n"
+                         "  \"description\": \"Post-coercion flags2env config generated from .cli-flags.toml.\",\n"
+                         "  \"x-flags2env-stage\": \"coerced\",\n"
+                         "  \"x-flags2env-source\": \".cli-flags.toml\",\n"
+                         "  \"type\": \"object\",\n"
+                         "  \"additionalProperties\": false,\n"
+                         "  \"properties\": {")) {
+    free(source.data);
+    return NULL;
+  }
+
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!f2e_buffer_append(&source, i == 0 ? "\n    " : ",\n    ") ||
+        !f2e_buffer_append_json_string(&source, flag->env) ||
+        !f2e_buffer_append(&source, ": {")) {
+      free(source.data);
+      return NULL;
+    }
+    int wrote = 0;
+    if (!f2e_codegen_append_json_schema_type(&source, flag->type, &wrote)) {
+      free(source.data);
+      return NULL;
+    }
+    if (flag->help[0] != '\0') {
+      if ((wrote && !f2e_buffer_append_char(&source, ',')) ||
+          !f2e_buffer_append(&source, "\"description\":") ||
+          !f2e_buffer_append_json_string(&source, flag->help)) {
+        free(source.data);
+        return NULL;
+      }
+      wrote = 1;
+    }
+    if (flag->has_default) {
+      if ((wrote && !f2e_buffer_append_char(&source, ',')) ||
+          !f2e_buffer_append(&source, "\"default\":") ||
+          !f2e_codegen_append_default_json(&source, flag)) {
+        free(source.data);
+        return NULL;
+      }
+      wrote = 1;
+    }
+    if ((wrote && !f2e_buffer_append_char(&source, ',')) ||
+        !f2e_buffer_append(&source, "\"x-flags2env-type\":") ||
+        !f2e_buffer_append_json_string(&source, f2e_value_type_name(flag->type))) {
+      free(source.data);
+      return NULL;
+    }
+    wrote = 1;
+    if (!f2e_buffer_append_char(&source, ',') ||
+        !f2e_buffer_append(&source, "\"x-flags2env-flag\":") ||
+        !f2e_buffer_append_json_string(&source, f2e_audit_flag_name(flag)) ||
+        !f2e_buffer_append_char(&source, '}')) {
+      free(source.data);
+      return NULL;
+    }
+  }
+  if (config->flag_count > 0 && !f2e_buffer_append_char(&source, '\n')) {
+    free(source.data);
+    return NULL;
+  }
+  if (!f2e_buffer_append(&source, "  },\n  \"required\": [")) {
+    free(source.data);
+    return NULL;
+  }
+  int wrote_required = 0;
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    if (!flag->has_default) {
+      continue;
+    }
+    if ((wrote_required && !f2e_buffer_append(&source, ", ")) ||
+        !f2e_buffer_append_json_string(&source, flag->env)) {
+      free(source.data);
+      return NULL;
+    }
+    wrote_required = 1;
+  }
+  if (!f2e_buffer_append(&source, "]\n}\n")) {
+    free(source.data);
+    return NULL;
+  }
+  return source.data;
+}
+
+static char *f2e_generate_types_from_config(const F2EConfig *config, const char *language, const char *type_name) {
+  const char *name = type_name && type_name[0] ? type_name : "CliConfig";
+  if (!config || !language || !f2e_codegen_identifier_is_valid(name)) {
+    return NULL;
+  }
+  if (f2e_streq(language, "typescript") || f2e_streq(language, "ts")) {
+    return f2e_codegen_typescript(config, name);
+  }
+  if (f2e_streq(language, "python") || f2e_streq(language, "py")) {
+    return f2e_codegen_python(config, name);
+  }
+  if (f2e_streq(language, "go") || f2e_streq(language, "golang")) {
+    return f2e_codegen_go(config, name);
+  }
+  if (f2e_streq(language, "rust") || f2e_streq(language, "rs")) {
+    return f2e_codegen_rust(config, name);
+  }
+  if (f2e_streq(language, "java")) {
+    return f2e_codegen_java(config, name);
+  }
+  if (f2e_streq(language, "csharp") || f2e_streq(language, "c#") ||
+      f2e_streq(language, "cs") || f2e_streq(language, "dotnet")) {
+    return f2e_codegen_csharp(config, name);
+  }
+  if (f2e_streq(language, "dart")) {
+    return f2e_codegen_dart(config, name);
+  }
+  if (f2e_streq(language, "json-schema") || f2e_streq(language, "jsonschema") ||
+      f2e_streq(language, "schema")) {
+    return f2e_codegen_json_schema(config, name);
+  }
+  return NULL;
+}
+
+static int f2e_codegen_env_is_declared(const F2EConfig *config, const char *env) {
+  for (size_t i = 0; i < config->flag_count; i++) {
+    if (f2e_streq(config->flags[i].env, env)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/*
+ * Generated types describe every env key the parser may emit, so command
+ * marker envs and parse.command_env are appended as synthetic optional
+ * fields (bool markers, string command path) before rendering.
+ */
+static void f2e_codegen_append_command_envs(F2EConfig *config) {
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->env[0] == '\0' || f2e_codegen_env_is_declared(config, command->env)) {
+      continue;
+    }
+    F2EFlag *flag = f2e_add_flag(config, command->name);
+    if (!flag) {
+      return;
+    }
+    f2e_strlcpy(flag->env, command->env, sizeof(flag->env));
+    flag->type = F2E_TYPE_BOOL;
+    f2e_strlcpy(flag->help, command->help, sizeof(flag->help));
+  }
+  if (config->command_count > 0 && config->command_env[0] != '\0' &&
+      !f2e_codegen_env_is_declared(config, config->command_env)) {
+    F2EFlag *flag = f2e_add_flag(config, "command");
+    if (flag) {
+      f2e_strlcpy(flag->env, config->command_env, sizeof(flag->env));
+      flag->type = F2E_TYPE_STRING;
+      f2e_strlcpy(flag->help, "Space-joined subcommand path selected by argv.", sizeof(flag->help));
+    }
+  }
+}
+
+char *f2e_generate_types_from_file(const char *config_path, const char *language, const char *type_name) {
+  F2EConfig *config = (F2EConfig *)malloc(sizeof(F2EConfig));
+  if (!config) {
+    return NULL;
+  }
+  if (!config_path || !f2e_load_config(config_path, config) || f2e_config_has_audit_errors(config)) {
+    free(config);
+    return NULL;
+  }
+  f2e_codegen_append_command_envs(config);
+  for (size_t i = 0; i < config->flag_count; i++) {
+    /* a command-scoped default is only emitted when its command runs, so the
+       generated field must be optional */
+    if (config->flags[i].command != F2E_SCOPE_ROOT) {
+      config->flags[i].has_default = 0;
+    }
+  }
+  char *source = f2e_generate_types_from_config(config, language, type_name);
+  free(config);
+  return source;
+}
+
+char *f2e_generate_types(const char *language, const char *type_name) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *source = f2e_generate_types_from_file(path, language, type_name);
+  free(path);
+  return source;
 }
 
 typedef struct {
@@ -3075,13 +5129,13 @@ static int f2e_help_append_row(F2EBuffer *buffer, const char *const *cells, cons
   return ok;
 }
 
-static char *f2e_help_flag_names(const F2EFlag *flag) {
-  F2EBuffer names;
+static char *f2e_help_flag_names(const F2EFlag *flag, int show_short) {
+  F2EBuffer names = {0};
   if (!f2e_buffer_init(&names)) {
     return NULL;
   }
 
-  if (flag->short_name != '\0') {
+  if (flag->short_name != '\0' && show_short) {
     char short_name[3] = {'-', flag->short_name, '\0'};
     if (!f2e_buffer_append(&names, short_name)) {
       free(names.data);
@@ -3127,7 +5181,7 @@ static int f2e_help_append_bool_values(F2EBuffer *buffer, const F2EFlag *flag) {
 }
 
 static char *f2e_help_flag_description(const F2EFlag *flag) {
-  F2EBuffer description;
+  F2EBuffer description = {0};
   if (!f2e_buffer_init(&description)) {
     return NULL;
   }
@@ -3174,7 +5228,7 @@ static int f2e_help_details_sep(F2EBuffer *details, int *wrote) {
 }
 
 static char *f2e_help_flag_details_for_columns(const F2EFlag *flag, unsigned columns) {
-  F2EBuffer details;
+  F2EBuffer details = {0};
   if (!f2e_buffer_init(&details)) {
     return NULL;
   }
@@ -3388,7 +5442,121 @@ static const char *f2e_help_column_value(unsigned column,
   }
 }
 
-static char *f2e_help_table_from_config(const F2EConfig *config, const char *command_name, int terminal_columns) {
+/*
+ * Collects the flags reachable from a command scope for the help table:
+ * the scope's own flags first, then ancestor/global flags that are not
+ * shadowed by a nearer definition.
+ */
+static size_t f2e_help_collect_scope_flags(const F2EConfig *config, int scope, size_t out[F2E_MAX_FLAGS]) {
+  size_t count = 0;
+  int level = scope;
+  for (;;) {
+    for (size_t i = 0; i < config->flag_count && count < F2E_MAX_FLAGS; i++) {
+      const F2EFlag *flag = &config->flags[i];
+      if (flag->command != level) {
+        continue;
+      }
+      int reachable = level == scope;
+      for (size_t j = 0; !reachable && j < flag->alias_count; j++) {
+        reachable = f2e_find_flag_by_alias_const(config, scope, flag->aliases[j]) == flag;
+      }
+      if (!reachable && flag->short_name != '\0') {
+        reachable = f2e_find_flag_by_short((F2EConfig *)config, scope, flag->short_name) == flag;
+      }
+      if (reachable) {
+        out[count++] = i;
+      }
+    }
+    if (level < 0) {
+      break;
+    }
+    level = f2e_scope_parent(config, level);
+  }
+  return count;
+}
+
+/*
+ * Renders a command's name cell relative to the help scope, so nested
+ * commands read as their invocation path (e.g. "remote add"), with any
+ * aliases appended ("commit, ci").
+ */
+static char *f2e_help_command_row_name(const F2EConfig *config, int index, int scope) {
+  F2EBuffer names = {0};
+  if (!f2e_buffer_init(&names)) {
+    return NULL;
+  }
+  int chain[F2E_MAX_COMMAND_DEPTH];
+  size_t depth = 0;
+  for (int cursor = index; cursor >= 0 && cursor != scope && depth < F2E_MAX_COMMAND_DEPTH;
+       cursor = config->commands[cursor].parent) {
+    chain[depth++] = cursor;
+  }
+  for (size_t i = depth; i > 0; i--) {
+    if ((i < depth && !f2e_buffer_append_char(&names, ' ')) ||
+        !f2e_buffer_append(&names, config->commands[chain[i - 1]].name)) {
+      free(names.data);
+      return NULL;
+    }
+  }
+  const F2ECommand *command = &config->commands[index];
+  for (size_t i = 0; i < command->alias_count; i++) {
+    if (!f2e_buffer_append(&names, ", ") || !f2e_buffer_append(&names, command->aliases[i])) {
+      free(names.data);
+      return NULL;
+    }
+  }
+  return names.data;
+}
+
+static size_t f2e_help_commands_name_width(const F2EConfig *config, int help_scope, int parent, size_t depth) {
+  size_t width = 0;
+  if (depth >= F2E_MAX_COMMAND_DEPTH) {
+    return width;
+  }
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->parent != parent) {
+      continue;
+    }
+    char *names = f2e_help_command_row_name(config, (int)i, help_scope);
+    if (names) {
+      width = f2e_size_max(width, strlen(names));
+      free(names);
+    }
+    width = f2e_size_max(width, f2e_help_commands_name_width(config, help_scope, (int)i, depth + 1));
+  }
+  return width;
+}
+
+static int f2e_help_append_command_rows(const F2EConfig *config,
+                                        int help_scope,
+                                        int parent,
+                                        size_t depth,
+                                        F2EBuffer *table,
+                                        const size_t *widths) {
+  if (depth >= F2E_MAX_COMMAND_DEPTH) {
+    return 1;
+  }
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECommand *command = &config->commands[i];
+    if (command->parent != parent) {
+      continue;
+    }
+    char *names = f2e_help_command_row_name(config, (int)i, help_scope);
+    if (!names) {
+      return 0;
+    }
+    const char *row[] = {names, command->help[0] != '\0' ? command->help : "-"};
+    int ok = f2e_help_append_row(table, row, widths, 2);
+    free(names);
+    if (!ok || !f2e_help_append_command_rows(config, help_scope, (int)i, depth + 1, table, widths)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static char *f2e_help_table_scoped(const F2EConfig *config, const char *command_name, int terminal_columns, int scope) {
   if (!config) {
     return NULL;
   }
@@ -3410,7 +5578,7 @@ static char *f2e_help_table_from_config(const F2EConfig *config, const char *com
     column_count = 2;
   }
 
-  F2EBuffer table;
+  F2EBuffer table = {0};
   if (!f2e_buffer_init(&table)) {
     return NULL;
   }
@@ -3421,17 +5589,47 @@ static char *f2e_help_table_from_config(const F2EConfig *config, const char *com
     return NULL;
   }
 
+  char path_label[F2E_MAX_VALUE];
+  path_label[0] = '\0';
+  if (scope >= 0 && !f2e_command_path_label(config, scope, path_label, sizeof(path_label))) {
+    path_label[0] = '\0';
+  }
+  int has_children = f2e_command_has_children(config, scope);
+
   size_t table_width = f2e_help_table_width(widths, column_count);
-  char title[F2E_MAX_VALUE];
-  snprintf(title, sizeof(title), "Command: %s [OPTIONS]", command);
-  if (!f2e_help_append_border(&table, widths, column_count) ||
-      !f2e_help_append_spanning_row(&table, title, table_width) ||
+  F2EBuffer title = {0};
+  int title_ok = f2e_buffer_init(&title) &&
+                 f2e_buffer_append(&title, "Command: ") &&
+                 f2e_buffer_append(&title, command) &&
+                 (path_label[0] == '\0' ||
+                  (f2e_buffer_append_char(&title, ' ') &&
+                   f2e_buffer_append(&title, path_label))) &&
+                 (!has_children || f2e_buffer_append(&title, " [COMMAND]")) &&
+                 f2e_buffer_append(&title, " [OPTIONS]");
+  if (!title_ok ||
+      !f2e_help_append_border(&table, widths, column_count) ||
+      !f2e_help_append_spanning_row(&table, title.data, table_width) ||
       !f2e_help_append_border(&table, widths, column_count)) {
+    free(title.data);
     free(table.data);
     return NULL;
   }
+  free(title.data);
 
-  if (wide) {
+  if (scope >= 0 && (size_t)scope < config->command_count && config->commands[scope].help[0] != '\0') {
+    if (!f2e_help_append_spanning_row(&table, config->commands[scope].help, table_width) ||
+        !f2e_help_append_border(&table, widths, column_count)) {
+      free(table.data);
+      return NULL;
+    }
+  }
+
+  size_t scope_flags[F2E_MAX_FLAGS];
+  size_t scope_flag_count = f2e_help_collect_scope_flags(config, scope, scope_flags);
+
+  if (scope_flag_count == 0) {
+    /* no reachable flags at this scope; skip the options table entirely */
+  } else if (wide) {
     const char *header[5] = {0};
     for (size_t i = 0; i < column_count; i++) {
       header[i] = f2e_help_column_header(wide_columns[i]);
@@ -3457,9 +5655,12 @@ static char *f2e_help_table_from_config(const F2EConfig *config, const char *com
     }
   }
 
-  for (size_t i = 0; i < config->flag_count; i++) {
-    const F2EFlag *flag = &config->flags[i];
-    char *names = f2e_help_flag_names(flag);
+  for (size_t k = 0; k < scope_flag_count; k++) {
+    const F2EFlag *flag = &config->flags[scope_flags[k]];
+    /* hide a short flag that a nearer scope reuses for a different option */
+    int show_short = flag->short_name == '\0' ||
+                     f2e_find_flag_by_short((F2EConfig *)config, scope, flag->short_name) == flag;
+    char *names = f2e_help_flag_names(flag, show_short);
     if (!names) {
       free(table.data);
       return NULL;
@@ -3502,6 +5703,40 @@ static char *f2e_help_table_from_config(const F2EConfig *config, const char *com
     }
   }
 
+  if (has_children) {
+    size_t name_width = f2e_help_commands_name_width(config, scope, scope, 0);
+    name_width = f2e_size_max(name_width, strlen("Command"));
+    size_t max_name_width = table_width > 7 + 18 ? table_width - 7 - 18 : name_width;
+    name_width = f2e_size_min(name_width, f2e_size_min(max_name_width, 40));
+    size_t command_widths[2] = {name_width, table_width - name_width - 7};
+    const char *command_header[] = {"Command", "Description"};
+    if (!f2e_help_append_spanning_row(&table, "Commands:", table_width) ||
+        !f2e_help_append_border(&table, command_widths, 2) ||
+        !f2e_help_append_row(&table, command_header, command_widths, 2) ||
+        !f2e_help_append_border(&table, command_widths, 2) ||
+        !f2e_help_append_command_rows(config, scope, scope, 0, &table, command_widths) ||
+        !f2e_help_append_border(&table, command_widths, 2)) {
+      free(table.data);
+      return NULL;
+    }
+    F2EBuffer hint = {0};
+    int hint_ok = f2e_buffer_init(&hint) &&
+                  f2e_buffer_append(&hint, "Run '") &&
+                  f2e_buffer_append(&hint, command) &&
+                  (path_label[0] == '\0' ||
+                   (f2e_buffer_append_char(&hint, ' ') &&
+                    f2e_buffer_append(&hint, path_label))) &&
+                  f2e_buffer_append(&hint, " <command> --help' for command-specific options.");
+    if (!hint_ok ||
+        !f2e_help_append_spanning_row(&table, hint.data, table_width) ||
+        !f2e_help_append_border(&table, widths, column_count)) {
+      free(hint.data);
+      free(table.data);
+      return NULL;
+    }
+    free(hint.data);
+  }
+
   if (config->help_url[0] != '\0') {
     char help_url[F2E_MAX_VALUE + 16];
     snprintf(help_url, sizeof(help_url), "More help: %s", config->help_url);
@@ -3513,6 +5748,10 @@ static char *f2e_help_table_from_config(const F2EConfig *config, const char *com
   }
 
   return table.data;
+}
+
+static char *f2e_help_table_from_config(const F2EConfig *config, const char *command_name, int terminal_columns) {
+  return f2e_help_table_scoped(config, command_name, terminal_columns, F2E_SCOPE_ROOT);
 }
 
 static int f2e_print_stream_locked(FILE *stream, const char *value) {
@@ -3571,6 +5810,69 @@ char *f2e_help_table(const char *command_name, int terminal_columns) {
   return table;
 }
 
+static int f2e_help_scope_from_argv(F2EConfig *config, int argc, const char *const argv[]) {
+  if (argc < 0 || !argv || config->command_count == 0) {
+    return F2E_SCOPE_ROOT;
+  }
+  F2ECommandPath path;
+  memset(&path, 0, sizeof(path));
+  f2e_resolve_command_path(config, argc, argv, &path);
+  return path.depth > 0 ? path.commands[path.depth - 1] : F2E_SCOPE_ROOT;
+}
+
+char *f2e_help_table_for_argv_from_file(const char *config_path,
+                                        const char *command_name,
+                                        int argc,
+                                        const char *const argv[],
+                                        int terminal_columns) {
+  F2EConfig *config = (F2EConfig *)malloc(sizeof(F2EConfig));
+  if (!config) {
+    return NULL;
+  }
+  if (!config_path || !f2e_load_config(config_path, config)) {
+    free(config);
+    return NULL;
+  }
+  int scope = f2e_help_scope_from_argv(config, argc, argv);
+  char *table = f2e_help_table_scoped(config, command_name, terminal_columns, scope);
+  free(config);
+  return table;
+}
+
+char *f2e_help_table_for_argv(const char *command_name, int argc, const char *const argv[], int terminal_columns) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *table = f2e_help_table_for_argv_from_file(path, command_name, argc, argv, terminal_columns);
+  free(path);
+  return table;
+}
+
+int f2e_print_table_for_argv_from_file(const char *config_path,
+                                       const char *command_name,
+                                       int argc,
+                                       const char *const argv[],
+                                       int terminal_columns) {
+  char *table = f2e_help_table_for_argv_from_file(config_path, command_name, argc, argv, terminal_columns);
+  if (!table) {
+    return 1;
+  }
+  int ok = f2e_print_stream_locked(stdout, table);
+  f2e_free(table);
+  return ok ? 0 : 1;
+}
+
+int f2e_print_table_for_argv(const char *command_name, int argc, const char *const argv[], int terminal_columns) {
+  char *table = f2e_help_table_for_argv(command_name, argc, argv, terminal_columns);
+  if (!table) {
+    return 1;
+  }
+  int ok = f2e_print_stream_locked(stdout, table);
+  f2e_free(table);
+  return ok ? 0 : 1;
+}
+
 int f2e_print_table_from_file(const char *config_path, const char *command_name, int terminal_columns) {
   char *table = f2e_help_table_from_file(config_path, command_name, terminal_columns);
   if (!table) {
@@ -3589,6 +5891,124 @@ int f2e_print_table(const char *command_name, int terminal_columns) {
   int ok = f2e_print_stream_locked(stdout, table);
   f2e_free(table);
   return ok ? 0 : 1;
+}
+
+/*
+ * Walks argv once: matches subcommand tokens, resolves flags in the active
+ * command scope, and (when pairs is non-NULL) records the parsed values.
+ * A NULL pairs pointer makes this a dry run used to discover the command
+ * path before defaults are applied; both passes consume tokens identically.
+ *
+ * Command matching skips leading positionals (program or wrapper names) until
+ * the first token matches a top-level command; after that, each positional
+ * must match a subcommand of the current scope or matching stops for good.
+ */
+static void f2e_scan_argv(F2EConfig *config,
+                          F2EPair *pairs,
+                          size_t pair_count,
+                          int argc,
+                          const char *const argv[],
+                          F2EJsonList *positionals,
+                          F2EJsonList *unknown_options,
+                          F2EJsonList *errors,
+                          F2EJsonList *extras,
+                          int extras_after_match,
+                          int allow_unknown,
+                          int allow_unknown_forced,
+                          int lenient,
+                          F2ECommandPath *path_out) {
+  int scope = lenient ? F2E_SCOPE_LENIENT : F2E_SCOPE_ROOT;
+  /* lenient mode keeps the command-mode positional handling (leading tokens
+     are skipped, never triggering stop_at_first_positional) but resolves no
+     commands, mirroring the dry-run pass that found none */
+  int matching = config->command_count > 0;
+  int matched_any = 0;
+
+  for (int i = 0; i < argc; i++) {
+    const char *token = argv[i];
+    if (!token || token[0] != '-' || token[1] == '\0') {
+      if (matching && token && token[0] != '\0') {
+        int next = lenient ? -1 : f2e_find_command_by_token(config, scope, token);
+        if (next >= 0) {
+          scope = next;
+          matched_any = 1;
+          if (!allow_unknown_forced && config->commands[next].allow_unknown_set) {
+            allow_unknown = config->commands[next].allow_unknown;
+          }
+          if (path_out && path_out->depth < F2E_MAX_COMMAND_DEPTH) {
+            path_out->commands[path_out->depth++] = next;
+          }
+          continue;
+        }
+        if (!matched_any) {
+          if (positionals) {
+            f2e_json_list_append(positionals, token);
+          }
+          if (extras && !extras_after_match && i > 0) {
+            f2e_json_list_append(extras, token);
+          }
+          continue;
+        }
+        matching = 0;
+      }
+      if (extras) {
+        if (config->stop_at_first_positional) {
+          for (int j = i; j < argc; j++) {
+            if (extras_after_match ? matched_any : j > 0) {
+              f2e_json_list_append(extras, argv[j]);
+            }
+          }
+        } else if (extras_after_match ? matched_any : i > 0) {
+          f2e_json_list_append(extras, token);
+        }
+      }
+      if (positionals) {
+        if (config->stop_at_first_positional) {
+          for (int j = i; j < argc; j++) {
+            f2e_json_list_append(positionals, argv[j]);
+          }
+          break;
+        }
+        f2e_json_list_append(positionals, token);
+      } else if (config->stop_at_first_positional) {
+        break;
+      }
+      continue;
+    }
+    if (strcmp(token, "--") == 0) {
+      if (extras && (extras_after_match ? matched_any : 1)) {
+        for (int j = i + 1; j < argc; j++) {
+          f2e_json_list_append(extras, argv[j]);
+        }
+      }
+      if (positionals) {
+        for (int j = i + 1; j < argc; j++) {
+          f2e_json_list_append(positionals, argv[j]);
+        }
+      }
+      break;
+    }
+    if (!f2e_token_looks_like_known_option(config, scope, token)) {
+      int parsed_allow_unknown = 0;
+      if (f2e_token_sets_allow_unknown(token, &parsed_allow_unknown)) {
+        allow_unknown = parsed_allow_unknown;
+        allow_unknown_forced = 1;
+      } else if (!allow_unknown && unknown_options) {
+        f2e_json_list_append(unknown_options, token);
+      }
+      continue;
+    }
+    if (token[1] == '-') {
+      f2e_apply_long_arg(config, scope, pairs, pair_count, token, &i, argc, argv, errors);
+    } else {
+      f2e_apply_short_arg(config, scope, pairs, pair_count, token, &i, argc, argv, errors);
+    }
+  }
+}
+
+/* Dry-run scan that only resolves the command path selected by argv. */
+static void f2e_resolve_command_path(F2EConfig *config, int argc, const char *const argv[], F2ECommandPath *path_out) {
+  f2e_scan_argv(config, NULL, 0, argc, argv, NULL, NULL, NULL, NULL, 0, 1, 1, 0, path_out);
 }
 
 char *f2e_parse_from_file(const char *config_path, int argc, const char *const argv[]) {
@@ -3618,49 +6038,48 @@ char *f2e_parse_from_file(const char *config_path, int argc, const char *const a
   int track_positionals = config->positionals_env[0] != '\0' && f2e_json_list_init(&positionals);
   int track_unknown_options = config->unknown_options_env[0] != '\0' && f2e_json_list_init(&unknown_options);
   int track_errors = config->errors_env[0] != '\0' && f2e_json_list_init(&errors);
-  int allow_unknown = f2e_resolve_allow_unknown(config, argc, argv);
+  int allow_unknown_forced = 0;
+  int allow_unknown = f2e_resolve_allow_unknown(config, argc, argv, &allow_unknown_forced);
 
-  f2e_apply_defaults(config, pairs, F2E_MAX_PAIRS);
-
-  for (int i = 0; i < argc; i++) {
-    const char *token = argv[i];
-    if (!token || token[0] != '-' || token[1] == '\0') {
-      if (track_positionals) {
-        if (config->stop_at_first_positional) {
-          for (int j = i; j < argc; j++) {
-            f2e_json_list_append(&positionals, argv[j]);
-          }
-          break;
-        }
-        f2e_json_list_append(&positionals, token);
-      } else if (config->stop_at_first_positional) {
-        break;
+  int lenient = 0;
+  if (config->command_count > 0) {
+    F2ECommandPath path;
+    memset(&path, 0, sizeof(path));
+    f2e_resolve_command_path(config, argc, argv, &path);
+    /* a wrapper script may have consumed the subcommand before argv reached
+       this parser; when nothing matched, fall back to lenient global
+       resolution instead of treating scoped flags as unknown */
+    lenient = path.depth == 0;
+    char joined[F2E_MAX_VALUE];
+    int tail = path.depth > 0 ? path.commands[path.depth - 1] : F2E_SCOPE_ROOT;
+    if (f2e_command_path_label(config, tail, joined, sizeof(joined))) {
+      f2e_set_pair(pairs, F2E_MAX_PAIRS, config->command_env, joined);
+    }
+    for (size_t i = 0; i < path.depth; i++) {
+      const F2ECommand *command = &config->commands[path.commands[i]];
+      if (command->env[0] != '\0') {
+        f2e_set_pair(pairs, F2E_MAX_PAIRS, command->env, "true");
       }
-      continue;
     }
-    if (strcmp(token, "--") == 0) {
-      if (track_positionals) {
-        for (int j = i + 1; j < argc; j++) {
-          f2e_json_list_append(&positionals, argv[j]);
-        }
-      }
-      break;
-    }
-    if (!f2e_token_looks_like_known_option(config, token)) {
-      int parsed_allow_unknown = 0;
-      if (f2e_token_sets_allow_unknown(token, &parsed_allow_unknown)) {
-        allow_unknown = parsed_allow_unknown;
-      } else if (!allow_unknown && track_unknown_options) {
-        f2e_json_list_append(&unknown_options, token);
-      }
-      continue;
-    }
-    if (token[1] == '-') {
-      f2e_apply_long_arg(config, pairs, F2E_MAX_PAIRS, token, &i, argc, argv, track_errors ? &errors : NULL);
-    } else {
-      f2e_apply_short_arg(config, pairs, F2E_MAX_PAIRS, token, &i, argc, argv, track_errors ? &errors : NULL);
-    }
+    f2e_apply_defaults_for_path(config, pairs, F2E_MAX_PAIRS, &path);
+  } else {
+    f2e_apply_defaults(config, pairs, F2E_MAX_PAIRS);
   }
+
+  f2e_scan_argv(config,
+                pairs,
+                F2E_MAX_PAIRS,
+                argc,
+                argv,
+                track_positionals ? &positionals : NULL,
+                track_unknown_options ? &unknown_options : NULL,
+                track_errors ? &errors : NULL,
+                NULL,
+                0,
+                allow_unknown,
+                allow_unknown_forced,
+                lenient,
+                NULL);
 
   if (track_positionals && positionals.count > 0) {
     char value[F2E_MAX_VALUE];
@@ -3704,6 +6123,292 @@ char *f2e_parse(int argc, const char *const argv[]) {
   return result;
 }
 
+static int f2e_json_list_close(F2EJsonList *list) {
+  if (!list || list->failed || !list->initialized) {
+    return 0;
+  }
+  if (!f2e_buffer_append_char(&list->buffer, ']')) {
+    list->failed = 1;
+    return 0;
+  }
+  return 1;
+}
+
+/*
+ * Structured parse: returns every channel separately instead of packing them
+ * into env keys, so nothing can be shadowed by real environment variables:
+ *   {"flags":{...},               the same env map f2e_parse returns
+ *    "providedFlags":{...},       argv-derived values without schema defaults
+ *    "command":"remote add",      space-joined resolved command path
+ *    "subcommands":["remote","add"],
+ *    "extras":["abc","efg"],      operands: positionals after the last matched
+ *                                 command (including tokens after --); with no
+ *                                 command matched, everything but argv[0]
+ *    "unknownOptions":[...],      collected regardless of unknown_options_env
+ *    "errors":[...]}              collected regardless of errors_env
+ */
+char *f2e_parse_structured_from_file(const char *config_path, int argc, const char *const argv[]) {
+  if (argc < 0 || !argv) {
+    argc = 0;
+  }
+
+  F2EConfig *config = (F2EConfig *)malloc(sizeof(F2EConfig));
+  if (!config) {
+    return NULL;
+  }
+  if (!config_path || !f2e_load_config(config_path, config)) {
+    free(config);
+    return NULL;
+  }
+
+  F2EPair *pairs = (F2EPair *)calloc(F2E_MAX_PAIRS, sizeof(F2EPair));
+  if (!pairs) {
+    free(config);
+    return NULL;
+  }
+  F2EPair *provided_pairs = (F2EPair *)calloc(F2E_MAX_PAIRS, sizeof(F2EPair));
+  if (!provided_pairs) {
+    free(pairs);
+    free(config);
+    return NULL;
+  }
+
+  F2EJsonList positionals = {0};
+  F2EJsonList unknown_options = {0};
+  F2EJsonList errors = {0};
+  F2EJsonList extras = {0};
+  F2EJsonList subcommands = {0};
+  int track_positionals = config->positionals_env[0] != '\0' && f2e_json_list_init(&positionals);
+  int lists_ok = f2e_json_list_init(&unknown_options) &&
+                 f2e_json_list_init(&errors) &&
+                 f2e_json_list_init(&extras) &&
+                 f2e_json_list_init(&subcommands);
+  int allow_unknown_forced = 0;
+  int allow_unknown = f2e_resolve_allow_unknown(config, argc, argv, &allow_unknown_forced);
+
+  F2ECommandPath path;
+  memset(&path, 0, sizeof(path));
+  int lenient = 0;
+  if (config->command_count > 0) {
+    f2e_resolve_command_path(config, argc, argv, &path);
+    lenient = path.depth == 0;
+    char joined[F2E_MAX_VALUE];
+    int tail = path.depth > 0 ? path.commands[path.depth - 1] : F2E_SCOPE_ROOT;
+    if (f2e_command_path_label(config, tail, joined, sizeof(joined))) {
+      f2e_set_pair(pairs, F2E_MAX_PAIRS, config->command_env, joined);
+      f2e_set_pair(provided_pairs, F2E_MAX_PAIRS, config->command_env, joined);
+    }
+    for (size_t i = 0; i < path.depth; i++) {
+      const F2ECommand *command = &config->commands[path.commands[i]];
+      f2e_json_list_append(&subcommands, command->name);
+      if (command->env[0] != '\0') {
+        f2e_set_pair(pairs, F2E_MAX_PAIRS, command->env, "true");
+        f2e_set_pair(provided_pairs, F2E_MAX_PAIRS, command->env, "true");
+      }
+    }
+    f2e_apply_defaults_for_path(config, pairs, F2E_MAX_PAIRS, &path);
+  } else {
+    f2e_apply_defaults(config, pairs, F2E_MAX_PAIRS);
+  }
+
+  f2e_scan_argv(config,
+                pairs,
+                F2E_MAX_PAIRS,
+                argc,
+                argv,
+                track_positionals ? &positionals : NULL,
+                lists_ok ? &unknown_options : NULL,
+                lists_ok ? &errors : NULL,
+                lists_ok ? &extras : NULL,
+                path.depth > 0,
+                allow_unknown,
+                allow_unknown_forced,
+                lenient,
+                NULL);
+
+  /*
+   * Scan the same argv without seeded defaults. Diagnostics and operands were
+   * already collected above; this pass only captures normalized CLI
+   * overrides for callers that merge them over a real environment before
+   * coercion.
+   */
+  f2e_scan_argv(config,
+                provided_pairs,
+                F2E_MAX_PAIRS,
+                argc,
+                argv,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                0,
+                allow_unknown,
+                allow_unknown_forced,
+                lenient,
+                NULL);
+
+  if (track_positionals && positionals.count > 0) {
+    char value[F2E_MAX_VALUE];
+    if (f2e_json_list_finish(&positionals, value, sizeof(value))) {
+      f2e_set_pair(pairs, F2E_MAX_PAIRS, config->positionals_env, value);
+      f2e_set_pair(provided_pairs, F2E_MAX_PAIRS, config->positionals_env, value);
+    }
+  }
+  if (config->unknown_options_env[0] != '\0' && unknown_options.count > 0) {
+    char value[F2E_MAX_VALUE];
+    F2EBuffer copy = unknown_options.buffer;
+    if (copy.len + 2 <= sizeof(value)) {
+      memcpy(value, copy.data, copy.len);
+      value[copy.len] = ']';
+      value[copy.len + 1] = '\0';
+      f2e_set_pair(pairs, F2E_MAX_PAIRS, config->unknown_options_env, value);
+      f2e_set_pair(provided_pairs, F2E_MAX_PAIRS, config->unknown_options_env, value);
+    }
+  }
+  if (config->errors_env[0] != '\0' && errors.count > 0) {
+    char value[F2E_MAX_VALUE];
+    F2EBuffer copy = errors.buffer;
+    if (copy.len + 2 <= sizeof(value)) {
+      memcpy(value, copy.data, copy.len);
+      value[copy.len] = ']';
+      value[copy.len + 1] = '\0';
+      f2e_set_pair(pairs, F2E_MAX_PAIRS, config->errors_env, value);
+      f2e_set_pair(provided_pairs, F2E_MAX_PAIRS, config->errors_env, value);
+    }
+  }
+
+  char *flags_json = f2e_pairs_to_json(pairs, F2E_MAX_PAIRS);
+  char *provided_flags_json = f2e_pairs_to_json(provided_pairs, F2E_MAX_PAIRS);
+  char label[F2E_MAX_VALUE];
+  label[0] = '\0';
+  if (path.depth > 0 &&
+      !f2e_command_path_label(config, path.commands[path.depth - 1], label, sizeof(label))) {
+    label[0] = '\0';
+  }
+
+  char *result = NULL;
+  if (flags_json && provided_flags_json && lists_ok &&
+      f2e_json_list_close(&subcommands) &&
+      f2e_json_list_close(&extras) &&
+      f2e_json_list_close(&unknown_options) &&
+      f2e_json_list_close(&errors)) {
+    F2EBuffer out = {0};
+    if (f2e_buffer_init(&out)) {
+      int ok = f2e_buffer_append(&out, "{\"flags\":") &&
+               f2e_buffer_append(&out, flags_json) &&
+               f2e_buffer_append(&out, ",\"providedFlags\":") &&
+               f2e_buffer_append(&out, provided_flags_json) &&
+               f2e_buffer_append(&out, ",\"command\":") &&
+               f2e_buffer_append_json_string(&out, label) &&
+               f2e_buffer_append(&out, ",\"subcommands\":") &&
+               f2e_buffer_append(&out, subcommands.buffer.data) &&
+               f2e_buffer_append(&out, ",\"extras\":") &&
+               f2e_buffer_append(&out, extras.buffer.data) &&
+               f2e_buffer_append(&out, ",\"unknownOptions\":") &&
+               f2e_buffer_append(&out, unknown_options.buffer.data) &&
+               f2e_buffer_append(&out, ",\"errors\":") &&
+               f2e_buffer_append(&out, errors.buffer.data) &&
+               f2e_buffer_append_char(&out, '}');
+      if (ok) {
+        result = out.data;
+      } else {
+        free(out.data);
+      }
+    }
+  }
+
+  f2e_free(flags_json);
+  f2e_free(provided_flags_json);
+  f2e_json_list_discard(&positionals);
+  f2e_json_list_discard(&unknown_options);
+  f2e_json_list_discard(&errors);
+  f2e_json_list_discard(&extras);
+  f2e_json_list_discard(&subcommands);
+  free(pairs);
+  free(provided_pairs);
+  free(config);
+  return result;
+}
+
+char *f2e_parse_structured(int argc, const char *const argv[]) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *result = f2e_parse_structured_from_file(path, argc, argv);
+  free(path);
+  return result;
+}
+
+/*
+ * Returns the resolved command path as its own JSON report, independent of
+ * the env map (whose keys can be shadowed by real environment variables):
+ *   {"path":["remote","add"],"label":"remote add"}
+ * An empty path means argv selected no command (or none are declared).
+ */
+char *f2e_resolve_commands_from_file(const char *config_path, int argc, const char *const argv[]) {
+  if (argc < 0 || !argv) {
+    argc = 0;
+  }
+
+  F2EConfig *config = (F2EConfig *)malloc(sizeof(F2EConfig));
+  if (!config) {
+    return NULL;
+  }
+  if (!config_path || !f2e_load_config(config_path, config)) {
+    free(config);
+    return NULL;
+  }
+
+  F2ECommandPath path;
+  memset(&path, 0, sizeof(path));
+  if (config->command_count > 0) {
+    f2e_resolve_command_path(config, argc, argv, &path);
+  }
+
+  F2EBuffer out = {0};
+  if (!f2e_buffer_init(&out)) {
+    free(config);
+    return NULL;
+  }
+
+  int ok = f2e_buffer_append(&out, "{\"path\":[");
+  for (size_t i = 0; ok && i < path.depth; i++) {
+    if (i > 0) {
+      ok = f2e_buffer_append_char(&out, ',');
+    }
+    ok = ok && f2e_buffer_append_json_string(&out, config->commands[path.commands[i]].name);
+  }
+  char label[F2E_MAX_VALUE];
+  label[0] = '\0';
+  if (path.depth > 0) {
+    if (!f2e_command_path_label(config, path.commands[path.depth - 1], label, sizeof(label))) {
+      label[0] = '\0';
+    }
+  }
+  ok = ok &&
+       f2e_buffer_append(&out, "],\"label\":") &&
+       f2e_buffer_append_json_string(&out, label) &&
+       f2e_buffer_append_char(&out, '}');
+
+  free(config);
+  if (!ok) {
+    free(out.data);
+    return NULL;
+  }
+  return out.data;
+}
+
+char *f2e_resolve_commands(int argc, const char *const argv[]) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *result = f2e_resolve_commands_from_file(path, argc, argv);
+  free(path);
+  return result;
+}
+
 static int f2e_json_array_append(char ***items, int *count, int *cap, const char *value) {
   if (*count >= *cap) {
     int next = *cap == 0 ? 8 : *cap * 2;
@@ -3726,6 +6431,7 @@ static int f2e_json_array_append(char ***items, int *count, int *cap, const char
 static int f2e_parse_json_string_token(const char **cursor_ref, char *out, size_t out_size) {
   const char *cursor = f2e_trim_left((char *)*cursor_ref);
   size_t len = 0;
+  int overflow = 0;
   if (*cursor != '"') {
     return 0;
   }
@@ -3768,6 +6474,8 @@ static int f2e_parse_json_string_token(const char **cursor_ref, char *out, size_
     }
     if (len + 1 < out_size) {
       out[len++] = ch;
+    } else {
+      overflow = 1;
     }
   }
   if (*cursor != '"') {
@@ -3778,7 +6486,623 @@ static int f2e_parse_json_string_token(const char **cursor_ref, char *out, size_
     out[len] = '\0';
   }
   *cursor_ref = cursor;
+  return !overflow;
+}
+
+typedef enum {
+  F2E_JSON_INPUT_STRING = 0,
+  F2E_JSON_INPUT_NUMBER = 1,
+  F2E_JSON_INPUT_BOOL = 2,
+  F2E_JSON_INPUT_ARRAY = 3,
+  F2E_JSON_INPUT_OBJECT = 4,
+  F2E_JSON_INPUT_NULL = 5
+} F2EJsonInputKind;
+
+typedef struct {
+  int present;
+  F2EJsonInputKind kind;
+  char text[F2E_MAX_VALUE];
+  char raw[F2E_MAX_LINE];
+} F2ECoerceValue;
+
+static size_t f2e_find_flag_index_by_env(const F2EConfig *config, const char *env) {
+  if (!config || !env) {
+    return SIZE_MAX;
+  }
+  for (size_t i = 0; i < config->flag_count; i++) {
+    if (f2e_streq(config->flags[i].env, env)) {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+
+/*
+ * Coercion slots: [0, flag_count) are flags, [flag_count, flag_count +
+ * command_count) are per-command marker envs, and the final slot is
+ * parse.command_env.
+ */
+static size_t f2e_coerce_slot_count_values(size_t flag_count, size_t command_count) {
+  return flag_count + command_count + 1;
+}
+
+static size_t f2e_coerce_slot_count(const F2EConfig *config) {
+  return f2e_coerce_slot_count_values(config->flag_count, config->command_count);
+}
+
+static size_t f2e_coerce_slot_for_key(const F2EConfig *config, const char *key) {
+  size_t index = f2e_find_flag_index_by_env(config, key);
+  if (index != SIZE_MAX) {
+    return index;
+  }
+  for (size_t i = 0; i < config->command_count; i++) {
+    if (config->commands[i].env[0] != '\0' && f2e_streq(config->commands[i].env, key)) {
+      return config->flag_count + i;
+    }
+  }
+  if (config->command_count > 0 && config->command_env[0] != '\0' && f2e_streq(config->command_env, key)) {
+    return config->flag_count + config->command_count;
+  }
+  return SIZE_MAX;
+}
+
+static int f2e_coerce_value_is_true(const F2ECoerceValue *value) {
+  if (!value || !value->present) {
+    return 0;
+  }
+  if (value->kind == F2E_JSON_INPUT_BOOL) {
+    return f2e_streq(value->raw, "true");
+  }
+  return value->kind == F2E_JSON_INPUT_STRING && f2e_streq(value->text, "true");
+}
+
+static int f2e_command_is_same_or_descendant(const F2EConfig *config,
+                                             int candidate,
+                                             int ancestor) {
+  while (candidate >= 0 && (size_t)candidate < config->command_count) {
+    if (candidate == ancestor) {
+      return 1;
+    }
+    candidate = config->commands[candidate].parent;
+  }
+  return 0;
+}
+
+/*
+ * Command-scoped defaults are only materialized when the input identifies an
+ * active command. Parsed maps always carry parse.command_env; command marker
+ * envs are also accepted for callers that construct a map directly.
+ */
+static int f2e_coerce_command_is_active(const F2EConfig *config,
+                                        const F2ECoerceValue *values,
+                                        int command) {
+  if (!config || !values || command < 0 || (size_t)command >= config->command_count) {
+    return 0;
+  }
+
+  const F2ECoerceValue *path =
+      &values[config->flag_count + config->command_count];
+  if (path->present && path->kind == F2E_JSON_INPUT_STRING) {
+    for (size_t i = 0; i < config->command_count; i++) {
+      char label[F2E_MAX_VALUE];
+      if (f2e_command_path_label(config, (int)i, label, sizeof(label)) &&
+          f2e_streq(label, path->text) &&
+          f2e_command_is_same_or_descendant(config, (int)i, command)) {
+        return 1;
+      }
+    }
+  }
+
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECoerceValue *marker = &values[config->flag_count + i];
+    if (f2e_coerce_value_is_true(marker) &&
+        f2e_command_is_same_or_descendant(config, (int)i, command)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int f2e_copy_json_span(char *out, size_t out_size, const char *start, const char *end) {
+  if (!out || out_size == 0 || !start || !end || end < start) {
+    return 0;
+  }
+  size_t len = (size_t)(end - start);
+  if (len >= out_size) {
+    return 0;
+  }
+  memcpy(out, start, len);
+  out[len] = '\0';
   return 1;
+}
+
+static int f2e_parse_coerce_input(const F2EConfig *config,
+                                  const char *values_json,
+                                  F2ECoerceValue *values,
+                                  F2ECoerceValue *parse_errors) {
+  if (!config || !values_json || !values || !parse_errors) {
+    return 0;
+  }
+  const char *cursor = values_json;
+  f2e_json_skip_ws(&cursor);
+  if (*cursor != '{') {
+    return 0;
+  }
+  cursor++;
+  f2e_json_skip_ws(&cursor);
+  if (*cursor == '}') {
+    cursor++;
+    f2e_json_skip_ws(&cursor);
+    return *cursor == '\0';
+  }
+
+  while (*cursor) {
+    char key[F2E_MAX_LINE];
+    if (!f2e_parse_json_string_token(&cursor, key, sizeof(key))) {
+      return 0;
+    }
+    size_t index = f2e_coerce_slot_for_key(config, key);
+    int is_parse_errors = config->errors_env[0] != '\0' && f2e_streq(config->errors_env, key);
+    f2e_json_skip_ws(&cursor);
+    if (*cursor != ':') {
+      return 0;
+    }
+    cursor++;
+    f2e_json_skip_ws(&cursor);
+
+    const char *start = cursor;
+    if (index == SIZE_MAX && !is_parse_errors) {
+      if (!f2e_json_parse_value(&cursor, 0)) {
+        return 0;
+      }
+    }
+    F2EJsonInputKind kind;
+    char text[F2E_MAX_VALUE] = "";
+    if (index == SIZE_MAX && !is_parse_errors) {
+      kind = F2E_JSON_INPUT_NULL;
+    } else if (*cursor == '"') {
+      kind = F2E_JSON_INPUT_STRING;
+      if (!f2e_parse_json_string_token(&cursor, text, sizeof(text))) {
+        return 0;
+      }
+    } else {
+      switch (*cursor) {
+        case '{':
+          kind = F2E_JSON_INPUT_OBJECT;
+          break;
+        case '[':
+          kind = F2E_JSON_INPUT_ARRAY;
+          break;
+        case 't':
+        case 'f':
+          kind = F2E_JSON_INPUT_BOOL;
+          break;
+        case 'n':
+          kind = F2E_JSON_INPUT_NULL;
+          break;
+        default:
+          kind = F2E_JSON_INPUT_NUMBER;
+          break;
+      }
+      if (!f2e_json_parse_value(&cursor, 0)) {
+        return 0;
+      }
+    }
+
+    if (index != SIZE_MAX) {
+      F2ECoerceValue *value = &values[index];
+      value->present = 1;
+      value->kind = kind;
+      f2e_strlcpy(value->text, text, sizeof(value->text));
+      if (!f2e_copy_json_span(value->raw, sizeof(value->raw), start, cursor)) {
+        return 0;
+      }
+    } else if (is_parse_errors) {
+      parse_errors->present = 1;
+      parse_errors->kind = kind;
+      f2e_strlcpy(parse_errors->text, text, sizeof(parse_errors->text));
+      if (!f2e_copy_json_span(parse_errors->raw, sizeof(parse_errors->raw), start, cursor)) {
+        return 0;
+      }
+    }
+
+    f2e_json_skip_ws(&cursor);
+    if (*cursor == ',') {
+      cursor++;
+      f2e_json_skip_ws(&cursor);
+      if (*cursor == '}') {
+        return 0;
+      }
+      continue;
+    }
+    if (*cursor == '}') {
+      cursor++;
+      f2e_json_skip_ws(&cursor);
+      return *cursor == '\0';
+    }
+    return 0;
+  }
+  return 0;
+}
+
+static int f2e_coerce_append_parse_errors(F2EJsonList *errors, const char *json) {
+  if (!errors || !json || !f2e_json_container_is_valid(json, '[')) {
+    return 0;
+  }
+  const char *cursor = json;
+  f2e_json_skip_ws(&cursor);
+  cursor++;
+  f2e_json_skip_ws(&cursor);
+  if (*cursor == ']') {
+    return 1;
+  }
+  while (*cursor) {
+    char message[F2E_MAX_VALUE];
+    if (!f2e_parse_json_string_token(&cursor, message, sizeof(message)) ||
+        !f2e_json_list_append(errors, message)) {
+      return 0;
+    }
+    f2e_json_skip_ws(&cursor);
+    if (*cursor == ',') {
+      cursor++;
+      f2e_json_skip_ws(&cursor);
+      continue;
+    }
+    if (*cursor == ']') {
+      cursor++;
+      f2e_json_skip_ws(&cursor);
+      return *cursor == '\0';
+    }
+    return 0;
+  }
+  return 0;
+}
+
+static const char *f2e_coerce_input_kind_name(F2EJsonInputKind kind) {
+  switch (kind) {
+    case F2E_JSON_INPUT_STRING:
+      return "a string";
+    case F2E_JSON_INPUT_NUMBER:
+      return "a number";
+    case F2E_JSON_INPUT_BOOL:
+      return "a boolean";
+    case F2E_JSON_INPUT_ARRAY:
+      return "a JSON array";
+    case F2E_JSON_INPUT_OBJECT:
+      return "a JSON object";
+    case F2E_JSON_INPUT_NULL:
+      return "null";
+    default:
+      return "an unsupported value";
+  }
+}
+
+static void f2e_coerce_add_error(F2EJsonList *errors,
+                                 const F2EFlag *flag,
+                                 const char *expected,
+                                 F2EJsonInputKind received_kind) {
+  char message[F2E_MAX_VALUE];
+  const char *env = flag && flag->env[0] ? flag->env : "<unknown>";
+  const char *name = flag && flag->name[0] ? flag->name : "<unknown>";
+  const char *declared_type = flag ? f2e_value_type_name(flag->type) : "unknown";
+  snprintf(message,
+           sizeof(message),
+           "env %s (flags.%s) must be %s because .cli-flags.toml declares type = \"%s\"; received %s. Set %s to %s or update flags.%s.type",
+           env,
+           name,
+           expected,
+           declared_type,
+           f2e_coerce_input_kind_name(received_kind),
+           env,
+           expected,
+           name);
+  f2e_json_list_append(errors, message);
+}
+
+static int f2e_coerce_value_to_json(const F2EFlag *flag,
+                                    const F2ECoerceValue *input,
+                                    const char *default_value,
+                                    F2EBuffer *out,
+                                    F2EJsonList *errors) {
+  if (!flag || !out || !errors || !f2e_buffer_init(out)) {
+    if (errors) {
+      errors->failed = 1;
+    }
+    return 0;
+  }
+
+  F2EJsonInputKind kind = input ? input->kind : F2E_JSON_INPUT_STRING;
+  const char *text = input ? input->text : default_value;
+  const char *raw = input ? input->raw : NULL;
+  int valid = 0;
+
+  switch (flag->type) {
+    case F2E_TYPE_STRING:
+      valid = kind == F2E_JSON_INPUT_STRING && f2e_buffer_append_json_string(out, text ? text : "");
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "a string", kind);
+      }
+      break;
+
+    case F2E_TYPE_BOOL:
+      if (kind == F2E_JSON_INPUT_BOOL && raw) {
+        valid = f2e_buffer_append(out, raw);
+      } else if (kind == F2E_JSON_INPUT_STRING) {
+        const char *canonical = NULL;
+        if (f2e_bool_value_alias(flag, text, &canonical)) {
+          valid = f2e_buffer_append(out, canonical);
+        }
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "a boolean", kind);
+      }
+      break;
+
+    case F2E_TYPE_INT:
+      if ((kind == F2E_JSON_INPUT_STRING || kind == F2E_JSON_INPUT_NUMBER) &&
+          f2e_int_value_is_valid(kind == F2E_JSON_INPUT_STRING ? text : raw)) {
+        char canonical[64];
+        long long parsed = strtoll(kind == F2E_JSON_INPUT_STRING ? text : raw, NULL, 10);
+        snprintf(canonical, sizeof(canonical), "%lld", parsed);
+        valid = f2e_buffer_append(out, canonical);
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "an integer", kind);
+      }
+      break;
+
+    case F2E_TYPE_FLOAT:
+      if ((kind == F2E_JSON_INPUT_STRING || kind == F2E_JSON_INPUT_NUMBER) &&
+          f2e_float_value_is_valid(kind == F2E_JSON_INPUT_STRING ? text : raw)) {
+        char canonical[128];
+        double parsed = strtod(kind == F2E_JSON_INPUT_STRING ? text : raw, NULL);
+        snprintf(canonical, sizeof(canonical), "%.17g", parsed);
+        valid = f2e_json_value_is_valid(canonical) && f2e_buffer_append(out, canonical);
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "a finite number", kind);
+      }
+      break;
+
+    case F2E_TYPE_JSON: {
+      const char *json = kind == F2E_JSON_INPUT_STRING ? text : raw;
+      if (json && f2e_json_value_is_valid(json)) {
+        valid = f2e_buffer_append(out, json);
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "valid JSON", kind);
+      }
+      break;
+    }
+
+    case F2E_TYPE_ARRAY: {
+      const char *json = kind == F2E_JSON_INPUT_STRING ? text : raw;
+      if ((kind == F2E_JSON_INPUT_STRING || kind == F2E_JSON_INPUT_ARRAY) &&
+          json && f2e_json_container_is_valid(json, '[')) {
+        valid = f2e_buffer_append(out, json);
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "a JSON array", kind);
+      }
+      break;
+    }
+
+    case F2E_TYPE_MAP: {
+      const char *json = kind == F2E_JSON_INPUT_STRING ? text : raw;
+      if ((kind == F2E_JSON_INPUT_STRING || kind == F2E_JSON_INPUT_OBJECT) &&
+          json && f2e_json_container_is_valid(json, '{')) {
+        valid = f2e_buffer_append(out, json);
+      }
+      if (!valid) {
+        f2e_coerce_add_error(errors, flag, "a JSON object", kind);
+      }
+      break;
+    }
+
+    default:
+      f2e_coerce_add_error(errors, flag, "a supported value", kind);
+      break;
+  }
+
+  if (!valid) {
+    free(out->data);
+    memset(out, 0, sizeof(*out));
+  }
+  return valid;
+}
+
+static char *f2e_coerce_error_report(const char *message) {
+  F2EBuffer report = {0};
+  if (!f2e_buffer_init(&report)) {
+    return NULL;
+  }
+  if (!f2e_buffer_append(&report, "{\"ok\":false,\"errors\":[") ||
+      !f2e_buffer_append_json_string(&report, message ? message : "coercion failed") ||
+      !f2e_buffer_append(&report, "]}")) {
+    free(report.data);
+    return NULL;
+  }
+  return report.data;
+}
+
+static char *f2e_coerce_report_from_config(const F2EConfig *config, const char *values_json) {
+  if (!config || !values_json) {
+    return f2e_coerce_error_report("values must be a JSON object");
+  }
+
+  F2ECoerceValue *values = (F2ECoerceValue *)calloc(f2e_coerce_slot_count(config), sizeof(F2ECoerceValue));
+  if (!values) {
+    return NULL;
+  }
+  F2ECoerceValue parse_errors = {0};
+  if (!f2e_parse_coerce_input(config, values_json, values, &parse_errors)) {
+    free(values);
+    return f2e_coerce_error_report("values must be a valid JSON object with supported value sizes");
+  }
+
+  F2EJsonList errors = {0};
+  F2EBuffer output = {0};
+  if (!f2e_json_list_init(&errors) || !f2e_buffer_init(&output) || !f2e_buffer_append_char(&output, '{')) {
+    free(values);
+    f2e_json_list_discard(&errors);
+    free(output.data);
+    return NULL;
+  }
+
+  if (parse_errors.present) {
+    const char *json = parse_errors.kind == F2E_JSON_INPUT_STRING ? parse_errors.text : parse_errors.raw;
+    if ((parse_errors.kind != F2E_JSON_INPUT_STRING && parse_errors.kind != F2E_JSON_INPUT_ARRAY) ||
+        !f2e_coerce_append_parse_errors(&errors, json)) {
+      char message[512];
+      snprintf(message, sizeof(message), "env %s must be a JSON array of error strings", config->errors_env);
+      f2e_json_list_append(&errors, message);
+    }
+  }
+
+  int wrote = 0;
+  for (size_t i = 0; i < config->flag_count; i++) {
+    const F2EFlag *flag = &config->flags[i];
+    const F2ECoerceValue *input = values[i].present ? &values[i] : NULL;
+    if (!input && !flag->has_default) {
+      continue;
+    }
+    if (!input &&
+        flag->command != F2E_SCOPE_ROOT &&
+        !f2e_coerce_command_is_active(config, values, flag->command)) {
+      continue;
+    }
+
+    F2EBuffer coerced = {0};
+    if (!f2e_coerce_value_to_json(flag, input, flag->default_value, &coerced, &errors)) {
+      continue;
+    }
+    if ((wrote && !f2e_buffer_append_char(&output, ',')) ||
+        !f2e_buffer_append_json_string(&output, flag->env) ||
+        !f2e_buffer_append_char(&output, ':') ||
+        !f2e_buffer_append(&output, coerced.data)) {
+      errors.failed = 1;
+    } else {
+      wrote = 1;
+    }
+    free(coerced.data);
+  }
+
+  for (size_t i = 0; i < config->command_count; i++) {
+    const F2ECoerceValue *input = &values[config->flag_count + i];
+    const char *env = config->commands[i].env;
+    if (!input->present || env[0] == '\0') {
+      continue;
+    }
+    const char *emitted = NULL;
+    if (input->kind == F2E_JSON_INPUT_BOOL) {
+      emitted = input->raw;
+    } else if (input->kind == F2E_JSON_INPUT_STRING &&
+               (f2e_streq(input->text, "true") || f2e_streq(input->text, "false"))) {
+      emitted = f2e_streq(input->text, "true") ? "true" : "false";
+    }
+    if (!emitted) {
+      char message[F2E_MAX_VALUE];
+      snprintf(message, sizeof(message),
+               "env %s (commands.%s) must be a boolean command marker; received %s",
+               env,
+               config->commands[i].name,
+               f2e_coerce_input_kind_name(input->kind));
+      f2e_json_list_append(&errors, message);
+      continue;
+    }
+    if ((wrote && !f2e_buffer_append_char(&output, ',')) ||
+        !f2e_buffer_append_json_string(&output, env) ||
+        !f2e_buffer_append_char(&output, ':') ||
+        !f2e_buffer_append(&output, emitted)) {
+      errors.failed = 1;
+    } else {
+      wrote = 1;
+    }
+  }
+
+  {
+    const F2ECoerceValue *input = &values[config->flag_count + config->command_count];
+    if (input->present && config->command_env[0] != '\0') {
+      if (input->kind != F2E_JSON_INPUT_STRING) {
+        char message[F2E_MAX_VALUE];
+        snprintf(message, sizeof(message),
+                 "env %s (parse.command_env) must be a string command path; received %s",
+                 config->command_env,
+                 f2e_coerce_input_kind_name(input->kind));
+        f2e_json_list_append(&errors, message);
+      } else if ((wrote && !f2e_buffer_append_char(&output, ',')) ||
+                 !f2e_buffer_append_json_string(&output, config->command_env) ||
+                 !f2e_buffer_append_char(&output, ':') ||
+                 !f2e_buffer_append_json_string(&output, input->text)) {
+        errors.failed = 1;
+      } else {
+        wrote = 1;
+      }
+    }
+  }
+  free(values);
+
+  if (!f2e_buffer_append_char(&output, '}') || errors.failed) {
+    free(output.data);
+    f2e_json_list_discard(&errors);
+    return NULL;
+  }
+
+  F2EBuffer report = {0};
+  if (!f2e_buffer_init(&report)) {
+    free(output.data);
+    f2e_json_list_discard(&errors);
+    return NULL;
+  }
+  int ok = 1;
+  if (errors.count > 0) {
+    ok = f2e_buffer_append_char(&errors.buffer, ']') &&
+         f2e_buffer_append(&report, "{\"ok\":false,\"errors\":") &&
+         f2e_buffer_append(&report, errors.buffer.data) &&
+         f2e_buffer_append_char(&report, '}');
+  } else {
+    ok = f2e_buffer_append(&report, "{\"ok\":true,\"value\":") &&
+         f2e_buffer_append(&report, output.data) &&
+         f2e_buffer_append_char(&report, '}');
+  }
+  free(output.data);
+  f2e_json_list_discard(&errors);
+  if (!ok) {
+    free(report.data);
+    return NULL;
+  }
+  return report.data;
+}
+
+char *f2e_coerce_json_from_file(const char *config_path, const char *values_json) {
+  F2EConfig *config = (F2EConfig *)malloc(sizeof(F2EConfig));
+  if (!config) {
+    return NULL;
+  }
+  if (!config_path || !f2e_load_config(config_path, config)) {
+    free(config);
+    return f2e_coerce_error_report(
+        "could not read .cli-flags.toml; verify configPath and file permissions");
+  }
+  if (f2e_config_has_audit_errors(config)) {
+    free(config);
+    return f2e_coerce_error_report(
+        ".cli-flags.toml failed audit; run \"f2e audit <path>\" and fix the reported errors");
+  }
+  char *report = f2e_coerce_report_from_config(config, values_json);
+  free(config);
+  return report;
+}
+
+char *f2e_coerce_json(const char *values_json) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return f2e_coerce_error_report(
+        "no usable .cli-flags.toml found before HOME; add one to the project or pass an explicit configPath");
+  }
+  char *report = f2e_coerce_json_from_file(path, values_json);
+  free(path);
+  return report;
 }
 
 static void f2e_free_json_items(char **items, int count);
@@ -3836,6 +7160,35 @@ int f2e_is_help_requested_json_argv(const char *argv_json) {
   int requested = f2e_is_help_requested(count, (const char *const *)items);
   f2e_free_json_items(items, count);
   return requested;
+}
+
+char *f2e_help_table_for_json_argv_from_file(const char *config_path,
+                                             const char *command_name,
+                                             const char *argv_json,
+                                             int terminal_columns) {
+  char **items = NULL;
+  int count = 0;
+  if (!argv_json || !f2e_parse_json_argv_items(argv_json, &items, &count)) {
+    f2e_free_json_items(items, count);
+    return f2e_help_table_from_file(config_path, command_name, terminal_columns);
+  }
+  char *table = f2e_help_table_for_argv_from_file(config_path,
+                                                  command_name,
+                                                  count,
+                                                  (const char *const *)items,
+                                                  terminal_columns);
+  f2e_free_json_items(items, count);
+  return table;
+}
+
+char *f2e_help_table_for_json_argv(const char *command_name, const char *argv_json, int terminal_columns) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *table = f2e_help_table_for_json_argv_from_file(path, command_name, argv_json, terminal_columns);
+  free(path);
+  return table;
 }
 
 static void f2e_free_json_items(char **items, int count) {
@@ -4037,6 +7390,50 @@ char *f2e_parse_json_argv_from_file(const char *config_path, const char *argv_js
 
   char *result = f2e_parse_from_file(config_path, count, (const char *const *)items);
   f2e_free_json_items(items, count);
+  return result;
+}
+
+char *f2e_parse_structured_json_argv_from_file(const char *config_path, const char *argv_json) {
+  char **items = NULL;
+  int count = 0;
+  if (!argv_json || !f2e_parse_json_argv_items(argv_json, &items, &count)) {
+    f2e_free_json_items(items, count);
+    return f2e_parse_structured_from_file(config_path, 0, NULL);
+  }
+  char *result = f2e_parse_structured_from_file(config_path, count, (const char *const *)items);
+  f2e_free_json_items(items, count);
+  return result;
+}
+
+char *f2e_parse_structured_json_argv(const char *argv_json) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *result = f2e_parse_structured_json_argv_from_file(path, argv_json);
+  free(path);
+  return result;
+}
+
+char *f2e_resolve_commands_json_argv_from_file(const char *config_path, const char *argv_json) {
+  char **items = NULL;
+  int count = 0;
+  if (!argv_json || !f2e_parse_json_argv_items(argv_json, &items, &count)) {
+    f2e_free_json_items(items, count);
+    return f2e_resolve_commands_from_file(config_path, 0, NULL);
+  }
+  char *result = f2e_resolve_commands_from_file(config_path, count, (const char *const *)items);
+  f2e_free_json_items(items, count);
+  return result;
+}
+
+char *f2e_resolve_commands_json_argv(const char *argv_json) {
+  char *path = f2e_default_config_path();
+  if (!path) {
+    return NULL;
+  }
+  char *result = f2e_resolve_commands_json_argv_from_file(path, argv_json);
+  free(path);
   return result;
 }
 
