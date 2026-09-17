@@ -1,0 +1,51 @@
+# Multi-architecture image validation and publication.
+# The reusable workflow owns Dockerfile derivation/drift checks and callers pin it
+# by immutable commit SHA. This repository has no GCP Artifact Registry project
+# configured yet, so GCP publication is intentionally omitted rather than passing
+# an empty credential-bearing target.
+name: images
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - Dockerfile
+      - Dockerfile.*.dkf
+      - src/**
+      - Cargo.*
+      - vendor/**
+      - lmx.toml
+      - .cli-flags.toml
+      - .github/workflows/images.yml
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - Dockerfile.*.dkf
+      - src/**
+      - Cargo.*
+      - vendor/**
+      - lmx.toml
+      - .cli-flags.toml
+      - .github/workflows/images.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  images:
+    uses: ORESoftware/ores-gha-workflows/.github/workflows/container-images.yml@8765ad307f4a5a45120e7bc405e6af90095a33bc
+    with:
+      image-name: oresoftware/live-mutex-rs
+      dockerhub-namespace: oresoftware
+      push: ${{ github.event_name != 'pull_request' }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
