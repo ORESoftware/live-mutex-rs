@@ -3,8 +3,12 @@
 //! The public [`Client`] / [`RwClient`] exports fail closed on successful
 //! responses that do not contain complete fencing authority. Raw historical
 //! clients remain available as [`RawClient`] / [`RawRwClient`] for migration
-//! and protocol-level testing.
+//! and protocol-level testing. The public [`Broker`] similarly reserves bounded
+//! fencing authority before lock state can mutate.
 
+#[path = "broker.rs"]
+pub(crate) mod broker_raw;
+#[path = "hardened_broker.rs"]
 pub mod broker;
 pub mod broker_raft;
 pub mod cli_flags;
