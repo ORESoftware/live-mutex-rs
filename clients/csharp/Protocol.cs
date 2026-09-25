@@ -43,6 +43,7 @@ public sealed record Response(
     IReadOnlyList<string> Keys,
     bool? Acquired,
     bool? Unlocked,
+    bool? Granted,
     string? LockUuid,
     ulong? FencingToken,
     IReadOnlyDictionary<string, ulong> FencingTokens,
@@ -52,6 +53,7 @@ public static class Protocol
 {
     public const string ProtocolVersion = "0.1.0";
     public const int MaxCompositeKeys = 5;
+    public const ulong MaxFencingToken = 9_007_199_254_740_991UL;
 
     public static readonly string[] RequestTypes =
     [
@@ -194,21 +196,79 @@ public static class Protocol
     {
         using var doc = JsonDocument.Parse(jsonLine);
         var root = doc.RootElement;
-        var type = ResponseTypeFromWire(GetString(root, "type") ?? "");
-        var keys = GetStringArray(root, "keys");
-        var fencingTokens = GetUInt64Map(root, "fencingTokens");
-
-        return new Response(
-            type,
+        var response = new Response(
+            ResponseTypeFromWire(GetString(root, "type") ?? ""),
             GetString(root, "uuid") ?? "",
             GetString(root, "key"),
-            keys,
+            GetStringArray(root, "keys"),
             GetBool(root, "acquired"),
             GetBool(root, "unlocked"),
+            GetBool(root, "granted"),
             GetString(root, "lockUuid"),
             GetUInt64(root, "fencingToken"),
-            fencingTokens,
+            GetUInt64Map(root, "fencingTokens"),
             GetString(root, "error"));
+
+        ValidateAuthority(response);
+        return response;
+    }
+
+    private static void ValidateAuthority(Response response)
+    {
+        if (response.Type == ResponseType.Lock && response.Acquired == true)
+        {
+            if (string.IsNullOrEmpty(response.Key)
+                || string.IsNullOrEmpty(response.LockUuid)
+                || !IsValidFencingToken(response.FencingToken))
+            {
+                throw new JsonException("successful lock grant omitted valid fenced authority");
+            }
+
+            return;
+        }
+
+        if (response.Type == ResponseType.CompositeLock && response.Acquired == true)
+        {
+            var distinctKeys = new HashSet<string>(response.Keys, StringComparer.Ordinal);
+            if (string.IsNullOrEmpty(response.LockUuid)
+                || response.Keys.Count is < 1 or > MaxCompositeKeys
+                || distinctKeys.Count != response.Keys.Count
+                || response.FencingTokens.Count != response.Keys.Count)
+            {
+                throw new JsonException("successful composite grant omitted complete fenced authority");
+            }
+
+            foreach (var key in response.Keys)
+            {
+                if (!response.FencingTokens.TryGetValue(key, out var token) || !IsValidFencingToken(token))
+                {
+                    throw new JsonException($"successful composite grant has invalid fencing token for key {key}");
+                }
+            }
+
+            return;
+        }
+
+        if ((response.Type == ResponseType.RegisterReadResult || response.Type == ResponseType.RegisterWriteResult)
+            && response.Granted == true)
+        {
+            if (string.IsNullOrEmpty(response.Key)
+                || string.IsNullOrEmpty(response.LockUuid)
+                || !IsValidFencingToken(response.FencingToken))
+            {
+                throw new JsonException("successful reader/writer grant omitted valid fenced authority");
+            }
+        }
+    }
+
+    private static bool IsValidFencingToken(ulong? token)
+    {
+        return token is >= 1 and <= MaxFencingToken;
+    }
+
+    private static bool IsValidFencingToken(ulong token)
+    {
+        return token is >= 1 and <= MaxFencingToken;
     }
 
     private static string Frame(IDictionary<string, object?> fields)
@@ -247,7 +307,7 @@ public static class Protocol
             return new Dictionary<string, ulong>();
         }
 
-        var map = new Dictionary<string, ulong>();
+        var map = new Dictionary<string, ulong>(StringComparer.Ordinal);
         foreach (var prop in value.EnumerateObject())
         {
             if (prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetUInt64(out var n))
@@ -259,4 +319,3 @@ public static class Protocol
         return map;
     }
 }
-
