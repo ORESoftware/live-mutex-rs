@@ -5,12 +5,13 @@
 //! exports route through this module so a successful acquire cannot escape to
 //! application code without complete, exact fencing authority.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::client::{
-    Client as RawClient, ClientConfig, ClientError, LockGuard, LockInfo,
-    RwClient as RawRwClient, RwReadGuard, RwWriteGuard,
+    Client as RawClient, ClientConfig, ClientError, LockGuard, LockInfo, RwClient as RawRwClient,
+    RwReadGuard, RwWriteGuard,
 };
 
 /// Largest authority value that every first-class JSON client can represent
@@ -18,11 +19,14 @@ use crate::client::{
 pub const MAX_FENCING_TOKEN: u64 = 9_007_199_254_740_991;
 
 fn valid_token(token: u64) -> bool {
-    (1..=MAX_FENCING_TOKEN).contains(&token)
+    return (1..=MAX_FENCING_TOKEN).contains(&token);
 }
 
 fn invalid(msg: impl Into<String>) -> ClientError {
-    ClientError::Invalid(format!("invalid fenced authority from broker: {}", msg.into()))
+    return ClientError::Invalid(format!(
+        "invalid fenced authority from broker: {}",
+        msg.into()
+    ));
 }
 
 fn validate_guard(guard: &LockGuard) -> Result<(), ClientError> {
@@ -38,21 +42,30 @@ fn validate_guard(guard: &LockGuard) -> Result<(), ClientError> {
             .fencing_token
             .ok_or_else(|| invalid("single-key grant omitted fencing_token"))?;
         if !valid_token(token) {
-            return Err(invalid(format!("single-key fencing token {token} outside 1..={MAX_FENCING_TOKEN}")));
+            return Err(invalid(format!(
+                "single-key fencing token {token} outside 1..={MAX_FENCING_TOKEN}"
+            )));
         }
-        if guard.fencing_tokens.len() != 1 || guard.fencing_tokens.get(&guard.keys[0]) != Some(&token) {
-            return Err(invalid("single-key grant token map does not exactly match fencing_token"));
+        if guard.fencing_tokens.len() != 1
+            || guard.fencing_tokens.get(&guard.keys[0]) != Some(&token)
+        {
+            return Err(invalid(
+                "single-key grant token map does not exactly match fencing_token",
+            ));
         }
         return Ok(());
     }
 
     if guard.fencing_token.is_some() {
-        return Err(invalid("composite grant exposed an ambiguous scalar fencing_token"));
+        return Err(invalid(
+            "composite grant exposed an ambiguous scalar fencing_token",
+        ));
     }
     if guard.fencing_tokens.len() != guard.keys.len() {
         return Err(invalid("composite grant token/key cardinality mismatch"));
     }
-    let mut unique = std::collections::BTreeSet::new();
+
+    let mut unique = BTreeSet::new();
     for key in &guard.keys {
         if !unique.insert(key) {
             return Err(invalid(format!("composite grant repeated key {key:?}")));
@@ -63,10 +76,35 @@ fn validate_guard(guard: &LockGuard) -> Result<(), ClientError> {
             .copied()
             .ok_or_else(|| invalid(format!("composite grant omitted token for key {key:?}")))?;
         if !valid_token(token) {
-            return Err(invalid(format!("composite token for {key:?} outside 1..={MAX_FENCING_TOKEN}")));
+            return Err(invalid(format!(
+                "composite token for {key:?} outside 1..={MAX_FENCING_TOKEN}"
+            )));
         }
     }
-    Ok(())
+
+    return Ok(());
+}
+
+fn validate_expected_keys(guard: &LockGuard, expected_keys: &[&str]) -> Result<(), ClientError> {
+    if expected_keys.is_empty() {
+        return Err(invalid("caller requested no protected keys"));
+    }
+
+    let expected: BTreeSet<&str> = expected_keys.iter().copied().collect();
+    let returned: BTreeSet<&str> = guard.keys.iter().map(String::as_str).collect();
+    if expected.len() != expected_keys.len() {
+        return Err(invalid("caller requested duplicate keys"));
+    }
+    if returned.len() != guard.keys.len() {
+        return Err(invalid("broker grant repeated a protected key"));
+    }
+    if expected != returned {
+        return Err(invalid(format!(
+            "broker granted key set {returned:?}, expected {expected:?}"
+        )));
+    }
+
+    return Ok(());
 }
 
 fn validate_rw_token(lock_uuid: &str, token: Option<u64>, kind: &str) -> Result<(), ClientError> {
@@ -75,9 +113,11 @@ fn validate_rw_token(lock_uuid: &str, token: Option<u64>, kind: &str) -> Result<
     }
     let token = token.ok_or_else(|| invalid(format!("{kind} grant omitted fencing_token")))?;
     if !valid_token(token) {
-        return Err(invalid(format!("{kind} fencing token {token} outside 1..={MAX_FENCING_TOKEN}")));
+        return Err(invalid(format!(
+            "{kind} fencing token {token} outside 1..={MAX_FENCING_TOKEN}"
+        )));
     }
-    Ok(())
+    return Ok(());
 }
 
 /// Public exclusive/composite client. Transport and correlation behavior is
@@ -92,7 +132,9 @@ impl Client {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_tcp(addr, config).await? })
+        return Ok(Self {
+            inner: RawClient::connect_tcp(addr, config).await?,
+        });
     }
 
     #[cfg(unix)]
@@ -100,7 +142,9 @@ impl Client {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_uds(path, config).await? })
+        return Ok(Self {
+            inner: RawClient::connect_uds(path, config).await?,
+        });
     }
 
     #[cfg(not(unix))]
@@ -108,13 +152,16 @@ impl Client {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_uds(path, config).await? })
+        return Ok(Self {
+            inner: RawClient::connect_uds(path, config).await?,
+        });
     }
 
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire(key, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        validate_expected_keys(&guard, &[key])?;
+        return Ok(guard);
     }
 
     pub async fn acquire_with_max(
@@ -125,7 +172,8 @@ impl Client {
     ) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire_with_max(key, max, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        validate_expected_keys(&guard, &[key])?;
+        return Ok(guard);
     }
 
     pub async fn acquire_composite(
@@ -135,7 +183,8 @@ impl Client {
     ) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire_composite(keys, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        validate_expected_keys(&guard, keys)?;
+        return Ok(guard);
     }
 
     pub async fn try_acquire(
@@ -144,10 +193,11 @@ impl Client {
         ttl: Duration,
     ) -> Result<Option<LockGuard>, ClientError> {
         let guard = self.inner.try_acquire(key, ttl).await?;
-        if let Some(ref g) = guard {
-            validate_guard(g)?;
+        if let Some(ref granted) = guard {
+            validate_guard(granted)?;
+            validate_expected_keys(granted, &[key])?;
         }
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn try_acquire_composite(
@@ -156,32 +206,33 @@ impl Client {
         ttl: Duration,
     ) -> Result<Option<LockGuard>, ClientError> {
         let guard = self.inner.try_acquire_composite(keys, ttl).await?;
-        if let Some(ref g) = guard {
-            validate_guard(g)?;
+        if let Some(ref granted) = guard {
+            validate_guard(granted)?;
+            validate_expected_keys(granted, keys)?;
         }
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn release(&self, guard: &LockGuard) -> Result<(), ClientError> {
-        self.inner.release(guard).await
+        return self.inner.release(guard).await;
     }
 
     pub async fn lock_info(&self, key: &str) -> Result<LockInfo, ClientError> {
-        self.inner.lock_info(key).await
+        return self.inner.lock_info(key).await;
     }
 
     pub async fn ls(&self) -> Result<Vec<String>, ClientError> {
-        self.inner.ls().await
+        return self.inner.ls().await;
     }
 
     pub fn config(&self) -> &ClientConfig {
-        self.inner.config()
+        return self.inner.config();
     }
 
     /// Explicit escape hatch for migration/testing code. Application code that
     /// performs external effects should not bypass fenced grant admission.
     pub fn into_raw(self) -> RawClient {
-        self.inner
+        return self.inner;
     }
 }
 
@@ -196,30 +247,46 @@ impl RwClient {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawRwClient::connect_tcp(addr, config).await? })
+        return Ok(Self {
+            inner: RawRwClient::connect_tcp(addr, config).await?,
+        });
     }
 
     pub async fn connect_uds(
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawRwClient::connect_uds(path, config).await? })
+        return Ok(Self {
+            inner: RawRwClient::connect_uds(path, config).await?,
+        });
     }
 
     pub async fn acquire_read(&self, key: &str) -> Result<RwReadGuard, ClientError> {
         let guard = self.inner.acquire_read(key).await?;
         validate_rw_token(&guard.lock_uuid, guard.fencing_token, "read")?;
-        Ok(guard)
+        if guard.key != key {
+            return Err(invalid(format!(
+                "read grant returned key {:?}, expected {key:?}",
+                guard.key
+            )));
+        }
+        return Ok(guard);
     }
 
     pub async fn acquire_write(&self, key: &str) -> Result<RwWriteGuard, ClientError> {
         let guard = self.inner.acquire_write(key).await?;
         validate_rw_token(&guard.lock_uuid, guard.fencing_token, "write")?;
-        Ok(guard)
+        if guard.key != key {
+            return Err(invalid(format!(
+                "write grant returned key {:?}, expected {key:?}",
+                guard.key
+            )));
+        }
+        return Ok(guard);
     }
 
     pub fn into_raw(self) -> RawRwClient {
-        self.inner
+        return self.inner;
     }
 }
 
@@ -250,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_grants_for_unexpected_keys() {
+        let mut tokens = BTreeMap::new();
+        tokens.insert("wrong".into(), 1);
+        let guard = LockGuard {
+            keys: vec!["wrong".into()],
+            lock_uuid: "l".into(),
+            fencing_token: Some(1),
+            fencing_tokens: tokens,
+        };
+        validate_guard(&guard).unwrap();
+        assert!(validate_expected_keys(&guard, &["expected"]).is_err());
+    }
+
+    #[test]
     fn accepts_exact_single_and_composite_authority() {
         let mut one = BTreeMap::new();
         one.insert("k".into(), MAX_FENCING_TOKEN);
@@ -260,6 +341,7 @@ mod tests {
             fencing_tokens: one,
         };
         validate_guard(&single).unwrap();
+        validate_expected_keys(&single, &["k"]).unwrap();
 
         let mut many = BTreeMap::new();
         many.insert("a".into(), 1);
@@ -271,5 +353,6 @@ mod tests {
             fencing_tokens: many,
         };
         validate_guard(&composite).unwrap();
+        validate_expected_keys(&composite, &["b", "a"]).unwrap();
     }
 }
