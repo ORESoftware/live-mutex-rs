@@ -57,7 +57,7 @@ impl Default for RaftSimConfig {
     fn default() -> Self {
         crate::routine_id!("ddl-routine-raft-sim-config-default-1");
         let defaults = BrokerRaftConfig::default();
-        Self {
+        return Self {
             node_count: 3,
             data_dir: std::env::temp_dir().join(format!("lmx-raft-sim-{}", Uuid::new_v4())),
             cleanup_data_dir: true,
@@ -75,7 +75,7 @@ impl Default for RaftSimConfig {
             sync_log: defaults.sync_log,
             sync_commit: defaults.sync_commit,
             peer_token: None,
-        }
+        };
     }
 }
 
@@ -119,11 +119,11 @@ pub struct RaftSim {
 impl RaftSim {
     pub async fn new(node_count: usize) -> Result<Self, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-new-1");
-        Self::with_config(RaftSimConfig {
+        return Self::with_config(RaftSimConfig {
             node_count,
             ..RaftSimConfig::default()
         })
-        .await
+        .await;
     }
 
     pub async fn with_config(config: RaftSimConfig) -> Result<Self, RaftSimError> {
@@ -175,33 +175,33 @@ impl RaftSim {
             tasks.insert(node_id.clone(), node.spawn_in_memory_raft_tasks());
         }
 
-        Ok(Self {
+        return Ok(Self {
             nodes,
             tasks,
             network,
             data_dir: config.data_dir,
             cleanup_data_dir: config.cleanup_data_dir,
-        })
+        });
     }
 
     pub fn data_dir(&self) -> &Path {
         crate::routine_id!("ddl-routine-raft-sim-data-dir-1");
-        &self.data_dir
+        return &self.data_dir;
     }
 
     pub fn node_ids(&self) -> Vec<String> {
         crate::routine_id!("ddl-routine-raft-sim-node-ids-1");
-        self.nodes.keys().cloned().collect()
+        return self.nodes.keys().cloned().collect();
     }
 
     pub fn node(&self, node_id: &str) -> Option<&BrokerRaft> {
         crate::routine_id!("ddl-routine-raft-sim-node-1");
-        self.nodes.get(node_id)
+        return self.nodes.get(node_id);
     }
 
     pub fn nodes(&self) -> &BTreeMap<String, BrokerRaft> {
         crate::routine_id!("ddl-routine-raft-sim-nodes-1");
-        &self.nodes
+        return &self.nodes;
     }
 
     pub fn restart_node(&mut self, node_id: &str) -> Result<(), RaftSimError> {
@@ -225,7 +225,7 @@ impl RaftSim {
         self.tasks
             .insert(node_id.to_string(), node.spawn_in_memory_raft_tasks());
         self.nodes.insert(node_id.to_string(), node);
-        Ok(())
+        return Ok(());
     }
 
     pub fn add_node(&mut self, node_id: impl Into<String>) -> Result<RaftPeerConfig, RaftSimError> {
@@ -257,28 +257,28 @@ impl RaftSim {
         self.tasks
             .insert(node_id.clone(), node.spawn_in_memory_raft_tasks());
         self.nodes.insert(node_id, node);
-        Ok(peer)
+        return Ok(peer);
     }
 
     pub fn progress(&self) -> Vec<RaftProgressSnapshot> {
         crate::routine_id!("ddl-routine-raft-sim-progress-1");
-        self.nodes
+        return self.nodes
             .values()
             .map(BrokerRaft::progress_snapshot)
-            .collect()
+            .collect();
     }
 
     pub fn leader(&self) -> Option<BrokerRaft> {
         crate::routine_id!("ddl-routine-raft-sim-leader-1");
-        self.nodes.values().find(|node| node.is_leader()).cloned()
+        return self.nodes.values().find(|node| node.is_leader()).cloned();
     }
 
     pub fn ready_leader(&self) -> Option<BrokerRaft> {
         crate::routine_id!("ddl-routine-raft-sim-ready-leader-1");
-        self.nodes
+        return self.nodes
             .values()
             .find(|node| node.is_leader_ready())
-            .cloned()
+            .cloned();
     }
 
     pub async fn wait_for_leader(&self, timeout: Duration) -> Result<BrokerRaft, RaftSimError> {
@@ -342,7 +342,7 @@ impl RaftSim {
         is_acquire: bool,
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-node-1");
-        retry_sim_response(
+        return retry_sim_response(
             "raft node response",
             DEFAULT_SIM_REQUEST_TIMEOUT,
             |_| {
@@ -359,7 +359,7 @@ impl RaftSim {
             },
             |_| false,
         )
-        .await
+        .await;
     }
 
     pub async fn run_on_leader(
@@ -370,7 +370,7 @@ impl RaftSim {
         is_acquire: bool,
     ) -> Result<Option<Response>, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-run-leader-1");
-        retry_sim_response(
+        return retry_sim_response(
             "ready raft leader",
             DEFAULT_SIM_REQUEST_TIMEOUT,
             |remaining| {
@@ -385,7 +385,7 @@ impl RaftSim {
             },
             retryable_sim_leader_error,
         )
-        .await
+        .await;
     }
 
     pub async fn change_membership(&self, peers: Vec<RaftPeerConfig>) -> Result<u64, RaftSimError> {
@@ -419,7 +419,7 @@ impl RaftSim {
 
     pub async fn acquire(&self, key: impl Into<String>) -> Result<RaftSimLock, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-acquire-1");
-        self.acquire_with_wait(key, Duration::ZERO).await
+        return self.acquire_with_wait(key, Duration::ZERO).await;
     }
 
     pub async fn acquire_with_wait(
@@ -452,7 +452,7 @@ impl RaftSim {
             .ok_or_else(|| RaftSimError::NoResponse {
                 request_id: request_uuid.clone(),
             })?;
-        match response {
+        return match response {
             Response::Lock {
                 acquired: true,
                 lock_uuid: Some(lock_uuid),
@@ -467,13 +467,13 @@ impl RaftSim {
                 request_id: request_uuid,
                 response: Box::new(response),
             }),
-        }
+        };
     }
 
     pub async fn release(&self, lock: &RaftSimLock) -> Result<Response, RaftSimError> {
         crate::routine_id!("ddl-routine-raft-sim-release-1");
-        self.release_key(&lock.key, Some(lock.lock_uuid.clone()), false)
-            .await
+        return self.release_key(&lock.key, Some(lock.lock_uuid.clone()), false)
+            .await;
     }
 
     pub async fn release_key(
@@ -485,7 +485,7 @@ impl RaftSim {
         crate::routine_id!("ddl-routine-raft-sim-release-key-1");
         let key = key.into();
         let request_uuid = format!("sim-release-{}", Uuid::new_v4());
-        self.run_on_leader(
+        return self.run_on_leader(
             Request::Unlock {
                 uuid: request_uuid.clone(),
                 key: Some(key),
@@ -500,7 +500,7 @@ impl RaftSim {
         .await?
         .ok_or(RaftSimError::NoResponse {
             request_id: request_uuid,
-        })
+        });
     }
 
     pub fn disconnect_node(&self, node_id: &str) {
@@ -551,19 +551,19 @@ impl Drop for RaftSim {
 
 fn sim_peers(node_count: usize) -> Vec<RaftPeerConfig> {
     crate::routine_id!("ddl-routine-raft-sim-peers-1");
-    (1..=node_count)
+    return (1..=node_count)
         .map(|idx| RaftPeerConfig {
             id: format!("node-{idx}"),
             addr: format!("memory://node-{idx}"),
         })
-        .collect()
+        .collect();
 }
 
 fn deadline_after(timeout: Duration) -> tokio::time::Instant {
     crate::routine_id!("ddl-routine-raft-sim-deadline-after-1");
     let now = tokio::time::Instant::now();
-    now.checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+    return now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
 }
 
 async fn retry_sim_response<F, Fut, R>(
@@ -613,19 +613,19 @@ where
 
 fn retryable_sim_leader_error(err: &RaftSimError) -> bool {
     crate::routine_id!("ddl-routine-raft-sim-retryable-leader-error-1");
-    matches!(
+    return matches!(
         err,
         RaftSimError::Raft(
             BrokerRaftError::NotLeader { .. }
                 | BrokerRaftError::QuorumUnavailable { .. }
                 | BrokerRaftError::ClientProposalUncertain { .. }
         )
-    )
+    );
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
     crate::routine_id!("ddl-routine-raft-sim-duration-ms-1");
-    duration.as_millis().min(u64::MAX as u128) as u64
+    return duration.as_millis().min(u64::MAX as u128) as u64;
 }
 
 #[cfg(test)]
@@ -3068,7 +3068,7 @@ mod tests {
     impl SimRng {
         fn new(seed: u64) -> Self {
             crate::routine_id!("ddl-routine-raft-sim-test-rng-new-1");
-            Self { state: seed }
+            return Self { state: seed };
         }
 
         fn next_u64(&mut self) -> u64 {
@@ -3077,13 +3077,13 @@ mod tests {
                 .state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            self.state
+            return self.state;
         }
 
         fn index(&mut self, len: usize) -> usize {
             crate::routine_id!("ddl-routine-raft-sim-test-rng-index-1");
             debug_assert!(len > 0);
-            (self.next_u64() as usize) % len
+            return (self.next_u64() as usize) % len;
         }
     }
 
@@ -3092,7 +3092,7 @@ mod tests {
         node_ids: &[String],
     ) -> BTreeMap<String, FullLogMetricSnapshot> {
         crate::routine_id!("ddl-routine-raft-sim-test-full-log-metrics-nodes-1");
-        node_ids
+        return node_ids
             .iter()
             .map(|node_id| {
                 let node = sim
@@ -3100,13 +3100,13 @@ mod tests {
                     .unwrap_or_else(|| panic!("node {node_id} should exist for metric snapshot"));
                 (node_id.clone(), full_log_metrics_for_node(node))
             })
-            .collect()
+            .collect();
     }
 
     fn full_log_metrics_for_node(node: &BrokerRaft) -> FullLogMetricSnapshot {
         crate::routine_id!("ddl-routine-raft-sim-test-full-log-metrics-node-1");
         let metrics = node.raft_metrics_text();
-        FullLogMetricSnapshot {
+        return FullLogMetricSnapshot {
             reads_total: metric_value(&metrics, "dd_rust_network_mutex_raft_log_full_reads_total"),
             read_failures_total: metric_value(
                 &metrics,
@@ -3136,7 +3136,7 @@ mod tests {
                 &metrics,
                 "dd_rust_network_mutex_raft_log_full_rewrite_bytes_total",
             ),
-        }
+        };
     }
 
     fn assert_full_log_metrics_unchanged(
@@ -3170,7 +3170,7 @@ mod tests {
                 });
             }
         }
-        panic!("metric {name} missing from raft metrics");
+        return panic!("metric {name} missing from raft metrics");;
     }
 
     fn assert_lock_history_linearizable(history: &[LockHistoryOp]) {
@@ -3279,19 +3279,19 @@ mod tests {
                 return true;
             }
         }
-        false
+        return false;
     }
 
     fn apply_linear_model_op(holder: u16, op: LinearModelOp) -> Option<u16> {
         crate::routine_id!("ddl-routine-raft-sim-test-apply-linear-op-1");
-        match op {
+        return match op {
             LinearModelOp::AcquireGranted(lock_id) if holder == 0 => Some(lock_id),
             LinearModelOp::AcquireGranted(_) => None,
             LinearModelOp::AcquireRejected if holder != 0 => Some(holder),
             LinearModelOp::AcquireRejected => None,
             LinearModelOp::Release(lock_id) if holder == lock_id => Some(0),
             LinearModelOp::Release(_) => None,
-        }
+        };
     }
 
     struct NoWaitHistoryPhase {
@@ -3454,7 +3454,7 @@ mod tests {
             sim.wait_for_quorum_commit(last_index, Duration::from_secs(5))
                 .await?;
         }
-        Ok(last_index)
+        return Ok(last_index);
     }
 
     async fn acquire_composite_on_node(
@@ -3488,7 +3488,7 @@ mod tests {
             .ok_or_else(|| RaftSimError::NoResponse {
                 request_id: request_uuid.clone(),
             })?;
-        match response {
+        return match response {
             Response::CompositeLock {
                 acquired: true,
                 keys,
@@ -3512,7 +3512,7 @@ mod tests {
                 request_id: request_uuid,
                 response: Box::new(response),
             }),
-        }
+        };
     }
 
     async fn acquire_key_on_node(
@@ -3546,7 +3546,7 @@ mod tests {
             .ok_or_else(|| RaftSimError::NoResponse {
                 request_id: request_uuid.clone(),
             })?;
-        match response {
+        return match response {
             Response::Lock {
                 acquired: true,
                 lock_uuid: Some(lock_uuid),
@@ -3564,7 +3564,7 @@ mod tests {
                 request_id: request_uuid,
                 response: Box::new(response),
             }),
-        }
+        };
     }
 
     async fn release_composite_on_node(
@@ -3605,13 +3605,13 @@ mod tests {
         .ok_or_else(|| RaftSimError::NoResponse {
             request_id: request_uuid.clone(),
         })?;
-        match response {
+        return match response {
             Response::Unlock { unlocked: true, .. } => Ok(()),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
                 response: Box::new(response),
             }),
-        }
+        };
     }
 
     async fn release_lock_on_node(
@@ -3652,13 +3652,13 @@ mod tests {
         .ok_or_else(|| RaftSimError::NoResponse {
             request_id: request_uuid.clone(),
         })?;
-        match response {
+        return match response {
             Response::Unlock { unlocked: true, .. } => Ok(()),
             response => Err(RaftSimError::UnexpectedResponse {
                 request_id: request_uuid,
                 response: Box::new(response),
             }),
-        }
+        };
     }
 
     async fn release_all_held_on_seeded_nodes(
@@ -3680,7 +3680,7 @@ mod tests {
             sim.wait_for_quorum_commit(leader.commit_index(), Duration::from_secs(5))
                 .await?;
         }
-        Ok(())
+        return Ok(());
     }
 
     async fn wait_for_ready_leader_in(
@@ -3793,7 +3793,7 @@ mod tests {
 
     fn removed_member_guard_active(progress: &RaftProgressSnapshot) -> bool {
         crate::routine_id!("ddl-routine-raft-sim-test-removed-member-guard-1");
-        match &progress.membership {
+        return match &progress.membership {
             RaftMembership::Simple { peers } => {
                 !peers.iter().any(|peer| peer.id == progress.node_id)
             }
@@ -3804,7 +3804,7 @@ mod tests {
                 old_peers.iter().any(|peer| peer.id == progress.node_id)
                     && !new_peers.iter().any(|peer| peer.id == progress.node_id)
             }
-        }
+        };
     }
 
     async fn assert_removed_node_rejects_client(sim: &RaftSim, removed_id: &str) {
@@ -3859,34 +3859,34 @@ mod tests {
 
     fn append_entries_batches_total(sim: &RaftSim) -> u64 {
         crate::routine_id!("ddl-routine-raft-sim-test-append-batches-total-1");
-        sim.nodes()
+        return sim.nodes()
             .values()
             .map(|node| node.telemetry_snapshot().append_entries_batches_total)
-            .sum()
+            .sum();
     }
 
     fn append_entries_sent_total(sim: &RaftSim) -> u64 {
         crate::routine_id!("ddl-routine-raft-sim-test-append-sent-total-1");
-        sim.nodes()
+        return sim.nodes()
             .values()
             .map(|node| node.telemetry_snapshot().append_entries_sent_total)
-            .sum()
+            .sum();
     }
 
     fn append_snapshot_fallbacks_total(sim: &RaftSim) -> u64 {
         crate::routine_id!("ddl-routine-raft-sim-test-append-snapshot-fallbacks-1");
-        sim.nodes()
+        return sim.nodes()
             .values()
             .map(|node| node.telemetry_snapshot().append_snapshot_fallbacks_total)
-            .sum()
+            .sum();
     }
 
     fn install_snapshot_successes_total(sim: &RaftSim) -> u64 {
         crate::routine_id!("ddl-routine-raft-sim-test-install-snapshot-successes-1");
-        sim.nodes()
+        return sim.nodes()
             .values()
             .map(|node| node.telemetry_snapshot().install_snapshot_successes_total)
-            .sum()
+            .sum();
     }
 
     async fn wait_for_node_compaction(
