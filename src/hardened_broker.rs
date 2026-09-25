@@ -6,11 +6,11 @@
 //! before the raw broker is allowed to mutate lock state. That gives us one
 //! fail-closed boundary for single-key, RW, semaphore, and composite grants.
 
-use std::ops::Deref;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::broker_raw::{Broker as RawBroker, GrantOverrides};
 use crate::protocol::{Request, Response, MAX_COMPOSITE_KEYS};
@@ -43,6 +43,19 @@ impl AuthorityAllocator {
         return Self {
             next: wall_clock_micros.max(1),
         };
+    }
+
+    fn advance_past(&mut self, watermark: u64) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-hardened-broker-authority-advance-past-1");
+        if watermark > MAX_SERVER_FENCING_TOKEN {
+            return Err(format!(
+                "existing broker fencing watermark {watermark} exceeds fleet-safe ceiling {MAX_SERVER_FENCING_TOKEN}"
+            ));
+        }
+        if watermark >= self.next {
+            self.next = watermark.saturating_add(1);
+        }
+        return Ok(());
     }
 
     fn reserve(&mut self, width: u64) -> Result<u64, String> {
@@ -89,9 +102,9 @@ impl AuthorityAllocator {
     }
 }
 
-/// Public/server-facing broker. Non-authority methods delegate to the raw
-/// broker via `Deref`; grant admission is shadowed here so unsafe authority can
-/// never reach the mutation engine.
+/// Public/server-facing broker. Lock-state methods delegate to the raw broker;
+/// authority-bearing admission is shadowed here so unsafe authority can never
+/// reach the mutation engine.
 #[derive(Clone)]
 pub struct Broker {
     inner: RawBroker,
@@ -116,6 +129,24 @@ impl Broker {
             inner: RawBroker::with_response_observer(config, response_observer),
             authority: Arc::new(Mutex::new(AuthorityAllocator::new())),
         };
+    }
+
+    pub fn register_client(&self) -> (ClientId, mpsc::UnboundedReceiver<Response>) {
+        crate::routine_id!("ddl-routine-hardened-broker-register-client-1");
+        return self.inner.register_client();
+    }
+
+    pub(crate) fn register_client_with_id(
+        &self,
+        preferred_id: ClientId,
+    ) -> (ClientId, mpsc::UnboundedReceiver<Response>) {
+        crate::routine_id!("ddl-routine-hardened-broker-register-client-with-id-1");
+        return self.inner.register_client_with_id(preferred_id);
+    }
+
+    pub fn drop_client(&self, client: ClientId) {
+        crate::routine_id!("ddl-routine-hardened-broker-drop-client-1");
+        self.inner.drop_client(client);
     }
 
     pub fn handle_request(&self, client: ClientId, request: Request) {
@@ -153,14 +184,20 @@ impl Broker {
             return;
         };
 
+        // Snapshot/restore can lift the raw broker's watermark above this
+        // wrapper's wall-clock seed. Synchronize before every reservation so a
+        // restored authority can never be followed by a lower local grant.
+        let raw_watermark = self.inner.metrics().fencing_watermark;
         let authority_result = {
             let mut allocator = self.authority.lock();
-            match grant_overrides.fencing_seed {
-                Some(seed) => allocator
-                    .observe_reserved_range(seed, width)
-                    .map(|_| seed),
-                None => allocator.reserve(width),
-            }
+            allocator.advance_past(raw_watermark).and_then(|_| {
+                match grant_overrides.fencing_seed {
+                    Some(seed) => allocator
+                        .observe_reserved_range(seed, width)
+                        .map(|_| seed),
+                    None => allocator.reserve(width),
+                }
+            })
         };
 
         let seed = match authority_result {
@@ -176,11 +213,44 @@ impl Broker {
             .handle_request_with_grant_overrides(client, request, grant_overrides);
     }
 
+    pub fn try_send(&self, client: ClientId, response: Response) -> bool {
+        crate::routine_id!("ddl-routine-hardened-broker-try-send-1");
+        return self.inner.try_send(client, response);
+    }
+
+    pub fn detach_lock_from_client(&self, client: ClientId, lock_uuid: &str) {
+        crate::routine_id!("ddl-routine-hardened-broker-detach-lock-client-1");
+        self.inner.detach_lock_from_client(client, lock_uuid);
+    }
+
+    pub fn detach_lock_owner(&self, lock_uuid: &str) {
+        crate::routine_id!("ddl-routine-hardened-broker-detach-lock-owner-1");
+        self.inner.detach_lock_owner(lock_uuid);
+    }
+
+    pub fn metrics(&self) -> BrokerMetrics {
+        crate::routine_id!("ddl-routine-hardened-broker-metrics-1");
+        return self.inner.metrics();
+    }
+
+    pub(crate) fn snapshot_for_raft(&self) -> Result<serde_json::Value, String> {
+        crate::routine_id!("ddl-routine-hardened-broker-snapshot-for-raft-1");
+        return self.inner.snapshot_for_raft();
+    }
+
     pub(crate) fn validate_raft_snapshot_payload(
         payload: &serde_json::Value,
     ) -> Result<(), String> {
         crate::routine_id!("ddl-routine-hardened-broker-validate-raft-snapshot-1");
         return RawBroker::validate_raft_snapshot_payload(payload);
+    }
+
+    pub(crate) fn install_raft_snapshot(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-hardened-broker-install-raft-snapshot-1");
+        return self.inner.install_raft_snapshot(payload);
     }
 
     pub(crate) fn validate_idle_snapshot_payload(
@@ -189,14 +259,33 @@ impl Broker {
         crate::routine_id!("ddl-routine-hardened-broker-validate-idle-snapshot-1");
         return RawBroker::validate_idle_snapshot_payload(payload);
     }
-}
 
-impl Deref for Broker {
-    type Target = RawBroker;
+    pub(crate) fn install_idle_snapshot(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<(), String> {
+        crate::routine_id!("ddl-routine-hardened-broker-install-idle-snapshot-1");
+        return self.inner.install_idle_snapshot(payload);
+    }
 
-    fn deref(&self) -> &Self::Target {
-        crate::routine_id!("ddl-routine-hardened-broker-deref-1");
-        return &self.inner;
+    pub fn started_at(&self) -> Instant {
+        crate::routine_id!("ddl-routine-hardened-broker-started-at-1");
+        return self.inner.started_at();
+    }
+
+    pub fn top_keys(&self, n: usize) -> Vec<KeyContentionSnapshot> {
+        crate::routine_id!("ddl-routine-hardened-broker-top-keys-1");
+        return self.inner.top_keys(n);
+    }
+
+    pub fn tick_ttl(&self, now: Instant) -> usize {
+        crate::routine_id!("ddl-routine-hardened-broker-tick-ttl-1");
+        return self.inner.tick_ttl(now);
+    }
+
+    pub fn spawn_ttl_sweeper(&self) -> tokio::task::JoinHandle<()> {
+        crate::routine_id!("ddl-routine-hardened-broker-spawn-ttl-sweeper-1");
+        return self.inner.spawn_ttl_sweeper();
     }
 }
 
@@ -285,6 +374,13 @@ mod tests {
             MAX_SERVER_FENCING_TOKEN - 1
         );
         assert!(allocator.reserve(1).is_err());
+    }
+
+    #[test]
+    fn restored_watermark_lifts_next_local_reservation() {
+        let mut allocator = AuthorityAllocator { next: 10 };
+        allocator.advance_past(100).unwrap();
+        assert_eq!(allocator.reserve(1).unwrap(), 101);
     }
 
     #[test]
