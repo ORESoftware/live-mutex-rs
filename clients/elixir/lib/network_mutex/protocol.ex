@@ -9,12 +9,14 @@ defmodule NetworkMutex.Protocol do
 
   @protocol_version "0.1.0"
   @max_composite_keys 5
+  @max_fencing_token 9_007_199_254_740_991
 
   @request_types ~w(version auth lock unlock registerRead registerWrite endRead endWrite lockInfo ls heartbeat)
   @response_types ~w(version auth lock compositeLock unlock registerReadResult registerWriteResult endReadResult endWriteResult lockInfo lsResult reelection error ok)
 
   def protocol_version, do: @protocol_version
   def max_composite_keys, do: @max_composite_keys
+  def max_fencing_token, do: @max_fencing_token
   def request_types, do: @request_types
   def response_types, do: @response_types
 
@@ -55,33 +57,63 @@ defmodule NetworkMutex.Protocol do
   end
 
   def lock_request_single(uuid, key, opts \\ []) do
-    frame(compact(type: "lock", uuid: uuid, key: key, ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)), max: Keyword.get(opts, :max_holders), wait: Keyword.get(opts, :wait)))
+    frame(
+      compact(
+        type: "lock",
+        uuid: uuid,
+        key: key,
+        ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)),
+        max: Keyword.get(opts, :max_holders),
+        wait: Keyword.get(opts, :wait)
+      )
+    )
   end
 
   def lock_request_composite(uuid, keys, opts \\ []) do
     count = length(keys)
+
     if count < 1 or count > @max_composite_keys do
       raise ArgumentError, "composite key count must be 1..=5, got #{count}"
     end
-    frame(compact(type: "lock", uuid: uuid, keys: keys, ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)), wait: Keyword.get(opts, :wait)))
+
+    frame(
+      compact(
+        type: "lock",
+        uuid: uuid,
+        keys: keys,
+        ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)),
+        wait: Keyword.get(opts, :wait)
+      )
+    )
   end
 
   def unlock_request_single(uuid, key, lock_uuid, force \\ false) do
-    frame(compact(type: "unlock", uuid: uuid, key: key, lockUuid: blank_or_nil(lock_uuid), force: true_or_nil(force)))
+    frame(
+      compact(
+        type: "unlock",
+        uuid: uuid,
+        key: key,
+        lockUuid: blank_or_nil(lock_uuid),
+        force: true_or_nil(force)
+      )
+    )
   end
 
   def unlock_request_composite(uuid, keys, lock_uuid) do
     frame(compact(type: "unlock", uuid: uuid, keys: keys, lockUuid: blank_or_nil(lock_uuid)))
   end
 
-  def rw_request(type, uuid, key), do: frame(type: request_type_to_wire(type), uuid: uuid, key: key)
+  def rw_request(type, uuid, key) do
+    frame(type: request_type_to_wire(type), uuid: uuid, key: key)
+  end
+
   def lock_info_request(uuid, key), do: rw_request(:lock_info, uuid, key)
   def ls_request(uuid), do: frame(type: "ls", uuid: uuid)
   def heartbeat_request(uuid), do: frame(type: "heartbeat", uuid: uuid)
 
   def fencing_token_from_response(response) when is_map(response) do
     case Map.get(response, "fencingToken", Map.get(response, :fencingToken)) do
-      token when is_integer(token) and token > 0 -> {:ok, token}
+      token when is_integer(token) and token >= 1 and token <= @max_fencing_token -> {:ok, token}
       nil -> {:error, :missing_fencing_token}
       _ -> {:error, :invalid_fencing_token}
     end
@@ -90,13 +122,23 @@ defmodule NetworkMutex.Protocol do
   def fencing_tokens_from_response(response) when is_map(response) do
     case Map.get(response, "fencingTokens", Map.get(response, :fencingTokens)) do
       tokens when is_map(tokens) and map_size(tokens) > 0 ->
-        if Enum.all?(tokens, fn {key, token} -> (is_binary(key) or is_atom(key)) and is_integer(token) and token > 0 end) do
+        valid =
+          Enum.all?(tokens, fn {key, token} ->
+            (is_binary(key) or is_atom(key)) and is_integer(token) and token >= 1 and
+              token <= @max_fencing_token
+          end)
+
+        if valid do
           {:ok, tokens}
         else
           {:error, :invalid_fencing_tokens}
         end
-      nil -> {:error, :missing_fencing_tokens}
-      _ -> {:error, :invalid_fencing_tokens}
+
+      nil ->
+        {:error, :missing_fencing_tokens}
+
+      _ ->
+        {:error, :invalid_fencing_tokens}
     end
   end
 
@@ -115,7 +157,10 @@ defmodule NetworkMutex.Protocol do
   defp field_to_json({key, value}) when is_integer(value), do: json_quote(key) <> ":" <> Integer.to_string(value)
   defp field_to_json({key, true}), do: json_quote(key) <> ":true"
   defp field_to_json({key, false}), do: json_quote(key) <> ":false"
-  defp field_to_json({key, values}) when is_list(values), do: json_quote(key) <> ":[" <> Enum.map_join(values, ",", &json_quote/1) <> "]"
+
+  defp field_to_json({key, values}) when is_list(values) do
+    json_quote(key) <> ":[" <> Enum.map_join(values, ",", &json_quote/1) <> "]"
+  end
 
   defp json_quote(value), do: "\"" <> escape(to_string(value)) <> "\""
 
