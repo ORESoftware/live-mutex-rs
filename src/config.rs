@@ -129,7 +129,7 @@ pub fn load_runtime_config() -> Result<RuntimeConfig, ConfigError> {
     crate::routine_id!("ddl-routine-config-load-runtime-1");
     let explicit = env_string(CONFIG_PATH_ENV).map(PathBuf::from);
     let (file, source_path) = load_config_file(explicit.as_deref())?;
-    build_runtime_config(file, source_path)
+    return build_runtime_config(file, source_path);
 }
 
 fn load_config_file(
@@ -147,7 +147,7 @@ fn load_config_file(
         }
     }
 
-    Ok((ConfigFile::default(), None))
+    return Ok((ConfigFile::default(), None));
 }
 
 fn read_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
@@ -156,10 +156,10 @@ fn read_config_file(path: &Path) -> Result<ConfigFile, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+    return toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
         source: Box::new(source),
-    })
+    });
 }
 
 fn build_runtime_config(
@@ -172,11 +172,11 @@ fn build_runtime_config(
     let mut raft = build_raft_config(&file.raft)?;
     raft.broker = broker;
     raft.validate()?;
-    Ok(RuntimeConfig {
+    return Ok(RuntimeConfig {
         server,
         raft,
         source_path,
-    })
+    });
 }
 
 fn build_server_config(
@@ -233,7 +233,7 @@ fn build_server_config(
         .or_else(|| env_string("LMX_AUTH_TOKEN"))
         .or_else(|| non_empty(file.auth_token.clone()));
 
-    Ok(ServerConfig {
+    return Ok(ServerConfig {
         tcp_bind,
         uds_path,
         http_bind,
@@ -248,12 +248,12 @@ fn build_server_config(
         status_bind,
         #[cfg(feature = "tls")]
         tls: build_tls_config(file),
-    })
+    });
 }
 
 fn build_broker_config(file: &BrokerFileConfig) -> BrokerConfig {
     crate::routine_id!("ddl-routine-config-build-broker-1");
-    BrokerConfig {
+    return BrokerConfig {
         default_ttl: Duration::from_millis(
             env_parse("LMX_DEFAULT_TTL_MS")
                 .or(file.default_ttl_ms)
@@ -277,7 +277,7 @@ fn build_broker_config(file: &BrokerFileConfig) -> BrokerConfig {
                 .or(file.idle_key_grace_ms)
                 .unwrap_or(60_000),
         ),
-    }
+    };
 }
 
 fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigError> {
@@ -406,7 +406,7 @@ fn build_raft_config(file: &RaftFileConfig) -> Result<BrokerRaftConfig, ConfigEr
             .unwrap_or(cfg.inbound_rpc_idle_timeout.as_millis() as u64),
     );
     cfg.peers = file.peers.clone();
-    Ok(cfg)
+    return Ok(cfg);
 }
 
 #[cfg(feature = "tls")]
@@ -414,7 +414,7 @@ fn build_tls_config(file: &ServerFileConfig) -> Option<crate::server::TlsConfig>
     crate::routine_id!("ddl-routine-config-build-tls-1");
     let cert_path = env_path("LMX_TLS_CERT").or_else(|| file.tls_cert.clone());
     let key_path = env_path("LMX_TLS_KEY").or_else(|| file.tls_key.clone());
-    match (cert_path, key_path) {
+    return match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => Some(crate::server::TlsConfig {
             cert_path,
             key_path,
@@ -424,28 +424,28 @@ fn build_tls_config(file: &ServerFileConfig) -> Option<crate::server::TlsConfig>
             None
         }
         (None, None) => None,
-    }
+    };
 }
 
 fn parse_addr(value: &str, source: &str) -> Result<SocketAddr, ConfigError> {
     crate::routine_id!("ddl-routine-config-parse-addr-1");
-    value.parse().map_err(|_| ConfigError::InvalidSocketAddr {
+    return value.parse().map_err(|_| ConfigError::InvalidSocketAddr {
         value: value.to_string(),
         from: source.to_string(),
-    })
+    });
 }
 
 fn env_string(key: &str) -> Option<String> {
     crate::routine_id!("ddl-routine-config-env-string-1");
-    std::env::var(key)
+    return std::env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty());
 }
 
 fn env_path(key: &str) -> Option<PathBuf> {
     crate::routine_id!("ddl-routine-config-env-path-1");
-    env_string(key).map(PathBuf::from)
+    return env_string(key).map(PathBuf::from);
 }
 
 fn env_parse<T>(key: &str) -> Option<T>
@@ -453,7 +453,7 @@ where
     T: std::str::FromStr,
 {
     crate::routine_id!("ddl-routine-config-env-parse-1");
-    env_string(key).and_then(|v| v.parse::<T>().ok())
+    return env_string(key).and_then(|v| v.parse::<T>().ok());
 }
 
 fn env_parse_strict<T>(key: &'static str) -> Result<Option<T>, ConfigError>
@@ -461,28 +461,28 @@ where
     T: std::str::FromStr,
 {
     crate::routine_id!("ddl-routine-config-env-parse-strict-1");
-    env_string(key)
+    return env_string(key)
         .map(|value| parse_integer_env_value(key, &value))
-        .transpose()
+        .transpose();
 }
 
 fn env_bool(key: &'static str) -> Result<Option<bool>, ConfigError> {
     crate::routine_id!("ddl-routine-config-env-bool-1");
-    env_string(key)
+    return env_string(key)
         .map(|value| parse_bool_env_value(key, &value))
-        .transpose()
+        .transpose();
 }
 
 fn parse_bool_env_value(key: &'static str, value: &str) -> Result<bool, ConfigError> {
     crate::routine_id!("ddl-routine-config-parse-bool-env-1");
-    match value.trim().to_ascii_lowercase().as_str() {
+    return match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(ConfigError::InvalidBoolEnv {
             key,
             value: value.to_string(),
         }),
-    }
+    };
 }
 
 fn parse_integer_env_value<T>(key: &'static str, value: &str) -> Result<T, ConfigError>
@@ -490,20 +490,20 @@ where
     T: std::str::FromStr,
 {
     crate::routine_id!("ddl-routine-config-parse-integer-env-1");
-    value
+    return value
         .trim()
         .parse::<T>()
         .map_err(|_| ConfigError::InvalidIntegerEnv {
             key,
             value: value.to_string(),
-        })
+        });
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
     crate::routine_id!("ddl-routine-config-non-empty-1");
-    value
+    return value
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+        .filter(|v| !v.is_empty());
 }
 
 #[cfg(test)]
@@ -522,13 +522,13 @@ mod tests {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, previous }
+            return Self { key, previous };
         }
 
         fn clear(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key, previous }
+            return Self { key, previous };
         }
     }
 
@@ -543,11 +543,11 @@ mod tests {
     }
 
     fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().expect("config env lock")
+        return ENV_LOCK.lock().expect("config env lock");
     }
 
     fn clear_server_envs() -> Vec<EnvVarGuard> {
-        vec![
+        return vec![
             EnvVarGuard::clear("LMX_BIND_HOST"),
             EnvVarGuard::clear("LMX_TCP_PORT"),
             EnvVarGuard::clear("LMX_HTTP_PORT"),
@@ -560,30 +560,30 @@ mod tests {
             EnvVarGuard::clear("LMX_TCP_QUICKACK"),
             EnvVarGuard::clear("LMX_TLS_CERT"),
             EnvVarGuard::clear("LMX_TLS_KEY"),
-        ]
+        ];
     }
 
     fn clear_raft_bool_envs() -> Vec<EnvVarGuard> {
-        vec![
+        return vec![
             EnvVarGuard::clear("LMX_RAFT_ENABLED"),
             EnvVarGuard::clear("LMX_RAFT_DATA_DIR_LOCK"),
             EnvVarGuard::clear("LMX_RAFT_SYNC_LOG"),
             EnvVarGuard::clear("LMX_RAFT_SYNC_COMMIT"),
-        ]
+        ];
     }
 
     fn clear_raft_identity_envs() -> Vec<EnvVarGuard> {
-        vec![
+        return vec![
             EnvVarGuard::clear("LMX_RAFT_NODE_ID"),
             EnvVarGuard::clear("LMX_RAFT_BIND_ADDR"),
             EnvVarGuard::clear("LMX_RAFT_ADVERTISE_ADDR"),
             EnvVarGuard::clear("LMX_RAFT_DATA_DIR"),
             EnvVarGuard::clear("LMX_RAFT_PEER_TOKEN"),
-        ]
+        ];
     }
 
     fn clear_raft_numeric_envs() -> Vec<EnvVarGuard> {
-        vec![
+        return vec![
             EnvVarGuard::clear("LMX_RAFT_HEARTBEAT_INTERVAL_MS"),
             EnvVarGuard::clear("LMX_RAFT_ELECTION_TIMEOUT_MIN_MS"),
             EnvVarGuard::clear("LMX_RAFT_ELECTION_TIMEOUT_MAX_MS"),
@@ -608,7 +608,7 @@ mod tests {
             EnvVarGuard::clear("LMX_RAFT_PROXY_RETRY_BUDGET_MS"),
             EnvVarGuard::clear("LMX_RAFT_MAX_INBOUND_RPC_CONNECTIONS"),
             EnvVarGuard::clear("LMX_RAFT_INBOUND_RPC_IDLE_TIMEOUT_MS"),
-        ]
+        ];
     }
 
     #[test]
