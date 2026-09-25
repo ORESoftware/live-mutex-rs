@@ -34,14 +34,16 @@ check_response_types() ->
     unknown = network_mutex_protocol:response_type_from_wire("totallyBogus").
 
 check_fencing_tokens() ->
-    MaxExact = 9007199254740991,
+    MaxExact = network_mutex_protocol:max_fencing_token(),
     {ok, MaxExact} = network_mutex_protocol:fencing_token_from_response(#{<<"fencingToken">> => MaxExact}),
     {ok, 42} = network_mutex_protocol:fencing_token_from_response(#{'fencingToken' => 42}),
     {error, missing_fencing_token} = network_mutex_protocol:fencing_token_from_response(#{}),
     {error, invalid_fencing_token} = network_mutex_protocol:fencing_token_from_response(#{<<"fencingToken">> => 0}),
-    Tokens = #{<<"a">> => 5, <<"b">> => 12},
+    {error, invalid_fencing_token} = network_mutex_protocol:fencing_token_from_response(#{<<"fencingToken">> => MaxExact + 1}),
+    Tokens = #{<<"a">> => 5, <<"b">> => MaxExact},
     {ok, Tokens} = network_mutex_protocol:fencing_tokens_from_response(#{<<"fencingTokens">> => Tokens}),
     {error, invalid_fencing_tokens} = network_mutex_protocol:fencing_tokens_from_response(#{<<"fencingTokens">> => #{<<"a">> => 0}}),
+    {error, invalid_fencing_tokens} = network_mutex_protocol:fencing_tokens_from_response(#{<<"fencingTokens">> => #{<<"a">> => MaxExact + 1}}),
     {error, missing_fencing_tokens} = network_mutex_protocol:fencing_tokens_from_response(#{}).
 
 contains(Haystack, Needle) ->
