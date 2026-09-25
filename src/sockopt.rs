@@ -38,12 +38,13 @@ pub fn socket_handle(stream: &tokio::net::TcpStream) -> SocketHandle {
     crate::routine_id!("ddl-routine-socket-handle-portable-W7m");
     #[cfg(unix)]
     {
-        stream.as_raw_fd()
+        return stream.as_raw_fd();
     }
-    return #[cfg(windows)]
+
+    #[cfg(windows)]
     {
-        stream.as_raw_socket()
-    };
+        return stream.as_raw_socket();
+    }
 }
 
 /// Apply `TCP_NODELAY = 1` to a TCP stream. Errors are not fatal — the
@@ -73,12 +74,14 @@ pub fn apply_quickack(_fd: SocketHandle) -> io::Result<bool> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(true)
+
+        return Ok(true);
     }
-    return #[cfg(not(target_os = "linux"))]
+
+    #[cfg(not(target_os = "linux"))]
     {
-        Ok(false)
-    };
+        return Ok(false);
+    }
 }
 
 /// Whether `TCP_QUICKACK` is available on this build. Used by `metrics.rs`
