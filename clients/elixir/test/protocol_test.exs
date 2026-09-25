@@ -20,7 +20,9 @@ defmodule NetworkMutex.ProtocolTest do
   end
 
   test "composite oversize is rejected" do
-    assert_raise ArgumentError, fn -> Protocol.lock_request_composite("u", ["a", "b", "c", "d", "e", "f"]) end
+    assert_raise ArgumentError, fn ->
+      Protocol.lock_request_composite("u", ["a", "b", "c", "d", "e", "f"])
+    end
   end
 
   test "response discriminator mapping covers composite lock and ok" do
@@ -32,17 +34,21 @@ defmodule NetworkMutex.ProtocolTest do
 
   test "single-key fencing token is preserved exactly and fails closed" do
     max_exact = 9_007_199_254_740_991
+    assert Protocol.max_fencing_token() == max_exact
     assert Protocol.fencing_token_from_response(%{"fencingToken" => max_exact}) == {:ok, max_exact}
     assert Protocol.fencing_token_from_response(%{fencingToken: 42}) == {:ok, 42}
     assert Protocol.fencing_token_from_response(%{}) == {:error, :missing_fencing_token}
     assert Protocol.fencing_token_from_response(%{"fencingToken" => 0}) == {:error, :invalid_fencing_token}
+    assert Protocol.fencing_token_from_response(%{"fencingToken" => max_exact + 1}) == {:error, :invalid_fencing_token}
     assert Protocol.fencing_token_from_response(%{"fencingToken" => 1.5}) == {:error, :invalid_fencing_token}
   end
 
-  test "composite fencing tokens remain scoped to their keys" do
-    tokens = %{"a" => 5, "b" => 12}
+  test "composite fencing tokens remain scoped to their keys and bounded" do
+    max_exact = Protocol.max_fencing_token()
+    tokens = %{"a" => 5, "b" => max_exact}
     assert Protocol.fencing_tokens_from_response(%{"fencingTokens" => tokens}) == {:ok, tokens}
     assert Protocol.fencing_tokens_from_response(%{"fencingTokens" => %{"a" => 0}}) == {:error, :invalid_fencing_tokens}
+    assert Protocol.fencing_tokens_from_response(%{"fencingTokens" => %{"a" => max_exact + 1}}) == {:error, :invalid_fencing_tokens}
     assert Protocol.fencing_tokens_from_response(%{}) == {:error, :missing_fencing_tokens}
   end
 end
