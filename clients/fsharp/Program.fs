@@ -1,10 +1,17 @@
 open System
+open System.Text.Json
 open NetworkMutex
 
 let check condition name =
   if not condition then
     eprintfn $"FAIL: {name}"
     Environment.Exit 1
+
+let rejectsJson payload =
+  try
+    Protocol.decodeResponse payload |> ignore
+    false
+  with :? JsonException -> true
 
 let single = Protocol.lockRequestSingle "u-1" "k1" 4000 (Some 1) (Some false)
 check (single.Contains("\"type\":\"lock\"")) "lock type"
@@ -36,5 +43,20 @@ check (response.LockUuid = Some "L") "lock uuid"
 check (response.FencingTokens["a"] = 1780240060223UL) "64-bit token"
 check (Protocol.responseTypeFromWire "totallyBogus" = ResponseType.Unknown) "unknown response"
 
-printfn "[test-fsharp] all protocol tests passed"
+check
+  (rejectsJson "{\"type\":\"lock\",\"uuid\":\"u\",\"key\":\"k\",\"acquired\":true,\"lockUuid\":\"L\"}")
+  "missing single fencing token rejected"
 
+check
+  (rejectsJson "{\"type\":\"lock\",\"uuid\":\"u\",\"key\":\"k\",\"acquired\":true,\"lockUuid\":\"L\",\"fencingToken\":9007199254740992}")
+  "unsafe integer fencing token rejected"
+
+check
+  (rejectsJson "{\"type\":\"compositeLock\",\"uuid\":\"u\",\"keys\":[\"a\",\"b\"],\"acquired\":true,\"lockUuid\":\"L\",\"fencingTokens\":{\"a\":1}}")
+  "incomplete composite fencing map rejected"
+
+check
+  (rejectsJson "{\"type\":\"registerReadResult\",\"uuid\":\"u\",\"key\":\"k\",\"granted\":true,\"lockUuid\":\"L\"}")
+  "RW grant without fencing token rejected"
+
+printfn "[test-fsharp] all protocol tests passed"
