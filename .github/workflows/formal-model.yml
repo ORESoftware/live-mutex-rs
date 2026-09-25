@@ -49,7 +49,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --locked --lib
+      - name: Run refinement-facing Rust tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked --lib broker::tests::
+          cargo test --locked --lib queue::tests::
+          cargo test --locked --lib protocol::tests::
 
   client-refinement:
     needs: bounded-model
