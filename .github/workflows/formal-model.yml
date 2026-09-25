@@ -76,7 +76,7 @@ jobs:
         if: matrix.client == 'gleam'
         with:
           otp-version: '27'
-          gleam-version: '1.9.0'
+          gleam-version: '1.16.0'
       - uses: actions/setup-java@v4
         if: matrix.client == 'java'
         with:
