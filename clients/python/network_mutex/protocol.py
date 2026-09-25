@@ -1,12 +1,9 @@
-"""Wire protocol for ``dd-rust-network-mutex`` (Python mirror of ``src/protocol.rs``).
+"""Wire protocol for ``live-mutex-rs`` with fail-closed fencing admission.
 
-The broker speaks newline-delimited JSON with a camelCase ``type`` discriminator.
-We mirror the Rust ``Request`` / ``Response`` tagged enums using :class:`enum.Enum`
-discriminators plus typed builder functions, so a typo is a ``NameError`` at
-import time rather than a silently-misrouted magic string (the failure mode the
-upstream Node ``live-mutex`` library has with ``if (data.type === '...')``).
-
-See ``../../PROTOCOL.md`` for the single source of truth.
+Successful lock/RW grants are authority-bearing frames.  The decoder therefore
+rejects any such frame that omits a fencing token, supplies a boolean/fraction,
+uses zero, exceeds JavaScript's exact JSON integer ceiling, or returns an
+incomplete per-key token map for a composite grant.
 """
 
 from __future__ import annotations
@@ -16,10 +13,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+MAX_COMPOSITE_KEYS = 5
+MAX_FENCING_TOKEN = 9_007_199_254_740_991
+PROTOCOL_VERSION = "0.1.0"
+
 
 class RequestType(str, enum.Enum):
-    """Discriminator for client -> broker frames."""
-
     VERSION = "version"
     AUTH = "auth"
     LOCK = "lock"
@@ -34,8 +33,6 @@ class RequestType(str, enum.Enum):
 
 
 class ResponseType(str, enum.Enum):
-    """Discriminator for broker -> client frames."""
-
     VERSION = "version"
     AUTH = "auth"
     LOCK = "lock"
@@ -55,21 +52,11 @@ class ResponseType(str, enum.Enum):
     def parse(cls, raw: str) -> "ResponseType":
         try:
             return cls(raw)
-        except ValueError as exc:  # pragma: no cover - defensive
+        except ValueError as exc:
             raise ValueError(f"unknown response type from broker: {raw!r}") from exc
 
 
-MAX_COMPOSITE_KEYS = 5
-PROTOCOL_VERSION = "0.1.0"
-
-
 def _frame(payload: Dict[str, Any]) -> bytes:
-    """Serialize a request dict to one newline-delimited JSON frame.
-
-    ``None`` values are stripped so the broker sees the same shape the Rust
-    client produces (``skip_serializing_if = "Option::is_none"``).
-    """
-
     compact = {k: v for k, v in payload.items() if v is not None}
     return (json.dumps(compact, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -100,20 +87,18 @@ def lock_request(
         raise ValueError(
             f"composite key count must be 1..={MAX_COMPOSITE_KEYS}, got {len(keys)}"
         )
-    return _frame(
-        {
-            "type": RequestType.LOCK.value,
-            "uuid": uuid,
-            "key": key,
-            "keys": keys,
-            "pid": pid,
-            "ttl": ttl_ms,
-            "max": max_holders,
-            "force": force or None,
-            "keepLocksAfterDeath": keep_locks_after_death or None,
-            "wait": wait,
-        }
-    )
+    return _frame({
+        "type": RequestType.LOCK.value,
+        "uuid": uuid,
+        "key": key,
+        "keys": keys,
+        "pid": pid,
+        "ttl": ttl_ms,
+        "max": max_holders,
+        "force": force or None,
+        "keepLocksAfterDeath": keep_locks_after_death or None,
+        "wait": wait,
+    })
 
 
 def unlock_request(
@@ -124,16 +109,14 @@ def unlock_request(
     lock_uuid: Optional[str] = None,
     force: bool = False,
 ) -> bytes:
-    return _frame(
-        {
-            "type": RequestType.UNLOCK.value,
-            "uuid": uuid,
-            "key": key,
-            "keys": keys,
-            "lockUuid": lock_uuid,
-            "force": force or None,
-        }
-    )
+    return _frame({
+        "type": RequestType.UNLOCK.value,
+        "uuid": uuid,
+        "key": key,
+        "keys": keys,
+        "lockUuid": lock_uuid,
+        "force": force or None,
+    })
 
 
 def register_read_request(uuid: str, key: str) -> bytes:
@@ -164,25 +147,58 @@ def heartbeat_request(uuid: str) -> bytes:
     return _frame({"type": RequestType.HEARTBEAT.value, "uuid": uuid})
 
 
+def _fence(value: Any, field_name: str) -> int:
+    # bool is a subclass of int in Python and must never become authority.
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name}: fencing token must be an exact integer")
+    if value < 1 or value > MAX_FENCING_TOKEN:
+        raise ValueError(f"{field_name}: fencing token outside 1..{MAX_FENCING_TOKEN}")
+    return value
+
+
+def _validate_authority(data: Dict[str, Any], response_type: ResponseType) -> None:
+    if response_type is ResponseType.LOCK and data.get("acquired") is True:
+        if not isinstance(data.get("lockUuid"), str) or not data["lockUuid"]:
+            raise ValueError("acquired lock omitted lockUuid")
+        _fence(data.get("fencingToken"), "fencingToken")
+        return
+
+    if response_type is ResponseType.COMPOSITE_LOCK and data.get("acquired") is True:
+        keys = data.get("keys")
+        tokens = data.get("fencingTokens")
+        if not isinstance(data.get("lockUuid"), str) or not data["lockUuid"]:
+            raise ValueError("acquired composite lock omitted lockUuid")
+        if not isinstance(keys, list) or not keys or any(not isinstance(k, str) or not k for k in keys):
+            raise ValueError("acquired composite lock omitted valid keys")
+        if len(set(keys)) != len(keys):
+            raise ValueError("acquired composite lock contains duplicate keys")
+        if not isinstance(tokens, dict) or set(tokens) != set(keys):
+            raise ValueError("acquired composite lock has incomplete fencing token map")
+        for key in keys:
+            _fence(tokens[key], f"fencingTokens[{key!r}]")
+        return
+
+    if response_type in (
+        ResponseType.REGISTER_READ_RESULT,
+        ResponseType.REGISTER_WRITE_RESULT,
+    ) and data.get("granted") is True:
+        if not isinstance(data.get("lockUuid"), str) or not data["lockUuid"]:
+            raise ValueError("granted rw lock omitted lockUuid")
+        _fence(data.get("fencingToken"), "fencingToken")
+
+
 @dataclass
 class Response:
-    """Parsed broker frame. Optional fields are ``None`` when absent so callers
-    can tell ``false``/``0`` apart from "not present" (mirrors the Go client's
-    pointer fields)."""
-
     type: ResponseType
     uuid: str
     raw: Dict[str, Any] = field(repr=False, default_factory=dict)
-
     broker_version: Optional[str] = None
     ok: Optional[bool] = None
     error: Optional[str] = None
-
     key: Optional[str] = None
     keys: Optional[List[str]] = None
     acquired: Optional[bool] = None
     unlocked: Optional[bool] = None
-
     lock_request_count: Optional[int] = None
     lock_uuid: Optional[str] = None
     fencing_token: Optional[int] = None
@@ -195,8 +211,12 @@ class Response:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Response":
+        if not isinstance(data, dict) or not isinstance(data.get("type"), str):
+            raise ValueError("broker response must be an object with string type")
+        response_type = ResponseType.parse(data["type"])
+        _validate_authority(data, response_type)
         return cls(
-            type=ResponseType.parse(data["type"]),
+            type=response_type,
             uuid=data.get("uuid", ""),
             raw=data,
             broker_version=data.get("brokerVersion"),
