@@ -1,0 +1,97 @@
+name: formal lock refinement
+
+on:
+  pull_request:
+    paths:
+      - 'formal/**'
+      - 'src/**'
+      - 'clients/**'
+      - 'PROTOCOL.md'
+      - '.github/workflows/formal-model.yml'
+  push:
+    branches: [dev]
+    paths:
+      - 'formal/**'
+      - 'src/**'
+      - 'clients/**'
+      - 'PROTOCOL.md'
+      - '.github/workflows/formal-model.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-lock-refinement-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bounded-model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: node formal/model.mjs
+      - name: deterministic replay smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(printf '%s\n' '{"actions":[{"kind":"acquire","client":"a","requestId":"a-1"},{"kind":"acquire","client":"b","requestId":"b-1"},{"kind":"release","client":"a","fence":1}]}' | node formal/model.mjs --json-stdin)
+          node -e 'const x=JSON.parse(process.argv[1]); if(!x.ok || x.state.holder!=="b" || x.state.fence!==2) process.exit(1)' "$output"
+
+  rust-refinement:
+    needs: bounded-model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --lib
+
+  client-refinement:
+    needs: bounded-model
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        client: [ts, go, dart, gleam, python, cpp, java]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        if: matrix.client == 'ts'
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        if: matrix.client == 'go'
+        with:
+          go-version: '1.23.x'
+      - uses: dart-lang/setup-dart@v1
+        if: matrix.client == 'dart'
+      - uses: erlef/setup-beam@v1
+        if: matrix.client == 'gleam'
+        with:
+          otp-version: '27'
+          gleam-version: '1.9.0'
+      - uses: actions/setup-java@v4
+        if: matrix.client == 'java'
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: run native refinement regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.client }}" in
+            ts) (cd clients/ts && npm ci && npm test) ;;
+            go) (cd clients/go && go test ./...) ;;
+            dart) (cd clients/dart && dart pub get && dart test) ;;
+            gleam) (cd clients/gleam && gleam test) ;;
+            python) (cd clients/python && python3 -m unittest discover -s tests -p 'test_*.py') ;;
+            cpp) (cd clients/cpp && make test) ;;
+            java) (cd clients/java && ./build.sh && java -cp out com.oresoftware.networkmutex.ProtocolTest) ;;
+          esac
