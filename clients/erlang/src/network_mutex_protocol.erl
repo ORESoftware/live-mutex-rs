@@ -17,7 +17,9 @@
     rw_request/3,
     lock_info_request/2,
     ls_request/1,
-    heartbeat_request/1
+    heartbeat_request/1,
+    fencing_token_from_response/1,
+    fencing_tokens_from_response/1
 ]).
 
 protocol_version() -> "0.1.0".
@@ -153,6 +155,37 @@ ls_request(Uuid) ->
 heartbeat_request(Uuid) ->
     frame([{string, "type", request_type_to_wire(heartbeat)}, {string, "uuid", Uuid}]).
 
+%% Preserve broker-issued fencing authority exactly. JSON libraries commonly
+%% decode object keys as binaries; list and atom keys are accepted too for
+%% callers that normalize trusted maps. Invalid/missing authority fails closed.
+fencing_token_from_response(Response) when is_map(Response) ->
+    case map_value([<<"fencingToken">>, "fencingToken", 'fencingToken'], Response) of
+        Token when is_integer(Token), Token > 0 -> {ok, Token};
+        undefined -> {error, missing_fencing_token};
+        _ -> {error, invalid_fencing_token}
+    end.
+
+fencing_tokens_from_response(Response) when is_map(Response) ->
+    case map_value([<<"fencingTokens">>, "fencingTokens", 'fencingTokens'], Response) of
+        Tokens when is_map(Tokens), map_size(Tokens) > 0 ->
+            case lists:all(
+                fun({_Key, Token}) -> is_integer(Token) andalso Token > 0 end,
+                maps:to_list(Tokens)
+            ) of
+                true -> {ok, Tokens};
+                false -> {error, invalid_fencing_tokens}
+            end;
+        undefined -> {error, missing_fencing_tokens};
+        _ -> {error, invalid_fencing_tokens}
+    end.
+
+map_value([], _Map) -> undefined;
+map_value([Key | Rest], Map) ->
+    case maps:find(Key, Map) of
+        {ok, Value} -> Value;
+        error -> map_value(Rest, Map)
+    end.
+
 optional_string(Key, Value, true) -> {string, Key, Value};
 optional_string(_, _, false) -> skip.
 
@@ -191,4 +224,3 @@ escape([Char | Rest]) -> [Char | escape(Rest)].
 join([], _) -> "";
 join([One], _) -> One;
 join([One | Rest], Sep) -> One ++ Sep ++ join(Rest, Sep).
-

@@ -5,6 +5,7 @@ main(_) ->
     check_lock_request(),
     check_composite_request(),
     check_response_types(),
+    check_fencing_tokens(),
     io:format("[test-erlang] all protocol tests passed~n").
 
 check_lock_request() ->
@@ -32,6 +33,17 @@ check_response_types() ->
     ok = network_mutex_protocol:response_type_from_wire("ok"),
     unknown = network_mutex_protocol:response_type_from_wire("totallyBogus").
 
+check_fencing_tokens() ->
+    MaxExact = 9007199254740991,
+    {ok, MaxExact} = network_mutex_protocol:fencing_token_from_response(#{<<"fencingToken">> => MaxExact}),
+    {ok, 42} = network_mutex_protocol:fencing_token_from_response(#{'fencingToken' => 42}),
+    {error, missing_fencing_token} = network_mutex_protocol:fencing_token_from_response(#{}),
+    {error, invalid_fencing_token} = network_mutex_protocol:fencing_token_from_response(#{<<"fencingToken">> => 0}),
+    Tokens = #{<<"a">> => 5, <<"b">> => 12},
+    {ok, Tokens} = network_mutex_protocol:fencing_tokens_from_response(#{<<"fencingTokens">> => Tokens}),
+    {error, invalid_fencing_tokens} = network_mutex_protocol:fencing_tokens_from_response(#{<<"fencingTokens">> => #{<<"a">> => 0}}),
+    {error, missing_fencing_tokens} = network_mutex_protocol:fencing_tokens_from_response(#{}).
+
 contains(Haystack, Needle) ->
     string:find(Haystack, Needle) =/= nomatch.
 
@@ -41,4 +53,3 @@ assert(false, Name) -> fail(Name).
 fail(Name) ->
     io:format(standard_error, "FAIL: ~s~n", [Name]),
     halt(1).
-
