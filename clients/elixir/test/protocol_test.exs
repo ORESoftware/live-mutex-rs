@@ -35,5 +35,20 @@ defmodule NetworkMutex.ProtocolTest do
     assert Protocol.response_type_from_wire("ok") == :ok
     assert Protocol.response_type_from_wire("bogus") == :unknown
   end
-end
 
+  test "single-key fencing token is preserved exactly and fails closed" do
+    max_exact = 9_007_199_254_740_991
+    assert Protocol.fencing_token_from_response(%{"fencingToken" => max_exact}) == {:ok, max_exact}
+    assert Protocol.fencing_token_from_response(%{fencingToken: 42}) == {:ok, 42}
+    assert Protocol.fencing_token_from_response(%{}) == {:error, :missing_fencing_token}
+    assert Protocol.fencing_token_from_response(%{"fencingToken" => 0}) == {:error, :invalid_fencing_token}
+    assert Protocol.fencing_token_from_response(%{"fencingToken" => 1.5}) == {:error, :invalid_fencing_token}
+  end
+
+  test "composite fencing tokens remain scoped to their keys" do
+    tokens = %{"a" => 5, "b" => 12}
+    assert Protocol.fencing_tokens_from_response(%{"fencingTokens" => tokens}) == {:ok, tokens}
+    assert Protocol.fencing_tokens_from_response(%{"fencingTokens" => %{"a" => 0}}) == {:error, :invalid_fencing_tokens}
+    assert Protocol.fencing_tokens_from_response(%{}) == {:error, :missing_fencing_tokens}
+  end
+end
