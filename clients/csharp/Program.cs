@@ -1,4 +1,5 @@
 using NetworkMutex;
+using System.Text.Json;
 
 static void Check(bool condition, string name)
 {
@@ -42,5 +43,52 @@ Check(response.LockUuid == "L", "lock uuid");
 Check(response.FencingTokens["a"] == 1780240060223UL, "64-bit token");
 Check(Protocol.ResponseTypeFromWire("totallyBogus") == ResponseType.Unknown, "unknown response");
 
-Console.WriteLine("[test-csharp] all protocol tests passed");
+var missingFenceRejected = false;
+try
+{
+    _ = Protocol.DecodeResponse(
+        "{\"type\":\"lock\",\"uuid\":\"u\",\"key\":\"k\",\"acquired\":true,\"lockUuid\":\"L\"}");
+}
+catch (JsonException)
+{
+    missingFenceRejected = true;
+}
+Check(missingFenceRejected, "missing single fencing token rejected");
 
+var incompleteCompositeRejected = false;
+try
+{
+    _ = Protocol.DecodeResponse(
+        "{\"type\":\"compositeLock\",\"uuid\":\"u\",\"keys\":[\"a\",\"b\"],\"acquired\":true,\"lockUuid\":\"L\",\"fencingTokens\":{\"a\":1}}");
+}
+catch (JsonException)
+{
+    incompleteCompositeRejected = true;
+}
+Check(incompleteCompositeRejected, "incomplete composite fencing map rejected");
+
+var unsafeIntegerRejected = false;
+try
+{
+    _ = Protocol.DecodeResponse(
+        "{\"type\":\"lock\",\"uuid\":\"u\",\"key\":\"k\",\"acquired\":true,\"lockUuid\":\"L\",\"fencingToken\":9007199254740992}");
+}
+catch (JsonException)
+{
+    unsafeIntegerRejected = true;
+}
+Check(unsafeIntegerRejected, "fencing token above fleet exact-integer ceiling rejected");
+
+var rwMissingFenceRejected = false;
+try
+{
+    _ = Protocol.DecodeResponse(
+        "{\"type\":\"registerWriteResult\",\"uuid\":\"u\",\"key\":\"k\",\"granted\":true,\"lockUuid\":\"L\"}");
+}
+catch (JsonException)
+{
+    rwMissingFenceRejected = true;
+}
+Check(rwMissingFenceRejected, "RW grant without fencing token rejected");
+
+Console.WriteLine("[test-csharp] all protocol tests passed");
