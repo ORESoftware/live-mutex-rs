@@ -12,17 +12,8 @@
 # zsh/sh users run the scripts directly: the shebang selects bash. Source this
 # file and call the lmx_* functions; see smoke.sh for an end-to-end example.
 
-# The wire constants and the LMX_* result globals are this library's public API:
-# callers reference them (and check-protocol-parity.sh greps them), so the
-# "appears unused" (SC2034) heuristic is suppressed file-wide here.
 # shellcheck disable=SC2034
 
-# ---------------------------------------------------------------------------
-# Wire discriminators — mirror the Rust `Request` / `Response` tagged enums.
-# (kept here, in one file, so clients/check-protocol-parity.sh can verify them)
-# ---------------------------------------------------------------------------
-
-# Request `type` values (src/protocol.rs `enum Request`)
 readonly LMX_REQ_VERSION="version"
 readonly LMX_REQ_AUTH="auth"
 readonly LMX_REQ_LOCK="lock"
@@ -35,7 +26,6 @@ readonly LMX_REQ_LOCK_INFO="lockInfo"
 readonly LMX_REQ_LS="ls"
 readonly LMX_REQ_HEARTBEAT="heartbeat"
 
-# Response `type` values (src/protocol.rs `enum Response`)
 readonly LMX_RES_VERSION="version"
 readonly LMX_RES_AUTH="auth"
 readonly LMX_RES_LOCK="lock"
@@ -50,21 +40,16 @@ readonly LMX_RES_LS_RESULT="lsResult"
 readonly LMX_RES_REELECTION="reelection"
 readonly LMX_RES_ERROR="error"
 readonly LMX_RES_OK="ok"
+readonly LMX_MAX_FENCING_TOKEN="9007199254740991"
 
-# Read timeout (whole seconds; Bash read -t granularity).
 : "${LMX_TIMEOUT:=30}"
 
-# Populated by the round-trip helpers / op functions:
-LMX_REPLY=""       # last raw JSON frame received
-LMX_ERROR=""       # last broker error string (when an op fails)
-LMX_LOCK_UUID=""   # lock handle from the last successful acquire
-LMX_FENCE=""       # fencing token from the last successful acquire/grant
-LMX_FENCES=""      # raw fencingTokens object from the last composite grant
-LMX_KEYS=""        # raw keys array from the last ls
-
-# ---------------------------------------------------------------------------
-# Tiny helpers
-# ---------------------------------------------------------------------------
+LMX_REPLY=""
+LMX_ERROR=""
+LMX_LOCK_UUID=""
+LMX_FENCE=""
+LMX_FENCES=""
+LMX_KEYS=""
 
 lmx_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
@@ -76,9 +61,6 @@ lmx_uuid() {
   fi
 }
 
-# Escape a value for safe embedding inside a JSON string literal (backslash and
-# double-quote, plus the common control characters). Without this a key like
-# `a"b` would break the frame or forge extra fields.
 lmx_json_escape() {
   local s=$1
   s=${s//\\/\\\\}
@@ -89,226 +71,381 @@ lmx_json_escape() {
   printf '%s' "$s"
 }
 
-# Extract a string field: lmx_json_str <field> <<<"$json"
-lmx_json_str() { sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
-# Extract a numeric field: lmx_json_num <field> <<<"$json"
-lmx_json_num() { sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p"; }
+lmx_json_str() {
+  sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"
+}
 
-# Build a JSON array literal from positional args (each element escaped):
-# lmx_json_array a b c -> ["a","b","c"]
+lmx_json_num() {
+  sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p"
+}
+
 lmx_json_array() {
   local out="" k
-  for k in "$@"; do out="$out,\"$(lmx_json_escape "$k")\""; done
+  for k in "$@"; do
+    out="$out,\"$(lmx_json_escape "$k")\""
+  done
   printf '[%s]' "${out:1}"
 }
 
-# ---------------------------------------------------------------------------
-# Connection (one multiplexed TCP/UDS stream on fd 3)
-# ---------------------------------------------------------------------------
+_lmx_valid_fencing_token() {
+  local token="$1"
+  if [[ ! "$token" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if (( token < 1 || token > LMX_MAX_FENCING_TOKEN )); then
+    return 1
+  fi
+  return 0
+}
 
-# lmx_connect <host> <port> [token]   (TCP)
-# lmx_connect_uds <path> [token]      (Unix domain socket)
+_lmx_validate_single_authority() {
+  local expected_key="$1" context="$2" returned_key token lock_uuid
+  returned_key="$(lmx_json_str key <<<"$LMX_REPLY")"
+  lock_uuid="$(lmx_json_str lockUuid <<<"$LMX_REPLY")"
+  token="$(lmx_json_num fencingToken <<<"$LMX_REPLY")"
+
+  if [ -z "$returned_key" ] || [ "$returned_key" != "$expected_key" ]; then
+    LMX_ERROR="$context: successful grant returned unexpected/missing key"
+    return 1
+  fi
+  if [ -z "$lock_uuid" ]; then
+    LMX_ERROR="$context: successful grant omitted lockUuid"
+    return 1
+  fi
+  if ! _lmx_valid_fencing_token "$token"; then
+    LMX_ERROR="$context: successful grant omitted valid fencingToken"
+    return 1
+  fi
+
+  LMX_LOCK_UUID="$lock_uuid"
+  LMX_FENCE="$token"
+  return 0
+}
+
+_lmx_validate_composite_authority() {
+  local context="$1"
+  shift
+  local expected_keys=("$@") lock_uuid raw_fences token count key escaped
+
+  if [ "${#expected_keys[@]}" -lt 1 ] || [ "${#expected_keys[@]}" -gt 5 ]; then
+    LMX_ERROR="$context: composite grant key count outside 1..=5"
+    return 1
+  fi
+
+  lock_uuid="$(lmx_json_str lockUuid <<<"$LMX_REPLY")"
+  raw_fences="$(sed -n 's/.*\("fencingTokens":{[^}]*}\).*/\1/p' <<<"$LMX_REPLY")"
+  if [ -z "$lock_uuid" ] || [ -z "$raw_fences" ]; then
+    LMX_ERROR="$context: successful composite grant omitted authority"
+    return 1
+  fi
+
+  for key in "${expected_keys[@]}"; do
+    escaped="$(lmx_json_escape "$key")"
+    if ! grep -Fq "\"$escaped\":" <<<"$raw_fences"; then
+      LMX_ERROR="$context: fencing map omitted key $key"
+      return 1
+    fi
+  done
+
+  count=0
+  while IFS= read -r token; do
+    if [ -z "$token" ]; then
+      continue
+    fi
+    if ! _lmx_valid_fencing_token "$token"; then
+      LMX_ERROR="$context: composite grant contained invalid fencing token"
+      return 1
+    fi
+    count=$((count + 1))
+  done < <(grep -o ':[0-9][0-9]*' <<<"$raw_fences" | cut -c2-)
+
+  if [ "$count" -ne "${#expected_keys[@]}" ]; then
+    LMX_ERROR="$context: fencing-token map cardinality mismatch"
+    return 1
+  fi
+
+  LMX_LOCK_UUID="$lock_uuid"
+  LMX_FENCES="$raw_fences"
+  return 0
+}
+
 lmx_connect() {
   local host="${1:-127.0.0.1}" port="${2:-6970}" token="${3:-}"
-  exec 3<>"/dev/tcp/${host}/${port}" || { LMX_ERROR="connect ${host}:${port} failed"; return 1; }
+  exec 3<>"/dev/tcp/${host}/${port}" || {
+    LMX_ERROR="connect ${host}:${port} failed"
+    return 1
+  }
   _lmx_after_connect "$token"
 }
 
 lmx_connect_uds() {
   local path="$1" token="${2:-}"
-  exec 3<>"$path" || { LMX_ERROR="connect ${path} failed"; return 1; }
+  exec 3<>"$path" || {
+    LMX_ERROR="connect ${path} failed"
+    return 1
+  }
   _lmx_after_connect "$token"
 }
 
 _lmx_after_connect() {
   local token="$1"
-  [ -z "$token" ] && return 0
-  local uuid; uuid="$(lmx_uuid)"
+  if [ -z "$token" ]; then
+    return 0
+  fi
+  local uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","token":"%s"}' \
     "$LMX_REQ_AUTH" "$uuid" "$(lmx_json_escape "$token")")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="auth: no reply"; return 1; }
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="auth: no reply"
+    return 1
+  fi
   case "$LMX_REPLY" in
     *'"ok":true'*) return 0 ;;
     *) LMX_ERROR="auth rejected: $LMX_REPLY"; return 1 ;;
   esac
 }
 
-lmx_disconnect() { exec 3>&- 2>/dev/null; exec 3<&- 2>/dev/null; return 0; }
+lmx_disconnect() {
+  exec 3>&- 2>/dev/null
+  exec 3<&- 2>/dev/null
+  return 0
+}
 
-_lmx_send() { printf '%s\n' "$1" >&3; }
+_lmx_send() {
+  printf '%s\n' "$1" >&3
+}
 
-# Read frames until one carries our uuid; stash it in LMX_REPLY.
 _lmx_read_reply() {
   local want="$1" line
   while IFS= read -r -t "$LMX_TIMEOUT" line <&3; do
-    [ -z "$line" ] && continue
-    case "$line" in *"\"uuid\":\"$want\""*) LMX_REPLY="$line"; return 0 ;; esac
+    if [ -z "$line" ]; then
+      continue
+    fi
+    case "$line" in
+      *"\"uuid\":\"$want\""*) LMX_REPLY="$line"; return 0 ;;
+    esac
   done
   return 1
 }
 
-# Like _lmx_read_reply but skips queued (acquired:false, no error) notices so a
-# blocking acquire drains until the real grant or an error frame.
 _lmx_read_grant() {
   local want="$1" line
   while IFS= read -r -t "$LMX_TIMEOUT" line <&3; do
-    [ -z "$line" ] && continue
-    case "$line" in *"\"uuid\":\"$want\""*) ;; *) continue ;; esac
+    if [ -z "$line" ]; then
+      continue
+    fi
     case "$line" in
-      *'"acquired":true'*)  LMX_REPLY="$line"; return 0 ;;
-      *'"error":'*)         LMX_REPLY="$line"; return 0 ;;
-      *'"acquired":false'*) continue ;;   # queued notice; keep waiting
-      *)                    LMX_REPLY="$line"; return 0 ;;
+      *"\"uuid\":\"$want\""*) ;;
+      *) continue ;;
+    esac
+    case "$line" in
+      *'"acquired":true'*) LMX_REPLY="$line"; return 0 ;;
+      *'"error":'*) LMX_REPLY="$line"; return 0 ;;
+      *'"acquired":false'*) continue ;;
+      *) LMX_REPLY="$line"; return 0 ;;
     esac
   done
   return 1
 }
 
-# Read until an RW grant (granted:true) arrives for our uuid.
 _lmx_read_until_granted() {
   local want="$1" line
   while IFS= read -r -t "$LMX_TIMEOUT" line <&3; do
-    [ -z "$line" ] && continue
-    case "$line" in *"\"uuid\":\"$want\""*) ;; *) continue ;; esac
+    if [ -z "$line" ]; then
+      continue
+    fi
+    case "$line" in
+      *"\"uuid\":\"$want\""*) ;;
+      *) continue ;;
+    esac
     case "$line" in
       *'"granted":true'*) LMX_REPLY="$line"; return 0 ;;
-      *'"error":'*)       LMX_REPLY="$line"; return 1 ;;
+      *'"error":'*) LMX_REPLY="$line"; return 1 ;;
     esac
   done
   return 1
 }
 
-# ---------------------------------------------------------------------------
-# Exclusive / semaphore locks
-# ---------------------------------------------------------------------------
-
-# lmx_acquire <key> [ttl_ms] [max]  -> 0 + LMX_LOCK_UUID/LMX_FENCE, blocks until granted
 lmx_acquire() {
-  local key="$1" ttl="${2:-0}" max="${3:-}" uuid; uuid="$(lmx_uuid)"
-  local maxf=""; [ -n "$max" ] && maxf=",\"max\":$max"
+  local key="$1" ttl="${2:-0}" max="${3:-}" uuid
+  uuid="$(lmx_uuid)"
+  local maxf=""
+  if [ -n "$max" ]; then
+    maxf=",\"max\":$max"
+  fi
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","ttl":%s,"wait":true%s}' \
     "$LMX_REQ_LOCK" "$uuid" "$(lmx_json_escape "$key")" "$ttl" "$maxf")"
-  _lmx_read_grant "$uuid" || { LMX_ERROR="acquire($key): timeout"; return 1; }
-  case "$LMX_REPLY" in *'"acquired":true'*) ;; *) LMX_ERROR="acquire($key): $LMX_REPLY"; return 1 ;; esac
-  LMX_LOCK_UUID="$(lmx_json_str lockUuid <<<"$LMX_REPLY")"
-  LMX_FENCE="$(lmx_json_num fencingToken <<<"$LMX_REPLY")"
+  if ! _lmx_read_grant "$uuid"; then
+    LMX_ERROR="acquire($key): timeout"
+    return 1
+  fi
+  case "$LMX_REPLY" in
+    *'"acquired":true'*) ;;
+    *) LMX_ERROR="acquire($key): $LMX_REPLY"; return 1 ;;
+  esac
+  _lmx_validate_single_authority "$key" "acquire($key)"
 }
 
-# lmx_try_acquire <key> [ttl_ms] [max] -> 0 granted / 2 contended / 1 error
 lmx_try_acquire() {
-  local key="$1" ttl="${2:-0}" max="${3:-}" uuid; uuid="$(lmx_uuid)"
-  local maxf=""; [ -n "$max" ] && maxf=",\"max\":$max"
+  local key="$1" ttl="${2:-0}" max="${3:-}" uuid
+  uuid="$(lmx_uuid)"
+  local maxf=""
+  if [ -n "$max" ]; then
+    maxf=",\"max\":$max"
+  fi
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","ttl":%s,"wait":false%s}' \
     "$LMX_REQ_LOCK" "$uuid" "$(lmx_json_escape "$key")" "$ttl" "$maxf")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="try_acquire($key): timeout"; return 1; }
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="try_acquire($key): timeout"
+    return 1
+  fi
   case "$LMX_REPLY" in
-    *'"error":'*)         LMX_ERROR="try_acquire($key): $LMX_REPLY"; return 1 ;;
-    *'"acquired":true'*)  LMX_LOCK_UUID="$(lmx_json_str lockUuid <<<"$LMX_REPLY")"
-                          LMX_FENCE="$(lmx_json_num fencingToken <<<"$LMX_REPLY")"; return 0 ;;
-    *)                    return 2 ;;   # contended
+    *'"error":'*) LMX_ERROR="try_acquire($key): $LMX_REPLY"; return 1 ;;
+    *'"acquired":true'*) _lmx_validate_single_authority "$key" "try_acquire($key)"; return $? ;;
+    *) return 2 ;;
   esac
 }
 
-# lmx_release <key> <lock_uuid>
 lmx_release() {
-  local key="$1" lock="$2" uuid; uuid="$(lmx_uuid)"
+  local key="$1" lock="$2" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","lockUuid":"%s"}' \
     "$LMX_REQ_UNLOCK" "$uuid" "$(lmx_json_escape "$key")" "$(lmx_json_escape "$lock")")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="release($key): timeout"; return 1; }
-  case "$LMX_REPLY" in *'"unlocked":true'*) return 0 ;; *) LMX_ERROR="release($key): $LMX_REPLY"; return 1 ;; esac
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="release($key): timeout"
+    return 1
+  fi
+  case "$LMX_REPLY" in
+    *'"unlocked":true'*) return 0 ;;
+    *) LMX_ERROR="release($key): $LMX_REPLY"; return 1 ;;
+  esac
 }
 
-# lmx_force_unlock <key>
 lmx_force_unlock() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","force":true}' \
     "$LMX_REQ_UNLOCK" "$uuid" "$(lmx_json_escape "$key")")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="force_unlock($key): timeout"; return 1; }
-  case "$LMX_REPLY" in *'"error":'*) LMX_ERROR="force_unlock($key): $LMX_REPLY"; return 1 ;; *) return 0 ;; esac
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="force_unlock($key): timeout"
+    return 1
+  fi
+  case "$LMX_REPLY" in
+    *'"error":'*) LMX_ERROR="force_unlock($key): $LMX_REPLY"; return 1 ;;
+    *) return 0 ;;
+  esac
 }
 
-# ---------------------------------------------------------------------------
-# Composite (multi-key) locks — up to 5 keys, broker sorts for deadlock-freedom
-# ---------------------------------------------------------------------------
-
-# lmx_acquire_many [ttl_ms] -- <key>...   -> LMX_LOCK_UUID / LMX_FENCES
 lmx_acquire_many() {
-  local ttl="$1"; shift; [ "${1:-}" = "--" ] && shift
-  local uuid; uuid="$(lmx_uuid)"
+  local ttl="$1"
+  shift
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  local keys=("$@") uuid
+  if [ "${#keys[@]}" -lt 1 ] || [ "${#keys[@]}" -gt 5 ]; then
+    LMX_ERROR="acquire_many requires 1..=5 keys"
+    return 1
+  fi
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","keys":%s,"ttl":%s,"wait":true}' \
-    "$LMX_REQ_LOCK" "$uuid" "$(lmx_json_array "$@")" "$ttl")"
-  _lmx_read_grant "$uuid" || { LMX_ERROR="acquire_many: timeout"; return 1; }
-  case "$LMX_REPLY" in *'"acquired":true'*) ;; *) LMX_ERROR="acquire_many: $LMX_REPLY"; return 1 ;; esac
-  LMX_LOCK_UUID="$(lmx_json_str lockUuid <<<"$LMX_REPLY")"
-  LMX_FENCES="$(sed -n 's/.*\("fencingTokens":{[^}]*}\).*/\1/p' <<<"$LMX_REPLY")"
+    "$LMX_REQ_LOCK" "$uuid" "$(lmx_json_array "${keys[@]}")" "$ttl")"
+  if ! _lmx_read_grant "$uuid"; then
+    LMX_ERROR="acquire_many: timeout"
+    return 1
+  fi
+  case "$LMX_REPLY" in
+    *'"acquired":true'*) ;;
+    *) LMX_ERROR="acquire_many: $LMX_REPLY"; return 1 ;;
+  esac
+  _lmx_validate_composite_authority "acquire_many" "${keys[@]}"
 }
 
-# lmx_release_many <lock_uuid> -- <key>...
 lmx_release_many() {
-  local lock="$1"; shift; [ "${1:-}" = "--" ] && shift
-  local uuid; uuid="$(lmx_uuid)"
+  local lock="$1"
+  shift
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  local uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","keys":%s,"lockUuid":"%s"}' \
     "$LMX_REQ_UNLOCK" "$uuid" "$(lmx_json_array "$@")" "$(lmx_json_escape "$lock")")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="release_many: timeout"; return 1; }
-  case "$LMX_REPLY" in *'"unlocked":true'*) return 0 ;; *) LMX_ERROR="release_many: $LMX_REPLY"; return 1 ;; esac
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="release_many: timeout"
+    return 1
+  fi
+  case "$LMX_REPLY" in
+    *'"unlocked":true'*) return 0 ;;
+    *) LMX_ERROR="release_many: $LMX_REPLY"; return 1 ;;
+  esac
 }
 
-# ---------------------------------------------------------------------------
-# Reader / writer locks
-# ---------------------------------------------------------------------------
-
 lmx_acquire_read() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_REGISTER_READ" "$uuid" "$(lmx_json_escape "$key")")"
-  _lmx_read_until_granted "$uuid" || { LMX_ERROR="acquire_read($key): not granted"; return 1; }
-  LMX_FENCE="$(lmx_json_num fencingToken <<<"$LMX_REPLY")"
+  if ! _lmx_read_until_granted "$uuid"; then
+    LMX_ERROR="acquire_read($key): not granted"
+    return 1
+  fi
+  _lmx_validate_single_authority "$key" "acquire_read($key)"
 }
 
 lmx_acquire_write() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_REGISTER_WRITE" "$uuid" "$(lmx_json_escape "$key")")"
-  _lmx_read_until_granted "$uuid" || { LMX_ERROR="acquire_write($key): not granted"; return 1; }
-  LMX_FENCE="$(lmx_json_num fencingToken <<<"$LMX_REPLY")"
+  if ! _lmx_read_until_granted "$uuid"; then
+    LMX_ERROR="acquire_write($key): not granted"
+    return 1
+  fi
+  _lmx_validate_single_authority "$key" "acquire_write($key)"
 }
 
 lmx_release_read() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_END_READ" "$uuid" "$(lmx_json_escape "$key")")"
   _lmx_read_reply "$uuid"
 }
 
 lmx_release_write() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_END_WRITE" "$uuid" "$(lmx_json_escape "$key")")"
   _lmx_read_reply "$uuid"
 }
 
-# ---------------------------------------------------------------------------
-# Introspection / keepalive
-# ---------------------------------------------------------------------------
-
-# lmx_ls -> LMX_KEYS holds the raw keys array
 lmx_ls() {
-  local uuid; uuid="$(lmx_uuid)"
+  local uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s"}' "$LMX_REQ_LS" "$uuid")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="ls: timeout"; return 1; }
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="ls: timeout"
+    return 1
+  fi
   LMX_KEYS="$(sed -n 's/.*\("keys":\[[^]]*\]\).*/\1/p' <<<"$LMX_REPLY")"
 }
 
-# lmx_lock_info <key> -> LMX_REPLY holds the raw lockInfo frame
 lmx_lock_info() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_LOCK_INFO" "$uuid" "$(lmx_json_escape "$key")")"
-  _lmx_read_reply "$uuid" || { LMX_ERROR="lock_info($key): timeout"; return 1; }
+  if ! _lmx_read_reply "$uuid"; then
+    LMX_ERROR="lock_info($key): timeout"
+    return 1
+  fi
 }
 
-# lmx_heartbeat — fire-and-forget keepalive (broker no-ops it)
 lmx_heartbeat() {
-  local uuid; uuid="$(lmx_uuid)"
+  local uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s"}' "$LMX_REQ_HEARTBEAT" "$uuid")"
 }
