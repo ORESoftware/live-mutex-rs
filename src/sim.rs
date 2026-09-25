@@ -3170,7 +3170,7 @@ mod tests {
                 });
             }
         }
-        return panic!("metric {name} missing from raft metrics");;
+        panic!("metric {name} missing from raft metrics");
     }
 
     fn assert_lock_history_linearizable(history: &[LockHistoryOp]) {
