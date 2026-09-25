@@ -139,18 +139,18 @@ class LiveMutexClient {
 
     hidden [long] RequireToken([object] $value, [string] $context) {
         if ($null -eq $value) {
-            throw "$context: successful grant omitted fencing authority"
+            throw "${context}: successful grant omitted fencing authority"
         }
 
         try {
             $token = [long]$value
         }
         catch {
-            throw "$context: fencing token is not an exact integer"
+            throw "${context}: fencing token is not an exact integer"
         }
 
         if ($token -lt 1 -or $token -gt 9007199254740991) {
-            throw "$context: fencing token is outside 1..=9007199254740991"
+            throw "${context}: fencing token is outside 1..=9007199254740991"
         }
 
         return $token
@@ -158,43 +158,43 @@ class LiveMutexClient {
 
     hidden [long] ValidateSingleGrant([object] $reply, [string] $expectedKey, [string] $context) {
         if ([string]::IsNullOrWhiteSpace([string]$reply.lockUuid)) {
-            throw "$context: successful grant omitted lockUuid"
+            throw "${context}: successful grant omitted lockUuid"
         }
         if ($null -ne $reply.key -and [string]$reply.key -ne $expectedKey) {
-            throw "$context: broker returned authority for unexpected key"
+            throw "${context}: broker returned authority for unexpected key"
         }
         return $this.RequireToken($reply.fencingToken, $context)
     }
 
     hidden [object] ValidateCompositeGrant([object] $reply, [string[]] $expectedKeys, [string] $context) {
         if ([string]::IsNullOrWhiteSpace([string]$reply.lockUuid)) {
-            throw "$context: successful grant omitted lockUuid"
+            throw "${context}: successful grant omitted lockUuid"
         }
         if ($null -eq $reply.keys -or $null -eq $reply.fencingTokens) {
-            throw "$context: successful grant omitted composite authority"
+            throw "${context}: successful grant omitted composite authority"
         }
 
         $returnedKeys = @($reply.keys)
         if ($returnedKeys.Count -ne $expectedKeys.Count -or $returnedKeys.Count -lt 1 -or $returnedKeys.Count -gt 5) {
-            throw "$context: composite key cardinality mismatch"
+            throw "${context}: composite key cardinality mismatch"
         }
         if (@($returnedKeys | Select-Object -Unique).Count -ne $returnedKeys.Count) {
-            throw "$context: composite grant repeated a key"
+            throw "${context}: composite grant repeated a key"
         }
         foreach ($key in $expectedKeys) {
             if ($returnedKeys -notcontains $key) {
-                throw "$context: composite grant returned an unexpected key set"
+                throw "${context}: composite grant returned an unexpected key set"
             }
         }
 
         $properties = @($reply.fencingTokens.PSObject.Properties)
         if ($properties.Count -ne $returnedKeys.Count) {
-            throw "$context: fencing-token map cardinality mismatch"
+            throw "${context}: fencing-token map cardinality mismatch"
         }
         foreach ($key in $returnedKeys) {
             $property = $reply.fencingTokens.PSObject.Properties[$key]
             if ($null -eq $property) {
-                throw "$context: missing fencing token for key $key"
+                throw "${context}: missing fencing token for key $key"
             }
             $null = $this.RequireToken($property.Value, "$context/$key")
         }
