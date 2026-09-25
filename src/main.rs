@@ -7,6 +7,8 @@
 //! Required: at least one of `LMX_TCP_PORT`, `LMX_UDS_PATH`, or
 //! `LMX_HTTP_PORT` must produce a listener. Defaults bind TCP on 6970 and HTTP
 //! on 6971; UDS is off unless `LMX_UDS_PATH` is set.
+#![allow(clippy::needless_return)]
+
 
 use std::path::Path;
 
