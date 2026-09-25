@@ -98,6 +98,43 @@ defmodule NetworkMutex.Protocol do
   def ls_request(uuid), do: frame(type: "ls", uuid: uuid)
   def heartbeat_request(uuid), do: frame(type: "heartbeat", uuid: uuid)
 
+  @doc """
+  Returns the exact single-key fencing authority carried by a decoded broker response.
+
+  JSON decoders normally produce string-keyed maps, while callers may normalize
+  trusted maps to atom keys. Both are accepted. Missing, zero, negative, or
+  non-integer values fail closed instead of being rounded or synthesized.
+  """
+  def fencing_token_from_response(response) when is_map(response) do
+    case Map.get(response, "fencingToken", Map.get(response, :fencingToken)) do
+      token when is_integer(token) and token > 0 -> {:ok, token}
+      nil -> {:error, :missing_fencing_token}
+      _ -> {:error, :invalid_fencing_token}
+    end
+  end
+
+  @doc """
+  Returns the exact per-key fencing authorities from a decoded composite-lock response.
+  """
+  def fencing_tokens_from_response(response) when is_map(response) do
+    case Map.get(response, "fencingTokens", Map.get(response, :fencingTokens)) do
+      tokens when is_map(tokens) and map_size(tokens) > 0 ->
+        if Enum.all?(tokens, fn {key, token} ->
+             (is_binary(key) or is_atom(key)) and is_integer(token) and token > 0
+           end) do
+          {:ok, tokens}
+        else
+          {:error, :invalid_fencing_tokens}
+        end
+
+      nil ->
+        {:error, :missing_fencing_tokens}
+
+      _ ->
+        {:error, :invalid_fencing_tokens}
+    end
+  end
+
   defp positive_or_nil(n) when is_integer(n) and n > 0, do: n
   defp positive_or_nil(_), do: nil
 
@@ -134,4 +171,3 @@ defmodule NetworkMutex.Protocol do
     |> String.replace("\n", "\\n")
   end
 end
-
