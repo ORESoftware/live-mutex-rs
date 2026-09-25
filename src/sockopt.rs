@@ -40,17 +40,17 @@ pub fn socket_handle(stream: &tokio::net::TcpStream) -> SocketHandle {
     {
         stream.as_raw_fd()
     }
-    #[cfg(windows)]
+    return #[cfg(windows)]
     {
         stream.as_raw_socket()
-    }
+    };
 }
 
 /// Apply `TCP_NODELAY = 1` to a TCP stream. Errors are not fatal — the
 /// option is a hint, and we shouldn't fail the connection on a tunable.
 pub fn apply_nodelay(stream: &tokio::net::TcpStream) -> io::Result<()> {
     crate::routine_id!("ddl-routine-F00CV-i_xRTMHqbbNC");
-    stream.set_nodelay(true)
+    return stream.set_nodelay(true);
 }
 
 /// Apply `TCP_QUICKACK = 1` on Linux. No-op on non-Linux. Returns `Ok(false)`
@@ -75,10 +75,10 @@ pub fn apply_quickack(_fd: SocketHandle) -> io::Result<bool> {
         }
         Ok(true)
     }
-    #[cfg(not(target_os = "linux"))]
+    return #[cfg(not(target_os = "linux"))]
     {
         Ok(false)
-    }
+    };
 }
 
 /// Whether `TCP_QUICKACK` is available on this build. Used by `metrics.rs`
@@ -86,7 +86,7 @@ pub fn apply_quickack(_fd: SocketHandle) -> io::Result<bool> {
 /// honored at runtime.
 pub fn quickack_supported() -> bool {
     crate::routine_id!("ddl-routine-rkljS_AVn7foTX-8hV");
-    cfg!(target_os = "linux")
+    return cfg!(target_os = "linux");
 }
 
 #[cfg(test)]
