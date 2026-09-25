@@ -41,6 +41,7 @@ type Response =
     Keys: string list
     Acquired: bool option
     Unlocked: bool option
+    Granted: bool option
     LockUuid: string option
     FencingToken: uint64 option
     FencingTokens: Map<string, uint64>
@@ -52,6 +53,9 @@ module Protocol =
 
   [<Literal>]
   let MaxCompositeKeys = 5
+
+  [<Literal>]
+  let MaxFencingToken = 9_007_199_254_740_991UL
 
   let requestTypes =
     [ "version"
@@ -213,17 +217,62 @@ module Protocol =
       |> Map.ofSeq
     | _ -> Map.empty
 
+  let private validToken =
+    function
+    | Some token when token >= 1UL && token <= MaxFencingToken -> true
+    | _ -> false
+
+  let private validTokenValue token =
+    token >= 1UL && token <= MaxFencingToken
+
+  let private nonEmpty =
+    function
+    | Some value when not (String.IsNullOrWhiteSpace value) -> true
+    | _ -> false
+
+  let private validateAuthority response =
+    match response.Type, response.Acquired, response.Granted with
+    | ResponseType.Lock, Some true, _ ->
+      if not (nonEmpty response.Key && nonEmpty response.LockUuid && validToken response.FencingToken) then
+        raise (JsonException("successful lock grant omitted valid fenced authority"))
+    | ResponseType.CompositeLock, Some true, _ ->
+      let distinctKeys = response.Keys |> Set.ofList |> Set.count
+      let completeTokens =
+        response.Keys
+        |> List.forall (fun key ->
+          match Map.tryFind key response.FencingTokens with
+          | Some token -> validTokenValue token
+          | None -> false)
+
+      if not (nonEmpty response.LockUuid
+              && response.Keys.Length >= 1
+              && response.Keys.Length <= MaxCompositeKeys
+              && distinctKeys = response.Keys.Length
+              && Map.count response.FencingTokens = response.Keys.Length
+              && completeTokens) then
+        raise (JsonException("successful composite grant omitted complete fenced authority"))
+    | (ResponseType.RegisterReadResult | ResponseType.RegisterWriteResult), _, Some true ->
+      if not (nonEmpty response.Key && nonEmpty response.LockUuid && validToken response.FencingToken) then
+        raise (JsonException("successful reader/writer grant omitted valid fenced authority"))
+    | _ -> ()
+
+    response
+
   let decodeResponse (line: string) =
     use doc = JsonDocument.Parse(line)
     let root = doc.RootElement
 
-    { Type = responseTypeFromWire (tryGetString "type" root |> Option.defaultValue "")
-      Uuid = tryGetString "uuid" root |> Option.defaultValue ""
-      Key = tryGetString "key" root
-      Keys = getStringList "keys" root
-      Acquired = tryGetBool "acquired" root
-      Unlocked = tryGetBool "unlocked" root
-      LockUuid = tryGetString "lockUuid" root
-      FencingToken = tryGetUInt64 "fencingToken" root
-      FencingTokens = getUInt64Map "fencingTokens" root
-      Error = tryGetString "error" root }
+    let response =
+      { Type = responseTypeFromWire (tryGetString "type" root |> Option.defaultValue "")
+        Uuid = tryGetString "uuid" root |> Option.defaultValue ""
+        Key = tryGetString "key" root
+        Keys = getStringList "keys" root
+        Acquired = tryGetBool "acquired" root
+        Unlocked = tryGetBool "unlocked" root
+        Granted = tryGetBool "granted" root
+        LockUuid = tryGetString "lockUuid" root
+        FencingToken = tryGetUInt64 "fencingToken" root
+        FencingTokens = getUInt64Map "fencingTokens" root
+        Error = tryGetString "error" root }
+
+    validateAuthority response
