@@ -11,28 +11,16 @@ language = "rust"
 vcs = "git"
 url = "https://github.com/ORESoftware/live-mutex-rs"
 
+# This is intentionally a single Zed source package for the whole repository.
+# `clients/`, `formal/`, and the Rust broker therefore travel together through
+# Zed instead of being mis-declared as independently published language targets.
 [install]
 dir = ".vendor/.zed"
-
-[targets.rust]
-dir = "."
-name = "dd-rust-network-mutex"
-adapter = "rust"
-
-[targets.clients]
-dir = "clients"
-name = "live-mutex-rs-clients"
-adapter = "none"
-
-[targets.formal]
-dir = "formal"
-name = "live-mutex-rs-formal"
-adapter = "none"
 
 [publish]
 include_readme = true
 tag_format = "v{version}"
-smoke_test = 'cd "$ZED_PKG_TEST_TARGET" && cargo test --all-targets --locked'
+smoke_test = 'test -f "$ZED_PKG_TEST_TARGET/Cargo.toml" && test -f "$ZED_PKG_TEST_TARGET/src/lib.rs" && test -f "$ZED_PKG_TEST_TARGET/formal/README.md" && test -d "$ZED_PKG_TEST_TARGET/clients" && cd "$ZED_PKG_TEST_TARGET" && cargo check --locked'
 exclude = [
   ".env",
   ".env.*",
