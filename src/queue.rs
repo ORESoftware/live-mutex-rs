@@ -38,74 +38,74 @@ pub struct LinkedQueue<K: Eq + Hash + Clone, V> {
 impl<K: Eq + Hash + Clone, V> Default for LinkedQueue<K, V> {
     fn default() -> Self {
         crate::routine_id!("ddl-routine-jXkFFGyoB-wXxOy7FC");
-        Self::new()
+        return Self::new();
     }
 }
 
 impl<K: Eq + Hash + Clone, V> LinkedQueue<K, V> {
     pub fn new() -> Self {
         crate::routine_id!("ddl-routine-u7zVp19R7LDL_wL2Au");
-        Self {
+        return Self {
             inner: Inner::new(),
-        }
+        };
     }
 
     pub fn len(&self) -> usize {
         crate::routine_id!("ddl-routine-yOpS-zAjNsvBXBLSOt");
-        self.inner.len()
+        return self.inner.len();
     }
 
     pub fn is_empty(&self) -> bool {
         crate::routine_id!("ddl-routine-2R0CreVvd2mDaVd-G-");
-        self.inner.is_empty()
+        return self.inner.is_empty();
     }
 
     pub fn contains(&self, key: &K) -> bool {
         crate::routine_id!("ddl-routine-AER48-JGALNyb5R_xP");
-        self.inner.contains(key)
+        return self.inner.contains(key);
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
         crate::routine_id!("ddl-routine-1TZ61XitZ7fwwXz0Mm");
-        self.inner.get(key)
+        return self.inner.get(key);
     }
 
     /// Append to the tail (FIFO). No-op returning `false` if `key` is already
     /// present.
     pub fn push_back(&mut self, key: K, value: V) -> bool {
         crate::routine_id!("ddl-routine-_luiuBgLux_GbtPGIo");
-        self.inner.try_push_back(key, value).is_ok()
+        return self.inner.try_push_back(key, value).is_ok();
     }
 
     /// Push to the head. Used for force/retry insertions that should jump the
     /// queue. No-op returning `false` if `key` is already present.
     pub fn push_front(&mut self, key: K, value: V) -> bool {
         crate::routine_id!("ddl-routine-JWMK_pZuMQVZLjDpAI");
-        self.inner.try_push_front(key, value).is_ok()
+        return self.inner.try_push_front(key, value).is_ok();
     }
 
     /// Pop the head element (FIFO dequeue). Returns `(key, value)`.
     pub fn pop_front(&mut self) -> Option<(K, V)> {
         crate::routine_id!("ddl-routine-z5ECAdo119VbDKreQJ");
-        self.inner.pop_front()
+        return self.inner.pop_front();
     }
 
     /// Peek at the head without removing it.
     pub fn front(&self) -> Option<(&K, &V)> {
         crate::routine_id!("ddl-routine-HdN0Nd-ERLc5HFSzKW");
-        self.inner.front()
+        return self.inner.front();
     }
 
     /// Remove an element by `key` in O(1). Returns the value if present.
     pub fn remove(&mut self, key: &K) -> Option<V> {
         crate::routine_id!("ddl-routine-2kna_P2-hQO1bUmmZD");
-        self.inner.remove(key)
+        return self.inner.remove(key);
     }
 
     /// Iterate from head to tail without consuming.
     pub fn iter(&self) -> Iter<'_, K, V> {
         crate::routine_id!("ddl-routine-YL8_XRwkTGmdu0Eo2b");
-        self.inner.iter()
+        return self.inner.iter();
     }
 }
 
