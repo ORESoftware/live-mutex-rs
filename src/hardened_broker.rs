@@ -12,12 +12,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
-use crate::broker_raw::{Broker as RawBroker, GrantOverrides};
+use crate::broker_raw::Broker as RawBroker;
+pub(crate) use crate::broker_raw::GrantOverrides;
 use crate::protocol::{Request, Response, MAX_COMPOSITE_KEYS};
 
-pub use crate::broker_raw::{
-    BrokerConfig, BrokerMetrics, ClientId, KeyContentionSnapshot, Sender,
-};
+pub use crate::broker_raw::{BrokerConfig, BrokerMetrics, ClientId, KeyContentionSnapshot, Sender};
 
 /// Largest fencing value that every first-class JSON client can represent
 /// exactly. Keep this identical to `fenced_client::MAX_FENCING_TOKEN`.
@@ -190,14 +189,12 @@ impl Broker {
         let raw_watermark = self.inner.metrics().fencing_watermark;
         let authority_result = {
             let mut allocator = self.authority.lock();
-            allocator.advance_past(raw_watermark).and_then(|_| {
-                match grant_overrides.fencing_seed {
-                    Some(seed) => allocator
-                        .observe_reserved_range(seed, width)
-                        .map(|_| seed),
+            allocator
+                .advance_past(raw_watermark)
+                .and_then(|_| match grant_overrides.fencing_seed {
+                    Some(seed) => allocator.observe_reserved_range(seed, width).map(|_| seed),
                     None => allocator.reserve(width),
-                }
-            })
+                })
         };
 
         let seed = match authority_result {
@@ -245,10 +242,7 @@ impl Broker {
         return RawBroker::validate_raft_snapshot_payload(payload);
     }
 
-    pub(crate) fn install_raft_snapshot(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<(), String> {
+    pub(crate) fn install_raft_snapshot(&self, payload: &serde_json::Value) -> Result<(), String> {
         crate::routine_id!("ddl-routine-hardened-broker-install-raft-snapshot-1");
         return self.inner.install_raft_snapshot(payload);
     }
@@ -260,10 +254,7 @@ impl Broker {
         return RawBroker::validate_idle_snapshot_payload(payload);
     }
 
-    pub(crate) fn install_idle_snapshot(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<(), String> {
+    pub(crate) fn install_idle_snapshot(&self, payload: &serde_json::Value) -> Result<(), String> {
         crate::routine_id!("ddl-routine-hardened-broker-install-idle-snapshot-1");
         return self.inner.install_idle_snapshot(payload);
     }
@@ -296,7 +287,9 @@ fn authority_width(request: &Request) -> Option<u64> {
             key: Some(_),
             keys: None,
             ..
-        } => return Some(1),
+        } => {
+            return Some(1);
+        }
         Request::Lock {
             key: None,
             keys: Some(keys),
@@ -305,8 +298,31 @@ fn authority_width(request: &Request) -> Option<u64> {
             let distinct = keys.iter().collect::<std::collections::BTreeSet<_>>();
             return Some(distinct.len() as u64);
         }
-        Request::RegisterRead { .. } | Request::RegisterWrite { .. } => return Some(1),
-        _ => return None,
+        Request::RegisterRead { .. } | Request::RegisterWrite { .. } => {
+            return Some(1);
+        }
+        _ => {
+            return None;
+        }
+    }
+}
+
+fn request_uuid(request: &Request) -> &str {
+    crate::routine_id!("ddl-routine-hardened-broker-request-uuid-1");
+    match request {
+        Request::Version { uuid, .. }
+        | Request::Auth { uuid, .. }
+        | Request::Lock { uuid, .. }
+        | Request::Unlock { uuid, .. }
+        | Request::RegisterRead { uuid, .. }
+        | Request::RegisterWrite { uuid, .. }
+        | Request::EndRead { uuid, .. }
+        | Request::EndWrite { uuid, .. }
+        | Request::LockInfo { uuid, .. }
+        | Request::Ls { uuid }
+        | Request::Heartbeat { uuid } => {
+            return uuid;
+        }
     }
 }
 
@@ -353,7 +369,7 @@ fn authority_error_response(request: &Request, reason: String) -> Response {
         }
         _ => {
             return Response::Error {
-                uuid: request.correlation_uuid().to_string(),
+                uuid: request_uuid(request).to_string(),
                 error: reason,
             };
         }
