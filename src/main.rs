@@ -50,7 +50,7 @@ async fn main() -> std::io::Result<()> {
         server::run(runtime.server).await
     };
     dd_rust_network_mutex::shutdown_tracing();
-    result
+    return result;
 }
 
 fn log_startup(config: &ServerConfig, raft: &BrokerRaftConfig, config_path: Option<&Path>) {
