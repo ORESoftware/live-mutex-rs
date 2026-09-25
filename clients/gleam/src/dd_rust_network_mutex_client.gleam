@@ -18,6 +18,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 
+const max_fencing_token = 9_007_199_254_740_991
+
 pub type Connection
 
 @external(erlang, "dd_rust_network_mutex_client_ffi", "connect")
@@ -53,6 +55,78 @@ pub type CompositeLockHandle {
     lock_uuid: String,
     fencing_tokens: Dict(String, Int),
   )
+}
+
+fn valid_fencing_token(token: Int) -> Bool {
+  token > 0 && token <= max_fencing_token
+}
+
+fn contains_key(keys: List(String), wanted: String) -> Bool {
+  case keys {
+    [] -> False
+    [key, ..rest] -> {
+      case key == wanted {
+        True -> True
+        False -> contains_key(rest, wanted)
+      }
+    }
+  }
+}
+
+fn all_keys_present(expected: List(String), actual: List(String)) -> Bool {
+  case expected {
+    [] -> True
+    [key, ..rest] -> {
+      case contains_key(actual, key) {
+        True -> all_keys_present(rest, actual)
+        False -> False
+      }
+    }
+  }
+}
+
+fn same_key_set(expected: List(String), actual: List(String)) -> Bool {
+  case list.length(expected) == list.length(actual) {
+    False -> False
+    True ->
+      case all_keys_present(expected, actual) {
+        False -> False
+        True -> all_keys_present(actual, expected)
+      }
+  }
+}
+
+fn valid_token_entries(
+  keys: List(String),
+  tokens: Dict(String, Int),
+) -> Bool {
+  case keys {
+    [] -> True
+    [key, ..rest] -> {
+      case dict.get(tokens, key) {
+        Error(_) -> False
+        Ok(token) -> {
+          case valid_fencing_token(token) {
+            False -> False
+            True -> valid_token_entries(rest, tokens)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn valid_composite_authority(
+  expected_keys: List(String),
+  returned_keys: List(String),
+  tokens: Dict(String, Int),
+) -> Bool {
+  case list.length(returned_keys) > 0
+    && same_key_set(expected_keys, returned_keys)
+    && list.length(returned_keys) == dict.size(tokens) {
+    False -> False
+    True -> valid_token_entries(returned_keys, tokens)
+  }
 }
 
 pub fn connect(
@@ -142,10 +216,16 @@ pub fn acquire(
     )
   use resp <- result.try(send_until_grant(client, req, 30_000))
   case resp {
-    LockResponse(_, k, True, _, Some(lu), Some(ft), _, _) ->
-      Ok(SingleLockHandle(k, lu, ft))
-    LockResponse(_, _, True, _, Some(lu), None, _, _) ->
-      Ok(SingleLockHandle(key, lu, 0))
+    LockResponse(_, returned_key, True, _, Some(lock_uuid), Some(token), _, _) -> {
+      case returned_key == key
+        && lock_uuid != ""
+        && valid_fencing_token(token) {
+        True -> Ok(SingleLockHandle(returned_key, lock_uuid, token))
+        False -> Error("acquire: broker returned invalid fenced authority")
+      }
+    }
+    LockResponse(_, _, True, _, _, _, _, _) ->
+      Error("acquire: successful grant omitted valid fenced authority")
     other -> Error(format_unexpected("acquire", other))
   }
 }
@@ -170,10 +250,16 @@ pub fn try_acquire(
     )
   use resp <- result.try(send_and_recv(client, req, 5000))
   case resp {
-    LockResponse(_, k, True, _, Some(lu), Some(ft), _, _) ->
-      Ok(Some(SingleLockHandle(k, lu, ft)))
-    LockResponse(_, _, True, _, Some(lu), None, _, _) ->
-      Ok(Some(SingleLockHandle(key, lu, 0)))
+    LockResponse(_, returned_key, True, _, Some(lock_uuid), Some(token), _, _) -> {
+      case returned_key == key
+        && lock_uuid != ""
+        && valid_fencing_token(token) {
+        True -> Ok(Some(SingleLockHandle(returned_key, lock_uuid, token)))
+        False -> Error("try_acquire: broker returned invalid fenced authority")
+      }
+    }
+    LockResponse(_, _, True, _, _, _, _, _) ->
+      Error("try_acquire: successful grant omitted valid fenced authority")
     LockResponse(_, _, False, _, _, _, _, None) -> Ok(None)
     other -> Error(format_unexpected("try_acquire", other))
   }
@@ -202,10 +288,15 @@ pub fn acquire_many(
         )
       use resp <- result.try(send_until_grant(client, req, 30_000))
       case resp {
-        CompositeLockResponse(_, ks, True, Some(lu), Some(ft), _) ->
-          Ok(CompositeLockHandle(ks, lu, ft))
-        CompositeLockResponse(_, ks, True, Some(lu), None, _) ->
-          Ok(CompositeLockHandle(ks, lu, dict.new()))
+        CompositeLockResponse(_, returned_keys, True, Some(lock_uuid), Some(tokens), _) -> {
+          case lock_uuid != ""
+            && valid_composite_authority(keys, returned_keys, tokens) {
+            True -> Ok(CompositeLockHandle(returned_keys, lock_uuid, tokens))
+            False -> Error("acquire_many: broker returned invalid fenced authority")
+          }
+        }
+        CompositeLockResponse(_, _, True, _, _, _) ->
+          Error("acquire_many: successful grant omitted complete fenced authority")
         other -> Error(format_unexpected("acquire_many", other))
       }
     }
@@ -235,10 +326,15 @@ pub fn try_acquire_many(
         )
       use resp <- result.try(send_and_recv(client, req, 5000))
       case resp {
-        CompositeLockResponse(_, ks, True, Some(lu), Some(ft), _) ->
-          Ok(Some(CompositeLockHandle(ks, lu, ft)))
-        CompositeLockResponse(_, ks, True, Some(lu), None, _) ->
-          Ok(Some(CompositeLockHandle(ks, lu, dict.new())))
+        CompositeLockResponse(_, returned_keys, True, Some(lock_uuid), Some(tokens), _) -> {
+          case lock_uuid != ""
+            && valid_composite_authority(keys, returned_keys, tokens) {
+            True -> Ok(Some(CompositeLockHandle(returned_keys, lock_uuid, tokens)))
+            False -> Error("try_acquire_many: broker returned invalid fenced authority")
+          }
+        }
+        CompositeLockResponse(_, _, True, _, _, _) ->
+          Error("try_acquire_many: successful grant omitted complete fenced authority")
         CompositeLockResponse(_, _, False, _, _, None) -> Ok(None)
         other -> Error(format_unexpected("try_acquire_many", other))
       }
@@ -291,8 +387,16 @@ pub fn acquire_read(
   let req = RegisterReadRequest(uuid: new_uuid(), key: key)
   use resp <- result.try(send_until_grant(client, req, 30_000))
   case resp {
-    RegisterReadResultResponse(_, _, _, _, True, lu, ft) ->
-      Ok(#(option.unwrap(lu, ""), option.unwrap(ft, 0)))
+    RegisterReadResultResponse(_, returned_key, _, _, True, Some(lock_uuid), Some(token)) -> {
+      case returned_key == key
+        && lock_uuid != ""
+        && valid_fencing_token(token) {
+        True -> Ok(#(lock_uuid, token))
+        False -> Error("acquire_read: broker returned invalid fenced authority")
+      }
+    }
+    RegisterReadResultResponse(_, _, _, _, True, _, _) ->
+      Error("acquire_read: successful grant omitted valid fenced authority")
     other -> Error(format_unexpected("acquire_read", other))
   }
 }
@@ -310,8 +414,16 @@ pub fn acquire_write(
   let req = RegisterWriteRequest(uuid: new_uuid(), key: key)
   use resp <- result.try(send_until_grant(client, req, 30_000))
   case resp {
-    RegisterWriteResultResponse(_, _, _, _, True, lu, ft) ->
-      Ok(#(option.unwrap(lu, ""), option.unwrap(ft, 0)))
+    RegisterWriteResultResponse(_, returned_key, _, _, True, Some(lock_uuid), Some(token)) -> {
+      case returned_key == key
+        && lock_uuid != ""
+        && valid_fencing_token(token) {
+        True -> Ok(#(lock_uuid, token))
+        False -> Error("acquire_write: broker returned invalid fenced authority")
+      }
+    }
+    RegisterWriteResultResponse(_, _, _, _, True, _, _) ->
+      Error("acquire_write: successful grant omitted valid fenced authority")
     other -> Error(format_unexpected("acquire_write", other))
   }
 }
