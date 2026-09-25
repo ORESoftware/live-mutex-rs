@@ -1,0 +1,60 @@
+schema_version = 1
+id = "live-mutex-lock-refinement-v1"
+repository = "ORESoftware/live-mutex-rs"
+model = "formal/model.mjs"
+runner = "node"
+adapter_protocol = "jsonl-actions/v1"
+command = ["node", "formal/model.mjs"]
+replay_command = ["node", "formal/model.mjs", "--json-stdin"]
+claim = "finite-exhaustive-abstraction"
+timeout_seconds = 30
+
+[limits]
+clients = 2
+max_time = 5
+max_fence = 4
+lease_ttl = 2
+
+[[invariants]]
+id = "exclusive-live-holder"
+description = "At most one client is the live exclusive holder for a key."
+
+[[invariants]]
+id = "fifo-waiter-order"
+description = "A release or expiry grants the oldest queued request first."
+
+[[invariants]]
+id = "unique-request-id"
+description = "A request id is queued or resolved at most once."
+
+[[invariants]]
+id = "monotonic-fencing-token"
+description = "Every new grant advances the fencing token and tokens never regress."
+
+[[invariants]]
+id = "renew-preserves-fence"
+description = "Renewal extends authority without minting a new fence."
+
+[[invariants]]
+id = "stale-release-side-effect-free"
+description = "A stale/non-owner release cannot mutate the current grant."
+
+[[invariants]]
+id = "ttl-expiry-progress"
+description = "Expired authority is cleared and the oldest waiter can make progress."
+
+[refinement]
+status = "required"
+production_paths = [
+  "src/broker.rs",
+  "src/broker_raft.rs",
+  "src/protocol.rs",
+  "src/client.rs",
+  "clients/ts",
+  "clients/go",
+  "clients/dart",
+  "clients/gleam",
+  "clients/python",
+  "clients/cpp",
+  "clients/java",
+]
