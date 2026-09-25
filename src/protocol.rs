@@ -239,7 +239,7 @@ impl Response {
     /// Convenience for routers and tests.
     pub fn correlation_uuid(&self) -> &str {
         crate::routine_id!("ddl-routine-d7PH3GeHXLkM2Nb0I0");
-        match self {
+        return match self {
             Response::Version { uuid, .. }
             | Response::Auth { uuid, .. }
             | Response::Lock { uuid, .. }
@@ -254,7 +254,7 @@ impl Response {
             | Response::Reelection { uuid, .. }
             | Response::Error { uuid, .. }
             | Response::Ok { uuid } => uuid,
-        }
+        };
     }
 }
 
