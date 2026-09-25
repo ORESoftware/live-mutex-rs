@@ -89,7 +89,7 @@ jobs:
   clients:
     name: Client protocol checks
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
@@ -106,6 +106,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
+          cache: false
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -116,11 +117,23 @@ jobs:
       - name: Setup Dart
         uses: dart-lang/setup-dart@v1
 
-      - name: Setup Gleam
+      - name: Setup BEAM languages
         uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
+          elixir-version: "1.18.4"
           gleam-version: "1.14.0"
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Install OCaml
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocaml-nox
 
       - name: TypeScript checks
         working-directory: clients/ts
@@ -143,6 +156,14 @@ jobs:
         working-directory: clients/gleam
         run: gleam test
 
+      - name: Erlang checks
+        working-directory: clients/erlang
+        run: make test
+
+      - name: Elixir checks
+        working-directory: clients/elixir
+        run: mix test
+
       - name: Python checks
         working-directory: clients/python
         run: python3 -m unittest discover -s tests -p 'test_*.py'
@@ -157,10 +178,32 @@ jobs:
           ./build.sh
           java -cp out com.oresoftware.networkmutex.ProtocolTest
 
+      - name: C# checks
+        run: dotnet run --project clients/csharp/NetworkMutexProtocol.csproj
+
+      - name: F# checks
+        run: dotnet run --project clients/fsharp/NetworkMutexProtocol.fsproj
+
+      - name: OCaml checks
+        working-directory: clients/ocaml
+        run: make test
+
+      - name: Shell syntax check
+        run: bash -n clients/shell/live_mutex_client.sh
+
+      - name: PowerShell load check
+        shell: pwsh
+        run: |
+          . ./clients/powershell/LiveMutexClient.ps1
+          Write-Host '[test-powershell] client loaded'
+
+      - name: Protocol parity gate
+        run: bash clients/check-protocol-parity.sh
+
   live-smoke:
     name: Live client smokes
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     needs:
       - rust
       - clients
@@ -196,6 +239,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.23.x"
+          cache: false
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -206,10 +250,11 @@ jobs:
       - name: Setup Dart
         uses: dart-lang/setup-dart@v1
 
-      - name: Setup Gleam
+      - name: Setup BEAM languages
         uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
+          elixir-version: "1.18.4"
           gleam-version: "1.14.0"
 
       - name: Install TypeScript dependencies
@@ -237,3 +282,5 @@ jobs:
           (cd clients/cpp && make test && make run)
           (cd clients/java && ./build.sh && java -cp out com.oresoftware.networkmutex.ProtocolTest && java -cp out com.oresoftware.networkmutex.Smoke)
           (cd clients/dart && dart pub get && dart run bin/smoke.dart)
+          bash clients/shell/smoke.sh
+          pwsh -NoProfile -File clients/powershell/smoke.ps1
