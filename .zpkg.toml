@@ -1,0 +1,54 @@
+[package]
+org = "oresoftware"
+name = "live-mutex-rs"
+version = "0.1.127"
+description = "Rust network mutex broker and polyglot clients with fencing-token safety contracts"
+license = "MIT"
+keywords = ["mutex", "distributed-lock", "fencing", "rust", "polyglot"]
+language = "rust"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/ORESoftware/live-mutex-rs"
+
+[install]
+dir = ".vendor/.zed"
+
+[targets.rust]
+dir = "."
+name = "dd-rust-network-mutex"
+adapter = "rust"
+
+[targets.clients]
+dir = "clients"
+name = "live-mutex-rs-clients"
+adapter = "none"
+
+[targets.formal]
+dir = "formal"
+name = "live-mutex-rs-formal"
+adapter = "none"
+
+[publish]
+include_readme = true
+tag_format = "v{version}"
+smoke_test = 'cd "$ZED_PKG_TEST_TARGET" && cargo test --all-targets --locked'
+exclude = [
+  ".env",
+  ".env.*",
+  ".direnv/**",
+  ".zed/**",
+  ".zed-pack/**",
+  ".vendor/.zed/**",
+  "target/**",
+  "**/target/**",
+  "tmp/**",
+  "**/*.log",
+  ".DS_Store",
+]
+
+# Cargo/crates.io policy remains independent. Cargo.toml currently has
+# publish=false, so Zed adds a source/provenance channel without silently
+# changing native-registry publication policy.
+[scripts]
+test = "cargo test --all-targets --locked"
