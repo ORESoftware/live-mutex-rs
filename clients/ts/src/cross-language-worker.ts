@@ -38,7 +38,9 @@ stdinLines.on("line", (line) => {
 });
 
 async function waitAck(): Promise<void> {
-  const line = ackQueue.shift() ?? await new Promise<string>((resolve) => waiters.push(resolve));
+  const line = ackQueue.shift() ?? await new Promise<string>((resolve) => {
+    waiters.push(resolve);
+  });
   if (line.trim() !== "ack") {
     throw new Error(`expected ack from harness, got ${JSON.stringify(line)}`);
   }
@@ -71,7 +73,11 @@ async function holdBriefly(rng: ReturnType<typeof makeRng>): Promise<void> {
   if (ms === 0) {
     await Promise.resolve();
   }
-  else await new Promise((resolve) => setTimeout(resolve, ms));
+  else {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
 }
 
 async function grantReleaseExclusive(
