@@ -172,14 +172,14 @@ static RELOAD_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::
 static CURRENT_LOG_DIRECTIVE: OnceLock<parking_lot::RwLock<String>> = OnceLock::new();
 
 fn current_directive_slot() -> &'static parking_lot::RwLock<String> {
-    CURRENT_LOG_DIRECTIVE.get_or_init(|| parking_lot::RwLock::new(String::new()))
+    return CURRENT_LOG_DIRECTIVE.get_or_init(|| parking_lot::RwLock::new(String::new()));
 }
 
 /// Read-only accessor for the current `EnvFilter` directive. Returns
 /// the empty string before [`init_tracing`] has run.
 pub fn current_log_level() -> String {
     crate::routine_id!("ddl-routine-current-log-level-Q9");
-    current_directive_slot().read().clone()
+    return current_directive_slot().read().clone();
 }
 
 /// Replace the `EnvFilter` directive at runtime. Returns the new
@@ -201,7 +201,7 @@ pub fn set_log_level(directive: &str) -> Result<String, String> {
         directive = directive,
         "log-level reload applied"
     );
-    Ok(directive.to_string())
+    return Ok(directive.to_string());
 }
 
 /// Set the runtime kill-switch. Returns the previous value so callers
@@ -222,12 +222,12 @@ pub fn set_otel_enabled(enabled: bool) -> bool {
         next = enabled,
         "otel kill-switch toggled"
     );
-    previous
+    return previous;
 }
 
 /// Read-only accessor for the current runtime kill-switch state.
 pub fn is_otel_enabled() -> bool {
-    OTEL_ENABLED.load(Ordering::Relaxed)
+    return OTEL_ENABLED.load(Ordering::Relaxed);
 }
 
 /// Initialize the global `tracing` subscriber.
@@ -403,11 +403,11 @@ mod otel {
         let _ = PROVIDER.set(provider);
 
         let kill_switch = FilterFn::new(|_metadata| super::OTEL_ENABLED.load(Ordering::Relaxed));
-        Some(Box::new(
+        return Some(Box::new(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
                 .with_filter(kill_switch),
-        ))
+        ));
     }
 
     pub(super) fn shutdown() {

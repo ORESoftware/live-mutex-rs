@@ -89,7 +89,7 @@ pub struct TlsConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         crate::routine_id!("ddl-routine-Hw9N40elbjzI0ZcFDP");
-        Self {
+        return Self {
             tcp_bind: Some("0.0.0.0:6970".parse().unwrap()),
             uds_path: None,
             http_bind: Some("0.0.0.0:6971".parse().unwrap()),
@@ -100,7 +100,7 @@ impl Default for ServerConfig {
             status_bind: None,
             #[cfg(feature = "tls")]
             tls: None,
-        }
+        };
     }
 }
 
@@ -120,16 +120,16 @@ pub(crate) struct TcpFlags {
 
 impl TcpFlags {
     fn new(nodelay: bool, quickack: bool) -> Self {
-        Self {
+        return Self {
             nodelay: AtomicBool::new(nodelay),
             quickack: AtomicBool::new(quickack),
-        }
+        };
     }
     pub(crate) fn nodelay(&self) -> bool {
-        self.nodelay.load(Ordering::Relaxed)
+        return self.nodelay.load(Ordering::Relaxed);
     }
     pub(crate) fn quickack(&self) -> bool {
-        self.quickack.load(Ordering::Relaxed)
+        return self.quickack.load(Ordering::Relaxed);
     }
     fn set_nodelay(&self, v: bool) {
         self.nodelay.store(v, Ordering::Relaxed);
@@ -404,7 +404,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     }
 
     let (_first, _idx, _rest) = futures_util::future::select_all(tasks).await;
-    Ok(())
+    return Ok(());
 }
 
 #[derive(Clone)]
@@ -488,7 +488,7 @@ pub async fn run_raft(config: ServerConfig, raft_config: BrokerRaftConfig) -> st
     }
 
     let _ = tasks.join_next().await;
-    Ok(())
+    return Ok(());
 }
 
 struct BrokerRaftShutdownGuard(BrokerRaft);
@@ -500,7 +500,7 @@ impl Drop for BrokerRaftShutdownGuard {
 }
 
 fn raft_io_error(err: BrokerRaftError) -> std::io::Error {
-    std::io::Error::other(err.to_string())
+    return std::io::Error::other(err.to_string());
 }
 
 #[cfg(feature = "tls")]
@@ -521,7 +521,7 @@ fn build_tls_acceptor(cfg: &TlsConfig) -> Result<tokio_rustls::TlsAcceptor, std:
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+    return Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)));
 }
 
 /// Per-connection hook that runs after every successful frame read. Used
@@ -591,20 +591,20 @@ const DEFAULT_FRAME_YIELD_EVERY: usize = 1024;
 
 fn max_frame_bytes() -> usize {
     crate::routine_id!("ddl-routine-max-frame-bytes-Pq3");
-    std::env::var("LMX_MAX_FRAME_BYTES")
+    return std::env::var("LMX_MAX_FRAME_BYTES")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_FRAME_BYTES)
+        .unwrap_or(DEFAULT_MAX_FRAME_BYTES);
 }
 
 fn frame_yield_every() -> usize {
     crate::routine_id!("ddl-routine-frame-yield-every-Nz2");
-    std::env::var("LMX_FRAME_YIELD_EVERY")
+    return std::env::var("LMX_FRAME_YIELD_EVERY")
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_FRAME_YIELD_EVERY)
+        .unwrap_or(DEFAULT_FRAME_YIELD_EVERY);
 }
 
 /// Maximum concurrent TCP/UDS client connections. Beyond this, a new connection
@@ -625,11 +625,11 @@ static ACTIVE_STREAM_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 
 fn max_connections() -> u64 {
     crate::routine_id!("ddl-routine-max-connections-Cn4");
-    std::env::var("LMX_MAX_CONNECTIONS")
+    return std::env::var("LMX_MAX_CONNECTIONS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS);
 }
 
 fn auth_handshake_timeout() -> Option<Duration> {
@@ -638,7 +638,7 @@ fn auth_handshake_timeout() -> Option<Duration> {
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_AUTH_HANDSHAKE_MS);
-    (ms > 0).then(|| Duration::from_millis(ms))
+    return (ms > 0).then(|| Duration::from_millis(ms));
 }
 
 /// RAII guard bounding concurrent stream connections; `None` when at capacity.
@@ -648,14 +648,14 @@ struct StreamConnGuard {
 
 impl StreamConnGuard {
     fn try_acquire(max: u64, metrics: Arc<crate::metrics::Metrics>) -> Option<Self> {
-        if ACTIVE_STREAM_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= max {
+        return if ACTIVE_STREAM_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= max {
             ACTIVE_STREAM_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
             metrics.stream_connection_cap_drops_total.inc();
             None
         } else {
             metrics.stream_connections_active.inc();
             Some(StreamConnGuard { metrics })
-        }
+        };
     }
 }
 
@@ -986,7 +986,7 @@ where
     broker.drop_client(client_id);
     drop(reader);
     let _ = writer_task.await;
-    result
+    return result;
 }
 
 #[allow(dead_code)]
@@ -997,7 +997,7 @@ async fn _ensure_tcp_handler_compiles(
     metrics: Arc<crate::metrics::Metrics>,
 ) -> std::io::Result<()> {
     crate::routine_id!("ddl-routine-ZqIntiJXkbXsAaDxZT");
-    handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await
+    return handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await;
 }
 
 #[cfg(unix)]
@@ -1009,14 +1009,14 @@ async fn _ensure_uds_handler_compiles(
     metrics: Arc<crate::metrics::Metrics>,
 ) -> std::io::Result<()> {
     crate::routine_id!("ddl-routine-0jVAwo_ZNAd4KHqjYl");
-    handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await
+    return handle_stream(sock, broker, auth_token, metrics, AfterRead::None).await;
 }
 
 // ---------------- HTTP layer -----------------------------------------------
 
 fn http_unauthorized() -> AxumResponse {
     crate::routine_id!("ddl-routine-KaHmdHGpsEcVCMn-TA");
-    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
 }
 
 fn observe_http_response(
@@ -1037,7 +1037,7 @@ fn observe_http_response(
             "HTTP request completed slowly"
         );
     }
-    response
+    return response;
 }
 
 /// True if any accepted auth header carries `token`. Header names are
@@ -1049,25 +1049,25 @@ fn observe_http_response(
 fn http_token_matches(headers: &HeaderMap, token: &str) -> bool {
     crate::routine_id!("ddl-routine-server-http-token-matches-1");
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(token)
+    return header("authorization").and_then(|v| v.strip_prefix("Bearer ")) == Some(token)
         || header("auth") == Some(token)
-        || header("x-lmx-auth") == Some(token)
+        || header("x-lmx-auth") == Some(token);
 }
 
 fn http_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     crate::routine_id!("ddl-routine-68-wt_8VTaRoe5rbQz");
-    match state.auth_token.as_ref() {
+    return match state.auth_token.as_ref() {
         None => true,
         Some(token) => http_token_matches(headers, token),
-    }
+    };
 }
 
 fn raft_http_authorized(state: &RaftAppState, headers: &HeaderMap) -> bool {
     crate::routine_id!("ddl-routine-server-raft-http-auth-1");
-    match state.auth_token.as_ref() {
+    return match state.auth_token.as_ref() {
         None => true,
         Some(token) => http_token_matches(headers, token),
-    }
+    };
 }
 
 fn http_request_id(
@@ -1111,21 +1111,21 @@ fn http_request_id(
                 .into_response(),
         ));
     }
-    Ok(request_id)
+    return Ok(request_id);
 }
 
 async fn raft_metrics_endpoint(State(state): State<RaftAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-server-raft-metrics-1");
     let mut body = state.metrics.render(state.raft.broker());
     body.push_str(&state.raft.raft_metrics_text());
-    (
+    return (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
         body,
-    )
+    );
 }
 
 async fn raft_status(State(state): State<RaftAppState>) -> AxumResponse {
@@ -1136,7 +1136,7 @@ async fn raft_status(State(state): State<RaftAppState>) -> AxumResponse {
     };
     let cluster_size = progress.membership.cluster_size();
     let quorum_size = progress.membership.quorum_size();
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "nodeId": progress.node_id,
         "isLeader": progress.is_leader,
         "isLeaderReady": progress.is_leader_ready,
@@ -1157,7 +1157,7 @@ async fn raft_status(State(state): State<RaftAppState>) -> AxumResponse {
         "syncCommit": progress.sync_commit,
         "unsafeDurability": progress.unsafe_durability,
     }))
-    .into_response()
+    .into_response();
 }
 
 async fn raft_membership(State(state): State<RaftAppState>) -> AxumResponse {
@@ -1168,7 +1168,7 @@ async fn raft_membership(State(state): State<RaftAppState>) -> AxumResponse {
     };
     let cluster_size = progress.membership.cluster_size();
     let quorum_size = progress.membership.quorum_size();
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "nodeId": progress.node_id,
         "isLeader": progress.is_leader,
         "leaderId": progress.leader_id,
@@ -1178,15 +1178,15 @@ async fn raft_membership(State(state): State<RaftAppState>) -> AxumResponse {
         "membershipJoint": progress.membership_joint,
         "membership": progress.membership,
     }))
-    .into_response()
+    .into_response();
 }
 
 async fn raft_progress(State(state): State<RaftAppState>) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-progress-1");
-    match state.raft.progress_snapshot_fresh().await {
+    return match state.raft.progress_snapshot_fresh().await {
         Ok(progress) => Json(progress).into_response(),
         Err(err) => raft_unavailable(err),
-    }
+    };
 }
 
 async fn raft_learners(State(state): State<RaftAppState>) -> AxumResponse {
@@ -1200,7 +1200,7 @@ async fn raft_learners(State(state): State<RaftAppState>) -> AxumResponse {
         .into_iter()
         .filter(|peer| peer.staged_learner)
         .collect::<Vec<_>>();
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "nodeId": progress.node_id,
         "isLeader": progress.is_leader,
         "isLeaderReady": progress.is_leader_ready,
@@ -1214,7 +1214,7 @@ async fn raft_learners(State(state): State<RaftAppState>) -> AxumResponse {
         "unsafeDurability": progress.unsafe_durability,
         "learners": learners,
     }))
-    .into_response()
+    .into_response();
 }
 
 async fn raft_stage_learners(
@@ -1226,7 +1226,7 @@ async fn raft_stage_learners(
     if !raft_http_authorized(&state, &headers) {
         return http_unauthorized();
     }
-    match state.raft.stage_learners(req.peers).await {
+    return match state.raft.stage_learners(req.peers).await {
         Ok(learners) => Json(serde_json::json!({
             "learners": learners,
             "progress": state.raft.progress_snapshot(),
@@ -1239,7 +1239,7 @@ async fn raft_stage_learners(
         )
             .into_response(),
         Err(err) => raft_unavailable(err),
-    }
+    };
 }
 
 async fn raft_remove_learners(
@@ -1251,7 +1251,7 @@ async fn raft_remove_learners(
     if !raft_http_authorized(&state, &headers) {
         return http_unauthorized();
     }
-    match state.raft.remove_staged_learners(req.ids).await {
+    return match state.raft.remove_staged_learners(req.ids).await {
         Ok(learners) => Json(serde_json::json!({
             "learners": learners,
             "progress": state.raft.progress_snapshot(),
@@ -1264,7 +1264,7 @@ async fn raft_remove_learners(
         )
             .into_response(),
         Err(err) => raft_unavailable(err),
-    }
+    };
 }
 
 async fn raft_change_membership(
@@ -1276,7 +1276,7 @@ async fn raft_change_membership(
     if !raft_http_authorized(&state, &headers) {
         return http_unauthorized();
     }
-    match state.raft.change_membership(req.peers).await {
+    return match state.raft.change_membership(req.peers).await {
         Ok(index) => Json(serde_json::json!({
             "index": index,
             "membership": state.raft.membership(),
@@ -1291,7 +1291,7 @@ async fn raft_change_membership(
         )
             .into_response(),
         Err(err) => raft_unavailable(err),
-    }
+    };
 }
 
 async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
@@ -1312,11 +1312,11 @@ async fn raft_leaderz(State(state): State<RaftAppState>) -> AxumResponse {
         "syncCommit": progress.sync_commit,
         "unsafeDurability": progress.unsafe_durability,
     });
-    if progress.is_leader_ready {
+    return if progress.is_leader_ready {
         Json(body).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
-    }
+    };
 }
 
 /// Middleware that stamps the local node's Raft role and last-known leader onto
@@ -1403,7 +1403,7 @@ async fn raft_leader_response_headers(
     if let Some(leader_addr) = progress.leader_addr.as_ref() {
         insert_raft_response_header(headers, "x-raft-leader-addr", leader_addr);
     }
-    response
+    return response;
 }
 
 fn insert_raft_response_header(
@@ -1529,7 +1529,7 @@ async fn raft_http_acquire(
         Err(err) => raft_unavailable(err),
     };
     insert_raft_response_header(response.headers_mut(), "x-lmx-request-id", &request_uuid);
-    observe_http_response(&state.metrics, "raft_http_acquire", started, response)
+    return observe_http_response(&state.metrics, "raft_http_acquire", started, response);
 }
 
 async fn raft_http_release(
@@ -1592,12 +1592,12 @@ async fn raft_http_release(
         Err(err) => raft_unavailable(err),
     };
     insert_raft_response_header(response.headers_mut(), "x-lmx-request-id", &request_uuid);
-    observe_http_response(&state.metrics, "raft_http_release", started, response)
+    return observe_http_response(&state.metrics, "raft_http_release", started, response);
 }
 
 fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
     crate::routine_id!("ddl-routine-server-raft-unavailable-1");
-    match err {
+    return match err {
         BrokerRaftError::NotLeader {
             leader_id,
             leader_addr,
@@ -1648,7 +1648,7 @@ fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
             })),
         )
             .into_response(),
-    }
+    };
 }
 
 /// Shared secret used to authenticate `/admin/*` requests. Defaults to
@@ -1659,10 +1659,10 @@ fn raft_unavailable(err: BrokerRaftError) -> AxumResponse {
 /// auth is disabled.
 fn admin_token() -> String {
     crate::routine_id!("ddl-routine-admin-token-Ld2");
-    std::env::var("LMX_ADMIN_TOKEN")
+    return std::env::var("LMX_ADMIN_TOKEN")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "all-dogs-go-to-heaven".to_string())
+        .unwrap_or_else(|| "all-dogs-go-to-heaven".to_string());
 }
 
 /// Validate an admin shared-secret header on `/admin/*` routes. Accepts
@@ -1679,7 +1679,7 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_owned);
-    custom.as_deref() == Some(expected.as_str()) || bearer.as_deref() == Some(expected.as_str())
+    return custom.as_deref() == Some(expected.as_str()) || bearer.as_deref() == Some(expected.as_str());
 }
 
 /// `true` when the inbound request looks like it came from HTMX. We
@@ -1689,22 +1689,22 @@ fn admin_authorized(headers: &HeaderMap) -> bool {
 /// `<span>`), JSON for everyone else (so `curl`/operators see the
 /// same response shape they always have).
 fn is_htmx_request(headers: &HeaderMap) -> bool {
-    headers
+    return headers
         .get("hx-request")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 }
 
 /// HTML response with the right content-type for `hx-swap`. We return
 /// a tiny snippet (no `<html>`/`<body>`) because HTMX swaps it as
 /// fragment content.
 fn html_snippet(status: StatusCode, body: String) -> AxumResponse {
-    (
+    return (
         status,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
     )
-        .into_response()
+        .into_response();
 }
 
 /// Parse a small admin-POST body as either `application/json` or
@@ -1721,13 +1721,13 @@ where
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if ct.starts_with("application/x-www-form-urlencoded") {
+    return if ct.starts_with("application/x-www-form-urlencoded") {
         serde_urlencoded::from_bytes(body).map_err(|e| e.to_string())
     } else {
         // Default to JSON. `application/json` and the empty default
         // both land here.
         serde_json::from_slice(body).map_err(|e| e.to_string())
-    }
+    };
 }
 
 #[derive(serde::Deserialize)]
@@ -1740,7 +1740,7 @@ struct OtelToggleRequest {
 
 fn render_otel_snippet(enabled: bool) -> String {
     let state = if enabled { "on" } else { "off" };
-    format!("otel: <strong>{state}</strong>")
+    return format!("otel: <strong>{state}</strong>");
 }
 
 /// Tiny HTML escaper for the inline admin response snippets. We
@@ -1761,7 +1761,7 @@ fn html_escape_min(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    return out;
 }
 
 /// `GET /admin/otel` — return the current state of the OTel kill-switch.
@@ -1776,10 +1776,10 @@ async fn admin_otel_get(headers: HeaderMap) -> impl IntoResponse {
         )
             .into_response();
     }
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "enabled": crate::routine::is_otel_enabled(),
     }))
-    .into_response()
+    .into_response();
 }
 
 /// `POST /admin/otel` — flip the OTel kill-switch at runtime. Body is
@@ -1827,7 +1827,7 @@ async fn admin_otel_post(headers: HeaderMap, body: axum::body::Bytes) -> impl In
     };
     let previous = crate::routine::set_otel_enabled(req.enabled);
     let now = crate::routine::is_otel_enabled();
-    if htmx {
+    return if htmx {
         html_snippet(StatusCode::OK, render_otel_snippet(now))
     } else {
         Json(serde_json::json!({
@@ -1835,7 +1835,7 @@ async fn admin_otel_post(headers: HeaderMap, body: axum::body::Bytes) -> impl In
             "enabled": now,
         }))
         .into_response()
-    }
+    };
 }
 
 #[derive(serde::Deserialize)]
@@ -1855,10 +1855,10 @@ async fn admin_log_level_get(headers: HeaderMap) -> impl IntoResponse {
         )
             .into_response();
     }
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "directive": crate::routine::current_log_level(),
     }))
-    .into_response()
+    .into_response();
 }
 
 /// `POST /admin/log-level` — install a new `EnvFilter` directive at
@@ -1901,7 +1901,7 @@ async fn admin_log_level_post(headers: HeaderMap, body: axum::body::Bytes) -> im
         }
     };
     let previous = crate::routine::current_log_level();
-    match crate::routine::set_log_level(&req.directive) {
+    return match crate::routine::set_log_level(&req.directive) {
         Ok(applied) => {
             if htmx {
                 html_snippet(
@@ -1936,7 +1936,7 @@ async fn admin_log_level_post(headers: HeaderMap, body: axum::body::Bytes) -> im
                     .into_response()
             }
         }
-    }
+    };
 }
 
 #[derive(serde::Deserialize)]
@@ -1960,12 +1960,12 @@ async fn admin_tcp_get(State(state): State<AppState>, headers: HeaderMap) -> imp
     }
     let nodelay = state.tcp_flags.nodelay();
     let quickack = state.tcp_flags.quickack();
-    Json(serde_json::json!({
+    return Json(serde_json::json!({
         "nodelay": nodelay,
         "quickack": quickack,
         "quickack_supported": cfg!(target_os = "linux"),
     }))
-    .into_response()
+    .into_response();
 }
 
 /// `POST /admin/tcp` — flip NODELAY and/or QUICKACK at runtime. Body
@@ -2074,25 +2074,25 @@ async fn admin_tcp_post(
     if let Some(w) = warning {
         body["warning"] = serde_json::Value::String(w.to_string());
     }
-    Json(body).into_response()
+    return Json(body).into_response();
 }
 
 async fn healthz() -> impl IntoResponse {
     crate::routine_id!("ddl-routine-TswAzuekSL3ki9tHzu");
-    Json(serde_json::json!({"ok": true, "service": "dd-rust-network-mutex"}))
+    return Json(serde_json::json!({"ok": true, "service": "dd-rust-network-mutex"}));
 }
 
 async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-4f1x2CLglT8maVVKYh");
     let body = state.metrics.render(&state.broker);
-    (
+    return (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
         body,
-    )
+    );
 }
 
 /// HTML status page — upstream `live-mutex#108`.
@@ -2118,11 +2118,11 @@ async fn status_page(State(state): State<StatusAppState>) -> impl IntoResponse {
     info.log_directive = crate::routine::current_log_level();
     info.otel_enabled = crate::routine::is_otel_enabled();
     let html = crate::status::render(&state.broker, &info, &metrics_text);
-    (
+    return (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         html,
-    )
+    );
 }
 
 /// State for the status routes. Distinct from `AppState` so the
@@ -2141,7 +2141,7 @@ struct StatusAppState {
 
 fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
     crate::routine_id!("ddl-routine-aps2N0EHQfJbC80RxJ");
-    crate::status::StatusServerInfo {
+    return crate::status::StatusServerInfo {
         tcp_bind: config.tcp_bind.map(|a| a.to_string()),
         uds_path: config
             .uds_path
@@ -2166,31 +2166,31 @@ fn build_status_info(config: &ServerConfig) -> crate::status::StatusServerInfo {
         tls_enabled: config.tls.is_some(),
         #[cfg(not(feature = "tls"))]
         tls_enabled: false,
-    }
+    };
 }
 
 fn status_router(state: StatusAppState) -> Router {
     crate::routine_id!("ddl-routine-ElPo3wC15B8bZyLP5u");
-    Router::new()
+    return Router::new()
         .route("/", get(status_page))
         .route("/status", get(status_page))
         .route("/healthz", get(healthz))
         .route("/readyz", get(healthz))
         .route("/metrics", get(metrics_endpoint_status))
-        .with_state(state)
+        .with_state(state);
 }
 
 async fn metrics_endpoint_status(State(state): State<StatusAppState>) -> impl IntoResponse {
     crate::routine_id!("ddl-routine-i3VYM9l8j70h2x7bg6");
     let body = state.metrics.render(&state.broker);
-    (
+    return (
         StatusCode::OK,
         [(
             axum::http::header::CONTENT_TYPE,
             "text/plain; version=0.0.4",
         )],
         body,
-    )
+    );
 }
 
 /// Run a single broker request in an ephemeral client and await its response.
@@ -2240,7 +2240,7 @@ async fn run_ephemeral(
     }
     state.broker.drop_client(client_id);
     let _ = rx;
-    outcome
+    return outcome;
 }
 
 async fn http_acquire(
@@ -2350,7 +2350,7 @@ async fn http_acquire(
         })
         .into_response(),
     };
-    observe_http_response(&state.metrics, "http_acquire", started, response)
+    return observe_http_response(&state.metrics, "http_acquire", started, response);
 }
 
 async fn http_release(
@@ -2399,7 +2399,7 @@ async fn http_release(
         )
             .into_response(),
     };
-    observe_http_response(&state.metrics, "http_release", started, response)
+    return observe_http_response(&state.metrics, "http_release", started, response);
 }
 
 async fn http_rw_read(
@@ -2454,7 +2454,7 @@ async fn http_rw_read(
         })
         .into_response(),
     };
-    observe_http_response(&state.metrics, "http_rw_read", started, response)
+    return observe_http_response(&state.metrics, "http_rw_read", started, response);
 }
 
 async fn http_rw_read_end(
@@ -2501,7 +2501,7 @@ async fn http_rw_read_end(
         )
             .into_response(),
     };
-    observe_http_response(&state.metrics, "http_rw_read_end", started, response)
+    return observe_http_response(&state.metrics, "http_rw_read_end", started, response);
 }
 
 async fn http_rw_write(
@@ -2561,7 +2561,7 @@ async fn http_rw_write(
         })
         .into_response(),
     };
-    observe_http_response(&state.metrics, "http_rw_write", started, response)
+    return observe_http_response(&state.metrics, "http_rw_write", started, response);
 }
 
 async fn http_rw_write_end(
@@ -2608,7 +2608,7 @@ async fn http_rw_write_end(
         )
             .into_response(),
     };
-    observe_http_response(&state.metrics, "http_rw_write_end", started, response)
+    return observe_http_response(&state.metrics, "http_rw_write_end", started, response);
 }
 
 async fn http_lock_info(
@@ -2658,7 +2658,7 @@ async fn http_lock_info(
         .into_response(),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "broker did not respond").into_response(),
     };
-    observe_http_response(&state.metrics, "http_lock_info", started, response)
+    return observe_http_response(&state.metrics, "http_lock_info", started, response);
 }
 
 async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumResponse {
@@ -2685,14 +2685,14 @@ async fn http_ls(State(state): State<AppState>, headers: HeaderMap) -> AxumRespo
         }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "broker did not respond").into_response(),
     };
-    observe_http_response(&state.metrics, "http_ls", started, response)
+    return observe_http_response(&state.metrics, "http_ls", started, response);
 }
 
 fn deadline_after(timeout: Duration) -> tokio::time::Instant {
     crate::routine_id!("ddl-routine-server-deadline-after-Jb7");
     let now = tokio::time::Instant::now();
-    now.checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+    return now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
 }
 
 async fn wait_for(
