@@ -70,8 +70,12 @@ export class Broker1Client {
 
   private onData(chunk: Buffer): void {
     this.buffer += chunk.toString("utf8");
-    let nl: number;
-    while ((nl = this.buffer.indexOf("\n")) >= 0) {
+    while (true) {
+      const nl = this.buffer.indexOf("\n");
+      if (nl < 0) {
+        break;
+      }
+
       const line = this.buffer.slice(0, nl);
       this.buffer = this.buffer.slice(nl + 1);
       if (!line.trim()) {
