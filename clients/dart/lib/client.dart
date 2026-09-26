@@ -68,7 +68,11 @@ class NetworkMutexClient {
   Future<void> close() async {
     try {
       await _socket.close();
-    } catch (_) {}
+    } catch (_) {
+
+      // Best-effort cleanup.
+
+    }
   }
 
   Future<SingleLockHandle> acquire(
@@ -107,7 +111,9 @@ class NetworkMutexClient {
       throw StateError('tryAcquire($key) error: ${resp.error}');
     if (resp is! LockResponse)
       throw StateError('tryAcquire($key) unexpected: $resp');
-    if (!resp.acquired || resp.lockUuid == null) return null;
+    if (!resp.acquired || resp.lockUuid == null) {
+      return null;
+    }
     return SingleLockHandle(
       key: key,
       lockUuid: resp.lockUuid!,
@@ -159,7 +165,9 @@ class NetworkMutexClient {
       throw StateError('tryAcquireMany($keys) error: ${resp.error}');
     if (resp is! CompositeLockResponse)
       throw StateError('tryAcquireMany($keys) unexpected: $resp');
-    if (!resp.acquired || resp.lockUuid == null) return null;
+    if (!resp.acquired || resp.lockUuid == null) {
+      return null;
+    }
     return CompositeLockHandle(
       keys: keys,
       lockUuid: resp.lockUuid!,
@@ -228,17 +236,23 @@ class NetworkMutexClient {
         _buffer += utf8.decode(chunk);
         while (true) {
           final nl = _buffer.indexOf('\n');
-          if (nl < 0) break;
+          if (nl < 0) {
+            break;
+          }
           final line = _buffer.substring(0, nl).trim();
           _buffer = _buffer.substring(nl + 1);
-          if (line.isEmpty) continue;
+          if (line.isEmpty) {
+            continue;
+          }
           final resp = Response.decode(line);
           _dispatch(resp);
         }
       },
       onError: (Object err) {
         for (final inf in _inflight.values) {
-          if (!inf.completer.isCompleted) inf.completer.completeError(err);
+          if (!inf.completer.isCompleted) {
+            inf.completer.completeError(err);
+          }
         }
       },
       onDone: () {
@@ -253,13 +267,17 @@ class NetworkMutexClient {
 
   void _dispatch(Response resp) {
     final inf = _inflight[resp.uuid];
-    if (inf == null) return;
+    if (inf == null) {
+      return;
+    }
     if (inf.multi && _isIntermediate(resp)) {
       inf.seen.add(resp);
       return;
     }
     _inflight.remove(resp.uuid);
-    if (!inf.completer.isCompleted) inf.completer.complete(resp);
+    if (!inf.completer.isCompleted) {
+      inf.completer.complete(resp);
+    }
   }
 
   bool _isIntermediate(Response r) {

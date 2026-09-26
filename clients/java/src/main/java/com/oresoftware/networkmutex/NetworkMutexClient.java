@@ -111,7 +111,9 @@ public final class NetworkMutexClient implements AutoCloseable {
     if (r.type != ResponseType.LOCK) {
       throw new NetworkMutexException("tryAcquire(" + key + ") unexpected: " + Json.stringify(r.raw));
     }
-    if (!r.acquired() || r.lockUuid().isEmpty()) return Optional.empty();
+    if (!r.acquired() || r.lockUuid().isEmpty()) {
+      return Optional.empty();
+    }
     return Optional.of(new SingleLockHandle(key, r.lockUuid(), r.fencingToken()));
   }
 
@@ -133,7 +135,9 @@ public final class NetworkMutexClient implements AutoCloseable {
     if (r.type != ResponseType.COMPOSITE_LOCK) {
       throw new NetworkMutexException("tryAcquireMany unexpected: " + Json.stringify(r.raw));
     }
-    if (!r.acquired() || r.lockUuid().isEmpty()) return Optional.empty();
+    if (!r.acquired() || r.lockUuid().isEmpty()) {
+      return Optional.empty();
+    }
     return Optional.of(new CompositeLockHandle(keys, r.lockUuid(), r.fencingTokens()));
   }
 
@@ -193,7 +197,9 @@ public final class NetworkMutexClient implements AutoCloseable {
 
   @Override
   public void close() {
-    if (closed) return;
+    if (closed) {
+      return;
+    }
     closed = true;
     try {
       socket.close();
@@ -209,7 +215,9 @@ public final class NetworkMutexClient implements AutoCloseable {
   // ---- internals ----------------------------------------------------------
 
   private LinkedBlockingQueue<Response> register(String uuid) {
-    if (closed) throw new NetworkMutexException("client closed");
+    if (closed) {
+      throw new NetworkMutexException("client closed");
+    }
     var q = new LinkedBlockingQueue<Response>();
     inflight.put(uuid, q);
     return q;
@@ -229,7 +237,9 @@ public final class NetworkMutexClient implements AutoCloseable {
   private Response next(LinkedBlockingQueue<Response> q, long timeoutMs) {
     try {
       Response r = q.poll(timeoutMs, TimeUnit.MILLISECONDS);
-      if (r == null) throw new NetworkMutexException("timed out waiting for broker response");
+      if (r == null) {
+        throw new NetworkMutexException("timed out waiting for broker response");
+      }
       if (r == SENTINEL) {
         throw new NetworkMutexException(readError != null ? readError : "client closed");
       }
@@ -256,9 +266,13 @@ public final class NetworkMutexClient implements AutoCloseable {
       send(frame);
       while (true) {
         Response r = next(q, timeoutMs);
-        if (r.type == ResponseType.ERROR) return r;
+        if (r.type == ResponseType.ERROR) {
+          return r;
+        }
         if (r.type == ResponseType.LOCK || r.type == ResponseType.COMPOSITE_LOCK) {
-          if (r.acquired() || r.has("error")) return r;
+          if (r.acquired() || r.has("error")) {
+            return r;
+          }
           continue; // queued notice
         }
         return r;
@@ -274,7 +288,9 @@ public final class NetworkMutexClient implements AutoCloseable {
       send(frame);
       while (true) {
         Response r = next(q, timeoutMs);
-        if (r.granted()) return r;
+        if (r.granted()) {
+          return r;
+        }
         if (r.type == ResponseType.ERROR) {
           throw new NetworkMutexException("rw acquire failed: " + r.error());
         }
@@ -296,14 +312,20 @@ public final class NetworkMutexClient implements AutoCloseable {
         while ((nl = acc.indexOf("\n")) >= 0) {
           String line = acc.substring(0, nl);
           acc.delete(0, nl + 1);
-          if (line.isBlank()) continue;
+          if (line.isBlank()) {
+            continue;
+          }
           dispatch(Response.parse(line));
         }
       }
     } catch (IOException e) {
-      if (!closed) readError = e.getMessage();
+      if (!closed) {
+        readError = e.getMessage();
+      }
     } catch (RuntimeException e) {
-      if (!closed) readError = e.getMessage();
+      if (!closed) {
+        readError = e.getMessage();
+      }
     } finally {
       close();
     }
@@ -311,6 +333,8 @@ public final class NetworkMutexClient implements AutoCloseable {
 
   private void dispatch(Response r) {
     var q = inflight.get(r.uuid);
-    if (q != null) q.offer(r);
+    if (q != null) {
+      q.offer(r);
+    }
   }
 }

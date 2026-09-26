@@ -74,17 +74,29 @@ export class Broker1Client {
     while ((nl = this.buffer.indexOf("\n")) >= 0) {
       const line = this.buffer.slice(0, nl);
       this.buffer = this.buffer.slice(nl + 1);
-      if (!line.trim()) continue;
+      if (!line.trim()) {
+        continue;
+      }
       let msg: Record<string, unknown>;
-      try { msg = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+      try {
+        msg = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
       const uuid = msg["uuid"] as string | undefined;
-      if (!uuid) continue;
+      if (!uuid) {
+        continue;
+      }
       const w = this.inflight.get(uuid);
-      if (!w) continue;
+      if (!w) {
+        continue;
+      }
       if (w.untilGrant) {
         const acquired = msg["acquired"] === true;
         const hasError = typeof msg["error"] === "string";
-        if (!acquired && !hasError) continue;
+        if (!acquired && !hasError) {
+          continue;
+        }
       }
       this.inflight.delete(uuid);
       w.resolve(msg);
@@ -92,12 +104,16 @@ export class Broker1Client {
   }
 
   private failAll(err: Error): void {
-    for (const [, w] of this.inflight) w.reject(err);
+    for (const [, w] of this.inflight) {
+      w.reject(err);
+    }
     this.inflight.clear();
   }
 
   private write(obj: Record<string, unknown>): void {
-    if (!this.socket) throw new Error("not connected");
+    if (!this.socket) {
+      throw new Error("not connected");
+    }
     this.socket.write(JSON.stringify(obj) + "\n");
   }
 
@@ -114,7 +130,9 @@ export class Broker1Client {
       { type: "lock", uuid, key, pid: this.pid, keepLocksAfterDeath: false, ttl: ttlMs > 0 ? ttlMs : null, wait: true },
       uuid, true,
     );
-    if (reply["acquired"] !== true) throw new Error(`lock(${key}) not acquired: ${reply["error"] ?? JSON.stringify(reply)}`);
+    if (reply["acquired"] !== true) {
+      throw new Error(`lock(${key}) not acquired: ${reply["error"] ?? JSON.stringify(reply)}`);
+    }
     return { key, lockUuid: uuid, fencingToken: fence(reply["fencingToken"], `lock(${key})`) };
   }
 
@@ -124,8 +142,12 @@ export class Broker1Client {
       { type: "lock", uuid, key, pid: this.pid, keepLocksAfterDeath: false, ttl: ttlMs > 0 ? ttlMs : null, wait: false },
       uuid, false,
     );
-    if (typeof reply["error"] === "string") throw new Error(`tryAcquire(${key}) error: ${reply["error"]}`);
-    if (reply["acquired"] !== true) return null;
+    if (typeof reply["error"] === "string") {
+      throw new Error(`tryAcquire(${key}) error: ${reply["error"]}`);
+    }
+    if (reply["acquired"] !== true) {
+      return null;
+    }
     return { key, lockUuid: uuid, fencingToken: fence(reply["fencingToken"], `tryAcquire(${key})`) };
   }
 
@@ -134,7 +156,9 @@ export class Broker1Client {
     const reply = await this.roundtrip(
       { type: "unlock", uuid, _uuid: h.lockUuid, key: h.key, force: false }, uuid, false,
     );
-    if (reply["unlocked"] !== true) throw new Error(`unlock(${h.key}) rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
+    if (reply["unlocked"] !== true) {
+      throw new Error(`unlock(${h.key}) rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
+    }
   }
 
   async acquireMany(keys: string[], ttlMs = 30_000): Promise<Broker1CompositeHandle> {
@@ -142,10 +166,14 @@ export class Broker1Client {
     const reply = await this.roundtrip(
       { type: "acquire-many", uuid, keys, ttl: ttlMs > 0 ? ttlMs : null, wait: true }, uuid, true,
     );
-    if (reply["acquired"] !== true) throw new Error(`acquire-many rejected: ${reply["error"] ?? reply["contendedKey"] ?? JSON.stringify(reply)}`);
+    if (reply["acquired"] !== true) {
+      throw new Error(`acquire-many rejected: ${reply["error"] ?? reply["contendedKey"] ?? JSON.stringify(reply)}`);
+    }
     const grantedKeys = Array.isArray(reply["keys"]) ? reply["keys"] as string[] : keys;
     const lockUuid = reply["lockUuid"];
-    if (typeof lockUuid !== "string" || lockUuid.length === 0) throw new Error("acquire-many omitted lockUuid");
+    if (typeof lockUuid !== "string" || lockUuid.length === 0) {
+      throw new Error("acquire-many omitted lockUuid");
+    }
     return { keys: grantedKeys, lockUuid, fencingTokens: fenceMap(reply["fencingTokens"], grantedKeys, "acquire-many") };
   }
 
@@ -154,18 +182,26 @@ export class Broker1Client {
     const reply = await this.roundtrip(
       { type: "acquire-many", uuid, keys, ttl: ttlMs > 0 ? ttlMs : null, wait: false }, uuid, false,
     );
-    if (typeof reply["error"] === "string") throw new Error(`tryAcquireMany error: ${reply["error"]}`);
-    if (reply["acquired"] !== true) return null;
+    if (typeof reply["error"] === "string") {
+      throw new Error(`tryAcquireMany error: ${reply["error"]}`);
+    }
+    if (reply["acquired"] !== true) {
+      return null;
+    }
     const grantedKeys = Array.isArray(reply["keys"]) ? reply["keys"] as string[] : keys;
     const lockUuid = reply["lockUuid"];
-    if (typeof lockUuid !== "string" || lockUuid.length === 0) throw new Error("tryAcquireMany omitted lockUuid");
+    if (typeof lockUuid !== "string" || lockUuid.length === 0) {
+      throw new Error("tryAcquireMany omitted lockUuid");
+    }
     return { keys: grantedKeys, lockUuid, fencingTokens: fenceMap(reply["fencingTokens"], grantedKeys, "tryAcquireMany") };
   }
 
   async releaseMany(h: Broker1CompositeHandle): Promise<void> {
     const uuid = randomUUID();
     const reply = await this.roundtrip({ type: "release-many", uuid, lockUuid: h.lockUuid }, uuid, false);
-    if (reply["released"] !== true) throw new Error(`release-many rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
+    if (reply["released"] !== true) {
+      throw new Error(`release-many rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
+    }
   }
 
   async close(): Promise<void> {
