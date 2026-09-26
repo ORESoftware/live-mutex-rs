@@ -15,29 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Find redirect regression after merge
+      - name: Inspect retry cadence and full ping-pong oracle
         shell: bash
         run: |
           set -euo pipefail
-          echo '===== repository matches ====='
-          rg -n -C 12 -i 'ping.?pong|permanent redirect|redirect cycle|structured leader hint|proxy.*redirect|redirect.*proxy' src tests . --glob '!target/**' --glob '!.git/**' || true
-          echo '===== broker_raft test-ish matches ====='
-          python3 - <<'PY'
-          from pathlib import Path
-          src = Path('src/broker_raft.rs').read_text()
-          for needle in ['redirect', 'NotLeader', 'proxy_request_retries_total']:
-              print(f'--- {needle} occurrences in final 25% of file ---')
-              start = len(src) * 3 // 4
-              pos = start
-              shown = 0
-              while shown < 40:
-                  idx = src.lower().find(needle.lower(), pos)
-                  if idx < 0:
-                      break
-                  line = src.count('\n', 0, idx) + 1
-                  lo = max(0, idx - 700)
-                  hi = min(len(src), idx + 1800)
-                  print(f'LINE {line}\n{src[lo:hi]}\n---')
-                  pos = idx + len(needle)
-                  shown += 1
-          PY
+          echo '===== retry interval definitions/usages ====='
+          grep -n -C 4 'PROXY_RETRY_INTERVAL' src/broker_raft.rs || true
+          echo '===== ping-pong helper + test ====='
+          sed -n '56440,56610p' src/broker_raft.rs
