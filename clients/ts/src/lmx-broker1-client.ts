@@ -15,18 +15,14 @@ function fence(value: unknown, context: string): number {
 }
 
 function fenceMap(value: unknown, keys: string[], context: string): Record<string, number> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${context}: missing fencing token map`);
-  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${context}: missing fencing token map`);
   const raw = value as Record<string, unknown>;
   if (Object.keys(raw).length !== keys.length || new Set(keys).size !== keys.length) {
     throw new Error(`${context}: fencing token/key cardinality mismatch`);
   }
   const out: Record<string, number> = {};
   for (const key of keys) {
-    if (!(key in raw)) {
-      throw new Error(`${context}: missing fencing token for ${key}`);
-    }
+    if (!(key in raw)) throw new Error(`${context}: missing fencing token for ${key}`);
     out[key] = fence(raw[key], `${context}[${key}]`);
   }
   return out;
@@ -83,13 +79,9 @@ export class Broker1Client {
       }
       let msg: Record<string, unknown>;
       try {
-
         msg = JSON.parse(line) as Record<string, unknown>;
-
       } catch {
-
         continue;
-
       }
       const uuid = msg["uuid"] as string | undefined;
       if (!uuid) {
@@ -138,8 +130,8 @@ export class Broker1Client {
       { type: "lock", uuid, key, pid: this.pid, keepLocksAfterDeath: false, ttl: ttlMs > 0 ? ttlMs : null, wait: true },
       uuid, true,
     );
-    if (reply["acquired"] !== true) throw new Error(`lock(${key}) {
-      not acquired: ${reply["error"] ?? JSON.stringify(reply)}`);
+    if (reply["acquired"] !== true) {
+      throw new Error(`lock(${key}) not acquired: ${reply["error"] ?? JSON.stringify(reply)}`);
     }
     return { key, lockUuid: uuid, fencingToken: fence(reply["fencingToken"], `lock(${key})`) };
   }
@@ -150,8 +142,8 @@ export class Broker1Client {
       { type: "lock", uuid, key, pid: this.pid, keepLocksAfterDeath: false, ttl: ttlMs > 0 ? ttlMs : null, wait: false },
       uuid, false,
     );
-    if (typeof reply["error"] === "string") throw new Error(`tryAcquire(${key}) {
-      error: ${reply["error"]}`);
+    if (typeof reply["error"] === "string") {
+      throw new Error(`tryAcquire(${key}) error: ${reply["error"]}`);
     }
     if (reply["acquired"] !== true) {
       return null;
@@ -164,8 +156,8 @@ export class Broker1Client {
     const reply = await this.roundtrip(
       { type: "unlock", uuid, _uuid: h.lockUuid, key: h.key, force: false }, uuid, false,
     );
-    if (reply["unlocked"] !== true) throw new Error(`unlock(${h.key}) {
-      rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
+    if (reply["unlocked"] !== true) {
+      throw new Error(`unlock(${h.key}) rejected: ${reply["error"] ?? JSON.stringify(reply)}`);
     }
   }
 
