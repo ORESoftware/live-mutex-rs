@@ -31,7 +31,11 @@ public final class Protocol {
     public final String wire;
     ResponseType(String wire) { this.wire = wire; }
     public static ResponseType fromWire(String s) {
-      for (ResponseType t : values()) if (t.wire.equals(s)) return t;
+      for (ResponseType t : values()) {
+        if (t.wire.equals(s)) {
+          return t;
+        }
+      }
       return UNKNOWN;
     }
   }
@@ -50,26 +54,42 @@ public final class Protocol {
   public static String lockRequestSingle(String uuid, String key, long ttlMs, Integer maxHolders, Boolean wait) {
     var o = new LinkedHashMap<String, Object>();
     o.put("type", RequestType.LOCK.wire); o.put("uuid", uuid); o.put("key", key);
-    if (ttlMs > 0) o.put("ttl", ttlMs); if (maxHolders != null) o.put("max", (long) maxHolders); if (wait != null) o.put("wait", wait);
+    if (ttlMs > 0) {
+      o.put("ttl", ttlMs);
+    }
+    if (maxHolders != null) {
+      o.put("max", (long) maxHolders);
+    }
+    if (wait != null) {
+      o.put("wait", wait);
+    }
     return frame(o);
   }
   public static String lockRequestComposite(String uuid, List<String> keys, long ttlMs) { return lockRequestComposite(uuid, keys, ttlMs, null); }
   public static String lockRequestComposite(String uuid, List<String> keys, long ttlMs, Boolean wait) {
-    if (keys.isEmpty() || keys.size() > MAX_COMPOSITE_KEYS) {
-      throw new IllegalArgumentException("composite key count must be 1..=5, got " + keys.size());
-    }
+    if (keys.isEmpty() || keys.size() > MAX_COMPOSITE_KEYS) throw new IllegalArgumentException("composite key count must be 1..=5, got " + keys.size());
     var o = new LinkedHashMap<String, Object>(); o.put("type", RequestType.LOCK.wire); o.put("uuid", uuid); o.put("keys", keys);
-    if (ttlMs > 0) o.put("ttl", ttlMs); if (wait != null) o.put("wait", wait); return frame(o);
+    if (ttlMs > 0) {
+      o.put("ttl", ttlMs);
+    }
+    if (wait != null) {
+      o.put("wait", wait);
+    }
+    return frame(o);
   }
   public static String unlockRequestSingle(String uuid, String key, String lockUuid, boolean force) {
     var o = new LinkedHashMap<String, Object>(); o.put("type", RequestType.UNLOCK.wire); o.put("uuid", uuid); o.put("key", key);
-    if (lockUuid != null && !lockUuid.isEmpty()) o.put("lockUuid", lockUuid); if (force) o.put("force", Boolean.TRUE); return frame(o);
+    if (lockUuid != null && !lockUuid.isEmpty()) {
+      o.put("lockUuid", lockUuid);
+    }
+    if (force) {
+      o.put("force", Boolean.TRUE);
+    }
+    return frame(o);
   }
   public static String unlockRequestComposite(String uuid, List<String> keys, String lockUuid) {
     var o = new LinkedHashMap<String, Object>(); o.put("type", RequestType.UNLOCK.wire); o.put("uuid", uuid); o.put("keys", keys);
-    if (lockUuid != null && !lockUuid.isEmpty()) {
-      o.put("lockUuid", lockUuid); return frame(o);
-    }
+    if (lockUuid != null && !lockUuid.isEmpty()) o.put("lockUuid", lockUuid); return frame(o);
   }
   public static String rwRequest(RequestType type, String uuid, String key) {
     var o = new LinkedHashMap<String, Object>(); o.put("type", type.wire); o.put("uuid", uuid); o.put("key", key); return frame(o);
@@ -112,29 +132,19 @@ public final class Protocol {
 
     private void validateAuthority() {
       if (type == ResponseType.LOCK && acquired()) {
-        if (lockUuid().isEmpty()) {
-          throw new IllegalArgumentException("acquired lock omitted lockUuid");
-        }
+        if (lockUuid().isEmpty()) throw new IllegalArgumentException("acquired lock omitted lockUuid");
         exactFence(raw.get("fencingToken"), "fencingToken");
       } else if (type == ResponseType.COMPOSITE_LOCK && acquired()) {
-        if (lockUuid().isEmpty()) {
-          throw new IllegalArgumentException("acquired composite lock omitted lockUuid");
-        }
+        if (lockUuid().isEmpty()) throw new IllegalArgumentException("acquired composite lock omitted lockUuid");
         List<String> ks = keys();
-        if (ks.isEmpty() || new HashSet<>(ks).size() != ks.size()) {
-          throw new IllegalArgumentException("invalid composite keys");
-        }
+        if (ks.isEmpty() || new HashSet<>(ks).size() != ks.size()) throw new IllegalArgumentException("invalid composite keys");
         Object tokensRaw = raw.get("fencingTokens");
-        if (!(tokensRaw instanceof Map<?, ?> tokens) || tokens.size() != ks.size()) {
-          throw new IllegalArgumentException("incomplete composite fencing token map");
-        }
+        if (!(tokensRaw instanceof Map<?, ?> tokens) || tokens.size() != ks.size()) throw new IllegalArgumentException("incomplete composite fencing token map");
         for (String key : ks) {
           exactFence(tokens.get(key), "fencingTokens[" + key + "]");
         }
       } else if ((type == ResponseType.REGISTER_READ_RESULT || type == ResponseType.REGISTER_WRITE_RESULT) && granted()) {
-        if (lockUuid().isEmpty()) {
-          throw new IllegalArgumentException("granted rw lock omitted lockUuid");
-        }
+        if (lockUuid().isEmpty()) throw new IllegalArgumentException("granted rw lock omitted lockUuid");
         exactFence(raw.get("fencingToken"), "fencingToken");
       }
     }
@@ -150,11 +160,9 @@ public final class Protocol {
     public Map<String, Long> fencingTokens() {
       var out = new LinkedHashMap<String, Long>();
       Object v = raw.get("fencingTokens");
-      if (!(v instanceof Map<?, ?> m)) {
-        return out;
-      }
-      for (Map.Entry<?, ?> e : m.entrySet()) out.put(String.valueOf(e.getKey()), exactFence(e.getValue(), "fencingTokens[" + e.getKey() {
-        + "]"));
+      if (!(v instanceof Map<?, ?> m)) return out;
+      for (Map.Entry<?, ?> e : m.entrySet()) {
+        out.put(String.valueOf(e.getKey()), exactFence(e.getValue(), "fencingTokens[" + e.getKey() + "]"));
       }
       return out;
     }
