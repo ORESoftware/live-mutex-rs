@@ -10811,6 +10811,11 @@ impl BrokerRaft {
         // handoff cannot ping-pong RPCs with no backoff until the budget runs
         // out; revisiting a peer forces the normal paced retry instead.
         let mut redirect_chain: BTreeSet<String> = BTreeSet::new();
+        // Preserve the semantic reason for failure across paced retries. A
+        // redirect cycle means peers disagree about the leader; if the overall
+        // retry budget later expires during an RPC, that transport timeout must
+        // not overwrite the more useful NotLeader result.
+        let mut redirect_cycle_detected = false;
 
         loop {
             if self.is_leader() {
@@ -11123,6 +11128,7 @@ impl BrokerRaft {
                     redirected_leader_peer = Some(redirect_peer);
                     continue;
                 }
+                redirect_cycle_detected = true;
                 debug!(
                     target: "lmx::raft",
                     node_id = %self.config.node_id,
@@ -11153,6 +11159,23 @@ impl BrokerRaft {
                 .await
             {
                 continue;
+            }
+            if redirect_cycle_detected {
+                self.telemetry
+                    .proxy_request_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    target: "lmx::raft",
+                    node_id = %self.config.node_id,
+                    leader_id = ?leader_id,
+                    request_uuid,
+                    attempts,
+                    "raft follower proxy retry budget ended after a leader redirect cycle",
+                );
+                return Err(BrokerRaftError::NotLeader {
+                    leader_id: self.leader_id().or(leader_id.clone()),
+                    leader_addr: self.leader_addr(),
+                });
             }
             if let Some(error) = last_retry_error {
                 if proxy_error_is_not_leader(&error) {
@@ -56542,13 +56565,8 @@ mod tests {
             .await
             .expect_err("a permanent redirect ping-pong must give up, not succeed");
         assert!(
-            matches!(&err, BrokerRaftError::NotLeader { .. })
-                || matches!(
-                    &err,
-                    BrokerRaftError::Rpc(message)
-                        if message.contains("strict timeout budget expired")
-                ),
-            "ping-pong should end in a bounded terminal error: {err:?}"
+            matches!(err, BrokerRaftError::NotLeader { .. }),
+            "ping-pong should end in NotLeader: {err:?}"
         );
 
         n2_server.abort();
