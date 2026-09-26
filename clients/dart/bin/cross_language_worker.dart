@@ -17,7 +17,9 @@ const ttl = Duration(milliseconds: 60000);
 
 class Rng {
   Rng(BigInt seed) : _x = seed ^ BigInt.parse('9e3779b97f4a7c15', radix: 16) {
-    if (_x == BigInt.zero) _x = BigInt.one;
+    if (_x == BigInt.zero) {
+      _x = BigInt.one;
+    }
   }
 
   BigInt _x;
@@ -79,7 +81,9 @@ List<String> chooseKeys(Rng rng, List<String> keys) {
 
 Future<void> holdBriefly(Rng rng) async {
   final ms = rng.below(4);
-  if (ms > 0) await Future<void>.delayed(Duration(milliseconds: ms));
+  if (ms > 0) {
+    await Future<void>.delayed(Duration(milliseconds: ms));
+  }
 }
 
 Future<void> grantReleaseExclusive(
@@ -133,13 +137,17 @@ Future<void> main() async {
           keys[rng.below(keys.length)],
           ttl: ttl,
         );
-        if (h != null) await grantReleaseExclusive(client, h, rng);
+        if (h != null) {
+          await grantReleaseExclusive(client, h, rng);
+        }
       } else if (roll < 50) {
         final h = await client.acquire(keys[rng.below(keys.length)], ttl: ttl);
         await grantReleaseExclusive(client, h, rng);
       } else if (roll < 65) {
         final h = await client.tryAcquireMany(chooseKeys(rng, keys), ttl: ttl);
-        if (h != null) await grantReleaseExclusive(client, h, rng);
+        if (h != null) {
+          await grantReleaseExclusive(client, h, rng);
+        }
       } else if (roll < 75) {
         final h = await client.acquireMany(chooseKeys(rng, keys), ttl: ttl);
         await grantReleaseExclusive(client, h, rng);
