@@ -90,10 +90,18 @@ class Value {
  private:
   void write(std::ostringstream& os) const {
     switch (type_) {
-      case Type::Null: os << "null"; break;
-      case Type::Bool: os << (bool_ ? "true" : "false"); break;
-      case Type::Number: os << str_; break;
-      case Type::String: write_string(os, str_); break;
+      case Type::Null:
+        os << "null";
+        break;
+      case Type::Bool:
+        os << (bool_ ? "true" : "false");
+        break;
+      case Type::Number:
+        os << str_;
+        break;
+      case Type::String:
+        write_string(os, str_);
+        break;
       case Type::Array: {
         os << '[';
         for (size_t i = 0; i < arr_.size(); ++i) {
@@ -127,11 +135,21 @@ class Value {
     os << '"';
     for (char c : s) {
       switch (c) {
-        case '"': os << "\\\""; break;
-        case '\\': os << "\\\\"; break;
-        case '\n': os << "\\n"; break;
-        case '\r': os << "\\r"; break;
-        case '\t': os << "\\t"; break;
+        case '"':
+          os << "\\\"";
+          break;
+        case '\\':
+          os << "\\\\";
+          break;
+        case '\n':
+          os << "\\n";
+          break;
+        case '\r':
+          os << "\\r";
+          break;
+        case '\t':
+          os << "\\t";
+          break;
         default:
           if (static_cast<unsigned char>(c) < 0x20) {
             char buf[8];
@@ -188,12 +206,19 @@ class Parser {
   Value parse_value() {
     char c = peek();
     switch (c) {
-      case '{': return parse_object();
-      case '[': return parse_array();
-      case '"': return Value(parse_string());
-      case 't': case 'f': return parse_bool();
-      case 'n': return parse_null();
-      default: return parse_number();
+      case '{':
+        return parse_object();
+      case '[':
+        return parse_array();
+      case '"':
+        return Value(parse_string());
+      case 't':
+      case 'f':
+        return parse_bool();
+      case 'n':
+        return parse_null();
+      default:
+        return parse_number();
     }
   }
 
@@ -201,7 +226,10 @@ class Parser {
     Object obj;
     ++i_;  // {
     skip_ws();
-    if (peek() == '}') { ++i_; return Value(std::move(obj)); }
+    if (peek() == '}') {
+      ++i_;
+      return Value(std::move(obj));
+    }
     while (true) {
       skip_ws();
       std::string key = parse_string();
@@ -237,7 +265,10 @@ class Parser {
     Array arr;
     ++i_;  // [
     skip_ws();
-    if (peek() == ']') { ++i_; return Value(std::move(arr)); }
+    if (peek() == ']') {
+      ++i_;
+      return Value(std::move(arr));
+    }
     while (true) {
       skip_ws();
       arr.push_back(parse_value());
@@ -279,14 +310,30 @@ class Parser {
         }
         char e = s_[i_++];
         switch (e) {
-          case '"': out.push_back('"'); break;
-          case '\\': out.push_back('\\'); break;
-          case '/': out.push_back('/'); break;
-          case 'n': out.push_back('\n'); break;
-          case 'r': out.push_back('\r'); break;
-          case 't': out.push_back('\t'); break;
-          case 'b': out.push_back('\b'); break;
-          case 'f': out.push_back('\f'); break;
+          case '"':
+            out.push_back('"');
+            break;
+          case '\\':
+            out.push_back('\\');
+            break;
+          case '/':
+            out.push_back('/');
+            break;
+          case 'n':
+            out.push_back('\n');
+            break;
+          case 'r':
+            out.push_back('\r');
+            break;
+          case 't':
+            out.push_back('\t');
+            break;
+          case 'b':
+            out.push_back('\b');
+            break;
+          case 'f':
+            out.push_back('\f');
+            break;
           case 'u': {
             if (i_ + 4 > s_.size()) {
               throw ParseError("bad \\u escape");
@@ -306,7 +353,8 @@ class Parser {
             }
             break;
           }
-          default: throw ParseError("unknown escape");
+          default:
+            throw ParseError("unknown escape");
         }
       } else {
         out.push_back(c);
@@ -316,13 +364,22 @@ class Parser {
   }
 
   Value parse_bool() {
-    if (s_.compare(i_, 4, "true") == 0) { i_ += 4; return Value(true); }
-    if (s_.compare(i_, 5, "false") == 0) { i_ += 5; return Value(false); }
+    if (s_.compare(i_, 4, "true") == 0) {
+      i_ += 4;
+      return Value(true);
+    }
+    if (s_.compare(i_, 5, "false") == 0) {
+      i_ += 5;
+      return Value(false);
+    }
     throw ParseError("invalid literal");
   }
 
   Value parse_null() {
-    if (s_.compare(i_, 4, "null") == 0) { i_ += 4; return Value(nullptr); }
+    if (s_.compare(i_, 4, "null") == 0) {
+      i_ += 4;
+      return Value(nullptr);
+    }
     throw ParseError("invalid literal");
   }
 
