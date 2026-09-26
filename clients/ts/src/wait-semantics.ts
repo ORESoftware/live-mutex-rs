@@ -20,7 +20,9 @@ const THEIRS_HOST = process.env["THEIRS_HOST"] ?? "127.0.0.1";
 const THEIRS_PORT = Number(process.env["THEIRS_PORT"] ?? 7972);
 
 const TTL = 30_000;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+  setTimeout(resolve, ms);
+});
 
 interface Handle {
   release(): Promise<void>;
