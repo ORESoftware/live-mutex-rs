@@ -16,7 +16,8 @@ import java.util.Map;
  */
 public final class Json {
 
-  private Json() {}
+  private Json() {
+  }
 
   // ---- serialize ----------------------------------------------------------
 
@@ -39,7 +40,9 @@ public final class Json {
       sb.append('{');
       boolean first = true;
       for (Map.Entry<?, ?> e : m.entrySet()) {
-        if (!first) sb.append(',');
+        if (!first) {
+          sb.append(',');
+        }
         first = false;
         writeString(sb, String.valueOf(e.getKey()));
         sb.append(':');
@@ -49,7 +52,9 @@ public final class Json {
     } else if (v instanceof List<?> list) {
       sb.append('[');
       for (int i = 0; i < list.size(); i++) {
-        if (i > 0) sb.append(',');
+        if (i > 0) {
+          sb.append(',');
+        }
         write(sb, list.get(i));
       }
       sb.append(']');
@@ -109,13 +114,18 @@ public final class Json {
     void skipWs() {
       while (i < s.length()) {
         char c = s.charAt(i);
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') i++;
-        else break;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+          i++;
+        } else {
+          break;
+        }
       }
     }
 
     private char peek() {
-      if (i >= s.length()) throw new IllegalStateException("unexpected end of JSON");
+      if (i >= s.length()) {
+        throw new IllegalStateException("unexpected end of JSON");
+      }
       return s.charAt(i);
     }
 
@@ -144,7 +154,9 @@ public final class Json {
         skipWs();
         String key = parseStr();
         skipWs();
-        if (peek() != ':') throw new IllegalStateException("expected ':'");
+        if (peek() != ':') {
+          throw new IllegalStateException("expected ':'");
+        }
         i++;
         obj.put(key, parseValue());
         skipWs();
@@ -188,12 +200,16 @@ public final class Json {
     }
 
     private String parseStr() {
-      if (peek() != '"') throw new IllegalStateException("expected string");
+      if (peek() != '"') {
+        throw new IllegalStateException("expected string");
+      }
       i++;
       StringBuilder sb = new StringBuilder();
       while (i < s.length()) {
         char c = s.charAt(i++);
-        if (c == '"') return sb.toString();
+        if (c == '"') {
+          return sb.toString();
+        }
         if (c == '\\') {
           char e = s.charAt(i++);
           switch (e) {
@@ -254,7 +270,9 @@ public final class Json {
         }
       }
       String text = s.substring(start, i);
-      if (text.isEmpty()) throw new IllegalStateException("invalid number");
+      if (text.isEmpty()) {
+        throw new IllegalStateException("invalid number");
+      }
       return isFloat ? (Number) Double.parseDouble(text) : (Number) Long.parseLong(text);
     }
   }
