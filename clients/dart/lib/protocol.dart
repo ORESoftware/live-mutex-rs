@@ -12,13 +12,17 @@ int _fence(dynamic value, String field) {
 }
 
 Map<String, int> _fenceMap(dynamic value, List<String> keys) {
-  if (value is! Map) throw const FormatException('acquired composite lock omitted fencingTokens');
+  if (value is! Map) {
+    throw const FormatException('acquired composite lock omitted fencingTokens');
+  }
   if (keys.isEmpty || keys.toSet().length != keys.length || value.length != keys.length) {
     throw const FormatException('acquired composite lock has invalid key/token cardinality');
   }
   final out = <String, int>{};
   for (final key in keys) {
-    if (!value.containsKey(key)) throw FormatException('missing fencing token for $key');
+    if (!value.containsKey(key)) {
+      throw FormatException('missing fencing token for $key');
+    }
     out[key] = _fence(value[key], 'fencingTokens[$key]');
   }
   return out;
@@ -81,11 +85,21 @@ class LockRequest extends Request {
       'keepLocksAfterDeath': keepLocksAfterDeath,
       'ttl': ttl,
     };
-    if (key != null) m['key'] = key;
-    if (keys != null) m['keys'] = keys;
-    if (pid != null) m['pid'] = pid;
-    if (max != null) m['max'] = max;
-    if (wait != null) m['wait'] = wait;
+    if (key != null) {
+      m['key'] = key;
+    }
+    if (keys != null) {
+      m['keys'] = keys;
+    }
+    if (pid != null) {
+      m['pid'] = pid;
+    }
+    if (max != null) {
+      m['max'] = max;
+    }
+    if (wait != null) {
+      m['wait'] = wait;
+    }
     return m;
   }
 }
@@ -100,9 +114,15 @@ class UnlockRequest extends Request {
   @override
   Map<String, dynamic> toJson() {
     final m = <String, dynamic>{'type': type, 'uuid': uuid, 'force': force};
-    if (key != null) m['key'] = key;
-    if (keys != null) m['keys'] = keys;
-    if (lockUuid != null) m['lockUuid'] = lockUuid;
+    if (key != null) {
+      m['key'] = key;
+    }
+    if (keys != null) {
+      m['keys'] = keys;
+    }
+    if (lockUuid != null) {
+      m['lockUuid'] = lockUuid;
+    }
     return m;
   }
 }
@@ -163,10 +183,14 @@ sealed class Response {
 
   static Response decode(String line) {
     final decoded = jsonDecode(line);
-    if (decoded is! Map<String, dynamic>) throw const FormatException('broker response must be an object');
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('broker response must be an object');
+    }
     final j = decoded;
     final t = j['type'];
-    if (t is! String) throw const FormatException('broker response type must be a string');
+    if (t is! String) {
+      throw const FormatException('broker response type must be a string');
+    }
     final u = j['uuid'] as String? ?? '';
     switch (t) {
       case 'version':
@@ -177,7 +201,9 @@ sealed class Response {
         final acquired = j['acquired'] as bool? ?? false;
         final lockUuid = j['lockUuid'] as String?;
         final fencingToken = acquired ? _fence(j['fencingToken'], 'fencingToken') : null;
-        if (acquired && (lockUuid == null || lockUuid.isEmpty)) throw const FormatException('acquired lock omitted lockUuid');
+        if (acquired && (lockUuid == null || lockUuid.isEmpty)) {
+          throw const FormatException('acquired lock omitted lockUuid');
+        }
         return LockResponse(
           uuid: u,
           key: j['key'] as String? ?? '',
@@ -192,7 +218,9 @@ sealed class Response {
         final keys = ((j['keys'] as List?) ?? const []).map((e) => e as String).toList();
         final acquired = j['acquired'] as bool? ?? false;
         final lockUuid = j['lockUuid'] as String?;
-        if (acquired && (lockUuid == null || lockUuid.isEmpty)) throw const FormatException('acquired composite lock omitted lockUuid');
+        if (acquired && (lockUuid == null || lockUuid.isEmpty)) {
+          throw const FormatException('acquired composite lock omitted lockUuid');
+        }
         final tokens = acquired ? _fenceMap(j['fencingTokens'], keys) : null;
         return CompositeLockResponse(uuid: u, keys: keys, acquired: acquired, lockUuid: lockUuid, fencingTokens: tokens, error: j['error'] as String?);
       case 'unlock':
@@ -206,7 +234,9 @@ sealed class Response {
       case 'registerReadResult':
         final granted = j['granted'] as bool? ?? false;
         final lockUuid = j['lockUuid'] as String?;
-        if (granted && (lockUuid == null || lockUuid.isEmpty)) throw const FormatException('granted read lock omitted lockUuid');
+        if (granted && (lockUuid == null || lockUuid.isEmpty)) {
+          throw const FormatException('granted read lock omitted lockUuid');
+        }
         return RegisterReadResultResponse(
           uuid: u,
           key: j['key'] as String? ?? '',
@@ -219,7 +249,9 @@ sealed class Response {
       case 'registerWriteResult':
         final granted = j['granted'] as bool? ?? false;
         final lockUuid = j['lockUuid'] as String?;
-        if (granted && (lockUuid == null || lockUuid.isEmpty)) throw const FormatException('granted write lock omitted lockUuid');
+        if (granted && (lockUuid == null || lockUuid.isEmpty)) {
+          throw const FormatException('granted write lock omitted lockUuid');
+        }
         return RegisterWriteResultResponse(
           uuid: u,
           key: j['key'] as String? ?? '',
