@@ -1,0 +1,34 @@
+name: Inspect Raft proxy source
+
+on:
+  pull_request:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact pull request
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Print bounded proxy implementation context
+        shell: bash
+        run: |
+          set -euo pipefail
+          file='src/broker_raft.rs'
+          pattern='proxy_candidate_peers|proxy_redirect_peer|proxy_error_terminal_classifier|strict timeout budget expired|proxy_retry_budget|follower_proxy_backs_off_on_redirect_ping_pong_instead_of_hot_looping'
+          grep -nE "$pattern" "$file" | while IFS=: read -r line rest; do
+            if [[ -z "$line" ]]; then
+              continue
+            fi
+            start=$(( line > 90 ? line - 90 : 1 ))
+            end=$(( line + 150 ))
+            echo "===== ${file}:${start}-${end} around line ${line}: ${rest} ====="
+            sed -n "${start},${end}p" "$file"
+          done
