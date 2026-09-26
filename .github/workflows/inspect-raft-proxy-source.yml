@@ -32,3 +32,5 @@ jobs:
             echo "===== ${file}:${start}-${end} around line ${line}: ${rest} ====="
             sed -n "${start},${end}p" "$file"
           done
+
+          echo 'inspection-complete'
