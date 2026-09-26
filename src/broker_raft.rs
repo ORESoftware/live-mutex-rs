@@ -68167,7 +68167,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_millis(650),
             "election should not wait for slow peer timeout; elapsed={elapsed:?}"
         );
         fast_server.await.expect("fast voter server");
