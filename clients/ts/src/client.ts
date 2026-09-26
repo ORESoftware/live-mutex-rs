@@ -28,7 +28,9 @@ function fenceMap(value: unknown, keys: string[], context: string): Record<strin
   const raw = value as Record<string, unknown>;
   const result: Record<string, number> = {};
   for (const key of keys) {
-    if (!(key in raw)) throw new Error(`${context}: missing fencing token for ${key}`);
+    if (!(key in raw)) {
+      throw new Error(`${context}: missing fencing token for ${key}`);
+    }
     result[key] = fence(raw[key], `${context}[${key}]`);
   }
   if (Object.keys(raw).length !== keys.length) {
@@ -78,7 +80,9 @@ export class NetworkMutexClient {
   constructor(private readonly opts: ClientOptions = {}) {}
 
   async connect(): Promise<void> {
-    if (this.connected) return;
+    if (this.connected) {
+      return;
+    }
     const host = this.opts.host ?? "127.0.0.1";
     const port = this.opts.port ?? 6970;
     const timeoutMs = this.opts.connectTimeoutMs ?? 5_000;
@@ -96,14 +100,18 @@ export class NetworkMutexClient {
       sock.on("close", () => {
         this.connected = false;
         const err = new Error("connection closed");
-        for (const inf of this.inflight.values()) inf.reject(err);
+        for (const inf of this.inflight.values()) {
+          inf.reject(err);
+        }
         this.inflight.clear();
       });
     });
 
     if (this.opts.token) {
       const resp = await this.send({ type: "auth", uuid: randomUUID(), token: this.opts.token }, { multi: false });
-      if (resp.type !== "auth" || !resp.ok) throw new Error(`auth failed: ${JSON.stringify(resp)}`);
+      if (resp.type !== "auth" || !resp.ok) {
+        throw new Error(`auth failed: ${JSON.stringify(resp)}`);
+      }
     }
   }
 
@@ -114,7 +122,9 @@ export class NetworkMutexClient {
   }
 
   send(req: Request, { multi = false }: { multi?: boolean } = {}): Promise<Response> {
-    if (!this.socket || !this.connected) return Promise.reject(new Error("not connected"));
+    if (!this.socket || !this.connected) {
+      return Promise.reject(new Error("not connected"));
+    }
     const uuid = req.uuid;
     return new Promise<Response>((resolve, reject) => {
       this.inflight.set(uuid, { resolve, reject, multi });
@@ -137,7 +147,9 @@ export class NetworkMutexClient {
   }
 
   async acquireMany(keys: string[], opts: AcquireOptions = {}): Promise<CompositeLockHandle> {
-    if (keys.length === 0 || keys.length > 5) throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
+    if (keys.length === 0 || keys.length > 5) {
+      throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
+    }
     const req: LockRequest = {
       type: "lock", uuid: randomUUID(), keys, ttl: opts.ttlMs ?? 30_000,
       keepLocksAfterDeath: false, wait: true,
@@ -161,22 +173,36 @@ export class NetworkMutexClient {
       keepLocksAfterDeath: false, wait: false,
     };
     const resp = await this.send(req, { multi: false });
-    if (resp.type === "error") throw new Error(`tryAcquire(${key}) error: ${resp.error}`);
-    if (resp.type !== "lock") throw new Error(`tryAcquire(${key}) unexpected: ${resp.type}`);
-    if (!resp.acquired || !resp.lockUuid) return null;
+    if (resp.type === "error") throw new Error(`tryAcquire(${key}) {
+      error: ${resp.error}`);
+    }
+    if (resp.type !== "lock") throw new Error(`tryAcquire(${key}) {
+      unexpected: ${resp.type}`);
+    }
+    if (!resp.acquired || !resp.lockUuid) {
+      return null;
+    }
     return { kind: "single", key, lockUuid: resp.lockUuid, fencingToken: fence(resp.fencingToken, `tryAcquire(${key})`) };
   }
 
   async tryAcquireMany(keys: string[], opts: TryAcquireOptions = {}): Promise<CompositeLockHandle | null> {
-    if (keys.length === 0 || keys.length > 5) throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
+    if (keys.length === 0 || keys.length > 5) {
+      throw new Error(`composite key count must be 1..=5, got ${keys.length}`);
+    }
     const req: LockRequest = {
       type: "lock", uuid: randomUUID(), keys, ttl: opts.ttlMs ?? 30_000,
       keepLocksAfterDeath: false, wait: false,
     };
     const resp = await this.send(req, { multi: false });
-    if (resp.type === "error") throw new Error(`tryAcquireMany error: ${resp.error}`);
-    if (resp.type !== "compositeLock") throw new Error(`tryAcquireMany unexpected: ${resp.type}`);
-    if (!resp.acquired || !resp.lockUuid) return null;
+    if (resp.type === "error") {
+      throw new Error(`tryAcquireMany error: ${resp.error}`);
+    }
+    if (resp.type !== "compositeLock") {
+      throw new Error(`tryAcquireMany unexpected: ${resp.type}`);
+    }
+    if (!resp.acquired || !resp.lockUuid) {
+      return null;
+    }
     const grantedKeys = resp.keys ?? keys;
     return {
       kind: "composite", keys: grantedKeys, lockUuid: resp.lockUuid,
@@ -189,13 +215,17 @@ export class NetworkMutexClient {
       ? { type: "unlock", uuid: randomUUID(), key: handle.key, lockUuid: handle.lockUuid }
       : { type: "unlock", uuid: randomUUID(), keys: handle.keys, lockUuid: handle.lockUuid };
     const resp = await this.send(req, { multi: false });
-    if (resp.type !== "unlock" || !resp.unlocked) throw new Error(`release failed: ${JSON.stringify(resp)}`);
+    if (resp.type !== "unlock" || !resp.unlocked) {
+      throw new Error(`release failed: ${JSON.stringify(resp)}`);
+    }
   }
 
   async acquireRead(key: string): Promise<{ lockUuid: string; fencingToken: number }> {
     const req: Request = { type: "registerRead", uuid: randomUUID(), key };
     const resp = await this.awaitRwGrant(req, "registerReadResult");
-    if (!resp.lockUuid) throw new Error(`acquireRead(${key}): missing lockUuid`);
+    if (!resp.lockUuid) {
+      throw new Error(`acquireRead(${key}): missing lockUuid`);
+    }
     return { lockUuid: resp.lockUuid, fencingToken: fence(resp.fencingToken, `acquireRead(${key})`) };
   }
 
@@ -206,7 +236,9 @@ export class NetworkMutexClient {
   async acquireWrite(key: string): Promise<{ lockUuid: string; fencingToken: number }> {
     const req: Request = { type: "registerWrite", uuid: randomUUID(), key };
     const resp = await this.awaitRwGrant(req, "registerWriteResult");
-    if (!resp.lockUuid) throw new Error(`acquireWrite(${key}): missing lockUuid`);
+    if (!resp.lockUuid) {
+      throw new Error(`acquireWrite(${key}): missing lockUuid`);
+    }
     return { lockUuid: resp.lockUuid, fencingToken: fence(resp.fencingToken, `acquireWrite(${key})`) };
   }
 
@@ -220,12 +252,16 @@ export class NetworkMutexClient {
     while ((nl = this.buffer.indexOf("\n")) >= 0) {
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
-      if (!line) continue;
+      if (!line) {
+        continue;
+      }
       let resp: Response;
       try { resp = JSON.parse(line) as Response; }
       catch (err) {
         const next = this.inflight.values().next().value;
-        if (next) next.reject(new Error(`bad frame: ${(err as Error).message}`));
+        if (next) {
+          next.reject(new Error(`bad frame: ${(err as Error).message}`));
+        }
         continue;
       }
       this.dispatch(resp);
@@ -235,7 +271,9 @@ export class NetworkMutexClient {
   private dispatch(resp: Response): void {
     const uuid = resp.uuid;
     const inf = this.inflight.get(uuid);
-    if (!inf) return;
+    if (!inf) {
+      return;
+    }
     switch (resp.type) {
       case "version":
       case "auth":
@@ -283,7 +321,9 @@ export class NetworkMutexClient {
     expected: "registerReadResult" | "registerWriteResult",
   ): Promise<RegisterReadOrWriteResponse> {
     const resp = await this.send(req, { multi: true });
-    if (resp.type !== expected) throw new Error(`expected ${expected}, got ${resp.type}`);
+    if (resp.type !== expected) {
+      throw new Error(`expected ${expected}, got ${resp.type}`);
+    }
     return resp as RegisterReadOrWriteResponse;
   }
 }
