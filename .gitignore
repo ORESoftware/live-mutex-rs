@@ -31,3 +31,6 @@ clients/gleam/erl_crash.dump
 # Local temporary directories and repository-owned worktrees
 tmp/
 temp/
+
+# Machine-local ORE metadata / pointers
+.ores/

@@ -173,7 +173,7 @@ impl Metrics {
         for route in REQUEST_PAYLOAD_ROUTES {
             request_payload_bytes.with_label_values(&[route]);
         }
-        Self {
+        return Self {
             registry,
             requests_total,
             malformed_requests_total,
@@ -186,7 +186,7 @@ impl Metrics {
             tcp_quickack_applied_total,
             request_duration_seconds,
             request_payload_bytes,
-        }
+        };
     }
 
     pub fn observe_request_duration(&self, route: &'static str, elapsed: Duration) {
@@ -255,13 +255,13 @@ impl Metrics {
             snapshot.fencing_watermark,
             snapshot.idle_keys_pruned_total,
         ));
-        body
+        return body;
     }
 }
 
 impl Default for Metrics {
     fn default() -> Self {
         crate::routine_id!("ddl-routine-0kOF9HII9dTwi5WcsE");
-        Self::new()
+        return Self::new();
     }
 }
