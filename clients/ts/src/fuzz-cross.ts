@@ -159,7 +159,11 @@ class Model {
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return Promise.race([
     p,
-    new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`timeout (${ms}ms): ${what} — possible deadlock`)), ms)),
+    new Promise<T>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`timeout (${ms}ms): ${what} — possible deadlock`));
+      }, ms);
+    }),
   ]);
 }
 
