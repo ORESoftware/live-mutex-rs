@@ -120,12 +120,16 @@ async function runScenario(backend: Backend, tag: string): Promise<Check[]> {
     // k3 was a free member of the failed attempt; it must still be grabbable.
     const k3only = await b.tryAcquire(ns("k3"));
     add("free member not leaked by failed no-wait composite", k3only !== null, `k3 ${k3only ? "free" : "stuck"}`);
-    if (k3only) await k3only.release();
+    if (k3only) {
+      await k3only.release();
+    }
 
     // --- composite no-wait when fully free succeeds ----------------------
     const freeSet = await b.tryAcquireMany([ns("d1"), ns("d2")]);
     add("composite no-wait succeeds when free", freeSet !== null);
-    if (freeSet) await freeSet.release();
+    if (freeSet) {
+      await freeSet.release();
+    }
 
     // --- composite WAIT blocks until release, then is granted ------------
     let waitResolved = false;
@@ -155,7 +159,9 @@ async function runScenario(backend: Backend, tag: string): Promise<Check[]> {
     // No leftover waiter: a fresh no-wait acquire now succeeds.
     const sFree = await b.tryAcquire(ns("s1"));
     add("single no-wait succeeds after release (no leaked waiter)", sFree !== null);
-    if (sFree) await sFree.release();
+    if (sFree) {
+      await sFree.release();
+    }
   } finally {
     await a.close();
     await b.close();
@@ -178,7 +184,9 @@ async function main(): Promise<void> {
     for (const c of checks) {
       const status = c.pass ? "PASS" : "FAIL";
       console.log(`  ${status}  ${c.name}${c.detail ? `   (${c.detail})` : ""}`);
-      if (!c.pass) anyFail = true;
+      if (!c.pass) {
+        anyFail = true;
+      }
     }
   }
   console.log(

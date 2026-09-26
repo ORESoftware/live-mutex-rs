@@ -1,5 +1,6 @@
 let protocol_version = "0.1.0"
 let max_composite_keys = 5
+let max_fencing_token = 9_007_199_254_740_991
 
 type request_type =
   | Version
@@ -32,37 +33,13 @@ type response_type =
   | UnknownResponse
 
 let request_types =
-  [
-    "version";
-    "auth";
-    "lock";
-    "unlock";
-    "registerRead";
-    "registerWrite";
-    "endRead";
-    "endWrite";
-    "lockInfo";
-    "ls";
-    "heartbeat";
-  ]
+  [ "version"; "auth"; "lock"; "unlock"; "registerRead"; "registerWrite";
+    "endRead"; "endWrite"; "lockInfo"; "ls"; "heartbeat" ]
 
 let response_types =
-  [
-    "version";
-    "auth";
-    "lock";
-    "compositeLock";
-    "unlock";
-    "registerReadResult";
-    "registerWriteResult";
-    "endReadResult";
-    "endWriteResult";
-    "lockInfo";
-    "lsResult";
-    "reelection";
-    "error";
-    "ok";
-  ]
+  [ "version"; "auth"; "lock"; "compositeLock"; "unlock";
+    "registerReadResult"; "registerWriteResult"; "endReadResult";
+    "endWriteResult"; "lockInfo"; "lsResult"; "reelection"; "error"; "ok" ]
 
 let request_type_to_wire = function
   | Version -> "version"
@@ -93,6 +70,35 @@ let response_type_from_wire = function
   | "error" -> ErrorResponse
   | "ok" -> OkResponse
   | _ -> UnknownResponse
+
+let validate_fencing_token token =
+  if token < 1 || token > max_fencing_token then
+    Error "fencingToken must be an exact integer in the authority domain"
+  else Ok token
+
+let fencing_token_from_response fields =
+  match List.assoc_opt "fencingToken" fields with
+  | None -> Error "missing fencingToken"
+  | Some token -> validate_fencing_token token
+
+let fencing_tokens_from_response keys fields =
+  if keys = [] then Error "composite grant requires at least one key"
+  else if List.length (List.sort_uniq String.compare keys) <> List.length keys then
+    Error "composite grant keys must be unique"
+  else if List.length fields <> List.length keys then
+    Error "fencingTokens/key cardinality mismatch"
+  else
+    let rec loop acc = function
+      | [] -> Ok (List.rev acc)
+      | key :: rest ->
+          (match List.assoc_opt key fields with
+           | None -> Error ("missing fencingToken for key " ^ key)
+           | Some token ->
+               match validate_fencing_token token with
+               | Error why -> Error (why ^ ": " ^ key)
+               | Ok exact -> loop ((key, exact) :: acc) rest)
+    in
+    loop [] keys
 
 let json_escape s =
   let b = Buffer.create (String.length s) in
@@ -151,4 +157,3 @@ let rw_request request_type uuid key =
 let lock_info_request uuid key = rw_request LockInfo uuid key
 let ls_request uuid = frame [ field_string "type" "ls"; field_string "uuid" uuid ]
 let heartbeat_request uuid = frame [ field_string "type" "heartbeat"; field_string "uuid" uuid ]
-

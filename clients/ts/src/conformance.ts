@@ -180,8 +180,12 @@ async function mutualExclusion(backend: Backend): Promise<ScenarioResult> {
       for (let i = 0; i < ITERS; i++) {
         const h = await s.acquire(key);
         active += 1;
-        if (active > maxConcurrent) maxConcurrent = active;
-        if (active > 1) violations += 1;
+        if (active > maxConcurrent) {
+          maxConcurrent = active;
+        }
+        if (active > 1) {
+          violations += 1;
+        }
         await tick(); // yield so a broken broker could interleave here
         active -= 1;
         completed += 1;
@@ -216,7 +220,9 @@ async function fencingMonotonic(backend: Backend): Promise<ScenarioResult> {
   for (let i = 0; i < 16; i++) {
     const h = await s.acquire(key);
     const t = h.fencing ?? -1;
-    if (!(t > last)) ok = false;
+    if (!(t > last)) {
+      ok = false;
+    }
     last = t;
     await s.release(h);
   }
@@ -249,16 +255,24 @@ async function compositeAtomic(backend: Backend): Promise<ScenarioResult> {
   const sessions = await Promise.all(Array.from({ length: WORKERS }, () => backend.newSession()));
   await Promise.all(
     sessions.map(async (s, idx) => {
-      if (!s.acquireMany || !s.releaseMany) return;
+      if (!s.acquireMany || !s.releaseMany) {
+        return;
+      }
       // Each worker submits the keys in a rotated order to exercise the
       // broker's sorted-acquisition deadlock avoidance.
       const order = keys.slice(idx % keys.length).concat(keys.slice(0, idx % keys.length));
       for (let i = 0; i < iters; i++) {
         const h = await s.acquireMany(order);
         active += 1;
-        if (active > maxConcurrent) maxConcurrent = active;
-        if (active > 1) violations += 1;
-        if (keys.some((k) => !(k in h.fencingTokens) || !(h.fencingTokens[k]! > 0))) missingTokens += 1;
+        if (active > maxConcurrent) {
+          maxConcurrent = active;
+        }
+        if (active > 1) {
+          violations += 1;
+        }
+        if (keys.some((k) => !(k in h.fencingTokens) || !(h.fencingTokens[k]! > 0))) {
+          missingTokens += 1;
+        }
         await tick();
         active -= 1;
         completed += 1;
@@ -354,11 +368,15 @@ async function main(): Promise<void> {
   const correctnessScenarios = ["mutual-exclusion", "fencing-monotonic", "composite-atomic"];
   const failed: string[] = [];
   for (const r of oursOut.results) {
-    if (correctnessScenarios.includes(r.scenario) && !r.ok) failed.push(`ours/${r.scenario}`);
+    if (correctnessScenarios.includes(r.scenario) && !r.ok) {
+      failed.push(`ours/${r.scenario}`);
+    }
   }
   if (theirsOut) {
     for (const r of theirsOut.results) {
-      if (correctnessScenarios.includes(r.scenario) && !r.ok) failed.push(`theirs/${r.scenario}`);
+      if (correctnessScenarios.includes(r.scenario) && !r.ok) {
+        failed.push(`theirs/${r.scenario}`);
+      }
     }
   }
 

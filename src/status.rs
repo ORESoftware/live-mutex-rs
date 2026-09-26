@@ -87,7 +87,7 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
         None => String::new(),
     };
 
-    format!(
+    return format!(
         r##"<!doctype html>
 <html lang="en">
 <head>
@@ -404,7 +404,7 @@ pub fn render(broker: &Broker, info: &StatusServerInfo, metrics_text: &str) -> S
         } else {
             ""
         },
-    )
+    );
 }
 
 fn render_top_row(snap: &KeyContentionSnapshot) -> String {
@@ -417,7 +417,7 @@ fn render_top_row(snap: &KeyContentionSnapshot) -> String {
     } else {
         format!("{} / {}", snap.exclusive_holders, snap.max)
     };
-    format!(
+    return format!(
         "        <tr><td><code>{key}</code></td><td class=\"num\">{hm}</td><td class=\"num\">{rd}</td><td class=\"num\">{wr}</td><td class=\"num\">{wt}</td><td class=\"num\">{fc}</td></tr>\n",
         key = html_escape(&snap.key),
         hm = holders_cell,
@@ -425,16 +425,16 @@ fn render_top_row(snap: &KeyContentionSnapshot) -> String {
         wr = snap.writers,
         wt = snap.waiters,
         fc = snap.fencing_counter,
-    )
+    );
 }
 
 fn on_off(b: bool) -> &'static str {
     crate::routine_id!("ddl-routine-VrkSheCcfAmnVpqOuO");
-    if b {
+    return if b {
         "<strong>on</strong>"
     } else {
         "<span class=\"muted\">off</span>"
-    }
+    };
 }
 
 /// Minimal HTML-escape — covers the five characters that matter for
@@ -454,7 +454,7 @@ fn html_escape(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
+    return out;
 }
 
 /// Format a `Duration` for the status page header. Picks the smallest
@@ -463,7 +463,7 @@ fn html_escape(s: &str) -> String {
 fn format_duration(d: Duration) -> String {
     crate::routine_id!("ddl-routine-9ZTva3vMeb8Y9v_eeN");
     let secs = d.as_secs();
-    if secs < 60 {
+    return if secs < 60 {
         format!("{secs}s")
     } else if secs < 3600 {
         format!("{}m {:02}s", secs / 60, secs % 60)
@@ -471,7 +471,7 @@ fn format_duration(d: Duration) -> String {
         format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
     } else {
         format!("{}d {:02}h", secs / 86_400, (secs % 86_400) / 3600)
-    }
+    };
 }
 
 #[cfg(test)]
@@ -482,7 +482,7 @@ mod tests {
 
     fn info() -> StatusServerInfo {
         crate::routine_id!("ddl-routine-HhD4HTEvbjujZaAeBI");
-        StatusServerInfo {
+        return StatusServerInfo {
             tcp_bind: Some("0.0.0.0:6970".into()),
             uds_path: None,
             http_bind: Some("0.0.0.0:6971".into()),
@@ -498,7 +498,7 @@ mod tests {
             max_lock_holders: 1,
             max_concurrency_cap: crate::protocol::DEFAULT_MAX_CONCURRENCY_CAP,
             tls_enabled: false,
-        }
+        };
     }
 
     #[test]

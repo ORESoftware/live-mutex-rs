@@ -55,34 +55,15 @@ defmodule NetworkMutex.Protocol do
   end
 
   def lock_request_single(uuid, key, opts \\ []) do
-    frame(
-      compact(
-        type: "lock",
-        uuid: uuid,
-        key: key,
-        ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)),
-        max: Keyword.get(opts, :max_holders),
-        wait: Keyword.get(opts, :wait)
-      )
-    )
+    frame(compact(type: "lock", uuid: uuid, key: key, ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)), max: Keyword.get(opts, :max_holders), wait: Keyword.get(opts, :wait)))
   end
 
   def lock_request_composite(uuid, keys, opts \\ []) do
     count = length(keys)
-
     if count < 1 or count > @max_composite_keys do
       raise ArgumentError, "composite key count must be 1..=5, got #{count}"
     end
-
-    frame(
-      compact(
-        type: "lock",
-        uuid: uuid,
-        keys: keys,
-        ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)),
-        wait: Keyword.get(opts, :wait)
-      )
-    )
+    frame(compact(type: "lock", uuid: uuid, keys: keys, ttl: positive_or_nil(Keyword.get(opts, :ttl_ms, 0)), wait: Keyword.get(opts, :wait)))
   end
 
   def unlock_request_single(uuid, key, lock_uuid, force \\ false) do
@@ -98,34 +79,45 @@ defmodule NetworkMutex.Protocol do
   def ls_request(uuid), do: frame(type: "ls", uuid: uuid)
   def heartbeat_request(uuid), do: frame(type: "heartbeat", uuid: uuid)
 
+  def fencing_token_from_response(response) when is_map(response) do
+    case Map.get(response, "fencingToken", Map.get(response, :fencingToken)) do
+      token when is_integer(token) and token > 0 -> {:ok, token}
+      nil -> {:error, :missing_fencing_token}
+      _ -> {:error, :invalid_fencing_token}
+    end
+  end
+
+  def fencing_tokens_from_response(response) when is_map(response) do
+    case Map.get(response, "fencingTokens", Map.get(response, :fencingTokens)) do
+      tokens when is_map(tokens) and map_size(tokens) > 0 ->
+        if Enum.all?(tokens, fn {key, token} -> (is_binary(key) or is_atom(key)) and is_integer(token) and token > 0 end) do
+          {:ok, tokens}
+        else
+          {:error, :invalid_fencing_tokens}
+        end
+      nil -> {:error, :missing_fencing_tokens}
+      _ -> {:error, :invalid_fencing_tokens}
+    end
+  end
+
   defp positive_or_nil(n) when is_integer(n) and n > 0, do: n
   defp positive_or_nil(_), do: nil
-
   defp true_or_nil(true), do: true
   defp true_or_nil(_), do: nil
-
   defp blank_or_nil(nil), do: nil
   defp blank_or_nil(""), do: nil
   defp blank_or_nil(v), do: v
-
-  defp compact(fields) do
-    Enum.reject(fields, fn {_k, v} -> is_nil(v) end)
-  end
-
-  defp frame(fields) do
-    "{" <> Enum.map_join(fields, ",", &field_to_json/1) <> "}\n"
-  end
+  defp compact(fields), do: Enum.reject(fields, fn {_k, v} -> is_nil(v) end)
+  defp frame(fields), do: "{" <> Enum.map_join(fields, ",", &field_to_json/1) <> "}\n"
 
   defp field_to_json({key, value}) when is_atom(key), do: field_to_json({Atom.to_string(key), value})
-  defp field_to_json({key, value}) when is_binary(value), do: quote(key) <> ":" <> quote(value)
-  defp field_to_json({key, value}) when is_integer(value), do: quote(key) <> ":" <> Integer.to_string(value)
-  defp field_to_json({key, true}), do: quote(key) <> ":true"
-  defp field_to_json({key, false}), do: quote(key) <> ":false"
-  defp field_to_json({key, values}) when is_list(values), do: quote(key) <> ":[" <> Enum.map_join(values, ",", &quote/1) <> "]"
+  defp field_to_json({key, value}) when is_binary(value), do: json_quote(key) <> ":" <> json_quote(value)
+  defp field_to_json({key, value}) when is_integer(value), do: json_quote(key) <> ":" <> Integer.to_string(value)
+  defp field_to_json({key, true}), do: json_quote(key) <> ":true"
+  defp field_to_json({key, false}), do: json_quote(key) <> ":false"
+  defp field_to_json({key, values}) when is_list(values), do: json_quote(key) <> ":[" <> Enum.map_join(values, ",", &json_quote/1) <> "]"
 
-  defp quote(value) do
-    "\"" <> escape(to_string(value)) <> "\""
-  end
+  defp json_quote(value), do: "\"" <> escape(to_string(value)) <> "\""
 
   defp escape(value) do
     value
@@ -134,4 +126,3 @@ defmodule NetworkMutex.Protocol do
     |> String.replace("\n", "\\n")
   end
 end
-

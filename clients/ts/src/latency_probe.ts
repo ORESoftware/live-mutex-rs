@@ -32,7 +32,9 @@ const LABEL = process.env["LABEL"] ?? `${HOST}:${PORT}`;
 const SLEEP_BETWEEN_MS = Number(process.env["SLEEP_BETWEEN_MS"] ?? 0);
 
 function quantile(sorted: number[], q: number): number {
-  if (sorted.length === 0) return 0;
+  if (sorted.length === 0) {
+    return 0;
+  }
   const pos = (sorted.length - 1) * q;
   const base = Math.floor(pos);
   const rest = pos - base;
@@ -68,7 +70,9 @@ async function main(): Promise<void> {
     } catch {
       errors++;
     }
-    if (SLEEP_BETWEEN_MS > 0) await sleepMs(SLEEP_BETWEEN_MS);
+    if (SLEEP_BETWEEN_MS > 0) {
+      await sleepMs(SLEEP_BETWEEN_MS);
+    }
   }
   const totalMs = performance.now() - startedAt;
   await client.close();

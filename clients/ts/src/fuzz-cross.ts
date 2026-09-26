@@ -143,11 +143,15 @@ class Model {
   }
 
   onRelease(keys: string[]) {
-    for (const k of keys) this.occupied.set(k, false);
+    for (const k of keys) {
+      this.occupied.set(k, false);
+    }
   }
 
   anyOccupied(): boolean {
-    for (const v of this.occupied.values()) if (v) return true;
+    for (const v of this.occupied.values()) if (v) {
+      return true;
+    }
     return false;
   }
 }
@@ -244,7 +248,9 @@ async function main(): Promise<void> {
       if (model.violations.length > 0) {
         anyFail = true;
         console.log(`  FAIL  ${model.violations.length} invariant violation(s) in ${dt}ms:`);
-        for (const v of model.violations.slice(0, 12)) console.log(`        - ${v}`);
+        for (const v of model.violations.slice(0, 12)) {
+          console.log(`        - ${v}`);
+        }
       } else if (model.anyOccupied()) {
         anyFail = true;
         console.log(`  FAIL  keys still marked held after all workers finished (${dt}ms)`);

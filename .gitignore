@@ -27,10 +27,14 @@ clients/gleam/erl_crash.dump
 # Test / scratch outputs
 *.log
 .cargo-cache/
+
+# Local temporary directories and repository-owned worktrees
+tmp/
+temp/
+
+# Machine-local ORE metadata / pointers
+.ores/
 tmp
 temp
 tmp/worktrees
 temp/worktrees
-# Local temporary directories and repository-owned worktrees
-tmp/
-temp/

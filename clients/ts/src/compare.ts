@@ -76,7 +76,9 @@ async function runOurs(stats: Stats, deadline: number): Promise<void> {
         const dt = process.hrtime.bigint() - t0;
         stats.total++;
         stats.totalLatencyNs += dt;
-        if (dt > stats.maxLatencyNs) stats.maxLatencyNs = dt;
+        if (dt > stats.maxLatencyNs) {
+          stats.maxLatencyNs = dt;
+        }
       } catch {
         stats.errors++;
       }
@@ -110,7 +112,9 @@ async function runTheirs(stats: Stats, deadline: number): Promise<void> {
         const dt = process.hrtime.bigint() - t0;
         stats.total++;
         stats.totalLatencyNs += dt;
-        if (dt > stats.maxLatencyNs) stats.maxLatencyNs = dt;
+        if (dt > stats.maxLatencyNs) {
+          stats.maxLatencyNs = dt;
+        }
       } catch {
         stats.errors++;
       }
