@@ -158,7 +158,9 @@ interface ScenarioResult {
   detail: string;
 }
 
-const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
+const tick = (): Promise<void> => new Promise((resolve) => {
+  setImmediate(resolve);
+});
 
 /**
  * Mutual exclusion: WORKERS sessions each run ITERS acquire/critical/release
