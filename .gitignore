@@ -34,3 +34,7 @@ temp/
 
 # Machine-local ORE metadata / pointers
 .ores/
+tmp
+temp
+tmp/worktrees
+temp/worktrees
