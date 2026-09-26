@@ -31,7 +31,9 @@ const ackQueue: string[] = [];
 const waiters: Array<(line: string) => void> = [];
 stdinLines.on("line", (line) => {
   const waiter = waiters.shift();
-  if (waiter) waiter(line);
+  if (waiter) {
+    waiter(line);
+  }
   else ackQueue.push(line);
 });
 
@@ -58,13 +60,17 @@ function chooseKeys(rng: ReturnType<typeof makeRng>, keys: string[]): string[] {
 }
 
 function tokensFor(handle: LockHandle): Record<string, number> {
-  if (handle.kind === "single") return { [handle.key]: handle.fencingToken };
+  if (handle.kind === "single") {
+    return { [handle.key]: handle.fencingToken };
+  }
   return handle.fencingTokens;
 }
 
 async function holdBriefly(rng: ReturnType<typeof makeRng>): Promise<void> {
   const ms = rng.below(4);
-  if (ms === 0) await Promise.resolve();
+  if (ms === 0) {
+    await Promise.resolve();
+  }
   else await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -99,14 +105,18 @@ async function main(): Promise<void> {
       if (roll < 30) {
         const key = keys[rng.below(keys.length)]!;
         const h = await client.tryAcquire(key, { ttlMs: TTL_MS });
-        if (h) await grantReleaseExclusive(client, h, rng);
+        if (h) {
+          await grantReleaseExclusive(client, h, rng);
+        }
       } else if (roll < 50) {
         const key = keys[rng.below(keys.length)]!;
         const h = await client.acquire(key, { ttlMs: TTL_MS, waitMs: TTL_MS });
         await grantReleaseExclusive(client, h, rng);
       } else if (roll < 65) {
         const h = await client.tryAcquireMany(chooseKeys(rng, keys), { ttlMs: TTL_MS });
-        if (h) await grantReleaseExclusive(client, h, rng);
+        if (h) {
+          await grantReleaseExclusive(client, h, rng);
+        }
       } else if (roll < 75) {
         const h = await client.acquireMany(chooseKeys(rng, keys), { ttlMs: TTL_MS, waitMs: TTL_MS });
         await grantReleaseExclusive(client, h, rng);
