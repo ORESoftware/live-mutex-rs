@@ -253,7 +253,8 @@ _lmx_read_until_granted() {
 
 # lmx_acquire <key> [ttl_ms] [max]  -> 0 + LMX_LOCK_UUID/LMX_FENCE, blocks until granted
 lmx_acquire() {
-  local key="$1" ttl="${2:-0}" max="${3:-}" uuid; uuid="$(lmx_uuid)"
+  local key="$1" ttl="${2:-0}" max="${3:-}" uuid
+  uuid="$(lmx_uuid)"
   local maxf=""
   if [ -n "$max" ]; then
     maxf=",\"max\":$max"
@@ -278,7 +279,8 @@ lmx_acquire() {
 
 # lmx_try_acquire <key> [ttl_ms] [max] -> 0 granted / 2 contended / 1 error
 lmx_try_acquire() {
-  local key="$1" ttl="${2:-0}" max="${3:-}" uuid; uuid="$(lmx_uuid)"
+  local key="$1" ttl="${2:-0}" max="${3:-}" uuid
+  uuid="$(lmx_uuid)"
   local maxf=""
   if [ -n "$max" ]; then
     maxf=",\"max\":$max"
@@ -307,7 +309,8 @@ lmx_try_acquire() {
 
 # lmx_release <key> <lock_uuid>
 lmx_release() {
-  local key="$1" lock="$2" uuid; uuid="$(lmx_uuid)"
+  local key="$1" lock="$2" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","lockUuid":"%s"}' \
     "$LMX_REQ_UNLOCK" "$uuid" "$(lmx_json_escape "$key")" "$(lmx_json_escape "$lock")")"
   if ! _lmx_read_reply "$uuid"; then
@@ -327,7 +330,8 @@ lmx_release() {
 
 # lmx_force_unlock <key>
 lmx_force_unlock() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s","force":true}' \
     "$LMX_REQ_UNLOCK" "$uuid" "$(lmx_json_escape "$key")")"
   if ! _lmx_read_reply "$uuid"; then
@@ -407,7 +411,8 @@ lmx_release_many() {
 # ---------------------------------------------------------------------------
 
 lmx_acquire_read() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_REGISTER_READ" "$uuid" "$(lmx_json_escape "$key")")"
   if ! _lmx_read_until_granted "$uuid"; then
@@ -418,7 +423,8 @@ lmx_acquire_read() {
 }
 
 lmx_acquire_write() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_REGISTER_WRITE" "$uuid" "$(lmx_json_escape "$key")")"
   if ! _lmx_read_until_granted "$uuid"; then
@@ -429,14 +435,16 @@ lmx_acquire_write() {
 }
 
 lmx_release_read() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_END_READ" "$uuid" "$(lmx_json_escape "$key")")"
   _lmx_read_reply "$uuid"
 }
 
 lmx_release_write() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_END_WRITE" "$uuid" "$(lmx_json_escape "$key")")"
   _lmx_read_reply "$uuid"
@@ -460,7 +468,8 @@ lmx_ls() {
 
 # lmx_lock_info <key> -> LMX_REPLY holds the raw lockInfo frame
 lmx_lock_info() {
-  local key="$1" uuid; uuid="$(lmx_uuid)"
+  local key="$1" uuid
+  uuid="$(lmx_uuid)"
   _lmx_send "$(printf '{"type":"%s","uuid":"%s","key":"%s"}' \
     "$LMX_REQ_LOCK_INFO" "$uuid" "$(lmx_json_escape "$key")")"
   if ! _lmx_read_reply "$uuid"; then
