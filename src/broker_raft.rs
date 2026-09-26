@@ -26513,7 +26513,7 @@ mod tests {
                 return candidate;
             }
         }
-        panic!("could not find deterministic client-id prefix collision for `{target_id}`");
+        return panic!("could not find deterministic client-id prefix collision for `{target_id}`");;
     }
 
     fn idle_snapshot_payload() -> serde_json::Value {
