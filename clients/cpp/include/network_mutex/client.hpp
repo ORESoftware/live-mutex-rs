@@ -50,11 +50,11 @@ inline std::string new_uuid() {
   std::uniform_int_distribution<uint64_t> dist;
   uint64_t hi = dist(rng), lo = dist(rng);
   unsigned char b[16];
-  for (int i = 0; i < 8; ++i) b[i] = (hi >> (8 * i)) {
-    & 0xFF;
+  for (int i = 0; i < 8; ++i) {
+    b[i] = (hi >> (8 * i)) & 0xFF;
   }
-  for (int i = 0; i < 8; ++i) b[8 + i] = (lo >> (8 * i)) {
-    & 0xFF;
+  for (int i = 0; i < 8; ++i) {
+    b[8 + i] = (lo >> (8 * i)) & 0xFF;
   }
   b[6] = (b[6] & 0x0F) | 0x40;  // version 4
   b[8] = (b[8] & 0x3F) | 0x80;  // variant
@@ -81,8 +81,9 @@ class Client {
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* res = nullptr;
     std::string port_s = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res)
+    if (getaddrinfo(host.c_str(), port_s.c_str(), &hints, &res) != 0 || !res) {
       throw NetworkMutexError("getaddrinfo failed for " + host + ":" + port_s);
+    }
 
     int fd = -1;
     for (addrinfo* p = res; p; p = p->ai_next) {
@@ -117,14 +118,17 @@ class Client {
     return c;
   }
 
-  ~Client() { close(); }
+  ~Client() {
+    close();
+  }
 
   SingleLockHandle acquire(const std::string& key, uint64_t ttl_ms = 0,
                            std::optional<uint32_t> max_holders = std::nullopt) {
     std::string uuid = new_uuid();
     Response r = roundtrip_grant(lock_request_single(uuid, key, ttl_ms, max_holders, true), uuid);
-    if (r.type != ResponseType::Lock || !r.acquired || r.lock_uuid.empty())
+    if (r.type != ResponseType::Lock || !r.acquired || r.lock_uuid.empty()) {
       throw NetworkMutexError("lock(" + key + ") failed: " + r.raw.dump());
+    }
     return {key, r.lock_uuid, r.fencing_token};
   }
 
@@ -133,10 +137,12 @@ class Client {
       std::optional<uint32_t> max_holders = std::nullopt) {
     std::string uuid = new_uuid();
     Response r = roundtrip(lock_request_single(uuid, key, ttl_ms, max_holders, false), uuid);
-    if (r.type == ResponseType::Error)
+    if (r.type == ResponseType::Error) {
       throw NetworkMutexError("try_acquire(" + key + ") error: " + r.error);
-    if (r.type != ResponseType::Lock)
+    }
+    if (r.type != ResponseType::Lock) {
       throw NetworkMutexError("try_acquire(" + key + ") unexpected: " + r.raw.dump());
+    }
     if (!r.acquired || r.lock_uuid.empty()) {
       return std::nullopt;
     }
@@ -146,8 +152,9 @@ class Client {
   CompositeLockHandle acquire_many(const std::vector<std::string>& keys, uint64_t ttl_ms = 0) {
     std::string uuid = new_uuid();
     Response r = roundtrip_grant(lock_request_composite(uuid, keys, ttl_ms, true), uuid);
-    if (r.type != ResponseType::CompositeLock || !r.acquired || r.lock_uuid.empty())
+    if (r.type != ResponseType::CompositeLock || !r.acquired || r.lock_uuid.empty()) {
       throw NetworkMutexError("acquire_many failed: " + r.raw.dump());
+    }
     return {keys, r.lock_uuid, r.fencing_tokens};
   }
 
@@ -155,10 +162,12 @@ class Client {
       const std::vector<std::string>& keys, uint64_t ttl_ms = 0) {
     std::string uuid = new_uuid();
     Response r = roundtrip(lock_request_composite(uuid, keys, ttl_ms, false), uuid);
-    if (r.type == ResponseType::Error)
+    if (r.type == ResponseType::Error) {
       throw NetworkMutexError("try_acquire_many error: " + r.error);
-    if (r.type != ResponseType::CompositeLock)
+    }
+    if (r.type != ResponseType::CompositeLock) {
       throw NetworkMutexError("try_acquire_many unexpected: " + r.raw.dump());
+    }
     if (!r.acquired || r.lock_uuid.empty()) {
       return std::nullopt;
     }
@@ -168,15 +177,17 @@ class Client {
   void release(const SingleLockHandle& h) {
     std::string uuid = new_uuid();
     Response r = roundtrip(unlock_request_single(uuid, h.key, h.lock_uuid), uuid);
-    if (r.type != ResponseType::Unlock || !r.unlocked)
+    if (r.type != ResponseType::Unlock || !r.unlocked) {
       throw NetworkMutexError("unlock failed: " + r.raw.dump());
+    }
   }
 
   void release(const CompositeLockHandle& h) {
     std::string uuid = new_uuid();
     Response r = roundtrip(unlock_request_composite(uuid, h.keys, h.lock_uuid), uuid);
-    if (r.type != ResponseType::Unlock || !r.unlocked)
+    if (r.type != ResponseType::Unlock || !r.unlocked) {
       throw NetworkMutexError("unlock composite failed: " + r.raw.dump());
+    }
   }
 
   SingleLockHandle acquire_read(const std::string& key) {
