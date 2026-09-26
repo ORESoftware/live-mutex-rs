@@ -83,7 +83,9 @@ type Response struct {
 
 func (r Request) Encode() ([]byte, error) {
 	buf, err := json.Marshal(r)
-	if err != nil { return nil, fmt.Errorf("encode request: %w", err) }
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
 	return append(buf, '\n'), nil
 }
 
@@ -101,10 +103,14 @@ func validateFencedAuthority(resp Response) error {
 		}
 		seen := make(map[string]struct{}, len(resp.Keys))
 		for _, key := range resp.Keys {
-			if _, duplicate := seen[key]; duplicate { return fmt.Errorf("duplicate composite key %q", key) }
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("duplicate composite key %q", key)
+			}
 			seen[key] = struct{}{}
 			token, ok := resp.FencingTokens[key]
-			if !ok || !validFence(token) { return fmt.Errorf("invalid fencing token for composite key %q", key) }
+			if !ok || !validFence(token) {
+				return fmt.Errorf("invalid fencing token for composite key %q", key)
+			}
 		}
 	}
 	if (resp.Type == RespRegisterReadResult || resp.Type == RespRegisterWriteResult) && resp.Granted != nil && *resp.Granted {

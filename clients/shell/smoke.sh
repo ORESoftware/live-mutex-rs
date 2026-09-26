@@ -30,7 +30,8 @@ echo "[smoke-shell] released exclusive"
 lmx_acquire "smoke-shell-try" 5000
 held="$LMX_LOCK_UUID"
 if lmx_try_acquire "smoke-shell-try" 5000; then
-  echo "[smoke-shell] FAIL: try_acquire granted a held key" >&2; exit 1
+  echo "[smoke-shell] FAIL: try_acquire granted a held key" >&2
+  exit 1
 fi
 echo "[smoke-shell] try-lock correctly refused a held key"
 lmx_release "smoke-shell-try" "$held"

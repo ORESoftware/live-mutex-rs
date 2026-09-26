@@ -28,7 +28,9 @@ function fenceMap(value: unknown, keys: string[], context: string): Record<strin
   const raw = value as Record<string, unknown>;
   const result: Record<string, number> = {};
   for (const key of keys) {
-    if (!(key in raw)) throw new Error(`${context}: missing fencing token for ${key}`);
+    if (!(key in raw)) {
+      throw new Error(`${context}: missing fencing token for ${key}`);
+    }
     result[key] = fence(raw[key], `${context}[${key}]`);
   }
   if (Object.keys(raw).length !== keys.length) {
