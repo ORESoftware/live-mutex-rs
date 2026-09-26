@@ -147,6 +147,10 @@ jobs:
         working-directory: clients/gleam
         run: gleam test
 
+      - name: Shell syntax checks
+        shell: bash
+        run: bash -n clients/shell/live_mutex_client.sh clients/shell/smoke.sh
+
       - name: Python checks
         working-directory: clients/python
         run: python3 -m unittest discover -s tests -p 'test_*.py'
