@@ -15,44 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Instrument ping-pong test in runner working tree only
+      - name: Inspect follower proxy redirect loop
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('src/broker_raft.rs')
-          src = path.read_text()
-          marker = 'async fn follower_proxy_backs_off_on_redirect_ping_pong_instead_of_hot_looping() {'
-          start = src.index(marker)
-          end = src.index('    #[tokio::test]', start + len(marker))
-          chunk = src[start:end]
-          needle = '        let err = raft\n            .run_ephemeral('
-          if needle not in chunk:
-              raise SystemExit('could not find run_ephemeral anchor')
-          chunk = chunk.replace(
-              needle,
-              '        let started = Instant::now();\n        let err = raft\n            .run_ephemeral(',
-              1,
-          )
-          needle = '        let total = n2_count.load(Ordering::Relaxed) + n3_count.load(Ordering::Relaxed);\n'
-          if needle not in chunk:
-              raise SystemExit('could not find total anchor')
-          chunk = chunk.replace(
-              needle,
-              needle + '        eprintln!("OBS elapsed_ms={} total={} retries={} forwarded={} errors={}", started.elapsed().as_millis(), total, raft.telemetry_snapshot().proxy_request_retries_total, raft.telemetry_snapshot().proxy_requests_forwarded_total, raft.telemetry_snapshot().proxy_request_errors_total);\n',
-              1,
-          )
-          path.write_text(src[:start] + chunk + src[end:])
-          PY
-          cargo fmt --all
-      - name: Run ping-pong oracle repeatedly
-        shell: bash
-        run: |
-          set -euo pipefail
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-          for i in 1 2 3 4 5; do
-            echo "===== sample $i ====="
-            cargo test --locked --all-features follower_proxy_backs_off_on_redirect_ping_pong_instead_of_hot_looping -- --nocapture
-          done
+          sed -n '10920,11270p' src/broker_raft.rs
