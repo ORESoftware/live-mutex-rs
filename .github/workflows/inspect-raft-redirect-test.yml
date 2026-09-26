@@ -15,35 +15,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Print redirect regression context
+      - name: Find redirect regression after merge
         shell: bash
         run: |
+          set -euo pipefail
+          echo '===== repository matches ====='
+          rg -n -C 12 -i 'ping.?pong|permanent redirect|redirect cycle|structured leader hint|proxy.*redirect|redirect.*proxy' src tests . --glob '!target/**' --glob '!.git/**' || true
+          echo '===== broker_raft test-ish matches ====='
           python3 - <<'PY'
           from pathlib import Path
           src = Path('src/broker_raft.rs').read_text()
-          needles = [
-              'proxy_rejects_permanent_redirect_ping_pong',
-              'proxy_retry_backoff',
-              'strict timeout budget expired',
-              'attempted_peers',
-              'redirect_cycle_detected',
-          ]
-          for needle in needles:
-              print(f'===== {needle} =====')
-              start = 0
-              found = False
-              while True:
-                  idx = src.find(needle, start)
+          for needle in ['redirect', 'NotLeader', 'proxy_request_retries_total']:
+              print(f'--- {needle} occurrences in final 25% of file ---')
+              start = len(src) * 3 // 4
+              pos = start
+              shown = 0
+              while shown < 40:
+                  idx = src.lower().find(needle.lower(), pos)
                   if idx < 0:
                       break
-                  found = True
-                  lo = max(0, idx - 4500)
-                  hi = min(len(src), idx + 9000)
-                  print(src[lo:hi])
-                  print('\n===== MATCH END =====\n')
-                  start = idx + len(needle)
-                  if needle == 'proxy_rejects_permanent_redirect_ping_pong':
-                      break
-              if not found:
-                  print('not found')
+                  line = src.count('\n', 0, idx) + 1
+                  lo = max(0, idx - 700)
+                  hi = min(len(src), idx + 1800)
+                  print(f'LINE {line}\n{src[lo:hi]}\n---')
+                  pos = idx + len(needle)
+                  shown += 1
           PY
