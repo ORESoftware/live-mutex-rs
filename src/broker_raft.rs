@@ -56542,13 +56542,13 @@ mod tests {
             .await
             .expect_err("a permanent redirect ping-pong must give up, not succeed");
         assert!(
-            matches!(err, BrokerRaftError::NotLeader { .. })
+            matches!(&err, BrokerRaftError::NotLeader { .. })
                 || matches!(
                     &err,
                     BrokerRaftError::Rpc(message)
                         if message.contains("strict timeout budget expired")
                 ),
-            "ping-pong should terminate as NotLeader or retry-budget exhaustion: {err:?}"
+            "ping-pong should end in a bounded terminal error: {err:?}"
         );
 
         n2_server.abort();
