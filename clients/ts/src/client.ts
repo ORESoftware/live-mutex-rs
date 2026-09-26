@@ -28,9 +28,7 @@ function fenceMap(value: unknown, keys: string[], context: string): Record<strin
   const raw = value as Record<string, unknown>;
   const result: Record<string, number> = {};
   for (const key of keys) {
-    if (!(key in raw)) {
-      throw new Error(`${context}: missing fencing token for ${key}`);
-    }
+    if (!(key in raw)) throw new Error(`${context}: missing fencing token for ${key}`);
     result[key] = fence(raw[key], `${context}[${key}]`);
   }
   if (Object.keys(raw).length !== keys.length) {
@@ -95,7 +93,10 @@ export class NetworkMutexClient {
         resolve();
       });
       const t = setTimeout(() => sock.destroy(new Error(`connect timeout after ${timeoutMs}ms`)), timeoutMs);
-      sock.once("error", (err) => { clearTimeout(t); reject(err); });
+      sock.once("error", (err) => {
+        clearTimeout(t);
+        reject(err);
+      });
       sock.on("data", (chunk) => this.onData(chunk));
       sock.on("close", () => {
         this.connected = false;
@@ -129,7 +130,10 @@ export class NetworkMutexClient {
     return new Promise<Response>((resolve, reject) => {
       this.inflight.set(uuid, { resolve, reject, multi });
       this.socket!.write(JSON.stringify(req) + "\n", (err) => {
-        if (err) { this.inflight.delete(uuid); reject(err); }
+        if (err) {
+          this.inflight.delete(uuid);
+          reject(err);
+        }
       });
     });
   }
@@ -173,11 +177,11 @@ export class NetworkMutexClient {
       keepLocksAfterDeath: false, wait: false,
     };
     const resp = await this.send(req, { multi: false });
-    if (resp.type === "error") throw new Error(`tryAcquire(${key}) {
-      error: ${resp.error}`);
+    if (resp.type === "error") {
+      throw new Error(`tryAcquire(${key}) error: ${resp.error}`);
     }
-    if (resp.type !== "lock") throw new Error(`tryAcquire(${key}) {
-      unexpected: ${resp.type}`);
+    if (resp.type !== "lock") {
+      throw new Error(`tryAcquire(${key}) unexpected: ${resp.type}`);
     }
     if (!resp.acquired || !resp.lockUuid) {
       return null;
@@ -256,8 +260,9 @@ export class NetworkMutexClient {
         continue;
       }
       let resp: Response;
-      try { resp = JSON.parse(line) as Response; }
-      catch (err) {
+      try {
+        resp = JSON.parse(line) as Response;
+      } catch (err) {
         const next = this.inflight.values().next().value;
         if (next) {
           next.reject(new Error(`bad frame: ${(err as Error).message}`));
@@ -284,18 +289,30 @@ export class NetworkMutexClient {
       case "lsResult":
       case "ok":
       case "error":
-        this.inflight.delete(uuid); inf.resolve(resp); return;
+        this.inflight.delete(uuid);
+        inf.resolve(resp);
+        return;
       case "lock":
       case "compositeLock":
-        if (resp.acquired || resp.error) { this.inflight.delete(uuid); inf.resolve(resp); }
-        else if (!inf.multi) { this.inflight.delete(uuid); inf.resolve(resp); }
+        if (resp.acquired || resp.error) {
+          this.inflight.delete(uuid);
+          inf.resolve(resp);
+        } else if (!inf.multi) {
+          this.inflight.delete(uuid);
+          inf.resolve(resp);
+        }
         return;
       case "registerReadResult":
       case "registerWriteResult":
-        if (resp.granted) { this.inflight.delete(uuid); inf.resolve(resp); }
+        if (resp.granted) {
+          this.inflight.delete(uuid);
+          inf.resolve(resp);
+        }
         return;
-      case "reelection": return;
-      default: return assertNever(resp);
+      case "reelection":
+        return;
+      default:
+        return assertNever(resp);
     }
   }
 
@@ -313,7 +330,9 @@ export class NetworkMutexClient {
     try {
       const sendPromise = this.send(req, { multi: true });
       return await Promise.race([sendPromise, timeoutHandle.promise]);
-    } finally { timeoutHandle.cancel(); }
+    } finally {
+      timeoutHandle.cancel();
+    }
   }
 
   private async awaitRwGrant(
