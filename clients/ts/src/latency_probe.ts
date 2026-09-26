@@ -44,7 +44,9 @@ function quantile(sorted: number[], q: number): number {
 }
 
 function sleepMs(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function main(): Promise<void> {
