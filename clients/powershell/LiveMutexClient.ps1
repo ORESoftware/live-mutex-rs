@@ -68,7 +68,10 @@ class LiveMutexClient {
         if ($token) {
             $u = [LiveMutexClient]::NewUuid()
             $r = $c.Roundtrip(@{ type = $script:LmxReq.Auth; uuid = $u; token = $token }, $u)
-            if (-not $r.ok) { $c.Disconnect(); throw "auth rejected: $($r | ConvertTo-Json -Compress)" }
+            if (-not $r.ok) {
+                $c.Disconnect()
+                throw "auth rejected: $($r | ConvertTo-Json -Compress)"
+            }
         }
         return $c
     }
@@ -86,10 +89,16 @@ class LiveMutexClient {
     hidden [object] ReadReply([string] $want) {
         while ($true) {
             $line = $this.Reader.ReadLine()
-            if ($null -eq $line) { throw 'connection closed by broker' }
-            if ($line -eq '') { continue }
+            if ($null -eq $line) {
+                throw 'connection closed by broker'
+            }
+            if ($line -eq '') {
+                continue
+            }
             $obj = $line | ConvertFrom-Json
-            if ($obj.uuid -eq $want) { return $obj }
+            if ($obj.uuid -eq $want) {
+                return $obj
+            }
         }
         throw 'unreachable'
     }
@@ -98,9 +107,15 @@ class LiveMutexClient {
     hidden [object] ReadGrant([string] $want) {
         while ($true) {
             $obj = $this.ReadReply($want)
-            if ($null -ne $obj.error) { return $obj }
-            if ($obj.acquired -eq $true) { return $obj }
-            if ($obj.acquired -eq $false) { continue }
+            if ($null -ne $obj.error) {
+                return $obj
+            }
+            if ($obj.acquired -eq $true) {
+                return $obj
+            }
+            if ($obj.acquired -eq $false) {
+                continue
+            }
             return $obj
         }
         throw 'unreachable'
@@ -109,14 +124,19 @@ class LiveMutexClient {
     hidden [object] ReadUntilGranted([string] $want) {
         while ($true) {
             $obj = $this.ReadReply($want)
-            if ($obj.granted -eq $true) { return $obj }
-            if ($null -ne $obj.error) { throw "rw acquire failed: $($obj.error)" }
+            if ($obj.granted -eq $true) {
+                return $obj
+            }
+            if ($null -ne $obj.error) {
+                throw "rw acquire failed: $($obj.error)"
+            }
         }
         throw 'unreachable'
     }
 
     hidden [object] Roundtrip([hashtable] $frame, [string] $uuid) {
-        $this.Send($frame); return $this.ReadReply($uuid)
+        $this.Send($frame)
+        return $this.ReadReply($uuid)
     }
 
     # -- exclusive / semaphore -------------------------------------------
@@ -125,7 +145,9 @@ class LiveMutexClient {
         $u = [LiveMutexClient]::NewUuid()
         $this.Send(@{ type = $script:LmxReq.Lock; uuid = $u; key = $key; ttl = $ttlMs; wait = $true })
         $r = $this.ReadGrant($u)
-        if ($r.acquired -ne $true) { throw "acquire($key) failed: $($r | ConvertTo-Json -Compress)" }
+        if ($r.acquired -ne $true) {
+            throw "acquire($key) failed: $($r | ConvertTo-Json -Compress)"
+        }
         return [pscustomobject]@{ Key = $key; LockUuid = $r.lockUuid; FencingToken = $r.fencingToken }
     }
 
@@ -133,15 +155,21 @@ class LiveMutexClient {
     [pscustomobject] TryAcquire([string] $key, [int] $ttlMs) {
         $u = [LiveMutexClient]::NewUuid()
         $r = $this.Roundtrip(@{ type = $script:LmxReq.Lock; uuid = $u; key = $key; ttl = $ttlMs; wait = $false }, $u)
-        if ($r.type -eq $script:LmxRes.Error) { throw "try_acquire($key) error: $($r.error)" }
-        if ($r.acquired -ne $true) { return $null }
+        if ($r.type -eq $script:LmxRes.Error) {
+            throw "try_acquire($key) error: $($r.error)"
+        }
+        if ($r.acquired -ne $true) {
+            return $null
+        }
         return [pscustomobject]@{ Key = $key; LockUuid = $r.lockUuid; FencingToken = $r.fencingToken }
     }
 
     [void] Release([string] $key, [string] $lockUuid) {
         $u = [LiveMutexClient]::NewUuid()
         $r = $this.Roundtrip(@{ type = $script:LmxReq.Unlock; uuid = $u; key = $key; lockUuid = $lockUuid }, $u)
-        if ($r.unlocked -ne $true) { throw "release($key) failed: $($r | ConvertTo-Json -Compress)" }
+        if ($r.unlocked -ne $true) {
+            throw "release($key) failed: $($r | ConvertTo-Json -Compress)"
+        }
     }
 
     # -- composite (multi-key) -------------------------------------------
@@ -150,14 +178,18 @@ class LiveMutexClient {
         $u = [LiveMutexClient]::NewUuid()
         $this.Send(@{ type = $script:LmxReq.Lock; uuid = $u; keys = $keys; ttl = $ttlMs; wait = $true })
         $r = $this.ReadGrant($u)
-        if ($r.acquired -ne $true) { throw "acquire_many failed: $($r | ConvertTo-Json -Compress)" }
+        if ($r.acquired -ne $true) {
+            throw "acquire_many failed: $($r | ConvertTo-Json -Compress)"
+        }
         return [pscustomobject]@{ Keys = $keys; LockUuid = $r.lockUuid; FencingTokens = $r.fencingTokens }
     }
 
     [void] ReleaseMany([string[]] $keys, [string] $lockUuid) {
         $u = [LiveMutexClient]::NewUuid()
         $r = $this.Roundtrip(@{ type = $script:LmxReq.Unlock; uuid = $u; keys = $keys; lockUuid = $lockUuid }, $u)
-        if ($r.unlocked -ne $true) { throw "release_many failed: $($r | ConvertTo-Json -Compress)" }
+        if ($r.unlocked -ne $true) {
+            throw "release_many failed: $($r | ConvertTo-Json -Compress)"
+        }
     }
 
     # -- reader / writer -------------------------------------------------
@@ -191,12 +223,18 @@ class LiveMutexClient {
     [string[]] Ls() {
         $u = [LiveMutexClient]::NewUuid()
         $r = $this.Roundtrip(@{ type = $script:LmxReq.Ls; uuid = $u }, $u)
-        if ($null -eq $r.keys) { return @() }
+        if ($null -eq $r.keys) {
+            return @()
+        }
         return $r.keys
     }
 
     [void] Disconnect() {
-        if ($this.Reader) { $this.Reader.Dispose() }
-        if ($this.Tcp) { $this.Tcp.Close() }
+        if ($this.Reader) {
+            $this.Reader.Dispose()
+        }
+        if ($this.Tcp) {
+            $this.Tcp.Close()
+        }
     }
 }
