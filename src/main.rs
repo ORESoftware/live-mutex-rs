@@ -7,6 +7,8 @@
 //! Required: at least one of `LMX_TCP_PORT`, `LMX_UDS_PATH`, or
 //! `LMX_HTTP_PORT` must produce a listener. Defaults bind TCP on 6970 and HTTP
 //! on 6971; UDS is off unless `LMX_UDS_PATH` is set.
+#![allow(clippy::needless_return)]
+
 
 use std::path::Path;
 
@@ -50,7 +52,7 @@ async fn main() -> std::io::Result<()> {
         server::run(runtime.server).await
     };
     dd_rust_network_mutex::shutdown_tracing();
-    result
+    return result;
 }
 
 fn log_startup(config: &ServerConfig, raft: &BrokerRaftConfig, config_path: Option<&Path>) {

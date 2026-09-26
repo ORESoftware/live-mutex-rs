@@ -52,12 +52,12 @@ const DEFAULT_MAX_RESPONSE_FRAME_BYTES: usize = 1024 * 1024;
 
 fn max_response_frame_bytes() -> usize {
     crate::routine_id!("ddl-routine-client-max-frame-bytes-T2b");
-    std::env::var("LMX_MAX_RESPONSE_FRAME_BYTES")
+    return std::env::var("LMX_MAX_RESPONSE_FRAME_BYTES")
         .or_else(|_| std::env::var("LMX_MAX_FRAME_BYTES"))
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(DEFAULT_MAX_RESPONSE_FRAME_BYTES)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_FRAME_BYTES);
 }
 
 async fn read_response_frame_bounded<R>(
@@ -118,8 +118,8 @@ fn trim_response_frame(buf: &[u8]) -> &[u8] {
 fn deadline_after(timeout: Duration) -> tokio::time::Instant {
     crate::routine_id!("ddl-routine-client-deadline-after-f6K");
     let now = tokio::time::Instant::now();
-    now.checked_add(timeout)
-        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60))
+    return now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 24 * 60 * 60));
 }
 
 #[derive(Debug, Clone)]
@@ -131,10 +131,10 @@ pub struct ClientConfig {
 impl Default for ClientConfig {
     fn default() -> Self {
         crate::routine_id!("ddl-routine-h0o70WdF73Tn1IM1HU");
-        Self {
+        return Self {
             auth_token: None,
             default_request_timeout: Duration::from_secs(5),
-        }
+        };
     }
 }
 
@@ -175,7 +175,7 @@ impl Client {
         crate::routine_id!("ddl-routine-Vs4WhHDADTirOfwOaP");
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true).ok();
-        Self::start(stream, config).await
+        return Self::start(stream, config).await;
     }
 
     #[cfg(unix)]
@@ -185,7 +185,7 @@ impl Client {
     ) -> Result<Self, ClientError> {
         crate::routine_id!("ddl-routine-rymSP7H4L8S6yqNSir");
         let stream = UnixStream::connect(path.as_ref()).await?;
-        Self::start(stream, config).await
+        return Self::start(stream, config).await;
     }
 
     #[cfg(not(unix))]
@@ -195,11 +195,11 @@ impl Client {
     ) -> Result<Self, ClientError> {
         crate::routine_id!("ddl-routine-client-uds-unsupported-windows-P4n");
         let _ = (path.as_ref(), config);
-        Err(std::io::Error::new(
+        return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Unix-domain sockets are unavailable on this platform; use connect_tcp",
         )
-        .into())
+        .into());
     }
 
     async fn start<S>(stream: S, config: ClientConfig) -> Result<Self, ClientError>
@@ -297,13 +297,13 @@ impl Client {
                 }
             }
         }
-        Ok(client)
+        return Ok(client);
     }
 
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LockGuard, ClientError> {
         crate::routine_id!("ddl-routine-d2XKMm8wCgREqHR4iw");
-        self.acquire_internal(Some(key.to_string()), None, ttl, None)
-            .await
+        return self.acquire_internal(Some(key.to_string()), None, ttl, None)
+            .await;
     }
 
     /// Acquire a semaphore-style lock allowing up to `max` simultaneous
@@ -339,8 +339,8 @@ impl Client {
                 "acquire_with_max requires max >= 1; use acquire() for default semantics".into(),
             ));
         }
-        self.acquire_internal(Some(key.to_string()), None, ttl, Some(max))
-            .await
+        return self.acquire_internal(Some(key.to_string()), None, ttl, Some(max))
+            .await;
     }
 
     pub async fn acquire_composite(
@@ -354,13 +354,13 @@ impl Client {
                 "composite acquire requires 1..={MAX_COMPOSITE_KEYS} keys"
             )));
         }
-        self.acquire_internal(
+        return self.acquire_internal(
             None,
             Some(keys.iter().map(|s| s.to_string()).collect()),
             ttl,
             None,
         )
-        .await
+        .await;
     }
 
     async fn acquire_internal(
@@ -394,7 +394,7 @@ impl Client {
         let timeout = self.inner.config.default_request_timeout;
         let result = self.wait_for_acquire(&mut rx, &request_uuid, timeout).await;
         self.unregister_inflight(&request_uuid);
-        result
+        return result;
     }
 
     /// Non-blocking single-key acquire. Returns `Ok(None)` immediately if the
@@ -406,8 +406,8 @@ impl Client {
         ttl: Duration,
     ) -> Result<Option<LockGuard>, ClientError> {
         crate::routine_id!("ddl-routine-tryacq-single-7Qp");
-        self.try_acquire_internal(Some(key.to_string()), None, ttl, None)
-            .await
+        return self.try_acquire_internal(Some(key.to_string()), None, ttl, None)
+            .await;
     }
 
     /// Non-blocking composite acquire. Returns `Ok(None)` immediately if any
@@ -423,13 +423,13 @@ impl Client {
                 "composite acquire requires 1..={MAX_COMPOSITE_KEYS} keys"
             )));
         }
-        self.try_acquire_internal(
+        return self.try_acquire_internal(
             None,
             Some(keys.iter().map(|s| s.to_string()).collect()),
             ttl,
             None,
         )
-        .await
+        .await;
     }
 
     async fn try_acquire_internal(
@@ -494,7 +494,7 @@ impl Client {
             Err(err) => Err(err),
         };
         self.unregister_inflight(&request_uuid);
-        result
+        return result;
     }
 
     async fn roundtrip_recv(
@@ -502,11 +502,11 @@ impl Client {
         rx: &mut mpsc::UnboundedReceiver<Response>,
         timeout: Duration,
     ) -> Result<Response, ClientError> {
-        match tokio::time::timeout(timeout, rx.recv()).await {
+        return match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(resp)) => Ok(resp),
             Ok(None) => Err(ClientError::Closed),
             Err(_) => Err(ClientError::Timeout(timeout)),
-        }
+        };
     }
 
     async fn wait_for_acquire(
@@ -584,7 +584,7 @@ impl Client {
         };
         let outcome = self.roundtrip(request, &request_uuid, &mut rx).await;
         self.unregister_inflight(&request_uuid);
-        match outcome? {
+        return match outcome? {
             Response::Unlock { unlocked: true, .. } => Ok(()),
             Response::Unlock {
                 unlocked: false,
@@ -597,7 +597,7 @@ impl Client {
             other => Err(ClientError::Broker(format!(
                 "unexpected unlock response: {other:?}"
             ))),
-        }
+        };
     }
 
     pub async fn lock_info(&self, key: &str) -> Result<LockInfo, ClientError> {
@@ -610,7 +610,7 @@ impl Client {
         };
         let outcome = self.roundtrip(request, &request_uuid, &mut rx).await;
         self.unregister_inflight(&request_uuid);
-        match outcome? {
+        return match outcome? {
             Response::LockInfo {
                 key,
                 is_locked,
@@ -629,7 +629,7 @@ impl Client {
             }),
             Response::Error { error, .. } => Err(ClientError::Broker(error)),
             other => Err(ClientError::Broker(format!("unexpected: {other:?}"))),
-        }
+        };
     }
 
     pub async fn ls(&self) -> Result<Vec<String>, ClientError> {
@@ -646,17 +646,17 @@ impl Client {
             )
             .await;
         self.unregister_inflight(&request_uuid);
-        match outcome? {
+        return match outcome? {
             Response::LsResult { keys, .. } => Ok(keys),
             other => Err(ClientError::Broker(format!("unexpected: {other:?}"))),
-        }
+        };
     }
 
     fn register_inflight(&self, uuid: &str) -> mpsc::UnboundedReceiver<Response> {
         crate::routine_id!("ddl-routine-2CBu_Ti9-v9H5eOGph");
         let (tx, rx) = mpsc::unbounded_channel();
         self.inner.inflight.lock().insert(uuid.to_string(), tx);
-        rx
+        return rx;
     }
 
     fn unregister_inflight(&self, uuid: &str) {
@@ -671,7 +671,7 @@ impl Client {
         let mut writer = self.inner.writer.lock().await;
         writer.write_all(&bytes).await?;
         writer.flush().await?;
-        Ok(())
+        return Ok(());
     }
 
     async fn recv_one(
@@ -681,11 +681,11 @@ impl Client {
         timeout: Duration,
     ) -> Result<Response, ClientError> {
         crate::routine_id!("ddl-routine-UQewmszhGwoIxFb3Jn");
-        match tokio::time::timeout(timeout, rx.recv()).await {
+        return match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(resp)) => Ok(resp),
             Ok(None) => Err(ClientError::Closed),
             Err(_) => Err(ClientError::Timeout(timeout)),
-        }
+        };
     }
 
     async fn roundtrip(
@@ -696,8 +696,8 @@ impl Client {
     ) -> Result<Response, ClientError> {
         crate::routine_id!("ddl-routine-Xw2i3L2CdWqt0hyUn8");
         self.write_request(request).await?;
-        self.recv_one(rx, request_uuid, self.inner.config.default_request_timeout)
-            .await
+        return self.recv_one(rx, request_uuid, self.inner.config.default_request_timeout)
+            .await;
     }
 }
 
@@ -714,9 +714,9 @@ impl RwClient {
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
         crate::routine_id!("ddl-routine-BBsdaJ4ryHsNYPIk4P");
-        Ok(Self {
+        return Ok(Self {
             inner: Client::connect_tcp(addr, config).await?,
-        })
+        });
     }
 
     pub async fn connect_uds(
@@ -724,9 +724,9 @@ impl RwClient {
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
         crate::routine_id!("ddl-routine-O6v0Ns6yFrkvxBM0gW");
-        Ok(Self {
+        return Ok(Self {
             inner: Client::connect_uds(path, config).await?,
-        })
+        });
     }
 
     pub async fn acquire_read(&self, key: &str) -> Result<RwReadGuard, ClientError> {
@@ -747,12 +747,12 @@ impl RwClient {
         let result = self.wait_for_rw_grant(&mut rx, true, key).await;
         self.inner.unregister_inflight(&request_uuid);
         let (lock_uuid, fencing_token) = result?;
-        Ok(RwReadGuard {
+        return Ok(RwReadGuard {
             client: self.inner.clone(),
             key: key.to_string(),
             lock_uuid,
             fencing_token,
-        })
+        });
     }
 
     pub async fn acquire_write(&self, key: &str) -> Result<RwWriteGuard, ClientError> {
@@ -773,12 +773,12 @@ impl RwClient {
         let result = self.wait_for_rw_grant(&mut rx, false, key).await;
         self.inner.unregister_inflight(&request_uuid);
         let (lock_uuid, fencing_token) = result?;
-        Ok(RwWriteGuard {
+        return Ok(RwWriteGuard {
             client: self.inner.clone(),
             key: key.to_string(),
             lock_uuid,
             fencing_token,
-        })
+        });
     }
 
     async fn wait_for_rw_grant(
@@ -846,12 +846,12 @@ impl LockGuard {
         if let Some(t) = fencing_token {
             tokens.insert(key.clone(), t);
         }
-        Self {
+        return Self {
             keys: vec![key],
             lock_uuid,
             fencing_token,
             fencing_tokens: tokens,
-        }
+        };
     }
 
     fn composite(
@@ -860,12 +860,12 @@ impl LockGuard {
         fencing_tokens: BTreeMap<String, u64>,
     ) -> Self {
         crate::routine_id!("ddl-routine-CTCD-uPtmZSyMSv2eo");
-        Self {
+        return Self {
             keys,
             lock_uuid,
             fencing_token: None,
             fencing_tokens,
-        }
+        };
     }
 }
 
@@ -889,13 +889,13 @@ pub struct RwReadGuard {
 impl RwReadGuard {
     pub async fn release(self) -> Result<(), ClientError> {
         crate::routine_id!("ddl-routine-Vjn5LJ94ZLnulDL8RZ");
-        self.client
+        return self.client
             .release(&LockGuard::single(
                 self.key.clone(),
                 self.lock_uuid.clone(),
                 self.fencing_token,
             ))
-            .await
+            .await;
     }
 }
 
@@ -909,13 +909,13 @@ pub struct RwWriteGuard {
 impl RwWriteGuard {
     pub async fn release(self) -> Result<(), ClientError> {
         crate::routine_id!("ddl-routine-nRbRFq1_GRo4TWIU1y");
-        self.client
+        return self.client
             .release(&LockGuard::single(
                 self.key.clone(),
                 self.lock_uuid.clone(),
                 self.fencing_token,
             ))
-            .await
+            .await;
     }
 }
 
@@ -923,7 +923,7 @@ impl Client {
     /// Read-only accessor for the configured `ClientConfig`.
     pub fn config(&self) -> &ClientConfig {
         crate::routine_id!("ddl-routine-PJgckbbW53tEIY21kv");
-        &self.inner.config
+        return &self.inner.config;
     }
 }
 

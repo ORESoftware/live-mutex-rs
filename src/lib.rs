@@ -4,6 +4,8 @@
 //! responses that do not contain complete fencing authority. Raw historical
 //! clients remain available as [`RawClient`] / [`RawRwClient`] for migration
 //! and protocol-level testing.
+#![allow(clippy::needless_return)]
+
 
 pub mod broker;
 pub mod broker_raft;

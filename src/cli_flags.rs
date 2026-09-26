@@ -92,19 +92,19 @@ pub enum CliFlagError {
 
 impl BrokerCliEnv {
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.merged_env.get(key).map(String::as_str)
+        return self.merged_env.get(key).map(String::as_str);
     }
 
     pub fn merged_env(&self) -> &BTreeMap<String, String> {
-        &self.merged_env
+        return &self.merged_env;
     }
 
     pub fn cli_overrides(&self) -> &BTreeMap<String, String> {
-        &self.cli_overrides
+        return &self.cli_overrides;
     }
 
     pub fn source_path(&self) -> Option<&Path> {
-        self.source_path.as_deref()
+        return self.source_path.as_deref();
     }
 
     pub fn apply_cli_overrides_to_process_env(&self) {
@@ -116,16 +116,16 @@ impl BrokerCliEnv {
 
 impl BrokerCliHelp {
     pub fn table(&self) -> &str {
-        &self.table
+        return &self.table;
     }
 
     pub fn source_path(&self) -> &Path {
-        &self.source_path
+        return &self.source_path;
     }
 }
 
 pub fn load_broker_cli_config() -> Result<BrokerCliConfig, CliFlagError> {
-    load_broker_cli_config_from(std::env::args().collect(), std::env::vars())
+    return load_broker_cli_config_from(std::env::args().collect(), std::env::vars());
 }
 
 fn load_broker_cli_config_from<I, K, V>(
@@ -175,11 +175,11 @@ where
         merged_env.insert(key.clone(), value.clone());
     }
 
-    Ok(BrokerCliConfig::Run(BrokerCliEnv {
+    return Ok(BrokerCliConfig::Run(BrokerCliEnv {
         merged_env,
         cli_overrides,
         source_path: Some(config_path),
-    }))
+    }));
 }
 
 fn resolve_cli_flags_config_path(env: &BTreeMap<String, String>) -> Option<PathBuf> {
@@ -192,7 +192,7 @@ fn resolve_cli_flags_config_path(env: &BTreeMap<String, String>) -> Option<PathB
         return Some(path);
     }
 
-    find_upward_cli_flags_config().or_else(|| existing_path(DEFAULT_ETC_CLI_FLAGS_CONFIG_PATH))
+    return find_upward_cli_flags_config().or_else(|| existing_path(DEFAULT_ETC_CLI_FLAGS_CONFIG_PATH));
 }
 
 fn find_upward_cli_flags_config() -> Option<PathBuf> {
@@ -217,7 +217,7 @@ fn find_upward_cli_flags_config() -> Option<PathBuf> {
 
 fn existing_path(path: &str) -> Option<PathBuf> {
     let path = PathBuf::from(path);
-    path.exists().then_some(path)
+    return path.exists().then_some(path);
 }
 
 fn parse_cli_overrides(
@@ -235,11 +235,11 @@ fn parse_cli_overrides(
         )?
     };
 
-    serde_json::from_str(&raw).map_err(|source| CliFlagError::NativeJson {
+    return serde_json::from_str(&raw).map_err(|source| CliFlagError::NativeJson {
         operation: "parsing broker CLI flags",
         raw,
         source,
-    })
+    });
 }
 
 fn render_help_table(config_path: &Path, command_name: String) -> Result<String, CliFlagError> {
@@ -249,12 +249,12 @@ fn render_help_table(config_path: &Path, command_name: String) -> Result<String,
             value: command_name,
         })?;
     let columns = terminal_columns();
-    unsafe {
+    return unsafe {
         take_owned_c_string(
             f2e_help_table_from_file(config_path.as_ptr(), command_name.as_ptr(), columns),
             "rendering broker CLI help",
         )
-    }
+    };
 }
 
 fn validate_parser_metadata(
@@ -274,7 +274,7 @@ fn validate_parser_metadata(
         return Err(CliFlagError::Positionals(format_items(&positionals)));
     }
 
-    Ok(())
+    return Ok(());
 }
 
 fn take_json_array(
@@ -285,7 +285,7 @@ fn take_json_array(
         return Ok(Vec::new());
     };
 
-    serde_json::from_str(&value).map_err(|source| CliFlagError::MetadataJson { key, value, source })
+    return serde_json::from_str(&value).map_err(|source| CliFlagError::MetadataJson { key, value, source });
 }
 
 fn cstring_path(path: &Path) -> Result<CString, CliFlagError> {
@@ -294,9 +294,9 @@ fn cstring_path(path: &Path) -> Result<CString, CliFlagError> {
         .ok_or_else(|| CliFlagError::NonUtf8ConfigPath {
             path: path.to_path_buf(),
         })?;
-    CString::new(value).map_err(|_| CliFlagError::ConfigPathNul {
+    return CString::new(value).map_err(|_| CliFlagError::ConfigPathNul {
         path: path.to_path_buf(),
-    })
+    });
 }
 
 unsafe fn take_owned_c_string(
@@ -310,15 +310,15 @@ unsafe fn take_owned_c_string(
         .to_string_lossy()
         .into_owned();
     unsafe { f2e_free(ptr) };
-    Ok(value)
+    return Ok(value);
 }
 
 fn terminal_columns() -> c_int {
-    std::env::var("COLUMNS")
+    return std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.trim().parse::<c_int>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(100)
+        .unwrap_or(100);
 }
 
 fn command_name(args: &[String]) -> Result<String, CliFlagError> {
@@ -334,11 +334,11 @@ fn command_name(args: &[String]) -> Result<String, CliFlagError> {
     if name.contains('\0') {
         return Err(CliFlagError::CommandNameNul { value: name });
     }
-    Ok(name)
+    return Ok(name);
 }
 
 fn format_items(items: &[String]) -> String {
-    items.join(", ")
+    return items.join(", ");
 }
 
 #[cfg(test)]
@@ -346,10 +346,10 @@ mod tests {
     use super::*;
 
     fn manifest_cli_config() -> String {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        return Path::new(env!("CARGO_MANIFEST_DIR"))
             .join(CLI_FLAGS_FILE_NAME)
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
     }
 
     fn env_with_manifest_config(extra: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -359,7 +359,7 @@ mod tests {
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
         );
-        env
+        return env;
     }
 
     #[test]

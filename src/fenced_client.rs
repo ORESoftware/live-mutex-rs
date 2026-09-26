@@ -18,11 +18,11 @@ use crate::client::{
 pub const MAX_FENCING_TOKEN: u64 = 9_007_199_254_740_991;
 
 fn valid_token(token: u64) -> bool {
-    (1..=MAX_FENCING_TOKEN).contains(&token)
+    return (1..=MAX_FENCING_TOKEN).contains(&token);
 }
 
 fn invalid(msg: impl Into<String>) -> ClientError {
-    ClientError::Invalid(format!("invalid fenced authority from broker: {}", msg.into()))
+    return ClientError::Invalid(format!("invalid fenced authority from broker: {}", msg.into()));
 }
 
 fn validate_guard(guard: &LockGuard) -> Result<(), ClientError> {
@@ -66,7 +66,7 @@ fn validate_guard(guard: &LockGuard) -> Result<(), ClientError> {
             return Err(invalid(format!("composite token for {key:?} outside 1..={MAX_FENCING_TOKEN}")));
         }
     }
-    Ok(())
+    return Ok(());
 }
 
 fn validate_rw_token(lock_uuid: &str, token: Option<u64>, kind: &str) -> Result<(), ClientError> {
@@ -77,7 +77,7 @@ fn validate_rw_token(lock_uuid: &str, token: Option<u64>, kind: &str) -> Result<
     if !valid_token(token) {
         return Err(invalid(format!("{kind} fencing token {token} outside 1..={MAX_FENCING_TOKEN}")));
     }
-    Ok(())
+    return Ok(());
 }
 
 /// Public exclusive/composite client. Transport and correlation behavior is
@@ -92,7 +92,7 @@ impl Client {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_tcp(addr, config).await? })
+        return Ok(Self { inner: RawClient::connect_tcp(addr, config).await? });
     }
 
     #[cfg(unix)]
@@ -100,7 +100,7 @@ impl Client {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_uds(path, config).await? })
+        return Ok(Self { inner: RawClient::connect_uds(path, config).await? });
     }
 
     #[cfg(not(unix))]
@@ -108,13 +108,13 @@ impl Client {
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawClient::connect_uds(path, config).await? })
+        return Ok(Self { inner: RawClient::connect_uds(path, config).await? });
     }
 
     pub async fn acquire(&self, key: &str, ttl: Duration) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire(key, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn acquire_with_max(
@@ -125,7 +125,7 @@ impl Client {
     ) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire_with_max(key, max, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn acquire_composite(
@@ -135,7 +135,7 @@ impl Client {
     ) -> Result<LockGuard, ClientError> {
         let guard = self.inner.acquire_composite(keys, ttl).await?;
         validate_guard(&guard)?;
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn try_acquire(
@@ -147,7 +147,7 @@ impl Client {
         if let Some(ref g) = guard {
             validate_guard(g)?;
         }
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn try_acquire_composite(
@@ -159,29 +159,29 @@ impl Client {
         if let Some(ref g) = guard {
             validate_guard(g)?;
         }
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn release(&self, guard: &LockGuard) -> Result<(), ClientError> {
-        self.inner.release(guard).await
+        return self.inner.release(guard).await;
     }
 
     pub async fn lock_info(&self, key: &str) -> Result<LockInfo, ClientError> {
-        self.inner.lock_info(key).await
+        return self.inner.lock_info(key).await;
     }
 
     pub async fn ls(&self) -> Result<Vec<String>, ClientError> {
-        self.inner.ls().await
+        return self.inner.ls().await;
     }
 
     pub fn config(&self) -> &ClientConfig {
-        self.inner.config()
+        return self.inner.config();
     }
 
     /// Explicit escape hatch for migration/testing code. Application code that
     /// performs external effects should not bypass fenced grant admission.
     pub fn into_raw(self) -> RawClient {
-        self.inner
+        return self.inner;
     }
 }
 
@@ -196,30 +196,30 @@ impl RwClient {
         addr: impl tokio::net::ToSocketAddrs,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawRwClient::connect_tcp(addr, config).await? })
+        return Ok(Self { inner: RawRwClient::connect_tcp(addr, config).await? });
     }
 
     pub async fn connect_uds(
         path: impl AsRef<Path>,
         config: ClientConfig,
     ) -> Result<Self, ClientError> {
-        Ok(Self { inner: RawRwClient::connect_uds(path, config).await? })
+        return Ok(Self { inner: RawRwClient::connect_uds(path, config).await? });
     }
 
     pub async fn acquire_read(&self, key: &str) -> Result<RwReadGuard, ClientError> {
         let guard = self.inner.acquire_read(key).await?;
         validate_rw_token(&guard.lock_uuid, guard.fencing_token, "read")?;
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub async fn acquire_write(&self, key: &str) -> Result<RwWriteGuard, ClientError> {
         let guard = self.inner.acquire_write(key).await?;
         validate_rw_token(&guard.lock_uuid, guard.fencing_token, "write")?;
-        Ok(guard)
+        return Ok(guard);
     }
 
     pub fn into_raw(self) -> RawRwClient {
-        self.inner
+        return self.inner;
     }
 }
 
