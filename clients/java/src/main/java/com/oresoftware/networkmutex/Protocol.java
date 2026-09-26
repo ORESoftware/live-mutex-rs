@@ -132,19 +132,29 @@ public final class Protocol {
 
     private void validateAuthority() {
       if (type == ResponseType.LOCK && acquired()) {
-        if (lockUuid().isEmpty()) throw new IllegalArgumentException("acquired lock omitted lockUuid");
+        if (lockUuid().isEmpty()) {
+          throw new IllegalArgumentException("acquired lock omitted lockUuid");
+        }
         exactFence(raw.get("fencingToken"), "fencingToken");
       } else if (type == ResponseType.COMPOSITE_LOCK && acquired()) {
-        if (lockUuid().isEmpty()) throw new IllegalArgumentException("acquired composite lock omitted lockUuid");
+        if (lockUuid().isEmpty()) {
+          throw new IllegalArgumentException("acquired composite lock omitted lockUuid");
+        }
         List<String> ks = keys();
-        if (ks.isEmpty() || new HashSet<>(ks).size() != ks.size()) throw new IllegalArgumentException("invalid composite keys");
+        if (ks.isEmpty() || new HashSet<>(ks).size() != ks.size()) {
+          throw new IllegalArgumentException("invalid composite keys");
+        }
         Object tokensRaw = raw.get("fencingTokens");
-        if (!(tokensRaw instanceof Map<?, ?> tokens) || tokens.size() != ks.size()) throw new IllegalArgumentException("incomplete composite fencing token map");
+        if (!(tokensRaw instanceof Map<?, ?> tokens) || tokens.size() != ks.size()) {
+          throw new IllegalArgumentException("incomplete composite fencing token map");
+        }
         for (String key : ks) {
           exactFence(tokens.get(key), "fencingTokens[" + key + "]");
         }
       } else if ((type == ResponseType.REGISTER_READ_RESULT || type == ResponseType.REGISTER_WRITE_RESULT) && granted()) {
-        if (lockUuid().isEmpty()) throw new IllegalArgumentException("granted rw lock omitted lockUuid");
+        if (lockUuid().isEmpty()) {
+          throw new IllegalArgumentException("granted rw lock omitted lockUuid");
+        }
         exactFence(raw.get("fencingToken"), "fencingToken");
       }
     }
@@ -160,7 +170,9 @@ public final class Protocol {
     public Map<String, Long> fencingTokens() {
       var out = new LinkedHashMap<String, Long>();
       Object v = raw.get("fencingTokens");
-      if (!(v instanceof Map<?, ?> m)) return out;
+      if (!(v instanceof Map<?, ?> m)) {
+        return out;
+      }
       for (Map.Entry<?, ?> e : m.entrySet()) {
         out.put(String.valueOf(e.getKey()), exactFence(e.getValue(), "fencingTokens[" + e.getKey() + "]"));
       }
