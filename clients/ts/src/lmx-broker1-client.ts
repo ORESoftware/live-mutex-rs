@@ -15,14 +15,18 @@ function fence(value: unknown, context: string): number {
 }
 
 function fenceMap(value: unknown, keys: string[], context: string): Record<string, number> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${context}: missing fencing token map`);
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${context}: missing fencing token map`);
+  }
   const raw = value as Record<string, unknown>;
   if (Object.keys(raw).length !== keys.length || new Set(keys).size !== keys.length) {
     throw new Error(`${context}: fencing token/key cardinality mismatch`);
   }
   const out: Record<string, number> = {};
   for (const key of keys) {
-    if (!(key in raw)) throw new Error(`${context}: missing fencing token for ${key}`);
+    if (!(key in raw)) {
+      throw new Error(`${context}: missing fencing token for ${key}`);
+    }
     out[key] = fence(raw[key], `${context}[${key}]`);
   }
   return out;
