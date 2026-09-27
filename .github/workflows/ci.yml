@@ -57,10 +57,17 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features
 
+      # Several Raft config tests temporarily mutate process-wide environment
+      # variables. Rust's default parallel test runner can let unrelated tests
+      # observe those transient values, so serialize the Rust test harness.
       - name: Run tests with all features
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --locked --all-targets --all-features
 
       - name: Run tests without default features
+        env:
+          RUST_TEST_THREADS: "1"
         run: cargo test --locked --no-default-features
 
       - name: Verify broker CLI FFI packaging
