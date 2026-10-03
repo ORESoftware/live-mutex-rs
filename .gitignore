@@ -27,3 +27,7 @@ clients/gleam/erl_crash.dump
 # Test / scratch outputs
 *.log
 .cargo-cache/
+
+# Local temporary directories and repository-owned worktrees
+tmp/
+temp/
